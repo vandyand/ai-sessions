@@ -1,0 +1,22 @@
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.venv/
+venv/
+build/
+dist/
+
+# Never commit local provider conversations, credentials, or utility state.
+.codex/
+.claude/
+.config/ai-sessions/
+.cache/ai-sessions/
+state.json
+config.toml
+*.sqlite
+*.sqlite-shm
+*.sqlite-wal
+*.jsonl
