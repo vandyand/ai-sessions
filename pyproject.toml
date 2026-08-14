@@ -9,6 +9,7 @@ description = "A friendly terminal browser for local Codex CLI and Claude Code s
 readme = "README.md"
 requires-python = ">=3.11"
 license = "MIT"
+license-files = ["LICENSE"]
 authors = [{ name = "Andrew VanDyke", email = "vandyand@gmail.com" }]
 keywords = ["codex", "claude-code", "terminal", "sessions", "tui"]
 classifiers = [

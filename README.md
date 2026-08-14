@@ -42,7 +42,7 @@ pipx install .
 sessions
 ```
 
-Once published to PyPI, installation will be:
+From PyPI:
 
 ```bash
 pipx install ai-sessions
