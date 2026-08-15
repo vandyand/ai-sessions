@@ -37,7 +37,7 @@ from .paths import (
     STATE_FILE,
 )
 
-VERSION = "3.0.2"
+VERSION = "3.0.3"
 
 TOOL_LABELS = {"codex": "Codex", "claude": "Claude"}
 TOOL_ORDER = ("all", "codex", "claude")
@@ -130,11 +130,13 @@ class UserState:
     def __init__(self, path: Path = STATE_FILE) -> None:
         self.path = path
         self.names: dict[str, str] = {}
+        self.original_names: dict[str, dict[str, Any]] = {}
         self.hidden: set[str] = set()
         try:
             payload = json.loads(path.read_text(encoding="utf-8"))
-            if payload.get("version") in (1, 2):
+            if payload.get("version") in (1, 2, 3):
                 names = payload.get("names", {})
+                original_names = payload.get("original_names", {})
                 hidden = payload.get("hidden", [])
                 if isinstance(names, dict):
                     self.names = {
@@ -142,6 +144,14 @@ class UserState:
                         for key, value in names.items()
                         if normalize_space(value)
                     }
+                if isinstance(original_names, dict):
+                    for key, value in original_names.items():
+                        if not isinstance(value, dict) or not isinstance(value.get("named"), bool):
+                            continue
+                        self.original_names[self.stable_key(str(key))] = {
+                            "title": normalize_space(value.get("title")),
+                            "named": value["named"],
+                        }
                 if isinstance(hidden, list):
                     self.hidden = {self.stable_key(str(key)) for key in hidden}
         except (OSError, json.JSONDecodeError, AttributeError):
@@ -157,7 +167,11 @@ class UserState:
 
     def apply(self, sessions: Iterable[Session]) -> None:
         for item in sessions:
-            if not item.original_title:
+            remembered = self.original_names.get(item.key)
+            if remembered is not None:
+                item.original_title = str(remembered["title"])
+                item.original_named = bool(remembered["named"])
+            elif not item.original_title:
                 item.original_title = item.title
                 item.original_named = item.named
             item.title = item.original_title
@@ -175,7 +189,12 @@ class UserState:
         temp = self.path.with_suffix(f".tmp-{os.getpid()}")
         temp.write_text(
             json.dumps(
-                {"version": 2, "names": self.names, "hidden": sorted(self.hidden)},
+                {
+                    "version": 3,
+                    "names": self.names,
+                    "original_names": self.original_names,
+                    "hidden": sorted(self.hidden),
+                },
                 indent=2,
                 ensure_ascii=False,
             )
@@ -184,6 +203,20 @@ class UserState:
         )
         temp.chmod(0o600)
         temp.replace(self.path)
+
+    def remember_original_name(self, item: Session) -> None:
+        """Keep the pre-rename provider title stable across provider reloads."""
+        if item.key not in self.original_names:
+            self.original_names[item.key] = {
+                "title": item.original_title or item.title,
+                "named": item.original_named,
+            }
+
+    def original_name(self, item: Session) -> tuple[str, bool]:
+        remembered = self.original_names.get(item.key)
+        if remembered is None:
+            return item.original_title, item.original_named
+        return str(remembered["title"]), bool(remembered["named"])
 
     def set_name(self, item: Session, name: str) -> None:
         value = normalize_space(name)[:200]
@@ -222,7 +255,13 @@ def append_jsonl(path: Path, payload: dict[str, Any]) -> None:
         handle.write(prefix + line + b"\n")
 
 
-def publish_name(item: Session, name: str) -> str:
+def publish_name(
+    item: Session,
+    name: str,
+    *,
+    original_title: str | None = None,
+    original_named: bool | None = None,
+) -> str:
     """Record a rename in the provider's own store; return a note or "".
 
     Claude honours the last ``custom-title`` entry in a transcript and Codex
@@ -230,11 +269,13 @@ def publish_name(item: Session, name: str) -> str:
     appending a single line to append-only data the provider already owns.
     """
     if not name:
+        original_title = item.original_title if original_title is None else original_title
+        original_named = item.original_named if original_named is None else original_named
         # Nothing sensible to append: a provider title cannot be unset this
         # way, and inventing one would name a session the provider never named.
-        if not (item.original_named and item.original_title):
+        if not (original_named and original_title):
             return "provider title left unchanged; it cannot be cleared by appending"
-        name = item.original_title
+        name = original_title
     try:
         if item.tool == "claude":
             transcript = Path(item.storage)
@@ -253,6 +294,21 @@ def publish_name(item: Session, name: str) -> str:
     except OSError as error:
         return f"could not update the provider title: {error}"
     return ""
+
+
+def rename_session(state: UserState, item: Session, name: str) -> str:
+    """Rename locally and in provider storage while preserving reset history."""
+    value = normalize_space(name)[:200]
+    state.remember_original_name(item)
+    original_title, original_named = state.original_name(item)
+    note = publish_name(
+        item,
+        value,
+        original_title=original_title,
+        original_named=original_named,
+    )
+    state.set_name(item, value)
+    return note
 
 
 def normalize_space(value: Any) -> str:
@@ -520,6 +576,11 @@ class CodexMessageCountCache:
             pass
 
 
+def codex_resume_target(session_id: str, source: str, parent_id: str) -> str:
+    """Resume a subagent's usable parent thread, or the thread itself as fallback."""
+    return parent_id if source == "subagent" and parent_id else session_id
+
+
 def load_codex_sessions() -> list[Session]:
     databases = list(CODEX_HOME.glob("state_*.sqlite"))
     if not databases:
@@ -633,7 +694,7 @@ def load_codex_sessions() -> list[Session]:
                     source=source,
                     auxiliary=auxiliary,
                     origin=origin,
-                    resume_id=sid,
+                    resume_id=codex_resume_target(sid, source, parent_id),
                     parent_id=parent_id,
                     original_title=title,
                     original_named=bool(name),
@@ -1987,7 +2048,9 @@ class Browser:
                 top + 2,
                 left + 2,
                 "Original: "
-                + ellipsize(item.original_title or display_title(item), box_width - 14),
+                + ellipsize(
+                    self.state.original_name(item)[0] or display_title(item), box_width - 14
+                ),
                 self.style("muted"),
                 box_width - 4,
             )
@@ -2027,8 +2090,7 @@ class Browser:
         value = self.name_prompt(item)
         if value is None:
             return
-        note = publish_name(item, normalize_space(value))
-        self.state.set_name(item, value)
+        note = rename_session(self.state, item, value)
         self.state.apply(self.sessions)
         self.message = note or ("Name saved." if value else "Original name restored.")
 
@@ -2234,8 +2296,15 @@ class Browser:
                 self.keep_selection(previous)
 
 
-def custom_mode_notice(config: LaunchConfig) -> str:
+def custom_mode_notice(config: LaunchConfig, provider: str | None = None) -> str:
     """Explain why custom launch mode is adding nothing to the provider command."""
+    if provider in TOOL_LABELS:
+        provider_label = TOOL_LABELS[provider]
+        setting = f"launch.custom.{provider}_args"
+        return (
+            f"sessions: custom launch mode has no arguments configured for {provider_label}, "
+            f"so it starts with provider defaults; set {setting} in {config.path}"
+        )
     return (
         "sessions: custom launch mode has no arguments configured, so sessions "
         "start with provider defaults; set launch.custom.claude_args or "
@@ -2249,7 +2318,9 @@ def command_for(session: Session, config: LaunchConfig) -> list[str]:
         argv += ["--resume", session.resume_target]
     else:
         argv += ["resume"]
-        if session.source == "non-interactive":
+        if session.source == "non-interactive" or (
+            session.source == "subagent" and session.resume_target == session.session_id
+        ):
             argv.append("--include-non-interactive")
         argv.append(session.resume_target)
     return argv
@@ -2258,8 +2329,8 @@ def command_for(session: Session, config: LaunchConfig) -> list[str]:
 def launch(session: Session, config: LaunchConfig, dry_run: bool = False) -> int:
     argv = command_for(session, config)
     cwd = strip_extended_prefix(session.cwd) or str(HOME)
-    if config.custom_args_missing():
-        print(custom_mode_notice(config), file=sys.stderr)
+    if config.custom_args_missing(session.tool):
+        print(custom_mode_notice(config, session.tool), file=sys.stderr)
     if dry_run:
         if IS_WINDOWS:
             rendered = subprocess.list2cmdline(argv)
@@ -2443,8 +2514,7 @@ def main(argv: list[str] | None = None) -> int:
         item = resolve(target)
         if item is None:
             return 2
-        note = publish_name(item, normalize_space(new_name))
-        state.set_name(item, new_name)
+        note = rename_session(state, item, new_name)
         state.apply(sessions)
         print(f"Session name: {display_title(item)}")
         if note:

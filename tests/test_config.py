@@ -22,6 +22,11 @@ class LaunchConfigTests(unittest.TestCase):
             LaunchConfig(mode="custom", custom_codex_args=["--search"]).custom_args_missing()
         )
 
+    def test_custom_args_missing_is_provider_specific(self) -> None:
+        config = LaunchConfig(mode="custom", custom_claude_args=["--verbose"])
+        self.assertFalse(config.custom_args_missing("claude"))
+        self.assertTrue(config.custom_args_missing("codex"))
+
     def test_custom_args_missing_is_false_for_other_modes(self) -> None:
         self.assertFalse(LaunchConfig().custom_args_missing())
         self.assertFalse(LaunchConfig(mode="dangerous").custom_args_missing())

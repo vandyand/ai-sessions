@@ -4,14 +4,17 @@ from contextlib import redirect_stderr, redirect_stdout
 from unittest.mock import patch
 
 from ai_sessions import app
-from ai_sessions.app import Session, command_for, launch
+from ai_sessions.app import Session, codex_resume_target, command_for, launch
 from ai_sessions.config import LaunchConfig
 
 
 def session(
-    tool: str, source: str = "interactive", cwd: str = "/tmp/project with spaces"
+    tool: str,
+    source: str = "interactive",
+    cwd: str = "/tmp/project with spaces",
+    **overrides: object,
 ) -> Session:
-    return Session(
+    values = dict(
         tool=tool,
         session_id="session-id",
         title="Test",
@@ -23,6 +26,8 @@ def session(
         storage="",
         source=source,
     )
+    values.update(overrides)
+    return Session(**values)
 
 
 class LaunchCommandTests(unittest.TestCase):
@@ -43,6 +48,27 @@ class LaunchCommandTests(unittest.TestCase):
             command_for(session("codex", "non-interactive"), LaunchConfig()),
             ["codex", "resume", "--include-non-interactive", "session-id"],
         )
+
+    def test_codex_subagent_resumes_parent(self) -> None:
+        item = session(
+            "codex",
+            "subagent",
+            resume_id="parent-id",
+            parent_id="parent-id",
+        )
+        self.assertEqual(command_for(item, LaunchConfig()), ["codex", "resume", "parent-id"])
+
+    def test_orphaned_codex_subagent_resumes_itself_as_noninteractive(self) -> None:
+        item = session("codex", "subagent")
+        self.assertEqual(
+            command_for(item, LaunchConfig()),
+            ["codex", "resume", "--include-non-interactive", "session-id"],
+        )
+
+    def test_codex_subagent_target_prefers_parent_with_fallback(self) -> None:
+        self.assertEqual(codex_resume_target("child", "subagent", "parent"), "parent")
+        self.assertEqual(codex_resume_target("child", "subagent", ""), "child")
+        self.assertEqual(codex_resume_target("thread", "interactive", "parent"), "thread")
 
     def test_dangerous_flags_precede_resume(self) -> None:
         config = LaunchConfig(mode="dangerous")
@@ -122,6 +148,14 @@ class CustomModeNoticeTests(unittest.TestCase):
         with redirect_stdout(io.StringIO()), redirect_stderr(errors):
             launch(session("codex"), config, dry_run=True)
         self.assertEqual(errors.getvalue(), "")
+
+    def test_other_provider_args_do_not_suppress_warning(self) -> None:
+        config = LaunchConfig(mode="custom", custom_claude_args=["--verbose"])
+        errors = io.StringIO()
+        with redirect_stdout(io.StringIO()), redirect_stderr(errors):
+            launch(session("codex"), config, dry_run=True)
+        self.assertIn("no arguments configured for Codex", errors.getvalue())
+        self.assertIn("launch.custom.codex_args", errors.getvalue())
 
     def test_safe_mode_is_silent(self) -> None:
         errors = io.StringIO()
