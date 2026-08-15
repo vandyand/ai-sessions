@@ -5,7 +5,14 @@ from tempfile import TemporaryDirectory
 from unittest.mock import patch
 
 from ai_sessions import app
-from ai_sessions.app import Session, agent_tag, append_jsonl, publish_name
+from ai_sessions.app import (
+    Session,
+    UserState,
+    agent_tag,
+    append_jsonl,
+    publish_name,
+    rename_session,
+)
 
 
 def session(**overrides) -> Session:
@@ -97,6 +104,52 @@ class PublishNameTests(unittest.TestCase):
             item = session(storage=str(transcript), original_named=False, original_title="auto")
             self.assertIn("cannot be cleared", publish_name(item, ""))
             self.assertEqual(transcript.read_text(encoding="utf-8"), "")
+
+    def test_original_name_survives_provider_reload_before_reset(self) -> None:
+        with TemporaryDirectory() as directory:
+            root = Path(directory)
+            transcript = root / "abc.jsonl"
+            transcript.write_text('{"type":"ai-title","aiTitle":"Original"}\n', encoding="utf-8")
+            state_path = root / "state.json"
+            state = UserState(state_path)
+            first = session(
+                session_id="abc",
+                storage=str(transcript),
+                original_named=True,
+                original_title="Original",
+            )
+
+            self.assertEqual(rename_session(state, first, "Renamed"), "")
+
+            # A fresh provider scan now sees its own newly appended title. The
+            # v3 state must still know what existed before that first rename.
+            reloaded = session(
+                session_id="abc",
+                title="Renamed",
+                storage=str(transcript),
+                original_named=True,
+                original_title="Renamed",
+            )
+            state = UserState(state_path)
+            state.apply([reloaded])
+            self.assertEqual(reloaded.original_title, "Original")
+            self.assertEqual(reloaded.title, "Renamed")
+
+            self.assertEqual(rename_session(state, reloaded, ""), "")
+            last = json.loads(transcript.read_text(encoding="utf-8").splitlines()[-1])
+            self.assertEqual(last["customTitle"], "Original")
+
+            after_reset = session(
+                session_id="abc",
+                title="Original",
+                storage=str(transcript),
+                original_named=True,
+                original_title="Original",
+            )
+            state = UserState(state_path)
+            state.apply([after_reset])
+            self.assertEqual(after_reset.title, "Original")
+            self.assertFalse(after_reset.renamed)
 
 
 class AgentTagTests(unittest.TestCase):

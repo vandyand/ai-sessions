@@ -57,14 +57,21 @@ class LaunchConfig:
         self.set_mode(LAUNCH_MODES[(LAUNCH_MODES.index(self.mode) + 1) % len(LAUNCH_MODES)])
         return self.mode
 
-    def custom_args_missing(self) -> bool:
-        """True when custom mode is selected but contributes no arguments.
+    def custom_args_missing(self, provider: str | None = None) -> bool:
+        """True when custom mode contributes no arguments for a provider.
 
         Custom mode with empty argument lists is indistinguishable from safe
         mode at the command line, so callers surface a notice rather than let
-        the setting look effective when it is not.
+        the setting look effective when it is not.  Without a provider, this
+        reports whether both custom profiles are empty.
         """
-        return self.mode == "custom" and not (self.custom_claude_args or self.custom_codex_args)
+        if self.mode != "custom":
+            return False
+        if provider == "claude":
+            return not self.custom_claude_args
+        if provider == "codex":
+            return not self.custom_codex_args
+        return not (self.custom_claude_args or self.custom_codex_args)
 
     def provider_prefix(self, provider: str) -> list[str]:
         command = self.claude_command if provider == "claude" else self.codex_command

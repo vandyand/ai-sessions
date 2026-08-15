@@ -1,6 +1,6 @@
 # ai-sessions
 
-`ai-sessions` is a searchable terminal browser for local [Codex CLI](https://developers.openai.com/codex/cli/) and Claude Code conversations. It indexes each provider's existing on-disk history without modifying transcripts or provider databases.
+`ai-sessions` is a searchable terminal browser for local [Codex CLI](https://developers.openai.com/codex/cli/) and Claude Code conversations. It indexes each provider's existing on-disk history. Browsing is read-only; an explicit rename appends the provider's supported title record so the name also appears in that provider.
 
 It runs as `sessions` on Linux and native Windows PowerShell.
 
@@ -64,7 +64,7 @@ Run `sessions`, navigate with the arrow keys or `j`/`k`, and press Enter to resu
 | `d` | Choose a directory |
 | `s` | Cycle sort order |
 | `p` | Cycle Safe, Dangerous, and Custom launch modes |
-| `r` | Rename locally |
+| `r` | Rename in the utility and provider |
 | `h` | Hide or restore locally |
 | `Ctrl-R` | Refresh |
 | `?` | Show complete help |
@@ -135,7 +135,7 @@ Rename/hide state is kept alongside the configuration as `state.json`. Caches us
 - Codex on Windows records thread IDs alongside process IDs in its local log database.
 - Linux focus support follows the process into tmux and then uses `wmctrl`/`xdotool` when available.
 
-Detection is best-effort and read-only. The utility never writes to provider storage.
+Detection is best-effort and read-only. Renaming is the sole operation that writes to provider storage; hiding and all other utility state stay local to `ai-sessions`.
 
 ## Privacy
 
