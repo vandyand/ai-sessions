@@ -35,7 +35,7 @@ from .paths import (
     STATE_FILE,
 )
 
-VERSION = "3.0.0"
+VERSION = "3.0.1"
 
 TOOL_LABELS = {"codex": "Codex", "claude": "Claude"}
 TOOL_ORDER = ("all", "codex", "claude")
@@ -247,15 +247,25 @@ def timestamp(value: Any) -> float:
     return 0.0
 
 
+def strip_extended_prefix(value: str) -> str:
+    r"""Drop Win32's extended-length prefix from a recorded path.
+
+    Codex stores most Windows thread directories as ``\\?\C:\...``.  The prefix
+    is valid for Win32 file APIs but not for a process working directory:
+    cmd.exe refuses it and silently falls back to the Windows directory.  Strip
+    it before the path reaches a human, ``os.chdir``, or a rendered command.
+    """
+    if value.startswith("\\\\?\\UNC\\"):
+        return "\\\\" + value[8:]
+    if value.startswith("\\\\?\\"):
+        return value[4:]
+    return value
+
+
 def short_path(value: str) -> str:
     if not value:
         return "(unknown directory)"
-    # Codex uses Win32's extended-length prefix for some native paths. It is
-    # useful internally but noisy in a human-facing directory column.
-    if value.startswith("\\\\?\\UNC\\"):
-        value = "\\\\" + value[8:]
-    elif value.startswith("\\\\?\\"):
-        value = value[4:]
+    value = strip_extended_prefix(value)
     try:
         path = Path(value).expanduser()
         if path == HOME:
@@ -1753,7 +1763,12 @@ class Browser:
         if mode == "dangerous":
             self.message = "DANGEROUS launch mode: provider safeguards will be bypassed."
         elif mode == "custom":
-            self.message = "Custom launch mode selected; arguments come from config.toml."
+            if self.launch_config.custom_args_missing():
+                self.message = (
+                    "Custom launch mode has no arguments configured; provider defaults apply."
+                )
+            else:
+                self.message = "Custom launch mode selected; arguments come from config.toml."
         else:
             self.message = "Safe launch mode: provider permission defaults apply."
 
@@ -2120,6 +2135,15 @@ class Browser:
                 self.keep_selection(previous)
 
 
+def custom_mode_notice(config: LaunchConfig) -> str:
+    """Explain why custom launch mode is adding nothing to the provider command."""
+    return (
+        "sessions: custom launch mode has no arguments configured, so sessions "
+        "start with provider defaults; set launch.custom.claude_args or "
+        f"launch.custom.codex_args in {config.path}"
+    )
+
+
 def command_for(session: Session, config: LaunchConfig) -> list[str]:
     argv = config.provider_prefix(session.tool)
     if session.tool == "claude":
@@ -2134,7 +2158,9 @@ def command_for(session: Session, config: LaunchConfig) -> list[str]:
 
 def launch(session: Session, config: LaunchConfig, dry_run: bool = False) -> int:
     argv = command_for(session, config)
-    cwd = session.cwd or str(HOME)
+    cwd = strip_extended_prefix(session.cwd) or str(HOME)
+    if config.custom_args_missing():
+        print(custom_mode_notice(config), file=sys.stderr)
     if dry_run:
         if IS_WINDOWS:
             rendered = subprocess.list2cmdline(argv)
@@ -2270,6 +2296,8 @@ def main(argv: list[str] | None = None) -> int:
     if args.set_launch_mode:
         launch_config.set_mode(args.set_launch_mode)
         print(f"Launch mode saved: {launch_config.mode}")
+        if launch_config.custom_args_missing():
+            print(custom_mode_notice(launch_config), file=sys.stderr)
         return 0
     if args.launch_mode:
         launch_config.mode = args.launch_mode
