@@ -13,6 +13,19 @@ class LaunchConfigTests(unittest.TestCase):
         self.assertEqual(config.provider_prefix("claude"), ["claude"])
         self.assertEqual(config.provider_prefix("codex"), ["codex"])
 
+    def test_custom_args_missing_detects_empty_custom_mode(self) -> None:
+        self.assertTrue(LaunchConfig(mode="custom").custom_args_missing())
+        self.assertFalse(
+            LaunchConfig(mode="custom", custom_claude_args=["--verbose"]).custom_args_missing()
+        )
+        self.assertFalse(
+            LaunchConfig(mode="custom", custom_codex_args=["--search"]).custom_args_missing()
+        )
+
+    def test_custom_args_missing_is_false_for_other_modes(self) -> None:
+        self.assertFalse(LaunchConfig().custom_args_missing())
+        self.assertFalse(LaunchConfig(mode="dangerous").custom_args_missing())
+
     def test_dangerous_provider_flags(self) -> None:
         config = LaunchConfig(mode="dangerous")
         self.assertEqual(
