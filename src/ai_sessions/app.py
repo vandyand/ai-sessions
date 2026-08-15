@@ -2,8 +2,9 @@
 """Browse and resume local Claude Code and Codex CLI sessions.
 
 Core browsing uses only Python's standard library. Desktop focusing optionally
-uses local tmux/wmctrl/xdotool commands. Original transcripts and databases are
-never modified.
+uses local tmux/wmctrl/xdotool commands. Browsing never modifies provider data.
+Renaming is the one exception: it appends a title entry to the provider's own
+append-only index so the new name also shows up in Claude Code and Codex.
 """
 
 from __future__ import annotations
@@ -16,6 +17,7 @@ import locale
 import os
 import re
 import shlex
+import shutil
 import sqlite3
 import subprocess
 import sys
@@ -35,7 +37,7 @@ from .paths import (
     STATE_FILE,
 )
 
-VERSION = "3.0.1"
+VERSION = "3.0.2"
 
 TOOL_LABELS = {"codex": "Codex", "claude": "Claude"}
 TOOL_ORDER = ("all", "codex", "claude")
@@ -84,6 +86,7 @@ class Session:
     message_count: int = 0
     is_open: bool = False
     open_pid: int = 0
+    agent_nickname: str = ""
 
     @property
     def key(self) -> str:
@@ -117,7 +120,12 @@ class Session:
 
 
 class UserState:
-    """Private, utility-local names and visibility; vendor data stays untouched."""
+    """Utility-local names and visibility.
+
+    Visibility never leaves this file.  Names are mirrored here so a rename
+    survives even when the provider store cannot be written, but the rename
+    itself is published to the provider by ``publish_name``.
+    """
 
     def __init__(self, path: Path = STATE_FILE) -> None:
         self.path = path
@@ -191,6 +199,60 @@ class UserState:
         else:
             self.hidden.discard(item.key)
         self.save()
+
+
+def append_jsonl(path: Path, payload: dict[str, Any]) -> None:
+    """Append one compact JSON line, repairing a missing final newline first.
+
+    Both providers append to these files while they run, so the line is
+    written in one call and never rewrites what is already on disk.
+    """
+    line = json.dumps(payload, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
+    prefix = b""
+    try:
+        with path.open("rb") as handle:
+            if handle.seek(0, os.SEEK_END):
+                handle.seek(-1, os.SEEK_END)
+                if handle.read(1) != b"\n":
+                    prefix = b"\n"
+    except OSError:
+        pass
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.open("ab") as handle:
+        handle.write(prefix + line + b"\n")
+
+
+def publish_name(item: Session, name: str) -> str:
+    """Record a rename in the provider's own store; return a note or "".
+
+    Claude honours the last ``custom-title`` entry in a transcript and Codex
+    the last ``thread_name`` for a thread id, so a rename can be published by
+    appending a single line to append-only data the provider already owns.
+    """
+    if not name:
+        # Nothing sensible to append: a provider title cannot be unset this
+        # way, and inventing one would name a session the provider never named.
+        if not (item.original_named and item.original_title):
+            return "provider title left unchanged; it cannot be cleared by appending"
+        name = item.original_title
+    try:
+        if item.tool == "claude":
+            transcript = Path(item.storage)
+            if not transcript.is_file():
+                return f"transcript for {item.session_id} is missing; name kept local only"
+            append_jsonl(
+                transcript,
+                {"type": "custom-title", "customTitle": name, "sessionId": item.session_id},
+            )
+        else:
+            stamp = dt.datetime.now(dt.timezone.utc).isoformat().replace("+00:00", "Z")
+            append_jsonl(
+                CODEX_HOME / "session_index.jsonl",
+                {"id": item.session_id, "thread_name": name, "updated_at": stamp},
+            )
+    except OSError as error:
+        return f"could not update the provider title: {error}"
+    return ""
 
 
 def normalize_space(value: Any) -> str:
@@ -282,10 +344,26 @@ def display_title(session: Session) -> str:
     return title
 
 
+def agent_tag(session: Session) -> str:
+    """Label agent threads that borrowed their opening message.
+
+    Codex copies the parent's first user message into every subagent it
+    spawns, so a fan-out of five renders as five identical lines.  The
+    nickname identifies the sibling and the short parent id shows the lineage.
+    """
+    if session.source == "subagent":
+        nickname = session.agent_nickname or "sub"
+        parent = session.parent_id[:8]
+        return f"[{nickname}<{parent}] " if parent else f"[{nickname}] "
+    if session.source == "non-interactive":
+        return "[exec] "
+    return ""
+
+
 def display_list_title(session: Session) -> str:
     """Make generated/unnamed titles explicit without a separate flag column."""
     title = display_title(session)
-    return title if session.named else f"*- {title}"
+    return agent_tag(session) + (title if session.named else f"*- {title}")
 
 
 def load_codex_history() -> dict[str, dict[str, Any]]:
@@ -504,6 +582,18 @@ def load_codex_sessions() -> list[Session]:
                 source = "non-interactive"
             else:
                 source = "interactive"
+            # Codex describes a spawned thread with a JSON blob in `source`.
+            # It carries the parent and the nickname that tell otherwise
+            # identical sibling agents apart.
+            parent_id = ""
+            nickname = normalize_space(field("agent_nickname"))
+            if launch_source.startswith("{"):
+                try:
+                    spawn = json.loads(launch_source)["subagent"]["thread_spawn"]
+                    parent_id = str(spawn.get("parent_thread_id") or "")
+                    nickname = nickname or normalize_space(spawn.get("agent_nickname"))
+                except (json.JSONDecodeError, KeyError, TypeError):
+                    pass
             auxiliary = source != "interactive" or bool(field("archived", False))
             # Interactive CLI threads are human-launched. Codex exec threads
             # and internal subagents are normally created by agent workflows or
@@ -544,9 +634,11 @@ def load_codex_sessions() -> list[Session]:
                     auxiliary=auxiliary,
                     origin=origin,
                     resume_id=sid,
+                    parent_id=parent_id,
                     original_title=title,
                     original_named=bool(name),
                     message_count=message_count,
+                    agent_nickname=nickname,
                 )
             )
         connection.close()
@@ -1636,14 +1728,20 @@ class Browser:
                 segment(f"{item.message_count:<{messages_width}}", "messages")
                 segment(f"{relative_time(item.created):<{time_width}}", "muted")
                 segment(f"{relative_time(item.updated):<{time_width}}", "timestamp")
+                tag = agent_tag(item)
+                remaining = title_width
+                if tag:
+                    segment(tag, item.origin, curses.A_BOLD)
+                    remaining = max(0, remaining - len(tag))
                 if item.named:
-                    title = ellipsize(display_title(item), title_width)
-                    segment(f"{title:<{title_width}}", "primary", curses.A_BOLD)
+                    title = ellipsize(display_title(item), remaining)
+                    segment(f"{title:<{remaining}}", "primary", curses.A_BOLD)
                 else:
                     prefix = "*- "
-                    title = ellipsize(display_title(item), max(0, title_width - len(prefix)))
+                    room = max(0, remaining - len(prefix))
+                    title = ellipsize(display_title(item), room)
                     segment(prefix, "warning", curses.A_BOLD)
-                    segment(f"{title:<{max(0, title_width - len(prefix))}}", "primary")
+                    segment(f"{title:<{room}}", "primary")
                 if show_directory:
                     segment(ellipsize(directory, directory_width).ljust(directory_width), "muted")
 
@@ -1708,9 +1806,9 @@ class Browser:
                     width - 4,
                 )
 
-        footer = (
-            self.message
-            or "Enter focus/resume  Ctrl-F search  p launch  o origin  v view  s sort  r rename  h hide  ? help"
+        footer = self.message or (
+            "Enter focus/resume  Ctrl-F search  p launch  o origin  v view  "
+            "s sort  r rename  h hide  q quit  ? help"
         )
         self.add(footer_row, 1, footer, self.style("accent", curses.A_BOLD), width - 2)
         if self.searching:
@@ -1929,9 +2027,10 @@ class Browser:
         value = self.name_prompt(item)
         if value is None:
             return
+        note = publish_name(item, normalize_space(value))
         self.state.set_name(item, value)
         self.state.apply(self.sessions)
-        self.message = "Name saved." if value else "Original name restored."
+        self.message = note or ("Name saved." if value else "Original name restored.")
 
     def toggle_hidden(self) -> None:
         items = self.current()
@@ -2171,7 +2270,16 @@ def launch(session: Session, config: LaunchConfig, dry_run: bool = False) -> int
     try:
         os.chdir(cwd)
         if IS_WINDOWS:
-            return subprocess.call(argv)
+            # npm ships claude/codex as .cmd shims, and CreateProcess only ever
+            # appends .exe when searching PATH -- it does not honour PATHEXT.
+            # Resolve the shim the way the shell would before handing it over,
+            # or the launch fails with WinError 2 for a command that plainly
+            # works when typed.
+            executable = shutil.which(argv[0])
+            if executable is None:
+                print(f"sessions: {argv[0]!r} is not on PATH", file=sys.stderr)
+                return 127
+            return subprocess.call([executable, *argv[1:]])
         os.execvp(argv[0], argv)
     except OSError as error:
         print(f"sessions: could not launch {argv[0]!r}: {error}", file=sys.stderr)
@@ -2224,7 +2332,8 @@ def build_parser() -> argparse.ArgumentParser:
               sessions --query "tool:claude origin:agent dir:ascolais"
 
             Interactive keys: o filters by origin, v filters hidden sessions,
-            Ctrl-F starts search, r renames, h hides/unhides, and ? shows all shortcuts.
+            Ctrl-F starts search, r renames, h hides/unhides, q quits, and ?
+            shows all shortcuts.
             """
         ),
     )
@@ -2258,7 +2367,7 @@ def build_parser() -> argparse.ArgumentParser:
         "--rename",
         nargs=2,
         metavar=("ID_OR_NAME", "NEW_NAME"),
-        help="set a utility-local session name; use an empty name to reset",
+        help="rename a session in Claude Code or Codex too; empty name resets it",
     )
     parser.add_argument("--hide", metavar="ID_OR_NAME", help="hide a session from the normal view")
     parser.add_argument("--unhide", metavar="ID_OR_NAME", help="restore a hidden session")
@@ -2334,9 +2443,12 @@ def main(argv: list[str] | None = None) -> int:
         item = resolve(target)
         if item is None:
             return 2
+        note = publish_name(item, normalize_space(new_name))
         state.set_name(item, new_name)
         state.apply(sessions)
         print(f"Session name: {display_title(item)}")
+        if note:
+            print(f"sessions: {note}", file=sys.stderr)
     if args.hide or args.unhide or args.rename:
         return 0
 
