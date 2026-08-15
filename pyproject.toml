@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "ai-sessions"
-version = "3.0.1"
+version = "3.0.2"
 description = "A friendly terminal browser for local Codex CLI and Claude Code sessions"
 readme = "README.md"
 requires-python = ">=3.11"

@@ -1,7 +1,9 @@
 import io
 import unittest
 from contextlib import redirect_stderr, redirect_stdout
+from unittest.mock import patch
 
+from ai_sessions import app
 from ai_sessions.app import Session, command_for, launch
 from ai_sessions.config import LaunchConfig
 
@@ -79,6 +81,32 @@ class LaunchDirectoryTests(unittest.TestCase):
         with redirect_stdout(buffer):
             launch(session("codex"), LaunchConfig(), dry_run=True)
         self.assertIn("/tmp/project with spaces", buffer.getvalue())
+
+
+class WindowsShimResolutionTests(unittest.TestCase):
+    """CreateProcess appends only .exe, so PATHEXT shims must be resolved first."""
+
+    def test_windows_launch_resolves_the_shim_before_calling(self) -> None:
+        calls: list[list[str]] = []
+        with (
+            patch.object(app, "IS_WINDOWS", True),
+            patch.object(app.os, "chdir", lambda _: None),
+            patch.object(app.shutil, "which", lambda name: rf"C:\npm\{name}.CMD"),
+            patch.object(app.subprocess, "call", lambda argv: calls.append(argv) or 0),
+        ):
+            self.assertEqual(launch(session("claude"), LaunchConfig()), 0)
+        self.assertEqual(calls, [[r"C:\npm\claude.CMD", "--resume", "session-id"]])
+
+    def test_missing_command_reports_instead_of_raising(self) -> None:
+        errors = io.StringIO()
+        with (
+            patch.object(app, "IS_WINDOWS", True),
+            patch.object(app.os, "chdir", lambda _: None),
+            patch.object(app.shutil, "which", lambda _: None),
+            redirect_stderr(errors),
+        ):
+            self.assertEqual(launch(session("claude"), LaunchConfig()), 127)
+        self.assertIn("not on PATH", errors.getvalue())
 
 
 class CustomModeNoticeTests(unittest.TestCase):

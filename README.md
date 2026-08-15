@@ -10,7 +10,8 @@ It runs as `sessions` on Linux and native Windows PowerShell.
 - Search and filters for provider, directory, origin, open state, and visibility
 - Human, cross-provider, and subagent/automation origin labels
 - Started and updated timestamps plus user-message counts across compactions
-- Utility-local rename and hide operations that never alter vendor data
+- Rename that carries through to Claude Code and Codex, plus utility-local hiding
+- Nickname and parent labels that tell sibling subagent threads apart
 - Detection of currently open sessions on Linux and Windows
 - tmux pane and desktop-terminal focus on Linux when the environment exposes it
 - Safe, dangerous, and custom launch profiles
