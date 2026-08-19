@@ -22,10 +22,18 @@ import sqlite3
 import subprocess
 import sys
 import textwrap
-from dataclasses import asdict, dataclass, replace
+from dataclasses import asdict, dataclass, field, replace
 from pathlib import Path
 from typing import Any, Iterable
 
+from .bridge import (
+    BRIDGE_TOOLS,
+    DEFAULT_MAX_CHARS,
+    BridgeError,
+    append_jsonl,
+    bridge,
+    native_session_exists,
+)
 from .config import LAUNCH_MODES, LaunchConfig
 from .paths import (
     CACHE_FILE,
@@ -37,7 +45,7 @@ from .paths import (
     STATE_FILE,
 )
 
-VERSION = "3.0.3"
+VERSION = "3.1.0"
 
 TOOL_LABELS = {"codex": "Codex", "claude": "Claude"}
 TOOL_ORDER = ("all", "codex", "claude")
@@ -87,12 +95,69 @@ class Session:
     is_open: bool = False
     open_pid: int = 0
     agent_nickname: str = ""
+    launch_targets: dict[str, str] = field(default_factory=dict)
+    launch_tool: str = ""
 
     @property
     def key(self) -> str:
         # Origin is inferred metadata and can improve over time.  Keep utility
         # names/visibility attached to the stable vendor session identity.
         return f"{self.tool}:{self.session_id}"
+
+    @property
+    def can_bridge(self) -> bool:
+        """Whether the conversation can be copied into the other harness.
+
+        Bridging replays the stored transcript, so it needs one: sessions
+        discovered without a readable file on disk stay single-harness.
+        """
+        return bool(self.storage)
+
+    @property
+    def available_launch_tools(self) -> tuple[str, ...]:
+        """Harnesses this session can be resumed in, native ones first.
+
+        A provider id only ever resumes in its own CLI, so anything beyond
+        ``launch_targets`` is reached by bridging a copy across.
+        """
+        ordered = [self.tool, *(tool for tool in self.launch_targets if tool != self.tool)]
+        if self.can_bridge:
+            ordered += [tool for tool in BRIDGE_TOOLS if tool not in ordered]
+        return tuple(ordered)
+
+    @property
+    def active_launch_tool(self) -> str:
+        return self.launch_tool if self.launch_tool in self.available_launch_tools else self.tool
+
+    def launch_target(self, tool: str | None = None) -> str:
+        """The id that resumes this conversation in ``tool``, or "" if none yet."""
+        resolved = tool or self.active_launch_tool
+        return self.launch_targets.get(resolved, "")
+
+    def needs_bridge(self, tool: str | None = None) -> bool:
+        resolved = tool or self.active_launch_tool
+        return resolved != self.tool and resolved not in self.launch_targets
+
+    def cycle_launch_tool(self, backwards: bool = False) -> None:
+        options = self.available_launch_tools
+        if len(options) < 2:
+            return
+        selected = self.active_launch_tool
+        if selected not in options:
+            selected = options[0]
+        index = options.index(selected)
+        self.launch_tool = options[(index + (-1 if backwards else 1)) % len(options)]
+
+    def supports_launch_tool(self, value: str) -> bool:
+        return value in self.available_launch_tools
+
+    def __post_init__(self) -> None:
+        if not self.launch_targets:
+            self.launch_targets = {self.tool: self.session_id}
+        elif self.tool not in self.launch_targets:
+            self.launch_targets = {self.tool: self.session_id, **self.launch_targets}
+        if self.launch_tool and self.launch_tool not in self.available_launch_tools:
+            self.launch_tool = ""
 
     @property
     def resume_target(self) -> str:
@@ -104,6 +169,8 @@ class Session:
                 self.tool,
                 TOOL_LABELS.get(self.tool, self.tool),
                 self.session_id,
+                self.active_launch_tool,
+                *self.available_launch_tools,
                 self.title,
                 self.cwd,
                 self.preview,
@@ -132,12 +199,29 @@ class UserState:
         self.names: dict[str, str] = {}
         self.original_names: dict[str, dict[str, Any]] = {}
         self.hidden: set[str] = set()
+        self.launch_tools: dict[str, str] = {}
+        self.bridges: dict[str, dict[str, dict[str, Any]]] = {}
         try:
             payload = json.loads(path.read_text(encoding="utf-8"))
-            if payload.get("version") in (1, 2, 3):
+            if payload.get("version") in (1, 2, 3, 4, 5):
                 names = payload.get("names", {})
                 original_names = payload.get("original_names", {})
                 hidden = payload.get("hidden", [])
+                launch_tools = payload.get("launch_tools", {})
+                bridges = payload.get("bridges", {})
+                if isinstance(bridges, dict):
+                    for key, value in bridges.items():
+                        if not isinstance(value, dict):
+                            continue
+                        entries = {
+                            tool: entry
+                            for tool, entry in value.items()
+                            if tool in TOOL_LABELS
+                            and isinstance(entry, dict)
+                            and isinstance(entry.get("session_id"), str)
+                        }
+                        if entries:
+                            self.bridges[self.stable_key(str(key))] = entries
                 if isinstance(names, dict):
                     self.names = {
                         self.stable_key(str(key)): normalize_space(value)
@@ -154,6 +238,13 @@ class UserState:
                         }
                 if isinstance(hidden, list):
                     self.hidden = {self.stable_key(str(key)) for key in hidden}
+                if isinstance(launch_tools, dict):
+                    for key, value in launch_tools.items():
+                        if not isinstance(value, str):
+                            continue
+                        value = value.strip().lower()
+                        if value in TOOL_LABELS:
+                            self.launch_tools[self.stable_key(str(key))] = value
         except (OSError, json.JSONDecodeError, AttributeError):
             pass
 
@@ -177,6 +268,9 @@ class UserState:
             item.title = item.original_title
             item.named = item.original_named
             item.renamed = False
+            item.launch_tool = self.launch_tools.get(item.key, "")
+            if item.launch_tool and item.launch_tool not in item.available_launch_tools:
+                item.launch_tool = ""
             custom = self.names.get(item.key, "")
             if custom:
                 item.title = custom
@@ -190,10 +284,12 @@ class UserState:
         temp.write_text(
             json.dumps(
                 {
-                    "version": 3,
+                    "version": 5,
                     "names": self.names,
                     "original_names": self.original_names,
                     "hidden": sorted(self.hidden),
+                    "launch_tools": self.launch_tools,
+                    "bridges": self.bridges,
                 },
                 indent=2,
                 ensure_ascii=False,
@@ -206,53 +302,70 @@ class UserState:
 
     def remember_original_name(self, item: Session) -> None:
         """Keep the pre-rename provider title stable across provider reloads."""
-        if item.key not in self.original_names:
-            self.original_names[item.key] = {
+        key = self.stable_key(item.key)
+        if key not in self.original_names:
+            self.original_names[key] = {
                 "title": item.original_title or item.title,
                 "named": item.original_named,
             }
 
     def original_name(self, item: Session) -> tuple[str, bool]:
-        remembered = self.original_names.get(item.key)
+        remembered = self.original_names.get(self.stable_key(item.key))
         if remembered is None:
             return item.original_title, item.original_named
         return str(remembered["title"]), bool(remembered["named"])
 
     def set_name(self, item: Session, name: str) -> None:
         value = normalize_space(name)[:200]
+        key = self.stable_key(item.key)
         if value:
-            self.names[item.key] = value
+            self.names[key] = value
         else:
-            self.names.pop(item.key, None)
+            self.names.pop(key, None)
         self.save()
 
     def set_hidden(self, item: Session, hidden: bool) -> None:
+        key = self.stable_key(item.key)
         if hidden:
-            self.hidden.add(item.key)
+            self.hidden.add(key)
         else:
-            self.hidden.discard(item.key)
+            self.hidden.discard(key)
         self.save()
 
+    def set_launch_tool(self, item: Session, launch_tool: str) -> None:
+        key = self.stable_key(item.key)
+        if launch_tool and launch_tool in item.available_launch_tools and launch_tool != item.tool:
+            self.launch_tools[key] = launch_tool
+        else:
+            self.launch_tools.pop(key, None)
+        self.save()
 
-def append_jsonl(path: Path, payload: dict[str, Any]) -> None:
-    """Append one compact JSON line, repairing a missing final newline first.
+    def bridge_for(self, item: Session, tool: str) -> str:
+        """The id of an existing bridged copy that is still worth resuming.
 
-    Both providers append to these files while they run, so the line is
-    written in one call and never rewrites what is already on disk.
-    """
-    line = json.dumps(payload, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
-    prefix = b""
-    try:
-        with path.open("rb") as handle:
-            if handle.seek(0, os.SEEK_END):
-                handle.seek(-1, os.SEEK_END)
-                if handle.read(1) != b"\n":
-                    prefix = b"\n"
-    except OSError:
-        pass
-    path.parent.mkdir(parents=True, exist_ok=True)
-    with path.open("ab") as handle:
-        handle.write(prefix + line + b"\n")
+        A copy is a snapshot.  Once the source has moved on, resuming the old
+        copy would silently continue from a stale conversation, so the record
+        is discarded and the caller makes a fresh one.
+        """
+        entry = self.bridges.get(self.stable_key(item.key), {}).get(tool)
+        if not entry:
+            return ""
+        storage = str(entry.get("storage", ""))
+        if storage and not Path(storage).is_file():
+            return ""
+        recorded = entry.get("source_updated")
+        if not isinstance(recorded, (int, float)) or item.updated > float(recorded) + 1:
+            return ""
+        return str(entry["session_id"])
+
+    def set_bridge(self, item: Session, tool: str, session_id: str, storage: str) -> None:
+        key = self.stable_key(item.key)
+        self.bridges.setdefault(key, {})[tool] = {
+            "session_id": session_id,
+            "storage": storage,
+            "source_updated": item.updated,
+        }
+        self.save()
 
 
 def publish_name(
@@ -673,6 +786,11 @@ def load_codex_sessions() -> list[Session]:
                 or field("updated_at")
             )
             rollout_path = str(field("rollout_path", "") or "")
+            # Codex keeps its thread row after the rollout behind it is gone.
+            # Such a thread cannot be resumed or read, so listing it offers a
+            # session that does not exist.
+            if rollout_path and not Path(rollout_path).is_file():
+                continue
             if source == "interactive" and sid in history:
                 message_count = int(history[sid].get("count", 0))
                 latest_user_message = clean_prompt(history[sid].get("latest"))
@@ -787,9 +905,11 @@ class ClaudeMetadataCache:
         )
         meta = dict(cached) if can_continue else self.blank()
         start = int(meta.get("offset", 0)) if can_continue else 0
-        codex_refs = {
-            str(value) for value in meta.get("codex_session_refs", []) if isinstance(value, str)
-        }
+        codex_refs = [
+            str(value)
+            for value in meta.get("codex_session_refs", [])
+            if isinstance(value, str)
+        ]
         try:
             with path.open("rb") as handle:
                 handle.seek(start)
@@ -798,9 +918,10 @@ class ClaudeMetadataCache:
                     if not line:
                         break
                     meta["offset"] = handle.tell()
-                    codex_refs.update(
-                        match.decode("ascii") for match in CODEX_ID_PATTERN.findall(line)
-                    )
+                    for match in CODEX_ID_PATTERN.findall(line):
+                        found = match.decode("ascii")
+                        if found not in codex_refs:
+                            codex_refs.append(found)
                     if not any(marker in line for marker in self.INTERESTING):
                         continue
                     try:
@@ -864,7 +985,7 @@ class ClaudeMetadataCache:
             size=stat.st_size,
             mtime_ns=stat.st_mtime_ns,
             offset=stat.st_size,
-            codex_session_refs=sorted(codex_refs),
+            codex_session_refs=codex_refs,
         )
         self.entries[key] = meta
         self.dirty = True
@@ -933,7 +1054,7 @@ def load_claude_history() -> dict[str, dict[str, Any]]:
 
 def load_claude_sessions(
     use_cache: bool = True,
-    codex_refs: set[str] | None = None,
+    codex_refs: dict[str, list[str]] | None = None,
 ) -> list[Session]:
     projects = CLAUDE_HOME / "projects"
     if not projects.exists():
@@ -961,7 +1082,11 @@ def load_claude_sessions(
         except OSError:
             continue
         if codex_refs is not None:
-            codex_refs.update(str(value) for value in meta.get("codex_session_refs", []))
+            codex_refs[sid] = [
+                str(value)
+                for value in meta.get("codex_session_refs", [])
+                if isinstance(value, str)
+            ]
         custom = normalize_space(meta.get("custom_title"))
         automatic = normalize_space(meta.get("ai_title"))
         first = clean_prompt(meta.get("first_prompt") or hist.get("first_prompt"))
@@ -979,6 +1104,10 @@ def load_claude_sessions(
         )
         message_count = int(hist.get("message_count") or meta.get("user_messages") or 0)
         programmatic = meta.get("entrypoint") == "sdk-cli" or meta.get("prompt_source") == "sdk"
+        launch_targets = {"claude": sid}
+        refs = codex_refs.get(sid, []) if codex_refs is not None else []
+        if refs:
+            launch_targets["codex"] = str(refs[-1])
         result.append(
             Session(
                 tool="claude",
@@ -997,6 +1126,7 @@ def load_claude_sessions(
                 original_title=title,
                 original_named=bool(custom),
                 message_count=message_count,
+                launch_targets=launch_targets,
             )
         )
 
@@ -1021,7 +1151,13 @@ def load_claude_sessions(
         except OSError:
             continue
         if codex_refs is not None:
-            codex_refs.update(str(value) for value in meta.get("codex_session_refs", []))
+            agent_key = str(path.stem.removeprefix("agent-") or "")
+            if agent_key:
+                codex_refs[agent_key] = [
+                    str(value)
+                    for value in meta.get("codex_session_refs", [])
+                    if isinstance(value, str)
+                ]
         agent_id = str(meta.get("agent_id") or fallback_agent_id)
         parent_id = str(meta.get("parent_session_id") or fallback_parent_id)
         if not agent_id or not parent_id:
@@ -1034,6 +1170,7 @@ def load_claude_sessions(
         cwd = str(meta.get("cwd") or parent_history.get("cwd") or "")
         created = float(meta.get("created") or stat.st_ctime)
         updated = max(float(meta.get("updated") or 0), stat.st_mtime)
+        launch_targets = {"claude": agent_id}
         result.append(
             Session(
                 tool="claude",
@@ -1052,6 +1189,7 @@ def load_claude_sessions(
                 parent_id=parent_id,
                 original_title=title,
                 message_count=int(meta.get("user_messages") or 0),
+                launch_targets=launch_targets,
             )
         )
     cache.save()
@@ -1059,19 +1197,21 @@ def load_claude_sessions(
 
 
 def load_sessions(use_cache: bool = True, state: UserState | None = None) -> list[Session]:
-    codex_refs: set[str] = set()
+    codex_refs: dict[str, list[str]] = {}
     claude_sessions = load_claude_sessions(use_cache=use_cache, codex_refs=codex_refs)
     codex_sessions = load_codex_sessions()
+    codex_session_ids = {session_id for refs in codex_refs.values() for session_id in refs}
     for item in codex_sessions:
         # Claude captures the Codex thread ID in its transcript when it invokes
         # `codex exec`.  The Claude scratchpad path is a second strong native
         # signal for older calls whose output omitted that ID.
         if item.source == "non-interactive" and (
-            item.session_id in codex_refs
+            item.session_id in codex_session_ids
             or "/tmp/claude-" in item.cwd
             or "\\Temp\\claude-" in item.cwd
         ):
             item.origin = "cross"
+            item.launch_targets.setdefault("claude", item.session_id)
     sessions = codex_sessions + claude_sessions
     # In the unlikely event of duplicate metadata, prefer the most recently
     # updated record for a given tool/session pair.
@@ -1410,6 +1550,22 @@ def query_match(session: Session, query: str) -> tuple[bool, int]:
         if word.startswith("origin:"):
             wanted = word[7:]
             if wanted and not session.origin.startswith(wanted):
+                return False, 0
+            score += 20
+            continue
+        if word.startswith("launch:"):
+            wanted = word[7:]
+            if wanted and not any(
+                item.startswith(wanted) for item in session.available_launch_tools
+            ):
+                return False, 0
+            score += 20
+            continue
+        if word.startswith("harness:"):
+            wanted = word[8:]
+            if wanted and not any(
+                item.startswith(wanted) for item in session.available_launch_tools
+            ):
                 return False, 0
             score += 20
             continue
@@ -1814,6 +1970,9 @@ class Browser:
             name_badge = " · utility name" if item.renamed else (" · named" if item.named else "")
             source_badge = f" · {item.source}" if item.source != "interactive" else ""
             hidden_badge = " · hidden" if item.hidden else ""
+            launch_tool = TOOL_LABELS[item.active_launch_tool]
+            if item.needs_bridge():
+                launch_tool += " (bridged copy)"
             if item.is_open and process_state(item.open_pid) in ("T", "t"):
                 open_badge = f" · PAUSED in terminal (PID {item.open_pid})"
             else:
@@ -1821,7 +1980,7 @@ class Browser:
             self.add(
                 detail_top + 1,
                 2,
-                f"{TOOL_LABELS[item.tool]} · {ORIGIN_LABELS[item.origin]} · "
+                f"{TOOL_LABELS[item.tool]} · {ORIGIN_LABELS[item.origin]} · launch via {launch_tool} · "
                 f"{item.message_count} user msgs{name_badge}{source_badge}{hidden_badge}{open_badge}",
                 self.style(item.origin, curses.A_BOLD),
                 width - 4,
@@ -1868,7 +2027,7 @@ class Browser:
                 )
 
         footer = self.message or (
-            "Enter focus/resume  Ctrl-F search  p launch  o origin  v view  "
+            "Enter focus/resume  Ctrl-F search  x select launch harness  p launch  o origin  v view  "
             "s sort  r rename  h hide  q quit  ? help"
         )
         self.add(footer_row, 1, footer, self.style("accent", curses.A_BOLD), width - 2)
@@ -1910,6 +2069,28 @@ class Browser:
             (index + (-1 if backwards else 1)) % len(VISIBILITY_ORDER)
         ]
         self.keep_selection(previous)
+
+    def cycle_launch_tool(self) -> None:
+        items = self.current()
+        if not items:
+            return
+        item = items[self.selected]
+        before = item.active_launch_tool
+        item.cycle_launch_tool()
+        selected = item.active_launch_tool
+        self.state.set_launch_tool(item, selected)
+        if selected == before:
+            self.message = (
+                "Only one launch harness is available: this session has no readable "
+                "transcript to copy across."
+            )
+        elif item.needs_bridge(selected):
+            self.message = (
+                f"Launching {TOOL_LABELS[selected]}: a copy of this conversation will be "
+                "created there, with tool calls summarised inline."
+            )
+        else:
+            self.message = f"Launching {TOOL_LABELS[selected]} for this session."
 
     def cycle_sort(self) -> None:
         previous = self.selected_id()
@@ -2138,6 +2319,7 @@ class Browser:
             ("s", "Sort by recent, title, directory, messages ↓, or open first"),
             ("p", "Cycle Safe → Dangerous → Custom launch mode"),
             ("Ctrl-R", "Refresh the session index"),
+            ("x", "Cycle launch harness; the other one gets a bridged copy"),
             ("Esc", "Leave search mode, then clear an active search"),
             ("q", "Quit"),
         ]
@@ -2258,6 +2440,8 @@ class Browser:
                 self.cycle_origin()
             elif not self.searching and key == "v":
                 self.cycle_visibility()
+            elif not self.searching and key == "x":
+                self.cycle_launch_tool()
             elif not self.searching and key == "r":
                 self.rename_selected()
             elif not self.searching and key == "h":
@@ -2313,24 +2497,128 @@ def custom_mode_notice(config: LaunchConfig, provider: str | None = None) -> str
 
 
 def command_for(session: Session, config: LaunchConfig) -> list[str]:
-    argv = config.provider_prefix(session.tool)
-    if session.tool == "claude":
-        argv += ["--resume", session.resume_target]
+    """Build the resume command; the session must already resume in that tool.
+
+    Storage quirks such as subagent parents and non-interactive visibility
+    describe how the *recording* provider filed the session, so they apply
+    only when resuming there.  A bridged copy is an ordinary new session.
+    """
+    tool = session.active_launch_tool
+    if session.needs_bridge(tool):
+        raise BridgeError(
+            f"{TOOL_LABELS.get(tool, tool)} cannot resume a "
+            f"{TOOL_LABELS.get(session.tool, session.tool)} session id directly; "
+            "bridge a copy across first"
+        )
+    native = tool == session.tool
+    argv = config.provider_prefix(tool)
+    if tool == "codex" and native and session.source == "subagent":
+        resume_target = session.resume_target
+    else:
+        resume_target = session.launch_target(tool)
+    if tool == "claude":
+        argv += ["--resume", resume_target]
     else:
         argv += ["resume"]
-        if session.source == "non-interactive" or (
-            session.source == "subagent" and session.resume_target == session.session_id
+        if native and (
+            session.source == "non-interactive" or (
+                session.source == "subagent" and session.resume_target == session.session_id
+            )
         ):
             argv.append("--include-non-interactive")
-        argv.append(session.resume_target)
+        argv.append(resume_target)
     return argv
 
 
-def launch(session: Session, config: LaunchConfig, dry_run: bool = False) -> int:
+def prepare_launch(
+    session: Session,
+    *,
+    state: UserState | None = None,
+    max_chars: int = 0,
+    tool_calls: bool = True,
+) -> tuple[Session, str]:
+    """Ensure the selected harness has something to resume; return a note.
+
+    Reuses a previously bridged copy while the source has not moved on, so
+    repeatedly launching the same pairing continues one conversation rather
+    than spawning a new snapshot each time.
+    """
+    tool = session.active_launch_tool
+    if tool == session.tool:
+        return session, ""
+    stale = ""
+    recorded = session.launch_target(tool)
+    if recorded:
+        if native_session_exists(tool, recorded):
+            return session, ""
+        # The reference was matched out of transcript text, so it may never
+        # have been a session at all.  Fall through and make a real one.
+        stale = (
+            f"The recorded {TOOL_LABELS[tool]} counterpart {recorded} does not exist; "
+            "copying the conversation across instead. "
+        )
+
+    def attach(session_id: str) -> Session:
+        return replace(
+            session,
+            launch_targets={**session.launch_targets, tool: session_id},
+            launch_tool=tool,
+        )
+
+    if state is not None:
+        existing = state.bridge_for(session, tool)
+        if existing:
+            return attach(existing), (
+                f"{stale}Continuing the {TOOL_LABELS[tool]} copy of this session ({existing})."
+            )
+    result = bridge(
+        source_tool=session.tool,
+        target_tool=tool,
+        session_id=session.session_id,
+        storage=session.storage,
+        cwd=strip_extended_prefix(session.cwd) or str(HOME),
+        title=session.title,
+        max_chars=max_chars or DEFAULT_MAX_CHARS,
+        tool_calls=tool_calls,
+    )
+    if state is not None:
+        state.set_bridge(session, tool, result.session_id, str(result.path))
+    carried = f"{result.turns} message(s)"
+    if result.calls:
+        carried += f" and {result.calls} summarised tool call(s)"
+    dropped = f", {result.dropped} older message(s) dropped to fit" if result.dropped else ""
+    note = (
+        f"{stale}Copied {carried} into a new {TOOL_LABELS[tool]} session "
+        f"{result.session_id}{dropped}."
+    )
+    return attach(result.session_id), note
+
+
+def launch(
+    session: Session,
+    config: LaunchConfig,
+    dry_run: bool = False,
+    state: UserState | None = None,
+) -> int:
+    # A dry run still bridges, because the point of printing the command is
+    # that it can be pasted and run, and it cannot name a copy that does not
+    # exist yet.  Writing the copy is inert until something resumes it.
+    try:
+        session, note = prepare_launch(
+            session,
+            state=state,
+            max_chars=config.bridge_max_chars,
+            tool_calls=config.bridge_tool_calls,
+        )
+    except BridgeError as error:
+        print(f"sessions: {error}", file=sys.stderr)
+        return 2
+    if note:
+        print(f"sessions: {note}", file=sys.stderr)
     argv = command_for(session, config)
     cwd = strip_extended_prefix(session.cwd) or str(HOME)
-    if config.custom_args_missing(session.tool):
-        print(custom_mode_notice(config, session.tool), file=sys.stderr)
+    if config.custom_args_missing(session.active_launch_tool):
+        print(custom_mode_notice(config, session.active_launch_tool), file=sys.stderr)
     if dry_run:
         if IS_WINDOWS:
             rendered = subprocess.list2cmdline(argv)
@@ -2369,17 +2657,17 @@ def list_output(items: list[Session], as_json: bool = False) -> None:
         terminal_width = os.get_terminal_size().columns if sys.stdout.isatty() else 120
     except OSError:
         terminal_width = 120
-    title_width = max(24, terminal_width - 94)
+    title_width = max(24, terminal_width - 100)
     print(
-        f"{'TOOL':<8} {'ORIGIN':<7} {'OPEN':<5} {'MSGS':>5} {'STATE':<8} "
+        f"{'TOOL':<8} {'RUN':<6} {'ORIGIN':<7} {'OPEN':<5} {'MSGS':>5} {'STATE':<8} "
         f"{'STARTED':<12} {'UPDATED':<12} {'TITLE':<{title_width}} DIRECTORY"
     )
     for item in items:
         paused = item.is_open and process_state(item.open_pid) in ("T", "t")
         open_symbol = "Ⅱ" if paused else ("●" if item.is_open else "")
         print(
-            f"{TOOL_LABELS[item.tool]:<8} {ORIGIN_LABELS[item.origin]:<7} "
-            f"{open_symbol:<5} {item.message_count:>5} "
+            f"{TOOL_LABELS[item.tool]:<8} {TOOL_LABELS[item.active_launch_tool]:<6} "
+            f"{ORIGIN_LABELS[item.origin]:<7} {open_symbol:<5} {item.message_count:>5} "
             f"{('hidden' if item.hidden else 'visible'):<8} "
             f"{relative_time(item.created):<12} {relative_time(item.updated):<12} "
             f"{ellipsize(display_list_title(item), title_width):<{title_width}} {short_path(item.cwd)}"
@@ -2403,8 +2691,9 @@ def build_parser() -> argparse.ArgumentParser:
               sessions --query "tool:claude origin:agent dir:ascolais"
 
             Interactive keys: o filters by origin, v filters hidden sessions,
-            Ctrl-F starts search, r renames, h hides/unhides, q quits, and ?
-            shows all shortcuts.
+            x switches launch harness for the selected session, Ctrl-F starts
+            search, r renames, h hides/unhides, q quits, and ? shows all
+            shortcuts.
             """
         ),
     )
@@ -2433,6 +2722,14 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument(
         "--resume", metavar="ID_OR_NAME", help="resume an exact session ID or named session"
+    )
+    parser.add_argument(
+        "--launch-tool",
+        choices=TOOL_ORDER[1:],
+        help=(
+            "resume in this harness instead of the recording one; a session from the "
+            "other CLI is copied across first"
+        ),
     )
     parser.add_argument(
         "--rename",
@@ -2552,7 +2849,24 @@ def main(argv: list[str] | None = None) -> int:
         item = resolve(args.resume)
         if item is None:
             return 2
-        return launch(item, launch_config, dry_run=args.dry_run)
+        if args.launch_tool and not item.supports_launch_tool(args.launch_tool):
+            tools = ", ".join(
+                sorted(
+                    {
+                        TOOL_LABELS[tool] if tool in TOOL_LABELS else tool
+                        for tool in item.available_launch_tools
+                    }
+                )
+            )
+            print(
+                f"sessions: --launch-tool={args.launch_tool} is not available for "
+                f"that session (available: {tools})",
+                file=sys.stderr,
+            )
+            return 2
+        if args.launch_tool:
+            item = replace(item, launch_tool=args.launch_tool)
+        return launch(item, launch_config, dry_run=args.dry_run, state=state)
 
     if args.list or args.json or not (sys.stdin.isatty() and sys.stdout.isatty()):
         try:
@@ -2579,7 +2893,7 @@ def main(argv: list[str] | None = None) -> int:
 
     selected = curses.wrapper(wrapped)
     if selected:
-        return launch(selected, launch_config, dry_run=args.dry_run)
+        return launch(selected, launch_config, dry_run=args.dry_run, state=state)
     return 0
 
 

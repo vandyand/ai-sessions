@@ -12,6 +12,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
+from .bridge import DEFAULT_MAX_CHARS
 from .paths import CONFIG_FILE
 
 LAUNCH_MODES = ("safe", "dangerous", "custom")
@@ -25,6 +26,14 @@ class LaunchConfig:
     codex_command: list[str] = field(default_factory=lambda: ["codex"])
     custom_claude_args: list[str] = field(default_factory=list)
     custom_codex_args: list[str] = field(default_factory=list)
+    # How much conversation a bridged copy carries into the other harness.
+    # It is replayed into the target's context window, so the ceiling is a
+    # context budget rather than a storage one.
+    bridge_max_chars: int = DEFAULT_MAX_CHARS
+    # Whether tool calls cross over as inline summaries.  They are usually
+    # the most valuable context in an engineering session, and also the
+    # bulkiest, so they can be dropped for a conversation-only copy.
+    bridge_tool_calls: bool = True
 
     @classmethod
     def load(cls, path: Path = CONFIG_FILE) -> "LaunchConfig":
@@ -45,6 +54,14 @@ class LaunchConfig:
         if isinstance(custom, dict):
             result.custom_claude_args = _string_list(custom.get("claude_args"), [])
             result.custom_codex_args = _string_list(custom.get("codex_args"), [])
+        bridge = payload.get("bridge", {})
+        if isinstance(bridge, dict):
+            max_chars = bridge.get("max_chars")
+            if isinstance(max_chars, int) and not isinstance(max_chars, bool) and max_chars > 0:
+                result.bridge_max_chars = max_chars
+            tool_calls = bridge.get("tool_calls")
+            if isinstance(tool_calls, bool):
+                result.bridge_tool_calls = tool_calls
         return result
 
     def set_mode(self, mode: str) -> None:
@@ -108,7 +125,10 @@ class LaunchConfig:
             f"codex_command = {_toml_array(self.codex_command)}\n\n"
             "[launch.custom]\n"
             f"claude_args = {_toml_array(self.custom_claude_args)}\n"
-            f"codex_args = {_toml_array(self.custom_codex_args)}\n"
+            f"codex_args = {_toml_array(self.custom_codex_args)}\n\n"
+            "[bridge]\n"
+            f"max_chars = {self.bridge_max_chars}\n"
+            f"tool_calls = {str(self.bridge_tool_calls).lower()}\n"
         )
 
 
