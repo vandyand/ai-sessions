@@ -45,7 +45,7 @@ from .paths import (
     STATE_FILE,
 )
 
-VERSION = "3.1.1"
+VERSION = "3.1.2"
 
 TOOL_LABELS = {"codex": "Codex", "claude": "Claude"}
 TOOL_ORDER = ("all", "codex", "claude")
