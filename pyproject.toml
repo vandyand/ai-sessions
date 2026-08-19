@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "ai-sessions"
-version = "3.1.2"
+dynamic = ["version"]
 description = "A friendly terminal browser for local Codex CLI and Claude Code sessions"
 readme = "README.md"
 requires-python = ">=3.11"
@@ -36,6 +36,10 @@ Issues = "https://github.com/vandyand/ai-sessions/issues"
 
 [project.scripts]
 sessions = "ai_sessions.app:main"
+
+# The package itself is the one place the version is written.
+[tool.hatch.version]
+path = "src/ai_sessions/__init__.py"
 
 [tool.hatch.build.targets.wheel]
 packages = ["src/ai_sessions"]

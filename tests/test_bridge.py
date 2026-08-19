@@ -124,9 +124,7 @@ class ReadTurnsTests(unittest.TestCase):
 
     def test_tool_calls_can_be_left_behind(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
-            turns = read_turns(
-                "claude", self.claude_with_a_tool_call(directory), tool_calls=False
-            )
+            turns = read_turns("claude", self.claude_with_a_tool_call(directory), tool_calls=False)
             self.assertTrue(all(turn.calls == () for turn in turns))
 
     def test_prepare_renders_calls_into_the_turn_that_made_them(self) -> None:
@@ -456,7 +454,6 @@ class WriteSessionTests(unittest.TestCase):
             self.assertEqual(len(turn_ids), 1, "one exchange must share one turn id")
             self.assertEqual(named["id"], session_id)
             self.assertEqual(named["thread_name"], "Bridged")
-
 
     def test_each_exchange_gets_its_own_codex_turn(self) -> None:
         with tempfile.TemporaryDirectory() as directory:

@@ -193,7 +193,9 @@ def _clip(value: str, limit: int) -> str:
     return text if len(text) <= limit else text[:limit].rstrip() + " …"
 
 
-def _block_text(content: Any, kinds: tuple[str, ...] = ("text", "input_text", "output_text")) -> str:
+def _block_text(
+    content: Any, kinds: tuple[str, ...] = ("text", "input_text", "output_text")
+) -> str:
     """Concatenate the plain-text blocks of a provider message body."""
     if isinstance(content, str):
         return content
@@ -649,6 +651,7 @@ def write_codex_session(
             },
         }
     ]
+
     def add(kind: str, payload: dict[str, Any], at: float) -> None:
         records.append(
             {"timestamp": _iso(at), "ordinal": len(records), "type": kind, "payload": payload}
