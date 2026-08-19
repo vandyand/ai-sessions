@@ -26,6 +26,7 @@ from dataclasses import asdict, dataclass, field, replace
 from pathlib import Path
 from typing import Any, Iterable
 
+from . import __version__ as VERSION
 from .bridge import (
     BRIDGE_TOOLS,
     DEFAULT_MAX_CHARS,
@@ -44,8 +45,6 @@ from .paths import (
     IS_WINDOWS,
     STATE_FILE,
 )
-
-VERSION = "3.1.2"
 
 TOOL_LABELS = {"codex": "Codex", "claude": "Claude"}
 TOOL_ORDER = ("all", "codex", "claude")
