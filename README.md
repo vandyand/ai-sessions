@@ -134,11 +134,29 @@ came from and warning that the filesystem state is unverified. The source transc
 never modified, and the copy is named `<title> (from Codex)` or `<title> (from Claude)` so
 the two are never confused in the list.
 
-Long conversations are trimmed to a character budget before they are replayed, since the
-copy lands in the target's context window in full. The opening request and the most recent
-exchanges are kept and the middle gives way; the note says how many messages were dropped.
-Set `max_chars` in `config.toml` to change the budget, or `tool_calls = false` for a
-conversation-only copy.
+### Sessions that have been compacted
+
+A long session is not one conversation but a chain of context windows. When a harness runs
+out of room it summarises everything so far and carries on from the summary, so the
+transcript on disk holds every superseded window *and* a summary of each.
+
+Replaying all of that is both wasteful and untrue to where the session actually stands, so
+a bridged copy starts at the most recent summary — exactly where the source session itself
+picks up. On a real 7-compaction session here that is the difference between 949,000
+characters with 739 messages silently dropped to fit, and 147,000 characters with nothing
+dropped at all. Set `latest_window = false` to replay the whole transcript instead.
+
+This applies to Claude Code, whose summaries are plain text. Codex stores its compaction
+summaries as `encrypted_content` with no readable form, so there is nothing to resume from
+and the copy carries the full pre-compaction history instead. The handoff note says which
+happened, so an over-large copy is always explainable.
+
+### Budget
+
+Whatever survives the above is trimmed to a character budget, since the copy lands in the
+target's context window in full. The opening request and the most recent exchanges are kept
+and the middle gives way; the note says how many messages were dropped. Set `max_chars` in
+`config.toml` to change the budget, or `tool_calls = false` for a conversation-only copy.
 
 Bridged copies are remembered, so launching the same pairing again continues that copy
 rather than making a new one. Once the source session picks up new messages, the next
@@ -221,6 +239,7 @@ codex_args = ["--sandbox", "workspace-write", "--ask-for-approval", "on-request"
 [bridge]
 max_chars = 950000
 tool_calls = true
+latest_window = true
 ```
 
 Rename/hide state is kept alongside the configuration as `state.json`. Per-session

@@ -34,6 +34,10 @@ class LaunchConfig:
     # the most valuable context in an engineering session, and also the
     # bulkiest, so they can be dropped for a conversation-only copy.
     bridge_tool_calls: bool = True
+    # Whether a compacted session is carried from its most recent summary
+    # rather than replayed from the beginning.  The summary is what the
+    # source session itself resumes from.
+    bridge_latest_window: bool = True
 
     @classmethod
     def load(cls, path: Path = CONFIG_FILE) -> "LaunchConfig":
@@ -62,6 +66,9 @@ class LaunchConfig:
             tool_calls = bridge.get("tool_calls")
             if isinstance(tool_calls, bool):
                 result.bridge_tool_calls = tool_calls
+            latest_window = bridge.get("latest_window")
+            if isinstance(latest_window, bool):
+                result.bridge_latest_window = latest_window
         return result
 
     def set_mode(self, mode: str) -> None:
@@ -129,6 +136,7 @@ class LaunchConfig:
             "[bridge]\n"
             f"max_chars = {self.bridge_max_chars}\n"
             f"tool_calls = {str(self.bridge_tool_calls).lower()}\n"
+            f"latest_window = {str(self.bridge_latest_window).lower()}\n"
         )
 
 

@@ -45,7 +45,7 @@ from .paths import (
     STATE_FILE,
 )
 
-VERSION = "3.1.0"
+VERSION = "3.1.1"
 
 TOOL_LABELS = {"codex": "Codex", "claude": "Claude"}
 TOOL_ORDER = ("all", "codex", "claude")
@@ -2536,6 +2536,7 @@ def prepare_launch(
     state: UserState | None = None,
     max_chars: int = 0,
     tool_calls: bool = True,
+    latest_window: bool = True,
 ) -> tuple[Session, str]:
     """Ensure the selected harness has something to resume; return a note.
 
@@ -2580,6 +2581,7 @@ def prepare_launch(
         title=session.title,
         max_chars=max_chars or DEFAULT_MAX_CHARS,
         tool_calls=tool_calls,
+        latest_window=latest_window,
     )
     if state is not None:
         state.set_bridge(session, tool, result.session_id, str(result.path))
@@ -2609,6 +2611,7 @@ def launch(
             state=state,
             max_chars=config.bridge_max_chars,
             tool_calls=config.bridge_tool_calls,
+            latest_window=config.bridge_latest_window,
         )
     except BridgeError as error:
         print(f"sessions: {error}", file=sys.stderr)
