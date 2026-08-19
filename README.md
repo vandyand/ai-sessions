@@ -14,6 +14,7 @@ It runs as `sessions` on Linux and native Windows PowerShell.
 - Nickname and parent labels that tell sibling subagent threads apart
 - Detection of currently open sessions on Linux and Windows
 - tmux pane and desktop-terminal focus on Linux when the environment exposes it
+- Cross-harness resume: continue any session in Codex or Claude regardless of where it was created
 - Safe, dangerous, and custom launch profiles
 - Native paths and argument handling on both operating systems
 
@@ -63,6 +64,7 @@ Run `sessions`, navigate with the arrow keys or `j`/`k`, and press Enter to resu
 | `v` | Cycle visible, hidden, and all sessions |
 | `d` | Choose a directory |
 | `s` | Cycle sort order |
+| `x` | Cycle launch harness for selected session (bridges a copy when needed) |
 | `p` | Cycle Safe, Dangerous, and Custom launch modes |
 | `r` | Rename in the utility and provider |
 | `h` | Hide or restore locally |
@@ -76,8 +78,99 @@ sessions --list --tool codex
 sessions --list --query "is:open dir:my-project"
 sessions --list --visibility hidden
 sessions --resume SESSION_ID
+sessions --resume SESSION_ID --launch-tool claude
+sessions --resume SESSION_ID --launch-tool codex
 sessions --resume SESSION_ID --dry-run
 ```
+
+## What is written, and when
+
+Resuming a session in the harness that recorded it is a pure read: `sessions` runs
+`codex resume ID` or `claude --resume ID` against the original id and touches nothing.
+Sessions at rest are never rewritten, and no transcript is ever edited in place.
+
+Only two actions write to provider storage, and both are additive:
+
+- **Rename** (`r`) appends a title entry — a `custom-title` line to a Claude transcript, or
+  a `thread_name` line to `~/.codex/session_index.jsonl`.
+- **Bridging** creates a *new* session file next to the existing ones and appends its title.
+  The source transcript is opened read-only and left byte for byte unchanged.
+
+Everything else — hiding, sort order, per-session harness preference — stays in this
+utility's own `state.json`.
+
+## Cross-harness resume
+
+Codex and Claude Code store transcripts in different formats, and neither recognises the
+other's session id, so a conversation cannot simply be handed across by reference. Press
+`x` (or pass `--launch-tool`) and `ai-sessions` bridges it instead: it reads the source
+transcript, converts the conversation into the target harness's own on-disk format, and
+writes it there as a new native session. That copy is an ordinary session — the target CLI
+resumes it, appends to it, and lists it like any other.
+
+```bash
+sessions --resume CODEX_SESSION_ID --launch-tool claude
+sessions --resume CLAUDE_SESSION_ID --launch-tool codex
+```
+
+The user/assistant conversation crosses over as messages. Tool calls cross over
+*summarised*, folded into the turn that made them:
+
+```text
+⟦Bash⟧ python -m unittest discover -s tests
+   → Ran 75 tests in 0.066s
+     OK
+```
+
+They are deliberately not replayed as live tool calls: a `tool_use` block would name tools
+the target harness does not have, and would need a matching result to stay a valid
+conversation. Summarising keeps what was run and what it returned — usually the part worth
+having — without inventing structure the target cannot honour. Arguments and output are
+clipped, Codex's fixed result preamble is stripped, and a Codex `exec` snippet is reduced
+to the shell command it actually ran. Reasoning and attachments are dropped entirely.
+
+Because a summary is a record and not a result, the copy opens with a note saying where it
+came from and warning that the filesystem state is unverified. The source transcript is
+never modified, and the copy is named `<title> (from Codex)` or `<title> (from Claude)` so
+the two are never confused in the list.
+
+Long conversations are trimmed to a character budget before they are replayed, since the
+copy lands in the target's context window in full. The opening request and the most recent
+exchanges are kept and the middle gives way; the note says how many messages were dropped.
+Set `max_chars` in `config.toml` to change the budget, or `tool_calls = false` for a
+conversation-only copy.
+
+Bridged copies are remembered, so launching the same pairing again continues that copy
+rather than making a new one. Once the source session picks up new messages, the next
+launch bridges again from the current state.
+
+### Adding a harness
+
+Conversions run through a harness-neutral conversation rather than pairwise, so support
+for another CLI costs one reader and one writer rather than a converter per existing
+harness. Register it in `HARNESSES` in `bridge.py` with four things: a name, a display
+label, a reader that turns a transcript file into `Turn` objects, a writer that turns
+`Turn` objects into a resumable session file, and a check for whether a session id still
+exists on disk. Bridging in both directions then works for free.
+
+This seam covers bridging only. Listing, message counts, and open-session detection are
+still provider-specific in `app.py`, because each CLI records them differently — Codex in a
+SQLite state database and lock files, Claude Code in a PID registry and per-project
+transcript directories. That side is the larger job and is deliberately left concrete until
+a third harness makes the right abstraction obvious.
+
+A Codex writer has one non-obvious obligation. Codex records the model's context
+(`response_item`) separately from what its TUI redraws (`user_message` and `agent_message`
+events), and groups both into turns delimited by `task_started`/`task_complete`. A rollout
+carrying only the first kind resumes with the full conversation in context but a blank
+screen, which looks exactly like a failed bridge. Writers for other harnesses should expect
+a similar split and check the resumed session visually, not just by asking the model what
+it remembers.
+
+One more wrinkle: Codex enumerates its sessions from a local state database rather than
+from the rollout files, so a copy bridged into Codex is resumable immediately but only
+appears in the `sessions` list after Codex itself has opened it once. Copies bridged into
+Claude Code are listed straight away.
 
 ## Launch safety
 
@@ -124,9 +217,19 @@ codex_command = ["codex"]
 [launch.custom]
 claude_args = ["--permission-mode", "acceptEdits"]
 codex_args = ["--sandbox", "workspace-write", "--ask-for-approval", "on-request"]
+
+[bridge]
+max_chars = 950000
+tool_calls = true
 ```
 
-Rename/hide state is kept alongside the configuration as `state.json`. Caches use `~/.cache/ai-sessions` on Linux and `%LOCALAPPDATA%\ai-sessions` on Windows. Environment overrides are available through `AI_SESSIONS_CONFIG_FILE`, `AI_SESSIONS_STATE_FILE`, `CODEX_HOME`, and `CLAUDE_CONFIG_DIR`.
+Rename/hide state is kept alongside the configuration as `state.json`. Per-session
+launch-harness preferences are stored there too, with unset sessions defaulting to
+the harness where the session was started, along with the bridged copy made for each
+cross-harness pairing. Caches use `~/.cache/ai-sessions` on
+Linux and `%LOCALAPPDATA%\ai-sessions` on Windows. Environment overrides are available
+through `AI_SESSIONS_CONFIG_FILE`, `AI_SESSIONS_STATE_FILE`, `CODEX_HOME`, and
+`CLAUDE_CONFIG_DIR`.
 
 ## How open-session detection works
 
@@ -135,7 +238,7 @@ Rename/hide state is kept alongside the configuration as `state.json`. Caches us
 - Codex on Windows records thread IDs alongside process IDs in its local log database.
 - Linux focus support follows the process into tmux and then uses `wmctrl`/`xdotool` when available.
 
-Detection is best-effort and read-only. Renaming is the sole operation that writes to provider storage; hiding and all other utility state stay local to `ai-sessions`.
+Detection is best-effort and read-only. See [What is written, and when](#what-is-written-and-when) for the complete list of operations that touch provider storage.
 
 ## Privacy
 

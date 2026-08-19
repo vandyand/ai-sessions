@@ -43,6 +43,22 @@ class LaunchCommandTests(unittest.TestCase):
             ["codex", "resume", "session-id"],
         )
 
+    def test_selected_launch_harness_changes_command(self) -> None:
+        item = session(
+            "claude",
+            launch_targets={"claude": "c-1", "codex": "x-2"},
+            launch_tool="codex",
+        )
+        self.assertEqual(command_for(item, LaunchConfig()), ["codex", "resume", "x-2"])
+
+    def test_selected_launch_target_is_honored_for_codex(self) -> None:
+        item = session(
+            "codex",
+            launch_targets={"codex": "x-2", "claude": "c-1"},
+            launch_tool="claude",
+        )
+        self.assertEqual(command_for(item, LaunchConfig()), ["claude", "--resume", "c-1"])
+
     def test_noninteractive_codex_resume(self) -> None:
         self.assertEqual(
             command_for(session("codex", "non-interactive"), LaunchConfig()),

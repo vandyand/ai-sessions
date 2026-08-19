@@ -152,6 +152,80 @@ class PublishNameTests(unittest.TestCase):
             self.assertFalse(after_reset.renamed)
 
 
+class UserStateLaunchToolTests(unittest.TestCase):
+    def test_launch_tool_preference_is_applied_to_sessions(self) -> None:
+        with TemporaryDirectory() as directory:
+            state_path = Path(directory) / "state.json"
+            state_path.write_text(
+                json.dumps(
+                    {
+                        "version": 4,
+                        "names": {},
+                        "original_names": {},
+                        "hidden": [],
+                        "launch_tools": {
+                            "claude:ab": "codex",
+                            "codex:cd": "claude",
+                            "codex:invalid": "all",
+                        },
+                    }
+                ),
+                encoding="utf-8",
+            )
+            state = UserState(state_path)
+            items = [
+                session(
+                    tool="claude",
+                    session_id="ab",
+                    launch_targets={"claude": "ab", "codex": "x1"},
+                ),
+                session(
+                    tool="codex",
+                    session_id="cd",
+                    launch_targets={"codex": "cd", "claude": "c1"},
+                ),
+                session(
+                    tool="codex",
+                    session_id="invalid",
+                    launch_targets={"codex": "cd"},
+                ),
+            ]
+            state.apply(items)
+            self.assertEqual(items[0].active_launch_tool, "codex")
+            self.assertEqual(items[1].active_launch_tool, "claude")
+            self.assertEqual(items[2].active_launch_tool, "codex")
+
+    def test_launch_tool_preference_round_trips(self) -> None:
+        with TemporaryDirectory() as directory:
+            state_path = Path(directory) / "state.json"
+            state = UserState(state_path)
+            item = session(
+                tool="claude",
+                session_id="round-trip",
+                launch_targets={"claude": "ab", "codex": "cd"},
+            )
+            state.set_launch_tool(item, "codex")
+            state = UserState(state_path)
+            reloaded = session(
+                tool="claude",
+                session_id="round-trip",
+                launch_targets={"claude": "ab", "codex": "cd"},
+            )
+            state.apply([reloaded])
+            self.assertEqual(reloaded.launch_tool, "codex")
+
+            state.set_launch_tool(reloaded, "claude")
+            state = UserState(state_path)
+            fallback = session(
+                tool="claude",
+                session_id="round-trip",
+                launch_targets={"claude": "ab", "codex": "cd"},
+            )
+            state.apply([fallback])
+            self.assertEqual(fallback.launch_tool, "")
+            self.assertEqual(fallback.active_launch_tool, "claude")
+
+
 class AgentTagTests(unittest.TestCase):
     def test_subagent_shows_nickname_and_parent(self) -> None:
         item = session(source="subagent", agent_nickname="Bohr", parent_id="019f59af-e300-7bd1")
