@@ -914,9 +914,7 @@ class ClaudeMetadataCache:
         meta = dict(cached) if can_continue else self.blank()
         start = int(meta.get("offset", 0)) if can_continue else 0
         codex_refs = [
-            str(value)
-            for value in meta.get("codex_session_refs", [])
-            if isinstance(value, str)
+            str(value) for value in meta.get("codex_session_refs", []) if isinstance(value, str)
         ]
         try:
             with path.open("rb") as handle:
@@ -1091,9 +1089,7 @@ def load_claude_sessions(
             continue
         if codex_refs is not None:
             codex_refs[sid] = [
-                str(value)
-                for value in meta.get("codex_session_refs", [])
-                if isinstance(value, str)
+                str(value) for value in meta.get("codex_session_refs", []) if isinstance(value, str)
             ]
         custom = normalize_space(meta.get("custom_title"))
         automatic = normalize_space(meta.get("ai_title"))
@@ -2529,9 +2525,8 @@ def command_for(session: Session, config: LaunchConfig) -> list[str]:
     else:
         argv += ["resume"]
         if native and (
-            session.source == "non-interactive" or (
-                session.source == "subagent" and session.resume_target == session.session_id
-            )
+            session.source == "non-interactive"
+            or (session.source == "subagent" and session.resume_target == session.session_id)
         ):
             argv.append("--include-non-interactive")
         argv.append(resume_target)
