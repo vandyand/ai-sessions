@@ -98,6 +98,10 @@ class Turn:
     role: str
     text: str
     calls: tuple[ToolCall, ...] = ()
+    # A turn that supersedes everything before it: the harness ran out of
+    # context, summarised the conversation so far, and carried on from the
+    # summary.  Resuming from here is what the source session itself does.
+    compaction: bool = False
 
 
 @dataclass(frozen=True, slots=True)
@@ -110,13 +114,24 @@ class BridgeResult:
     dropped: int
 
 
+@dataclass(frozen=True, slots=True)
+class Transcript:
+    """A conversation read out of one harness, ready to be written to another."""
+
+    turns: list[Turn]
+    # Compactions whose summary the source harness stores unreadably, so the
+    # copy has to carry the pre-compaction history instead of resuming from
+    # the summary.  Reported so the size of the copy is explainable.
+    opaque_compactions: int = 0
+
+
 @dataclass(frozen=True)
 class Harness:
     """Everything bridging needs to know about one CLI."""
 
     name: str
     label: str
-    read: Callable[[Path], list[Turn]]
+    read: Callable[[Path], Transcript]
     write: Callable[..., tuple[str, Path]]
     locate: Callable[[str], bool]
 
@@ -283,11 +298,16 @@ class _Conversation:
 
     def __init__(self) -> None:
         self.turns: list[Turn] = []
+        self.opaque_compactions = 0
         self._pending: dict[str, tuple[int, int]] = {}
 
-    def message(self, role: str, text: str) -> None:
+    def opaque_compaction(self) -> None:
+        """Note a compaction whose summary cannot be read back."""
+        self.opaque_compactions += 1
+
+    def message(self, role: str, text: str, compaction: bool = False) -> None:
         if text:
-            self.turns.append(Turn(role, text))
+            self.turns.append(Turn(role, text, compaction=compaction))
 
     def call(self, call_id: str, name: str, request: str) -> None:
         if not self.turns or self.turns[-1].role != "assistant":
@@ -312,9 +332,16 @@ class _Conversation:
         return [turn for turn in self.turns if turn.text or turn.calls]
 
 
-def read_codex(path: Path) -> list[Turn]:
+def read_codex(path: Path) -> Transcript:
     conversation = _Conversation()
     for record in _records(path):
+        # Codex marks a compaction with a top-level ``compacted`` record whose
+        # summary is ``encrypted_content`` with no plaintext.  Unlike Claude's
+        # there is nothing readable to resume from, so the boundary is noted
+        # for reporting only and the full history carries the conversation.
+        if record.get("type") == "compacted":
+            conversation.opaque_compaction()
+            continue
         if record.get("type") != "response_item":
             continue
         payload = record.get("payload")
@@ -339,10 +366,10 @@ def read_codex(path: Path) -> list[Turn]:
             conversation.result(
                 str(payload.get("call_id", "")), _CODEX_RESULT_NOISE.sub("", text.strip())
             )
-    return conversation.finish()
+    return Transcript(conversation.finish(), conversation.opaque_compactions)
 
 
-def read_claude(path: Path) -> list[Turn]:
+def read_claude(path: Path) -> Transcript:
     main = _Conversation()
     sidechain = _Conversation()
     for record in _records(path):
@@ -356,7 +383,9 @@ def read_claude(path: Path) -> list[Turn]:
         # apart and only used when the file holds nothing else.
         conversation = sidechain if record.get("isSidechain") else main
         content = message.get("content")
-        conversation.message(role, scrub(_block_text(content)))
+        conversation.message(
+            role, scrub(_block_text(content)), compaction=bool(record.get("isCompactSummary"))
+        )
         if not isinstance(content, list):
             continue
         for block in content:
@@ -374,10 +403,10 @@ def read_claude(path: Path) -> list[Turn]:
                     str(block.get("tool_use_id", "")),
                     body if isinstance(body, str) else _block_text(body),
                 )
-    return main.finish() or sidechain.finish()
+    return Transcript(main.finish() or sidechain.finish(), main.opaque_compactions)
 
 
-def read_turns(tool: str, storage: str | Path, *, tool_calls: bool = True) -> list[Turn]:
+def read_transcript(tool: str, storage: str | Path, *, tool_calls: bool = True) -> Transcript:
     """Extract the conversation from a transcript, oldest first.
 
     Turns come back structured, with tool calls still attached, so callers
@@ -386,15 +415,43 @@ def read_turns(tool: str, storage: str | Path, *, tool_calls: bool = True) -> li
     path = Path(storage)
     if not storage or not path.is_file():
         raise BridgeError("the source transcript is missing, so there is nothing to carry over")
-    turns = harness(tool).read(path)
+    result = harness(tool).read(path)
+    turns = result.turns
     if not tool_calls:
         turns = [replace(turn, calls=()) for turn in turns]
-    return [turn for turn in turns if turn.text or turn.calls]
+    return Transcript(
+        [turn for turn in turns if turn.text or turn.calls], result.opaque_compactions
+    )
+
+
+def read_turns(tool: str, storage: str | Path, *, tool_calls: bool = True) -> list[Turn]:
+    """The conversation alone, for callers that do not need the rest."""
+    return read_transcript(tool, storage, tool_calls=tool_calls).turns
 
 
 def prepare(turns: Iterable[Turn]) -> list[Turn]:
     """Render tool summaries into text and restore alternating roles."""
     return merge_runs(flatten(turns))
+
+
+def count_compactions(turns: Iterable[Turn]) -> int:
+    return sum(1 for turn in turns if turn.compaction)
+
+
+def from_last_compaction(turns: list[Turn]) -> tuple[list[Turn], int]:
+    """Drop everything superseded by the newest compaction summary.
+
+    A long session is not one conversation but a chain of windows, each
+    opening with a summary of everything before it.  Replaying the whole
+    file carries superseded history *and* every summary of it, then leaves
+    the character budget to cut the middle out at an arbitrary point.
+    Starting at the last summary is both smaller and truer: it is the
+    conversation the source session itself is still holding.
+    """
+    boundaries = [index for index, turn in enumerate(turns) if turn.compaction]
+    if not boundaries:
+        return turns, 0
+    return turns[boundaries[-1] :], len(boundaries)
 
 
 def merge_runs(turns: Iterable[Turn]) -> list[Turn]:
@@ -456,6 +513,8 @@ def handoff_note(
     kept: int,
     calls: int,
     dropped: int,
+    compacted: int = 0,
+    opaque_compactions: int = 0,
 ) -> str:
     """The opening message that tells the target where this came from."""
     source = harness(source_tool).label
@@ -481,6 +540,20 @@ def handoff_note(
             "Tool calls and command output were not carried across, so treat the state of "
             "the filesystem as unverified and re-check anything that matters."
         )
+    if compacted:
+        lines += [
+            "",
+            f"The source ran out of context {compacted} time(s) and summarised itself. What "
+            "follows starts at the most recent of those summaries, which is where the source "
+            "session itself is picking up; earlier windows are in its transcript but not here.",
+        ]
+    if opaque_compactions:
+        lines += [
+            "",
+            f"The source also compacted {opaque_compactions} time(s), but {source} stores those "
+            "summaries encrypted, so the full pre-compaction history is carried instead of the "
+            "summary. Expect some of it to have been superseded later in the conversation.",
+        ]
     if dropped:
         lines += [
             "",
@@ -747,15 +820,20 @@ def bridge(
     title: str = "",
     max_chars: int = DEFAULT_MAX_CHARS,
     tool_calls: bool = True,
+    latest_window: bool = True,
 ) -> BridgeResult:
     """Materialise a conversation as a new native session in ``target_tool``."""
     target = harness(target_tool)
     if target_tool == source_tool:
         raise BridgeError("that session already belongs to this harness")
     harness(source_tool)
-    turns = read_turns(source_tool, storage, tool_calls=tool_calls)
+    source = read_transcript(source_tool, storage, tool_calls=tool_calls)
+    turns = source.turns
     if not turns:
         raise BridgeError("the source transcript holds no conversation to carry over")
+    compacted = 0
+    if latest_window:
+        turns, compacted = from_last_compaction(turns)
     kept, dropped = fit(prepare(turns), max_chars)
     summarised = sum(len(turn.calls) for turn in kept)
     note = handoff_note(
@@ -767,6 +845,8 @@ def bridge(
         kept=len(kept),
         calls=summarised,
         dropped=dropped,
+        compacted=compacted,
+        opaque_compactions=source.opaque_compactions,
     )
     payload = merge_runs([Turn("user", note), *kept])
     new_id, path = target.write(cwd=cwd, turns=payload, title=bridged_title(title, source_tool))

@@ -13,6 +13,7 @@ from ai_sessions.bridge import (
     Turn,
     bridged_title,
     fit,
+    from_last_compaction,
     merge_runs,
     prepare,
     read_turns,
@@ -269,6 +270,112 @@ class ShapingTests(unittest.TestCase):
             bridged_title("ai-sessions-cli-util", "codex"), "ai-sessions-cli-util (from Codex)"
         )
         self.assertEqual(bridged_title("", "claude"), "untitled session (from Claude)")
+
+
+class CompactionTests(unittest.TestCase):
+    def compacted_claude(self, directory: str) -> Path:
+        path = Path(directory) / "session.jsonl"
+        path.write_text(
+            "\n".join(
+                [
+                    claude_line("user", "original request"),
+                    claude_line("assistant", [{"type": "text", "text": "early work"}]),
+                    claude_line("user", "summary one", isCompactSummary=True),
+                    claude_line("assistant", [{"type": "text", "text": "middle work"}]),
+                    claude_line("user", "summary two", isCompactSummary=True),
+                    claude_line("assistant", [{"type": "text", "text": "recent work"}]),
+                ]
+            )
+            + "\n",
+            encoding="utf-8",
+        )
+        return path
+
+    def test_compaction_summaries_are_marked(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            turns = read_turns("claude", self.compacted_claude(directory))
+            self.assertEqual(
+                [turn.compaction for turn in turns], [False, False, True, False, True, False]
+            )
+
+    def test_only_the_newest_window_survives(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            turns = read_turns("claude", self.compacted_claude(directory))
+            kept, count = from_last_compaction(turns)
+            self.assertEqual(count, 2)
+            self.assertEqual([turn.text for turn in kept], ["summary two", "recent work"])
+
+    def test_a_conversation_that_never_compacted_is_untouched(self) -> None:
+        turns = [Turn("user", "a"), Turn("assistant", "b")]
+        self.assertEqual(from_last_compaction(turns), (turns, 0))
+
+    def test_bridging_starts_at_the_summary_and_says_so(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            with patch.object(bridge, "CODEX_HOME", Path(directory) / "codex"):
+                result = bridge.bridge(
+                    source_tool="claude",
+                    target_tool="codex",
+                    session_id="c-1",
+                    storage=str(self.compacted_claude(directory)),
+                    cwd="/home/andrew",
+                )
+            body = result.path.read_text(encoding="utf-8")
+            self.assertIn("ran out of context 2 time(s)", body)
+            self.assertIn("summary two", body)
+            self.assertNotIn("original request", body)
+
+    def test_the_whole_history_can_still_be_carried(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            with patch.object(bridge, "CODEX_HOME", Path(directory) / "codex"):
+                result = bridge.bridge(
+                    source_tool="claude",
+                    target_tool="codex",
+                    session_id="c-1",
+                    storage=str(self.compacted_claude(directory)),
+                    cwd="/home/andrew",
+                    latest_window=False,
+                )
+            self.assertIn("original request", result.path.read_text(encoding="utf-8"))
+
+    def test_codex_compactions_are_counted_but_never_truncate(self) -> None:
+        # Codex stores its summaries encrypted, so there is nothing to resume
+        # from and the pre-compaction history has to carry the conversation.
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "rollout.jsonl"
+            path.write_text(
+                "\n".join(
+                    [
+                        codex_line("user", "original request"),
+                        json.dumps(
+                            {
+                                "type": "compacted",
+                                "payload": {
+                                    "window_number": 1,
+                                    "replacement_history": [],
+                                    "message": "",
+                                },
+                            }
+                        ),
+                        codex_line("assistant", "recent work"),
+                    ]
+                )
+                + "\n",
+                encoding="utf-8",
+            )
+            source = bridge.read_transcript("codex", path)
+            self.assertEqual(source.opaque_compactions, 1)
+            self.assertEqual(from_last_compaction(source.turns)[1], 0)
+            with patch.object(bridge, "CLAUDE_HOME", Path(directory) / "claude"):
+                result = bridge.bridge(
+                    source_tool="codex",
+                    target_tool="claude",
+                    session_id="x-1",
+                    storage=str(path),
+                    cwd="/home/andrew",
+                )
+            body = result.path.read_text(encoding="utf-8")
+            self.assertIn("original request", body)
+            self.assertIn("stores those summaries encrypted", body)
 
 
 class HarnessRegistryTests(unittest.TestCase):
