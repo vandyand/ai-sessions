@@ -97,13 +97,89 @@ class PublishNameTests(unittest.TestCase):
             last = json.loads(transcript.read_text(encoding="utf-8").splitlines()[-1])
             self.assertEqual(last["customTitle"], "original")
 
-    def test_reset_without_a_provider_name_is_reported_not_invented(self) -> None:
+    def test_reset_republishes_a_generated_title(self) -> None:
+        """A published title cannot be withdrawn, so reset must supersede it."""
         with TemporaryDirectory() as directory:
             transcript = Path(directory) / "abc.jsonl"
             transcript.write_text("", encoding="utf-8")
-            item = session(storage=str(transcript), original_named=False, original_title="auto")
-            self.assertIn("cannot be cleared", publish_name(item, ""))
+            item = session(
+                session_id="abc",
+                storage=str(transcript),
+                original_named=False,
+                original_title="Auto Generated",
+            )
+            note = publish_name(item, "")
+            self.assertIn("explicit title", note)
+            last = json.loads(transcript.read_text(encoding="utf-8").splitlines()[-1])
+            self.assertEqual(last["customTitle"], "Auto Generated")
+
+    def test_reset_without_any_earlier_title_still_refuses(self) -> None:
+        with TemporaryDirectory() as directory:
+            transcript = Path(directory) / "abc.jsonl"
+            transcript.write_text("", encoding="utf-8")
+            item = session(storage=str(transcript), original_named=False, original_title="")
+            self.assertIn("no earlier title", publish_name(item, ""))
             self.assertEqual(transcript.read_text(encoding="utf-8"), "")
+
+    def test_reset_of_a_provider_named_session_is_silent(self) -> None:
+        with TemporaryDirectory() as directory:
+            transcript = Path(directory) / "abc.jsonl"
+            transcript.write_text("", encoding="utf-8")
+            item = session(
+                session_id="abc",
+                storage=str(transcript),
+                original_named=True,
+                original_title="Chosen",
+            )
+            self.assertEqual(publish_name(item, ""), "")
+
+    def test_reset_leaves_provider_and_utility_agreeing(self) -> None:
+        """The end-to-end case that previously diverged: auto-titled session."""
+        with TemporaryDirectory() as directory:
+            root = Path(directory)
+            transcript = root / "abc.jsonl"
+            transcript.write_text(
+                json.dumps(
+                    {
+                        "type": "ai-title",
+                        "aiTitle": "Explore Seeking Alpha",
+                        "sessionId": "abc",
+                    }
+                )
+                + "\n",
+                encoding="utf-8",
+            )
+            state = UserState(root / "state.json")
+
+            def make(title: str, named: bool, orig_title: str, orig_named: bool) -> Session:
+                return session(
+                    session_id="abc",
+                    title=title,
+                    named=named,
+                    storage=str(transcript),
+                    original_title=orig_title,
+                    original_named=orig_named,
+                )
+
+            first = make("Explore Seeking Alpha", False, "Explore Seeking Alpha", False)
+            self.assertEqual(rename_session(state, first, "my-name"), "")
+
+            # The provider now reports its own published title on rescan.
+            reloaded = make("my-name", True, "my-name", True)
+            state = UserState(root / "state.json")
+            state.apply([reloaded])
+            self.assertIn("explicit title", rename_session(state, reloaded, ""))
+
+            published = json.loads(transcript.read_text(encoding="utf-8").splitlines()[-1])
+            self.assertEqual(published["customTitle"], "Explore Seeking Alpha")
+
+            after = make("Explore Seeking Alpha", True, "Explore Seeking Alpha", True)
+            state = UserState(root / "state.json")
+            state.apply([after])
+            # Utility and provider now show the same title again.
+            self.assertEqual(after.title, "Explore Seeking Alpha")
+            self.assertEqual(published["customTitle"], after.title)
+            self.assertFalse(after.renamed)
 
     def test_original_name_survives_provider_reload_before_reset(self) -> None:
         with TemporaryDirectory() as directory:

@@ -45,7 +45,7 @@ from .paths import (
     STATE_FILE,
 )
 
-VERSION = "3.1.0"
+VERSION = "3.1.1"
 
 TOOL_LABELS = {"codex": "Codex", "claude": "Claude"}
 TOOL_ORDER = ("all", "codex", "claude")
@@ -381,14 +381,19 @@ def publish_name(
     the last ``thread_name`` for a thread id, so a rename can be published by
     appending a single line to append-only data the provider already owns.
     """
+    restored_generated = False
     if not name:
         original_title = item.original_title if original_title is None else original_title
         original_named = item.original_named if original_named is None else original_named
-        # Nothing sensible to append: a provider title cannot be unset this
-        # way, and inventing one would name a session the provider never named.
-        if not (original_named and original_title):
-            return "provider title left unchanged; it cannot be cleared by appending"
+        # A published title can be superseded but never withdrawn, so a reset
+        # republishes whatever the session showed before the rename.  Where the
+        # provider only ever generated that title, republishing records it as an
+        # explicit one -- the lesser evil, because the alternative leaves the
+        # provider showing a name this utility has already dropped.
+        if not original_title:
+            return "provider title left unchanged; there is no earlier title to restore"
         name = original_title
+        restored_generated = not original_named
     try:
         if item.tool == "claude":
             transcript = Path(item.storage)
@@ -406,6 +411,9 @@ def publish_name(
             )
     except OSError as error:
         return f"could not update the provider title: {error}"
+    if restored_generated:
+        label = TOOL_LABELS.get(item.tool, item.tool)
+        return f"restored {name!r}; {label} now records it as an explicit title"
     return ""
 
 
