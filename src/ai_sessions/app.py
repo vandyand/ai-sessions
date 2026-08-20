@@ -36,6 +36,8 @@ from .bridge import (
     native_session_exists,
 )
 from .config import LAUNCH_MODES, LaunchConfig
+from .diagnostics import clear_warnings, record_warning
+from .diagnostics import warnings as load_warnings
 from .paths import (
     CACHE_FILE,
     CLAUDE_HOME,
@@ -704,6 +706,10 @@ def codex_resume_target(session_id: str, source: str, parent_id: str) -> str:
 def load_codex_sessions() -> list[Session]:
     databases = list(CODEX_HOME.glob("state_*.sqlite"))
     if not databases:
+        # No Codex home at all just means Codex is not installed here.  A
+        # Codex home with no state database is an anomaly worth reporting.
+        if CODEX_HOME.is_dir():
+            record_warning(f"no Codex state database found in {CODEX_HOME}")
         return []
 
     def database_version(path: Path) -> tuple[int, float]:
@@ -829,7 +835,8 @@ def load_codex_sessions() -> list[Session]:
             )
         connection.close()
         count_cache.save()
-    except (sqlite3.Error, OSError):
+    except (sqlite3.Error, OSError) as error:
+        record_warning(f"could not read Codex sessions from {db}: {error}")
         return []
     return result
 
@@ -1200,6 +1207,7 @@ def load_claude_sessions(
 
 
 def load_sessions(use_cache: bool = True, state: UserState | None = None) -> list[Session]:
+    clear_warnings()
     codex_refs: dict[str, list[str]] = {}
     claude_sessions = load_claude_sessions(use_cache=use_cache, codex_refs=codex_refs)
     codex_sessions = load_codex_sessions()
@@ -2473,6 +2481,7 @@ class Browser:
                 self.message = "Refreshing…"
                 self.draw()
                 self.sessions = load_sessions(use_cache=self.use_cache, state=self.state)
+                self.message = "; ".join(load_warnings())
                 self.keep_selection(previous)
             elif key == "\x06" or (not self.searching and key == "/"):  # Ctrl-F or /
                 self.searching = True
@@ -2784,6 +2793,8 @@ def main(argv: list[str] | None = None) -> int:
     if args.launch_mode:
         launch_config.mode = args.launch_mode
     sessions = load_sessions(use_cache=not args.no_cache, state=state)
+    for note in load_warnings():
+        print(f"sessions: {note}", file=sys.stderr)
 
     def resolve(target: str) -> Session | None:
         exact = [
@@ -2894,6 +2905,9 @@ def main(argv: list[str] | None = None) -> int:
         browser.directory = directory
         browser.query = args.query
         browser.sort_mode = args.sort
+        # stderr is unusable once curses owns the screen, so the same notes
+        # ride in on the status line instead of vanishing.
+        browser.message = "; ".join(load_warnings())
         return browser.run()
 
     selected = curses.wrapper(wrapped)

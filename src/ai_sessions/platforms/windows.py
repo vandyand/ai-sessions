@@ -14,6 +14,8 @@ from typing import Any, Iterable
 
 import psutil
 
+from ..diagnostics import record_warning
+
 WINDOWS_EPOCH_FILETIME = 116_444_736_000_000_000
 
 
@@ -103,7 +105,8 @@ def _detect_codex(by_identity: dict[tuple[str, str], Any], codex_home: Path) -> 
                 item.is_open = True
                 item.open_pid = pid
         connection.close()
-    except (sqlite3.Error, OSError):
+    except (sqlite3.Error, OSError) as error:
+        record_warning(f"could not read Codex activity log {logs_db}: {error}")
         return
 
 
@@ -120,7 +123,8 @@ def _spawn_parents(codex_home: Path) -> dict[str, str]:
         result = {str(child): str(parent) for parent, child in rows}
         connection.close()
         return result
-    except (sqlite3.Error, OSError):
+    except (sqlite3.Error, OSError) as error:
+        record_warning(f"could not read Codex spawn edges from {database}: {error}")
         return {}
 
 
