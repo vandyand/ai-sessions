@@ -67,6 +67,7 @@ Part B additionally inherits P1's corrected **R5**: peak turns held must be **me
 - [ ] Phase 0 — Measure the ratio and the real budget ceiling
 - [ ] Phase 1 — Token-denominated budget (Part A)
 - [ ] Phase 2 — Boundary-aligned trimming (Part A)
-- [ ] Phase 3 — Adversarial review gate on Part B
+- [ ] Phase 3 — Adversarial review of the plan; gates Part B
 - [ ] Phase 4 — Deduplicated union, only if Phase 3 says yes (Part B)
-- [ ] Phase 5 — Doc Sync
+- [ ] Phase 5 — Adversarial review of the implementation; gates release
+- [ ] Phase 6 — Doc Sync

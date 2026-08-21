@@ -96,7 +96,19 @@ Only if Phase 3 says yes.
 
 ---
 
-## Phase 5: Doc Sync
+## Phase 5: Adversarial review of the implementation
+
+**Nothing is released until this returns.** Phase 3 reviews the plan; this reviews the code that came out of it. Both gates exist because P1 ran neither before shipping and paid for it: a documented option silently stopped working, and the invariant the design rested on was both mis-stated and proxy-tested.
+
+- [ ] Re-run the reviewer against the actual diff, with the spec as context, and with **no timeout** — the first P1 attempt died in a 340s wrapper and the completed run took 6m22s
+- [ ] Ask specifically for a mutation the test suite would not catch. That question found the proxy-tested invariant in P1 and is the highest-yield thing to ask
+- [ ] Ask whether the shipped behavior matches what the spec and the handoff note claim
+- [ ] Fix every HIGH and MEDIUM before release; record LOW items in the retro
+- [ ] Record the verdict under `### Phase 5 findings`
+
+---
+
+## Phase 6: Doc Sync
 
 - [ ] Update the repo `README.md` — the Budget section states characters and will be wrong
 - [ ] Update [`../NORTH_STAR.md`](../NORTH_STAR.md) — mark P3 complete with the SHA, add `### P3 observations`, and record Part B's outcome either way
