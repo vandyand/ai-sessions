@@ -1,6 +1,10 @@
 # Specifications
 
-*Updated on 2026-08-22*
+*Updated on 2026-08-23*
+
+## Planned
+
+- [Window-Aligned Selection and a Token Budget](conversation-log/window-aligned-selection/README.md)
 
 ## Completed
 
