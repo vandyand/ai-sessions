@@ -43,6 +43,8 @@ Self-contained. No architecture. Highest evidence-to-effort ratio in the set.
 
 ### P1 observations — what shipping the compaction window taught us
 
+> See also: [retro](codex-compaction-window/retro.md) — the consumer-shaped distillation of these observations.
+
 Measured on a real 366-compaction session, before and after:
 
 | | before | after |
