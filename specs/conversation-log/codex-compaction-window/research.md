@@ -4,18 +4,20 @@
 
 Parent north star: [`../NORTH_STAR.md`](../NORTH_STAR.md) — priority **P1**.
 
-Rendered design pass: https://claude.ai/code/artifact/d3dc3a4d-fbc8-48f5-bc7f-6fe2e26f8d17
+## Scope note
+
+This spec is about the **Codex transcript format**, not about any particular session. Requirements and success criteria below are stated as invariants that must hold for *any* Codex rollout. A single real session is cited once, in [Field observation](#field-observation), purely as the evidence that motivated the work — nothing in the plan depends on that file existing.
 
 ## Intake assumptions
 
-Intake was answered from the originating conversation rather than re-asked, per `/feature plan` Step 2. Recorded here so the spec stands alone:
+Answered from the originating conversation rather than re-asked. Recorded so the spec stands alone:
 
 | Question | Answer |
 |---|---|
 | Problem type | Bug in an existing feature — the Codex reader discards readable data and falls through to truncation |
-| Areas involved | `src/ai_sessions/bridge.py` (`read_codex`, `Transcript`, provenance note); `tests/test_bridge.py` |
-| Existing patterns to build on | Yes — `read_claude` already marks compaction boundaries via `_Conversation.message(..., compaction=True)`, and `from_last_compaction` already consumes them |
-| Known constraints / non-goals | Stdlib + `psutil` only; never modify provider data; do not change `DEFAULT_MAX_CHARS` (that is P3); do not touch round-trip resume (P2) |
+| Areas involved | `src/ai_sessions/bridge.py` (`read_codex`, `_Conversation`, `Transcript`, provenance note); `tests/test_bridge.py` |
+| Existing patterns to build on | `read_claude` already marks compaction boundaries via `_Conversation.message(..., compaction=True)`; `from_last_compaction` already consumes them |
+| Known constraints / non-goals | Stdlib + `psutil` only; never modify provider data; `DEFAULT_MAX_CHARS` is P3; round-trip resume is P2 |
 
 ## Problem Statement
 
@@ -28,141 +30,138 @@ if record.get("type") == "compacted":
     continue
 ```
 
-The comment justifying it says the summary "is `encrypted_content` with no plaintext … there is nothing readable to resume from." That is true of the **summary** and false of the **record**. The record also carries `replacement_history` — the context Codex itself resumes from — in plaintext.
+The justifying comment says the summary "is `encrypted_content` with no plaintext … there is nothing readable to resume from." That is true of the **summary** and false of the **record**: it also carries `replacement_history`, the plaintext context Codex itself resumes from.
 
-Because the record is skipped, no `Turn` is ever created with `compaction=True` for a Codex source. `count_compactions` returns 0, `from_last_compaction` slices nothing, and `fit()` falls back to head-and-tail character truncation.
+Consequences, for any Codex transcript containing compactions:
 
-### Measured on `019f59af` (local, 2026-08-21)
+1. No `Turn` is ever created with `compaction=True`, so `count_compactions` returns 0.
+2. `from_last_compaction` therefore slices nothing — the feature it exists for never engages on a Codex source.
+3. Every superseded window's raw history is carried, so total size grows with the whole file rather than the live context.
+4. `fit()` then reduces that by head-and-tail character truncation, which has no knowledge of window boundaries or of what any turn said.
 
-```
-turns parsed          : 10,077
-opaque compactions    : 366
-compaction boundaries : 0        <- what from_last_compaction can use
-after from_last_compaction: 10,077 turns (dropped 0)
-total text            : 7,570,464 chars   (budget 950,000)
-after fit()           : 1,217 turns kept, 8,860 dropped by truncation
-```
+The severity scales with compaction count: a transcript that never compacted is unaffected; a long one loses most of its conversation to truncation while a plaintext window sits unread.
 
-88% of the conversation is discarded by a rule with no knowledge of its content, while a semantically-chosen 224,498-character window sits unread.
+## The Codex compaction format
 
-## Codebase Context
+Verified against Codex CLI 0.148.0.
 
-All line references are against `30a311b` (3.1.3).
-
-| Symbol | Location | Relevance |
-|---|---|---|
-| `Turn` | `bridge.py:97` | `role`, `text`, `calls`, `compaction: bool = False`. The boundary flag already exists. |
-| `Transcript` | `bridge.py:118` | `turns: list[Turn]`, `opaque_compactions: int = 0` |
-| `_Conversation.message(role, text, compaction=False)` | `bridge.py:310` | Already accepts the boundary flag |
-| `_Conversation.opaque_compaction()` | `bridge.py:306` | Increments the counter only |
-| `read_codex` | `bridge.py:337` | The `compacted` skip lives at `bridge.py:345` |
-| `read_claude` | `bridge.py:374` | Reference implementation — passes `compaction=bool(record.get("isCompactSummary"))` at `bridge.py:389` |
-| `count_compactions` | `bridge.py:439` | `sum(1 for turn in turns if turn.compaction)` |
-| `from_last_compaction` | `bridge.py:443` | Slices `turns[boundaries[-1]:]` — keeps the boundary turn and everything after |
-| `provenance note` | `bridge.py:518-558` | `compacted` and `opaque_compactions` both feed the opening note |
-| `bridge()` | `bridge.py:826-852` | `if latest_window: turns, compacted = from_last_compaction(turns)` |
-
-## Live findings
-
-Probed directly against the real rollout, not inferred from source.
-
-### The `compacted` record shape
+A compaction is a top-level record:
 
 ```
 type: compacted
-payload keys: ['message', 'replacement_history', 'window_number',
-               'first_window_id', 'previous_window_id', 'window_id']
-message: ''                      <- always empty; likely why it read as opaque
-window_number: 366
+payload:
+  message               always ""      <- likely why the record read as opaque
+  replacement_history   list           <- the plaintext carried context
+  window_number         int            monotonically increasing
+  window_id / previous_window_id / first_window_id
 ```
 
-### `replacement_history` (newest window)
+`replacement_history` entries are of two kinds:
 
-```
-465 records, 224,498 chars
-kinds: {'message': 464, 'compaction': 1}
-roles: {'user': 461, 'developer': 3}
-```
+| Entry | Shape | Handling |
+|---|---|---|
+| Carried message | `{type: "message", role, content}` | Becomes a `Turn`; `developer` role is harness preamble and is dropped |
+| Sealed summary | `{type: "compaction", id, encrypted_content, …}` | Fernet ciphertext — not decodable; skipped, counted |
 
-- **460 of 461** user messages are byte-identical to records in the raw log; the one exception is a synthesized `<environment_context>` block.
-- Median length **110 chars** — these are real human turns. The raw log's 1,084 `user`-role records have a median of 5,471 chars because most are machine-injected context blocks that Codex drops.
-- **No assistant messages.** The assistant side went into the sealed blob.
-- The single `compaction` record is `{type, id, encrypted_content, internal_chat_message_metadata_passthrough}` — Fernet ciphertext (`gAAAAAB…`, first byte `0x80`, 36% printable). Not decodable. 46,154 reasoning records carry the same encoding.
+`encrypted_content` is a Fernet token (`gAAAAAB…`, version byte `0x80`, AES-CBC + HMAC). It holds reasoning state under zero-retention and is decryptable only by the provider — Codex cannot read it either. The same encoding appears on `reasoning` records. **No decoder exists or will.**
 
-### The live window
+The semantically important property is the field's own name: `replacement_history` *replaces* prior context. A reader that appends it is contradicting the format.
 
-```
-records after the last 'compacted' record : 46
-response_items: {'reasoning': 5, 'message': 10, 'custom_tool_call': 1, 'custom_tool_call_output': 1}
-message roles : {'assistant': 6, 'user': 4}   (22,484 chars)
-```
+## Codebase Context
 
-Both sides are intact after the boundary, so a carried window plus the live tail gives complete user intent *and* recent two-sided detail. Combined ≈ 247k chars against the 950,000 budget — no truncation.
+Line references against `30a311b` (3.1.3).
 
-### Claude's equivalent, for contrast
-
-`isCompactSummary: true`, role `user`, **one** generated prose summary of 26,710 chars — fully readable. One boundary in a 5,397-record session versus 366 in Codex. Window-aligned work is asymmetric between the two harnesses.
+| Symbol | Location | Relevance |
+|---|---|---|
+| `Turn` | `bridge.py:97` | `role`, `text`, `calls`, `compaction: bool = False` — the boundary flag already exists |
+| `Transcript` | `bridge.py:118` | `turns`, `opaque_compactions` |
+| `_Conversation.message(role, text, compaction=False)` | `bridge.py:310` | Already accepts the boundary flag |
+| `_Conversation.opaque_compaction()` | `bridge.py:306` | Increments a counter only |
+| `_Conversation._pending` | `bridge.py:304` | Open tool-call index — must be cleared on reseed |
+| `read_codex` | `bridge.py:337` | The skip is at `bridge.py:345` |
+| `read_claude` | `bridge.py:374` | Reference implementation for boundary marking (`bridge.py:389`) |
+| `count_compactions` | `bridge.py:439` | `sum(1 for turn in turns if turn.compaction)` |
+| `from_last_compaction` | `bridge.py:443` | Slices `turns[boundaries[-1]:]` — keeps the boundary turn and everything after |
+| provenance note | `bridge.py:518-558` | The `opaque_compactions` branch asserts full pre-compaction history is carried |
+| `bridge()` | `bridge.py:826-852` | `if latest_window: turns, compacted = from_last_compaction(turns)` |
 
 ## Requirements
 
-### Functional
+Stated as invariants over an arbitrary Codex transcript. Let **W** be the ordered `compacted` records carrying a non-empty `replacement_history`; **spine(w)** the carried plaintext turns of `w` (excluding sealed and `developer` entries); **tail** the turns parsed from records after `W[-1]`.
 
-1. `read_codex` must emit the plaintext content of a `compacted` record's `replacement_history` as `Turn`s.
-2. Exactly one emitted turn per compaction must carry `compaction=True`, so `count_compactions > 0` and `from_last_compaction` slices at the right index.
-3. The sealed `compaction` record inside `replacement_history` must be skipped, not emitted as text, and must remain countable for the provenance note.
-4. The provenance note must stop claiming the full pre-compaction history is carried when it is not.
-5. `read_claude` behavior must not change.
-6. A `compacted` record lacking `replacement_history` (older Codex versions) must fall back to today's behavior — count it opaque, carry surrounding history.
+| # | Invariant |
+|---|---|
+| R1 | When `W` is non-empty, `read_codex(f).turns == spine(W[-1]) + tail` |
+| R2 | Exactly one turn carries `compaction=True`, and it is the first turn of `spine(W[-1])` |
+| R3 | `count_compactions(read_codex(f).turns) == 1` when `W` is non-empty, else `0` |
+| R4 | `from_last_compaction` is a no-op on the result — the reader already starts at the boundary |
+| R5 | Peak turns held during the read ≤ `max(len(spine(w)) for w in W) + len(tail)` — **independent of `len(W)`** |
+| R6 | A `compacted` record without `replacement_history` does not reset; it increments `opaque_compactions` and leaves accumulated turns intact |
+| R7 | `read_claude` output is byte-identical before and after this change |
+| R8 | The provenance note never claims history was carried that was not |
+| R9 | Stdlib + `psutil` only; no provider data written |
 
-### Non-functional
-
-7. Stdlib + `psutil` only.
-8. No provider data is written.
-9. Peak memory must not scale with the number of windows. 366 windows × ~465 records is ~170k turns if every window is appended.
-10. Reading `019f59af` (530 MB) must stay within a few seconds — current parse is ~6s.
+R5 is the one that rules out the naive implementation, and it is testable without any large file: generate transcripts with 2 and 200 windows and assert peak is identical.
 
 ## Options Considered
 
 ### A. Append every window's `replacement_history`, let `from_last_compaction` slice — rejected
 
-Simplest diff. But it materializes ~170k `Turn` objects for this session before discarding all but the last window, violating requirement 9. Also leaves 365 redundant boundaries in the list.
+Smallest diff, and R1–R4 would hold. Fails **R5**: it materializes every window before discarding all but one, so peak memory scales with compaction count. Also leaves `len(W)` redundant boundaries in the list, so R3 fails too.
 
-### B. Two-pass — find the final `compacted` offset, then parse from there — rejected
+### B. Two-pass — locate the final `compacted` record, then parse from there — rejected
 
-Memory-safe and precise, but adds a full extra scan of a 530 MB file for a reader that is currently single-pass, and special-cases Codex against every other harness's reader shape.
+Satisfies every invariant. Rejected on design grounds: it makes Codex the only reader needing a pre-scan, costs a second full pass over the file, and does not generalize to a harness that streams.
 
-### C. Replace-on-boundary (recommended)
+### C. Replace-on-boundary — recommended
 
-On a `compacted` record, **discard the accumulated turns and reseed** from `replacement_history`, marking the first reseeded turn `compaction=True`.
+On a `compacted` record with a readable window: discard accumulated turns, reseed from `spine(w)`, mark the first reseeded turn `compaction=True`.
 
-This matches the record's own semantics — it is called *replacement*\_history because it replaces the prior context. At EOF the conversation naturally holds the final window plus everything appended after it, which is exactly what Codex is still holding.
+Matches the format's own semantics, satisfies R1–R6 in a single pass, and bounds peak at one window plus the tail. `from_last_compaction` becomes a verified no-op for Codex rather than a contradiction, and is untouched for Claude.
 
-- Memory bounded at roughly one window (~465 turns) plus the live tail.
-- Single pass, same shape as every other reader.
-- `from_last_compaction` becomes a no-op for Codex sources rather than a contradiction, and still works unchanged for Claude.
-
-Trade-off: assistant messages from superseded windows are dropped. That is correct — Codex itself dropped them; they survive only inside the sealed blob.
+Trade-off: assistant messages from superseded windows are dropped. That is correct — the source itself dropped them; they survive only inside the sealed blob.
 
 ## Recommendation
 
-Option **C**, plus a redefinition of the reported counter. `opaque_compactions` currently means "compactions we could not read at all." After this change the accurate distinction is:
+Option **C**, plus a correction to what gets reported. `opaque_compactions` currently means "a compaction we could not read at all." After this change two distinct facts need reporting:
 
-- **windows superseded** — how many earlier windows were replaced and are not carried (reportable as context for the copy's size).
+- **windows superseded** — replaced by the source and deliberately not carried.
 - **sealed summary** — the carried window's assistant-side summary could not cross.
 
-The provenance note text at `bridge.py:552-558` must be rewritten accordingly; its current wording ("the full pre-compaction history is carried instead of the summary") becomes false under this change.
+The note branch at `bridge.py:552-558` claims "the full pre-compaction history is carried instead of the summary." That becomes false and must be rewritten (R8).
 
-## Open Questions
+## Resolved Questions
 
-1. **Does `_Conversation` need a `reset()`?** Replace-on-boundary needs to clear `turns` and the `_pending` tool-call map. Adding a small method is cleaner than mutating internals from `read_codex`. — *resolve during init*
-2. **Which reseeded turn carries the flag?** Marking the first preserves `from_last_compaction`'s slice semantics (it keeps the boundary turn). Confirm the resulting first turn is not dropped by `finish()`'s `if turn.text or turn.calls` filter — a `developer`-role record with empty text would be. — *resolve at Phase 0*
-3. **Are `developer`-role records worth carrying?** 3 of 465. They are likely instruction preamble. Mapping them to `user` may pollute; dropping them may lose framing. — *resolve at Phase 0 by reading them*
-4. **Do all 366 records carry `replacement_history`?** Only the newest was inspected. If early ones predate the field, requirement 6's fallback fires mid-file, which must not corrupt the accumulated state. — *resolve at Phase 0*
+Resolved by probing real Codex output during exploration. Answers are properties of the **format**; the sample that revealed them is noted for provenance only.
+
+| Question | Answer | How |
+|---|---|---|
+| Is `replacement_history` reliably present? | Present on every `compacted` record observed (366/366 in one session, window sizes 12–465). R6's fallback is defensive, for older Codex versions | Direct scan |
+| Would the boundary turn survive `finish()`'s `if turn.text or turn.calls` filter? | Yes — the first entry of every observed window is a non-empty `user` message | Direct scan |
+| What are `developer`-role entries? | `<permissions instructions>` — sandbox/filesystem preamble. Harness configuration, meaningless in another harness. Drop them | Read contents |
+| Does `_Conversation` need a reset method? | Yes — reseeding must clear `turns` **and** `_pending`, or a tool result from a superseded window can attach to a turn in the carried one | Code reading |
+
+## Field observation
+
+One real session, cited once as the motivating evidence. Nothing in the plan or tests depends on it.
+
+A Codex session with 366 compactions (530 MB, 217,439 records) read through the current code:
+
+```
+turns parsed          : 10,077
+opaque compactions    : 366
+compaction boundaries : 0        <- what from_last_compaction can use
+total text            : 7,570,464 chars   (budget 950,000)
+after fit()           : 1,217 turns kept, 8,860 dropped by truncation
+```
+
+Its newest window held 465 entries / 224,498 chars — 461 real user messages, median 110 chars, 460 byte-identical to the raw log — and the live tail after it held 46 records with both sides intact. Carried together that is ≈247k chars, comfortably inside the budget, versus an arbitrary 12% slice today.
+
+For contrast, a Claude transcript of 5,397 records had **one** boundary carrying a single 26,710-char generated summary. Window-aligned reading is therefore high-value for Codex sources and near-neutral for Claude ones.
 
 ## References
 
-- `src/ai_sessions/bridge.py` — `read_codex:337`, boundary skip at `:345`, `_Conversation:303-42`, `from_last_compaction:443`, note assembly `:518-558`, `bridge():826`
+- `src/ai_sessions/bridge.py` — `read_codex:337`, skip at `:345`, `_Conversation:303`, `from_last_compaction:443`, note `:518-558`, `bridge():826`
 - `tests/test_bridge.py` — existing Codex reader coverage
-- Local fixture: `~/.codex/sessions/2026/07/13/rollout-2026-07-13T00-15-26-019f59af-e300-7bd1-be75-e47599b5b593.jsonl` (530 MB — do **not** commit; tests must synthesize their own records)
-- Claude contrast fixture: `~/.claude/projects/…/776daa15-39a3-4bd3-8fe4-86cdb7b2a5f8.jsonl`
-- Codex CLI 0.148.0, `~/.codex/state_5.sqlite` (WAL)
+- Codex CLI 0.148.0 rollout format (`~/.codex/sessions/**/rollout-*.jsonl`)
+- **No real transcript is a test dependency.** Tests synthesize rollouts; see [implementation-plan.md](implementation-plan.md) Phase 0.

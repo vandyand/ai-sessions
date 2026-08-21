@@ -6,66 +6,59 @@ priority: 10
 ---
 # Codex Compaction Window
 
-Make `read_codex` use the plaintext window Codex already hands us, instead of declaring every compaction unreadable and falling through to character truncation.
+Make `read_codex` use the plaintext window Codex already provides, instead of declaring every compaction unreadable and falling through to character truncation.
 
 Parent north star: [`../NORTH_STAR.md`](../NORTH_STAR.md) — priority **P1**.
-Research and measurements: [research.md](research.md).
+Format analysis and invariants: [research.md](research.md).
 Phased tasks: [implementation-plan.md](implementation-plan.md).
 
 ## Problem
 
-`read_codex` skips every `compacted` record because its *summary* is encrypted. The record also carries `replacement_history` — the plaintext context Codex itself resumes from — and that is discarded with it. No `Turn` is ever marked `compaction=True` for a Codex source, so `from_last_compaction` slices nothing and `fit()` truncates by character count.
+A Codex `compacted` record carries an encrypted summary *and* a plaintext `replacement_history` — the context Codex itself resumes from. `read_codex` skips the whole record because the summary is unreadable, discarding the plaintext with it.
 
-Measured on `019f59af`: **8,860 of 10,077 turns dropped** by truncation while a 224,498-character semantic window sat unread.
+For any transcript containing compactions this means no boundary is ever marked, `from_last_compaction` never engages, every superseded window's raw history is carried, and `fit()` reduces the result by head-and-tail character truncation. Severity scales with compaction count.
 
 ## Approach
 
-**Replace-on-boundary.** When `read_codex` meets a `compacted` record, discard the accumulated turns and reseed the conversation from `replacement_history`, marking the first reseeded turn as a compaction boundary. This matches the record's own semantics — it *replaces* prior context — and bounds peak memory at roughly one window rather than 366 of them.
+**Replace-on-boundary.** On a `compacted` record with a readable window, discard the accumulated turns and reseed from that window, marking the first reseeded turn as a compaction boundary.
 
-At EOF the conversation holds the final window plus everything appended after it: exactly what Codex is still holding.
+This matches the format's own semantics — `replacement_history` *replaces* prior context — and is the only option that keeps peak memory independent of how many times the session compacted.
 
 ## Key Decisions
 
 | # | Decision | Rationale | Alternative rejected |
 |---|---|---|---|
-| K1 | Replace accumulated turns on a boundary rather than appending every window | Matches `replacement_history` semantics; bounds memory at ~465 turns instead of ~170k | Append-all and let `from_last_compaction` slice — materializes every window before discarding all but one |
-| K2 | Single pass, same shape as every other reader | Keeps Codex from being the one reader that needs a pre-scan | Two-pass: locate the final boundary, then parse from there — costs a second scan of 530 MB |
-| K3 | Mark the **first** reseeded turn `compaction=True` | `from_last_compaction` keeps the boundary turn and everything after; verified every window's first record is a non-empty `user` message, so `finish()`'s filter will not drop it | Marking the last — inverts the slice and drops the window |
-| K4 | Drop `developer`-role records from the window | Verified content is `<permissions instructions>` sandbox preamble — Codex harness configuration, meaningless and misleading in another harness | Map them to `user`, which pollutes the copy with foreign sandbox rules |
-| K5 | Keep a fallback for a `compacted` record with no `replacement_history` | All 366 records on the local fixture carry it, but older Codex versions may not; the fallback must not corrupt accumulated state | Assume the field is always present |
-| K6 | Redefine the reported counter and rewrite the provenance note | The note currently claims the full pre-compaction history is carried; that becomes false | Leave the note alone and ship a copy that misdescribes itself |
-
-## Resolved Questions
-
-Answered empirically against the local fixture during exploration — see [research.md](research.md) for the probes.
-
-| Question | Answer |
-|---|---|
-| Do all `compacted` records carry `replacement_history`? | Yes — **366 of 366**. Sizes: min 12, median 463, max 465 records. K5's fallback is defensive only. |
-| Would the boundary turn survive `finish()`'s `if turn.text or turn.calls` filter? | Yes — the first record of **every** window is `role: user`, and the newest has 872 chars of text. |
-| What are the `developer` records? | `<permissions instructions>` — sandbox and filesystem-permission preamble. Dropped per K4. |
-| Does `_Conversation` need a reset method? | Yes — reseeding must clear both `turns` and the `_pending` tool-call map. Adding `reset()` beats mutating internals from `read_codex`. |
+| K1 | Replace accumulated turns on a boundary rather than appending every window | Only option satisfying R5 (peak independent of window count); matches `replacement_history` semantics | Append-all and let `from_last_compaction` slice — peak scales with compaction count, and leaves one boundary per window so R3 fails |
+| K2 | Single pass, same shape as every other reader | Keeps Codex from being the one reader needing a pre-scan, and generalizes to streaming harnesses | Two-pass: locate the last boundary, then parse from there |
+| K3 | Mark the **first** reseeded turn `compaction=True` | `from_last_compaction` keeps the boundary turn and everything after, so marking the first makes it a verified no-op (R4) | Marking the last — inverts the slice and discards the window |
+| K4 | Drop `developer`-role entries from a window | They are `<permissions instructions>` sandbox preamble — harness configuration that is meaningless, and actively misleading, in another harness | Map to `user`, importing foreign sandbox rules into the copy |
+| K5 | Fall back to today's behavior when `replacement_history` is absent | Older Codex versions may predate the field; the fallback must not corrupt accumulated state (R6) | Assume the field is always present |
+| K6 | Redefine the reported counters and rewrite the provenance note | The note currently asserts the full pre-compaction history is carried; that becomes false (R8) | Ship a copy that misdescribes its own contents |
+| K7 | Verify against synthesized transcripts, never a real session file | Invariants are properties of the format; tying them to one machine's data makes them unverifiable elsewhere and untestable in CI | Use a local 530 MB rollout as the fixture |
 
 ## Success Criteria
 
-1. `count_compactions` on a Codex source with compactions is **greater than 0**.
-2. Reading `019f59af` yields the newest window's user spine plus the live tail — on the order of 470 turns, not 10,077 — and `fit()` drops **0** turns at the default budget.
-3. Peak turn count during the read stays bounded at roughly one window.
-4. Read time for the 530 MB fixture stays within a few seconds of today's ~6s.
-5. `read_claude` behavior is unchanged; all existing tests pass.
-6. The provenance note accurately describes what was carried.
+Every criterion is checkable on a generated transcript, on any machine, in CI. `W`, `spine`, and `tail` are defined in [research.md](research.md#requirements).
+
+1. **R1 content** — `read_codex(f).turns == spine(W[-1]) + tail` when `W` is non-empty.
+2. **R2/R3 boundary** — exactly one turn has `compaction=True`; it is `spine(W[-1])[0]`; `count_compactions == 1`.
+3. **R4 selection** — `from_last_compaction(result) == result`.
+4. **R5 bounded peak** — peak turns held for a 200-window transcript equals that for a 2-window transcript with the same window and tail sizes.
+5. **R6 fallback** — a `compacted` record without `replacement_history` leaves accumulated turns intact and increments `opaque_compactions`.
+6. **R7 no regression** — `read_claude` output unchanged; existing suite green.
+7. **R8 honest note** — the provenance note describes what was actually carried.
 
 ## Non-Goals
 
-- Changing `DEFAULT_MAX_CHARS` or its unit — that is P3.
-- Window-aligned selection across multiple windows — that is P3.
+- `DEFAULT_MAX_CHARS`, its unit, or multi-window selection — that is P3.
 - Round-trip resume and bridge-group head tracking — that is P2.
-- Anything touching the Codex **writer**.
+- Anything in the Codex **writer**.
+- Decoding `encrypted_content` — impossible by construction.
 
 ## Implementation Status
 
-- [ ] Phase 0 — Spike: prove replace-on-boundary against the real rollout
+- [ ] Phase 0 — Fixture generator and spike
 - [ ] Phase 1 — `_Conversation.reset()` and the `read_codex` boundary path
 - [ ] Phase 2 — Counter semantics and provenance note
-- [ ] Phase 3 — Tests
+- [ ] Phase 3 — Invariant tests
 - [ ] Phase 4 — Doc Sync

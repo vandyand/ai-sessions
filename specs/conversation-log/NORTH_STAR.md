@@ -17,11 +17,11 @@ Two failures are live today:
 - **Round trips lose work.** Codex → Claude → Codex resumes the pre-bridge state. `prepare_launch` short-circuits when the target harness matches the session's own, and a bridged copy's provenance note makes `codex_refs` record the copy's own *ancestor* as its counterpart.
 - **Selection is a character count.** `read_codex` skips every `compacted` record as unreadable, so no turn is marked as a boundary, `from_last_compaction` drops nothing, and `fit()` falls back to head-and-tail truncation.
 
-Measured on `019f59af`:
+Observed on one real Codex session (530 MB, 366 compactions). Cited as the evidence that motivated P1 — the priorities themselves are stated as format-level invariants, not as properties of this session:
 
 | Observation | Value |
 |---|---|
-| Rollout size | 530 MB, 217,439 records |
+| Rollout size (sample) | 530 MB, 217,439 records |
 | Compactions | 366 |
 | Turns parsed | 10,077 |
 | Compaction boundaries usable by the selector | 0 |
@@ -37,7 +37,7 @@ Measured on `019f59af`:
 
 `read_codex` emits the compacted window's `replacement_history` as turns and marks a real boundary, instead of calling `opaque_compaction()` and skipping the record. `from_last_compaction` then does the job it was written for.
 
-Done when: bridging `019f59af` carries the 461-message user spine plus the live window instead of an 8,860-turn truncation, and `count_compactions` on a Codex source is greater than zero.
+Done when, for **any** Codex transcript containing compactions: the reader carries the newest window's plaintext spine plus the live tail, exactly one turn is marked as a boundary, `from_last_compaction` is a verified no-op, and peak turns held during the read is independent of how many times the session compacted. Verified on generated transcripts, so it holds on any machine and in CI.
 
 Self-contained. No architecture. Highest evidence-to-effort ratio in the set.
 
