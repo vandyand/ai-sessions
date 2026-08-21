@@ -50,12 +50,12 @@ Measured on a real 366-compaction session, before and after:
 | turns carried | 10,077 | **470** |
 | boundaries the selector can use | 0 | **1** |
 | characters | 7,570,464 | **132,762** |
-| turns dropped by  | 8,860 | **0** |
+| turns dropped by `fit()` | 8,860 | **0** |
 | read time | ~6s | ~7.3s |
 
-- **The spec was initially written against that one session, and that was a defect.** Success criteria phrased as "reading  yields ~470 turns" are unverifiable on any other machine and untestable in CI. Restated as invariants over the format, with generated fixtures, they became both.
-- **R5 — peak turns independent of compaction count — is the load-bearing invariant**, and it is only expressible as an invariant. It is what rules out the obvious implementation (append every window, let  slice), and no single-session measurement would have caught that.
-- ** carries only the user side.** The assistant's own work in a window is inside the sealed blob. A carried window plus the live tail is therefore complete user intent plus recent two-sided detail — not a full two-sided history.
+- **The spec was initially written against that one session, and that was a defect.** Success criteria phrased as "reading `019f59af` yields ~470 turns" are unverifiable on any other machine and untestable in CI. Restated as invariants over the format, with generated fixtures, they became both.
+- **R5 — peak turns independent of compaction count — is the load-bearing invariant**, and it is only expressible as an invariant. It is what rules out the obvious implementation (append every window, let `from_last_compaction` slice), and no single-session measurement would have caught that.
+- **`replacement_history` carries only the user side.** The assistant's own work in a window is inside the sealed blob. A carried window plus the live tail is therefore complete user intent plus recent two-sided detail — not a full two-sided history.
 - Reading is ~20% slower on a 530 MB file: the window is parsed 366 times and discarded 365 of them. Acceptable now; if it ever matters, option B (locate the final boundary first) is the escape hatch.
 
 ### P2 — Stop the round trip losing work

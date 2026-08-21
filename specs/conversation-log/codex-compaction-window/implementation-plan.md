@@ -4,7 +4,7 @@ See [README.md](README.md) for decisions and [research.md](research.md) for the 
 
 ## Overview
 
-Five phases. Code changes are confined to `src/ai_sessions/bridge.py`; tests to `tests/test_bridge.py`.
+Five phases. Code changes are confined to `src/ai_sessions/bridge.py`; tests to `tests/test_codex_window.py`.
 
 ## Prerequisites
 
@@ -43,8 +43,8 @@ Build the generator first — it is what makes every later invariant checkable a
 ### Phase 0 findings
 
 - **K1 confirmed.** On generated transcripts with identical window and tail sizes, peak turns held was **54 for both 2 and 200 windows**. R5 holds; option A would not have.
-- ** is not a threat to R1.** It runs inside  and , *after* the reader, so element-wise equality at the reader level is unaffected. Consecutive carried  turns are folded only at render time, which is existing intended behavior ("providers expect a conversation that alternates"). Content is preserved; turn structure is not, and never was.
-- **Tests live in **, not . The generator is specific to this format and the separation keeps a 700-line file from growing further.
+- **`merge_runs` is not a threat to R1.** It runs inside `prepare()` and `bridge()`, *after* the reader, so element-wise equality at the reader level is unaffected. Consecutive carried `user` turns are folded only at render time, which is existing intended behavior ("providers expect a conversation that alternates"). Content is preserved; turn structure is not, and never was.
+- **Tests live in `tests/test_codex_window.py`**, not `tests/test_bridge.py`. The generator is specific to this format and the separation keeps a 700-line file from growing further.
 
 ---
 
@@ -134,4 +134,4 @@ Single-file change plus tests. Revert the `bridge.py` commit; no state schema, c
 
 ---
 
-Implemented in . All phases complete.
+Implemented in `5a8c8f3`. All phases complete.
