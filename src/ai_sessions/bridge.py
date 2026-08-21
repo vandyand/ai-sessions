@@ -119,10 +119,16 @@ class Transcript:
     """A conversation read out of one harness, ready to be written to another."""
 
     turns: list[Turn]
-    # Compactions whose summary the source harness stores unreadably, so the
-    # copy has to carry the pre-compaction history instead of resuming from
-    # the summary.  Reported so the size of the copy is explainable.
+    # Compactions whose summary the source harness stores unreadably *and*
+    # which carried no readable context either, so the copy has to fall back
+    # to the pre-compaction history.  Reported so the copy's size is explainable.
     opaque_compactions: int = 0
+    # Compactions that did carry readable context.  Only the newest window
+    # survives in ``turns``; this is how many the source actually ran.
+    carried_windows: int = 0
+    # Whether the carried window's own summary is sealed by the source, so it
+    # could not cross even though the messages around it did.
+    sealed_summary: bool = False
 
 
 @dataclass(frozen=True)
@@ -301,7 +307,30 @@ class _Conversation:
     def __init__(self) -> None:
         self.turns: list[Turn] = []
         self.opaque_compactions = 0
+        self.carried_windows = 0
+        self.sealed_summary = False
         self._pending: dict[str, tuple[int, int]] = {}
+
+    def reset(self) -> None:
+        """Drop everything accumulated so far, including open tool calls.
+
+        A pending call whose result never arrived must not survive into the
+        next window, or that result attaches to an unrelated turn.
+        """
+        self.turns.clear()
+        self._pending.clear()
+
+    def carry_window(self, turns: list[Turn], sealed: bool) -> None:
+        """Adopt a compaction's carried context in place of everything before it.
+
+        ``replacement_history`` is named for what it does: the window replaces
+        the conversation that preceded it.  Appending it instead would keep
+        every superseded window alive at once.
+        """
+        self.reset()
+        self.turns.extend(turns)
+        self.carried_windows += 1
+        self.sealed_summary = sealed
 
     def opaque_compaction(self) -> None:
         """Note a compaction whose summary cannot be read back."""
@@ -334,15 +363,58 @@ class _Conversation:
         return [turn for turn in self.turns if turn.text or turn.calls]
 
 
+def _codex_window_turns(payload: dict[str, Any]) -> tuple[list[Turn], bool] | None:
+    """The plaintext context a Codex compaction carries forward.
+
+    Codex seals its own summary in ``encrypted_content``, but records the
+    messages it keeps beside it under a field named for what it does:
+    ``replacement_history`` replaces the context before it.  Returns None when
+    that field is absent, which is how older rollouts read, and otherwise the
+    carried turns plus whether a sealed summary sat among them.
+    """
+    history = payload.get("replacement_history")
+    if not isinstance(history, list) or not history:
+        return None
+    carried: list[Turn] = []
+    sealed = False
+    for entry in history:
+        if not isinstance(entry, dict):
+            continue
+        if entry.get("type") == "compaction":
+            # The summary itself.  Encrypted by the provider, so not even the
+            # source harness can read it back; only its existence is reportable.
+            sealed = True
+            continue
+        role = entry.get("role")
+        # `developer` entries are sandbox and permission preamble: harness
+        # configuration, and actively misleading once carried somewhere else.
+        if role not in ("user", "assistant"):
+            continue
+        text = scrub(_block_text(entry.get("content")))
+        if text:
+            carried.append(Turn(role, text))
+    if not carried:
+        return None
+    # Marking the first turn makes from_last_compaction a no-op on this
+    # result: it keeps the boundary turn and everything after it.
+    return [replace(carried[0], compaction=True), *carried[1:]], sealed
+
+
 def read_codex(path: Path) -> Transcript:
     conversation = _Conversation()
     for record in _records(path):
-        # Codex marks a compaction with a top-level ``compacted`` record whose
-        # summary is ``encrypted_content`` with no plaintext.  Unlike Claude's
-        # there is nothing readable to resume from, so the boundary is noted
-        # for reporting only and the full history carries the conversation.
+        # Codex marks a compaction with a top-level ``compacted`` record.  Its
+        # summary is encrypted, but the record also carries the plaintext
+        # context the source resumes from, so the window replaces everything
+        # before it.  Only when that context is missing is there nothing to
+        # resume from, and the surrounding history has to carry the conversation.
         if record.get("type") == "compacted":
-            conversation.opaque_compaction()
+            payload = record.get("payload")
+            window = _codex_window_turns(payload) if isinstance(payload, dict) else None
+            if window is None:
+                conversation.opaque_compaction()
+            else:
+                conversation.carry_window(*window)
             continue
         if record.get("type") != "response_item":
             continue
@@ -368,7 +440,12 @@ def read_codex(path: Path) -> Transcript:
             conversation.result(
                 str(payload.get("call_id", "")), _CODEX_RESULT_NOISE.sub("", text.strip())
             )
-    return Transcript(conversation.finish(), conversation.opaque_compactions)
+    return Transcript(
+        conversation.finish(),
+        conversation.opaque_compactions,
+        conversation.carried_windows,
+        conversation.sealed_summary,
+    )
 
 
 def read_claude(path: Path) -> Transcript:
@@ -422,7 +499,10 @@ def read_transcript(tool: str, storage: str | Path, *, tool_calls: bool = True) 
     if not tool_calls:
         turns = [replace(turn, calls=()) for turn in turns]
     return Transcript(
-        [turn for turn in turns if turn.text or turn.calls], result.opaque_compactions
+        [turn for turn in turns if turn.text or turn.calls],
+        result.opaque_compactions,
+        result.carried_windows,
+        result.sealed_summary,
     )
 
 
@@ -517,6 +597,7 @@ def handoff_note(
     dropped: int,
     compacted: int = 0,
     opaque_compactions: int = 0,
+    sealed_summary: bool = False,
 ) -> str:
     """The opening message that tells the target where this came from."""
     source = harness(source_tool).label
@@ -549,6 +630,12 @@ def handoff_note(
             "follows starts at the most recent of those summaries, which is where the source "
             "session itself is picking up; earlier windows are in its transcript but not here.",
         ]
+        if sealed_summary:
+            lines.append(
+                f"{source} seals its own summary of that window, so the summary itself could "
+                "not cross. The messages it was written to stand in for did: what follows is "
+                "the conversation the source kept, not a paraphrase of it."
+            )
     if opaque_compactions:
         lines += [
             "",
@@ -848,8 +935,9 @@ def bridge(
         kept=len(kept),
         calls=summarised,
         dropped=dropped,
-        compacted=compacted,
+        compacted=max(compacted, source.carried_windows),
         opaque_compactions=source.opaque_compactions,
+        sealed_summary=source.sealed_summary,
     )
     payload = merge_runs([Turn("user", note), *kept])
     new_id, path = target.write(cwd=cwd, turns=payload, title=bridged_title(title, source_tool))
