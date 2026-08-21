@@ -95,13 +95,19 @@ Stated as invariants over an arbitrary Codex transcript. Let **W** be the ordere
 | R2 | Exactly one turn carries `compaction=True`, and it is the first turn of `spine(W[-1])` |
 | R3 | `count_compactions(read_codex(f).turns) == 1` when `W` is non-empty, else `0` |
 | R4 | `from_last_compaction` is a no-op on the result — the reader already starts at the boundary |
-| R5 | Peak turns held during the read ≤ `max(len(spine(w)) for w in W) + len(tail)` — **independent of `len(W)`** |
-| R6 | A `compacted` record without `replacement_history` does not reset; it increments `opaque_compactions` and leaves accumulated turns intact |
+| R5 | Peak turns held during the read **does not grow with `len(W)`**. It is bounded by the largest run of records between two consecutive boundaries, plus the carried window and the tail |
+| R6 | A `compacted` record whose carried context cannot be read does not reset; it increments `opaque_compactions` and leaves accumulated turns intact |
 | R7 | `read_claude` output is byte-identical before and after this change |
-| R8 | The provenance note never claims history was carried that was not |
+| R8 | The provenance note never claims history was carried that was not, and never claims the copy resumes where the source does unless it actually does |
 | R9 | Stdlib + `psutil` only; no provider data written |
+| R10 | `latest_window=False` still replays the whole transcript, including context a compaction superseded |
 
-R5 is the one that rules out the naive implementation, and it is testable without any large file: generate transcripts with 2 and 200 windows and assert peak is identical.
+R5 is the one that rules out the naive implementation. Two things about it were wrong in the first version of this spec and are worth keeping straight:
+
+- **The bound is not `max(spine) + tail`.** The reader accumulates ordinary records until it meets the *next* boundary, so a transcript with 5,000 messages before its first compaction holds 5,000 turns at peak. What must not happen is peak growing with the *number* of windows.
+- **It cannot be inferred from output length.** Comparing final turn counts passes just as happily for an implementation that appends everything and slices at the end. Peak has to be measured where it happens — see `PeakRecorder` in `tests/test_codex_window.py`.
+
+R10 is not optional politeness: `latest_window` is a documented config key with a documented meaning, and a reader that adopts windows unconditionally silently breaks it.
 
 ## Options Considered
 

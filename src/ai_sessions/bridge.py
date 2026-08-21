@@ -129,6 +129,10 @@ class Transcript:
     # Whether the carried window's own summary is sealed by the source, so it
     # could not cross even though the messages around it did.
     sealed_summary: bool = False
+    # Whether the most recent compaction was one we could read.  When it was
+    # not, the copy does not begin where the source is picking up, and the
+    # handoff note must not claim otherwise.
+    resumes_at_last_summary: bool = False
 
 
 @dataclass(frozen=True)
@@ -137,7 +141,7 @@ class Harness:
 
     name: str
     label: str
-    read: Callable[[Path], Transcript]
+    read: Callable[..., Transcript]
     write: Callable[..., tuple[str, Path]]
     locate: Callable[[str], bool]
 
@@ -309,6 +313,7 @@ class _Conversation:
         self.opaque_compactions = 0
         self.carried_windows = 0
         self.sealed_summary = False
+        self.resumes_at_last_summary = False
         self._pending: dict[str, tuple[int, int]] = {}
 
     def reset(self) -> None:
@@ -319,6 +324,18 @@ class _Conversation:
         """
         self.turns.clear()
         self._pending.clear()
+
+    def append_window(self, turns: list[Turn], sealed: bool) -> None:
+        """Keep a window's context without discarding what preceded it.
+
+        Only for ``latest_window = false``, where the caller has explicitly
+        asked to replay the whole transcript.  Peak memory then grows with the
+        file, which is the cost of that request.
+        """
+        self.turns.extend(turns)
+        self.carried_windows += 1
+        self.sealed_summary = sealed
+        self.resumes_at_last_summary = True
 
     def carry_window(self, turns: list[Turn], sealed: bool) -> None:
         """Adopt a compaction's carried context in place of everything before it.
@@ -331,9 +348,13 @@ class _Conversation:
         self.turns.extend(turns)
         self.carried_windows += 1
         self.sealed_summary = sealed
+        self.resumes_at_last_summary = True
 
     def opaque_compaction(self) -> None:
-        """Note a compaction whose summary cannot be read back."""
+        """Note a compaction whose carried context cannot be read back."""
+        # An unreadable compaction leaves the copy standing before the point
+        # the source resumes from, whatever happened in earlier windows.
+        self.resumes_at_last_summary = False
         self.opaque_compactions += 1
 
     def message(self, role: str, text: str, compaction: bool = False) -> None:
@@ -380,6 +401,9 @@ def _codex_window_turns(payload: dict[str, Any]) -> tuple[list[Turn], bool] | No
     for entry in history:
         if not isinstance(entry, dict):
             continue
+        if entry.get("type") not in ("message", "compaction"):
+            # Anything else in a window is provider bookkeeping, not conversation.
+            continue
         if entry.get("type") == "compaction":
             # The summary itself.  Encrypted by the provider, so not even the
             # source harness can read it back; only its existence is reportable.
@@ -400,7 +424,7 @@ def _codex_window_turns(payload: dict[str, Any]) -> tuple[list[Turn], bool] | No
     return [replace(carried[0], compaction=True), *carried[1:]], sealed
 
 
-def read_codex(path: Path) -> Transcript:
+def read_codex(path: Path, *, latest_window: bool = True) -> Transcript:
     conversation = _Conversation()
     for record in _records(path):
         # Codex marks a compaction with a top-level ``compacted`` record.  Its
@@ -413,8 +437,14 @@ def read_codex(path: Path) -> Transcript:
             window = _codex_window_turns(payload) if isinstance(payload, dict) else None
             if window is None:
                 conversation.opaque_compaction()
-            else:
+            elif latest_window:
                 conversation.carry_window(*window)
+            else:
+                # The caller asked for the whole transcript, so the window is
+                # appended as one more boundary rather than replacing what came
+                # before it.  from_last_compaction is then the thing that
+                # decides, which is what `latest_window = false` means.
+                conversation.append_window(*window)
             continue
         if record.get("type") != "response_item":
             continue
@@ -445,10 +475,11 @@ def read_codex(path: Path) -> Transcript:
         conversation.opaque_compactions,
         conversation.carried_windows,
         conversation.sealed_summary,
+        conversation.resumes_at_last_summary,
     )
 
 
-def read_claude(path: Path) -> Transcript:
+def read_claude(path: Path, *, latest_window: bool = True) -> Transcript:
     main = _Conversation()
     sidechain = _Conversation()
     for record in _records(path):
@@ -482,10 +513,14 @@ def read_claude(path: Path) -> Transcript:
                     str(block.get("tool_use_id", "")),
                     body if isinstance(body, str) else _block_text(body),
                 )
+    # latest_window is accepted for a uniform reader signature; Claude keeps
+    # its summaries in the turn list either way and from_last_compaction slices.
     return Transcript(main.finish() or sidechain.finish(), main.opaque_compactions)
 
 
-def read_transcript(tool: str, storage: str | Path, *, tool_calls: bool = True) -> Transcript:
+def read_transcript(
+    tool: str, storage: str | Path, *, tool_calls: bool = True, latest_window: bool = True
+) -> Transcript:
     """Extract the conversation from a transcript, oldest first.
 
     Turns come back structured, with tool calls still attached, so callers
@@ -494,7 +529,7 @@ def read_transcript(tool: str, storage: str | Path, *, tool_calls: bool = True) 
     path = Path(storage)
     if not storage or not path.is_file():
         raise BridgeError("the source transcript is missing, so there is nothing to carry over")
-    result = harness(tool).read(path)
+    result = harness(tool).read(path, latest_window=latest_window)
     turns = result.turns
     if not tool_calls:
         turns = [replace(turn, calls=()) for turn in turns]
@@ -503,6 +538,7 @@ def read_transcript(tool: str, storage: str | Path, *, tool_calls: bool = True) 
         result.opaque_compactions,
         result.carried_windows,
         result.sealed_summary,
+        result.resumes_at_last_summary,
     )
 
 
@@ -598,6 +634,7 @@ def handoff_note(
     compacted: int = 0,
     opaque_compactions: int = 0,
     sealed_summary: bool = False,
+    resumes_at_last_summary: bool = True,
 ) -> str:
     """The opening message that tells the target where this came from."""
     source = harness(source_tool).label
@@ -624,12 +661,20 @@ def handoff_note(
             "the filesystem as unverified and re-check anything that matters."
         )
     if compacted:
-        lines += [
-            "",
-            f"The source ran out of context {compacted} time(s) and summarised itself. What "
-            "follows starts at the most recent of those summaries, which is where the source "
-            "session itself is picking up; earlier windows are in its transcript but not here.",
-        ]
+        if resumes_at_last_summary:
+            lines += [
+                "",
+                f"The source ran out of context {compacted} time(s) and summarised itself. What "
+                "follows starts at the most recent of those summaries, which is where the source "
+                "session itself is picking up; earlier windows are in its transcript but not here.",
+            ]
+        else:
+            lines += [
+                "",
+                f"The source ran out of context {compacted} time(s) and summarised itself, but "
+                "its most recent summary could not be read. What follows therefore stands before "
+                "the point the source is picking up from, and some of it may be superseded.",
+            ]
         if sealed_summary:
             lines.append(
                 f"{source} seals its own summary of that window, so the summary itself could "
@@ -917,7 +962,9 @@ def bridge(
     if target_tool == source_tool:
         raise BridgeError("that session already belongs to this harness")
     harness(source_tool)
-    source = read_transcript(source_tool, storage, tool_calls=tool_calls)
+    source = read_transcript(
+        source_tool, storage, tool_calls=tool_calls, latest_window=latest_window
+    )
     turns = source.turns
     if not turns:
         raise BridgeError("the source transcript holds no conversation to carry over")
@@ -938,6 +985,7 @@ def bridge(
         compacted=max(compacted, source.carried_windows),
         opaque_compactions=source.opaque_compactions,
         sealed_summary=source.sealed_summary,
+        resumes_at_last_summary=source.resumes_at_last_summary or not source.carried_windows,
     )
     payload = merge_runs([Turn("user", note), *kept])
     new_id, path = target.write(cwd=cwd, turns=payload, title=bridged_title(title, source_tool))

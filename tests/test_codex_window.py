@@ -11,12 +11,44 @@ import tempfile
 import unittest
 from pathlib import Path
 
+from ai_sessions import bridge
 from ai_sessions.bridge import (
     count_compactions,
     from_last_compaction,
     handoff_note,
     read_transcript,
 )
+
+
+class PeakRecorder:
+    """Record the most turns a read ever holds at once.
+
+    Comparing final output length cannot distinguish replace-on-boundary from
+    accumulate-everything-then-slice, so the invariant has to be measured
+    where it actually happens.
+    """
+
+    def __enter__(self) -> "PeakRecorder":
+        self.peak = 0
+        self._message = bridge._Conversation.message
+        self._carry = bridge._Conversation.carry_window
+        recorder = self
+
+        def message(conversation, role, text, compaction=False):
+            recorder._message(conversation, role, text, compaction)
+            recorder.peak = max(recorder.peak, len(conversation.turns))
+
+        def carry(conversation, turns, sealed):
+            recorder._carry(conversation, turns, sealed)
+            recorder.peak = max(recorder.peak, len(conversation.turns))
+
+        bridge._Conversation.message = message
+        bridge._Conversation.carry_window = carry
+        return self
+
+    def __exit__(self, *exc: object) -> None:
+        bridge._Conversation.message = self._message
+        bridge._Conversation.carry_window = self._carry
 
 
 def make_codex_rollout(
@@ -234,6 +266,151 @@ class CodexCompactionNoteTests(unittest.TestCase):
             opaque_compactions=2,
         )
         self.assertIn("full pre-compaction history", note)
+
+
+class AdversarialReviewFindingsTests(unittest.TestCase):
+    """Regressions found reviewing the shipped v3.1.4 change."""
+
+    def rollout(self, **kwargs) -> Path:
+        return make_codex_rollout(Path(tempfile.mkdtemp()) / "rollout.jsonl", **kwargs)
+
+    def custom(self, records: list[dict]) -> Path:
+        path = Path(tempfile.mkdtemp()) / "rollout.jsonl"
+        path.write_text("\n".join(json.dumps(r) for r in records) + "\n", encoding="utf-8")
+        return path
+
+    @staticmethod
+    def item(role: str, text: str) -> dict:
+        kind = "output_text" if role == "assistant" else "input_text"
+        return {
+            "type": "response_item",
+            "payload": {"type": "message", "role": role, "content": [{"type": kind, "text": text}]},
+        }
+
+    @staticmethod
+    def compaction(entries: list[dict], window: int = 1) -> dict:
+        return {
+            "type": "compacted",
+            "payload": {"message": "", "window_number": window, "replacement_history": entries},
+        }
+
+    @staticmethod
+    def carried(text: str = "carried", role: str = "user") -> dict:
+        kind = "output_text" if role == "assistant" else "input_text"
+        return {"type": "message", "role": role, "content": [{"type": kind, "text": text}]}
+
+    def test_latest_window_false_still_replays_the_whole_transcript(self) -> None:
+        """The documented opt-out must survive the reader adopting windows."""
+        path = self.custom(
+            [
+                self.item("user", "original"),
+                self.compaction([self.carried()]),
+                self.item("user", "recent"),
+            ]
+        )
+        whole = read_transcript("codex", path, latest_window=False).turns
+        self.assertIn("original", [turn.text for turn in whole])
+        newest = read_transcript("codex", path, latest_window=True).turns
+        self.assertNotIn("original", [turn.text for turn in newest])
+
+    def test_peak_does_not_grow_with_compaction_count(self) -> None:
+        """R5 measured where it happens, not inferred from output length."""
+        with PeakRecorder() as few:
+            read_transcript(
+                "codex", self.rollout(windows=2, per_window=3, tail=2, superseded_per_window=5)
+            )
+        with PeakRecorder() as many:
+            read_transcript(
+                "codex", self.rollout(windows=200, per_window=3, tail=2, superseded_per_window=5)
+            )
+        self.assertEqual(few.peak, many.peak)
+        self.assertLess(many.peak, 30)
+
+    def test_peak_is_bounded_by_the_span_between_boundaries(self) -> None:
+        """The honest bound: the largest run between boundaries, not the file."""
+        with PeakRecorder() as recorder:
+            read_transcript(
+                "codex", self.rollout(windows=3, per_window=2, tail=1, superseded_per_window=40)
+            )
+        self.assertGreaterEqual(recorder.peak, 40)
+        self.assertLess(recorder.peak, 60)
+
+    def test_note_does_not_claim_to_resume_where_the_source_does(self) -> None:
+        """A readable window followed by an unreadable one moves the resume point."""
+        path = self.custom(
+            [
+                self.item("user", "a"),
+                self.compaction([self.carried()]),
+                self.item("user", "b"),
+                {"type": "compacted", "payload": {"message": "", "window_number": 2}},
+                self.item("user", "c"),
+            ]
+        )
+        transcript = read_transcript("codex", path)
+        self.assertFalse(transcript.resumes_at_last_summary)
+        note = handoff_note(
+            source_tool="codex",
+            target_tool="claude",
+            session_id="abc",
+            title="t",
+            cwd="/tmp",
+            kept=3,
+            calls=0,
+            dropped=0,
+            compacted=transcript.carried_windows,
+            resumes_at_last_summary=transcript.resumes_at_last_summary,
+        )
+        self.assertNotIn("which is where the source session itself is picking up", note)
+        self.assertIn("could not be read", note)
+
+    def test_unreadable_window_keeps_surrounding_history_deliberately(self) -> None:
+        """A window whose entries are all unreadable takes the fallback path.
+
+        Its carried context is real but sealed, so this is the same situation
+        as a record with no window at all: a superseded-but-readable history
+        beats an empty copy, and the note says so.
+        """
+        developer = {
+            "type": "message",
+            "role": "developer",
+            "content": [{"type": "text", "text": "<permissions instructions>"}],
+        }
+        path = self.custom(
+            [self.item("user", "stale"), self.compaction([developer]), self.item("user", "after")]
+        )
+        transcript = read_transcript("codex", path)
+        self.assertEqual(transcript.opaque_compactions, 1)
+        self.assertEqual(transcript.carried_windows, 0)
+        self.assertEqual([turn.text for turn in transcript.turns], ["stale", "after"])
+
+    def test_assistant_entries_inside_a_window_are_carried(self) -> None:
+        """The fixtures previously only ever generated user entries."""
+        path = self.custom(
+            [self.compaction([self.carried("asked"), self.carried("answered", "assistant")])]
+        )
+        turns = read_transcript("codex", path).turns
+        self.assertEqual(
+            [(t.role, t.text) for t in turns], [("user", "asked"), ("assistant", "answered")]
+        )
+
+    def test_non_message_entries_are_not_conversation(self) -> None:
+        """A window entry that is not a message must not become a turn."""
+        path = self.custom(
+            [
+                self.compaction(
+                    [
+                        {
+                            "type": "bookkeeping",
+                            "role": "user",
+                            "content": [{"type": "input_text", "text": "NOT A MESSAGE"}],
+                        },
+                        self.carried("real"),
+                    ]
+                )
+            ]
+        )
+        turns = read_transcript("codex", path).turns
+        self.assertEqual([turn.text for turn in turns], ["real"])
 
 
 if __name__ == "__main__":
