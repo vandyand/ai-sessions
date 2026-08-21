@@ -146,10 +146,14 @@ picks up. On a real 7-compaction session here that is the difference between 949
 characters with 739 messages silently dropped to fit, and 147,000 characters with nothing
 dropped at all. Set `latest_window = false` to replay the whole transcript instead.
 
-This applies to Claude Code, whose summaries are plain text. Codex stores its compaction
-summaries as `encrypted_content` with no readable form, so there is nothing to resume from
-and the copy carries the full pre-compaction history instead. The handoff note says which
-happened, so an over-large copy is always explainable.
+The two harnesses record this differently, and both are usable. Claude Code writes a
+plain-text summary. Codex seals its summary as `encrypted_content` — unreadable to anyone
+but the provider, including Codex itself — but records the messages it carries forward
+beside it, so the copy resumes from those. What crosses is the conversation the source
+kept, not a paraphrase of it; what cannot cross is the sealed summary of the assistant's
+own work in that window. Only a compaction with no carried context falls back to replaying
+the pre-compaction history. The handoff note says which happened, so an over-large copy is
+always explainable.
 
 ### Budget
 
