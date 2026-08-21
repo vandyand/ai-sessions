@@ -65,6 +65,27 @@ Cost: one file changed in `src/`, one new test file, +12 tests (93 → 105).
 - **The `encrypted_content` boundary is permanent.** Codex→anywhere will always lose the assistant-side summary of superseded windows. Worth stating plainly in user-facing docs rather than leaving it to be rediscovered.
 - **Reading is ~20% slower on very large files** because a window is parsed and discarded once per compaction. Option B — locate the final boundary first — is the recorded escape hatch if that ever matters.
 
+## Re-retro 2026-08-21 — the adversarial review that finally ran
+
+The codex review timed out during planning and was skipped. Re-fired against the **shipped** v3.1.4 with no timeout, it returned **HIGH=1 MEDIUM=3** plus two LOW, and every finding reproduced. Fixed in v3.1.5.
+
+### What it caught
+
+- **HIGH — `latest_window = false` silently stopped working for Codex.** A documented config key (`README.md:147`, `config.py:40`) whose whole meaning is "replay the whole transcript." The reader adopted windows unconditionally, before `bridge()` ever consulted the flag, so a user who explicitly opted out still got only the newest window. Neither the spec nor the tests mentioned `latest_window` once.
+- **MEDIUM — R5 was false as written, and untested.** The claimed bound was `max(spine) + tail`. Measured: a transcript with 5,000 pre-compaction messages holds **5,000** turns at peak. The property that mattered (peak does not grow with window count) was true; the bound stated for it was not. Worse, the test compared *final output length*, which an append-everything-then-slice implementation passes just as happily — exactly the mutation the reviewer was asked to name.
+- **MEDIUM — the note could claim a resume point it did not have.** A readable window followed by an unreadable one leaves the copy standing *before* where the source resumes, while the note still said "this is where the source session itself is picking up."
+- **MEDIUM/LOW — fixture blind spots.** Generated windows only ever contained `user` entries, so mutating `role not in ("user", "assistant")` to `role != "user"` would have survived the suite. Non-message entries with a `role` were also accepted as conversation.
+
+### What this says about the process
+
+**The gate that was skipped was the gate that mattered.** Three of these six are things the spec asserted and the tests appeared to confirm. A suite built entirely from fixtures I designed cannot find the case I did not think of — that is structurally what an adversary is for, and running it after shipping rather than before is the wrong order.
+
+**"Verified" meant "my checks passed."** 105 tests, 27/27 real transcripts, lint clean — and a documented user-facing option was broken the whole time. Breadth of passing checks is not coverage; nothing was exercising `latest_window=false` at all.
+
+**An invariant is only as good as where you measure it.** R5 was the one I called load-bearing, wrote into the north star, and used to reject the simpler design. It was still both mis-stated and unverified, because the test measured a proxy. Measuring the proxy felt like measuring the thing.
+
+**Timeouts hide findings.** The first attempt died at 340s inside a `timeout` wrapper and was recorded as graceful degradation. It was not graceful — it was a HIGH-severity regression staying in a release. The completed run took **6m22s**, barely past the limit that killed it.
+
 ## References
 
 - Spec: [README.md](README.md), [research.md](research.md), [implementation-plan.md](implementation-plan.md)
