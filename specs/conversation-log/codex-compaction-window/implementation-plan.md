@@ -25,11 +25,11 @@ Broad suite (`python -m unittest discover -s tests`) is a preflight/CI gate, not
 
 Build the generator first — it is what makes every later invariant checkable anywhere.
 
-- [ ] Add `make_codex_rollout(...)` to `tests/test_bridge.py` (test helper, not shipped code) that writes a synthetic rollout with configurable: number of windows, entries per window, whether each window's `replacement_history` is present, presence of a sealed `compaction` entry, presence of `developer` entries, and the number of trailing live records after the last boundary
-- [ ] Confirm the generated shape matches the real format documented in [research.md](research.md#the-codex-compaction-format) — top-level `{type: "compacted", payload: {...}}` alongside `{type: "response_item", payload: {...}}`
-- [ ] Spike replace-on-boundary in a throwaway script against a **generated** 200-window transcript; record final turn count, peak accumulator size, and whether peak varies between 2 and 200 windows
-- [ ] Confirm `merge_runs` / `finish()` do not collapse the reseeded consecutive `user` turns into one, which would break R1's element-wise equality
-- [ ] Record findings below under `### Phase 0 findings`
+- [x] Add `make_codex_rollout(...)` to `tests/test_bridge.py` (test helper, not shipped code) that writes a synthetic rollout with configurable: number of windows, entries per window, whether each window's `replacement_history` is present, presence of a sealed `compaction` entry, presence of `developer` entries, and the number of trailing live records after the last boundary
+- [x] Confirm the generated shape matches the real format documented in [research.md](research.md#the-codex-compaction-format) — top-level `{type: "compacted", payload: {...}}` alongside `{type: "response_item", payload: {...}}`
+- [x] Spike replace-on-boundary in a throwaway script against a **generated** 200-window transcript; record final turn count, peak accumulator size, and whether peak varies between 2 and 200 windows
+- [x] Confirm `merge_runs` / `finish()` do not collapse the reseeded consecutive `user` turns into one, which would break R1's element-wise equality
+- [x] Record findings below under `### Phase 0 findings`
 
 **Verification**
 
@@ -40,18 +40,24 @@ Build the generator first — it is what makes every later invariant checkable a
 
 **Bail condition:** if peak scales with window count, K1 is wrong — stop and reconsider option B before writing production code.
 
+### Phase 0 findings
+
+- **K1 confirmed.** On generated transcripts with identical window and tail sizes, peak turns held was **54 for both 2 and 200 windows**. R5 holds; option A would not have.
+- ** is not a threat to R1.** It runs inside  and , *after* the reader, so element-wise equality at the reader level is unaffected. Consecutive carried  turns are folded only at render time, which is existing intended behavior ("providers expect a conversation that alternates"). Content is preserved; turn structure is not, and never was.
+- **Tests live in **, not . The generator is specific to this format and the separation keeps a 700-line file from growing further.
+
 ---
 
 ## Phase 1: `_Conversation.reset()` and the `read_codex` boundary path
 
-- [ ] Add `_Conversation.reset()` near `opaque_compaction` (`bridge.py:306`) clearing `self.turns` **and** `self._pending`
-- [ ] Add a module-level helper `_codex_window_turns(payload) -> list[Turn] | None` returning the carried plaintext turns of a `compacted` payload, or `None` when `replacement_history` is absent or empty (K5)
+- [x] Add `_Conversation.reset()` near `opaque_compaction` (`bridge.py:306`) clearing `self.turns` **and** `self._pending`
+- [x] Add a module-level helper `_codex_window_turns(payload) -> list[Turn] | None` returning the carried plaintext turns of a `compacted` payload, or `None` when `replacement_history` is absent or empty (K5)
   - Skip entries with `type == "compaction"` (sealed blob)
   - Skip entries with `role == "developer"` (K4)
   - Map remaining entries to `Turn(role, text)`
   - Mark the first returned turn `compaction=True` (K3)
-- [ ] Replace the skip at `bridge.py:345`: on `type == "compacted"`, if the helper returns turns → `conversation.reset()` then extend, incrementing a superseded-window counter; if it returns `None` → today's behavior (`opaque_compaction()`, `continue`) leaving accumulated turns intact
-- [ ] Leave `read_claude` untouched
+- [x] Replace the skip at `bridge.py:345`: on `type == "compacted"`, if the helper returns turns → `conversation.reset()` then extend, incrementing a superseded-window counter; if it returns `None` → today's behavior (`opaque_compaction()`, `continue`) leaving accumulated turns intact
+- [x] Leave `read_claude` untouched
 
 **Verification**
 
@@ -68,10 +74,10 @@ Build the generator first — it is what makes every later invariant checkable a
 
 ## Phase 2: Counter semantics and provenance note
 
-- [ ] Report the two distinct facts separately: windows superseded and not carried, versus a sealed summary on the carried window. Keep `opaque_compactions` meaning "a compaction we could not read at all" so the K5 fallback still reports correctly
-- [ ] Rewrite the note branch at `bridge.py:552-558` — its claim that "the full pre-compaction history is carried instead of the summary" is false once Phase 1 lands (R8)
-- [ ] New wording states: the window's user history crossed verbatim, earlier windows were superseded by the source itself, and the carried window's assistant-side summary is sealed and did not cross
-- [ ] Confirm `bridge()` (`bridge.py:826-852`) passes the right counters into `provenance`
+- [x] Report the two distinct facts separately: windows superseded and not carried, versus a sealed summary on the carried window. Keep `opaque_compactions` meaning "a compaction we could not read at all" so the K5 fallback still reports correctly
+- [x] Rewrite the note branch at `bridge.py:552-558` — its claim that "the full pre-compaction history is carried instead of the summary" is false once Phase 1 lands (R8)
+- [x] New wording states: the window's user history crossed verbatim, earlier windows were superseded by the source itself, and the carried window's assistant-side summary is sealed and did not cross
+- [x] Confirm `bridge()` (`bridge.py:826-852`) passes the right counters into `provenance`
 
 **Verification**
 
@@ -86,17 +92,17 @@ Build the generator first — it is what makes every later invariant checkable a
 
 All fixtures generated by the Phase 0 helper. No transcript is committed.
 
-- [ ] `test_window_becomes_turns` — R1, single window, element-wise equality
-- [ ] `test_window_replaces_earlier_turns` — content before a boundary does not survive it; content after does
-- [ ] `test_exactly_one_boundary_marked` — R2/R3 across a multi-window transcript
-- [ ] `test_from_last_compaction_is_a_noop` — R4
-- [ ] `test_peak_is_independent_of_window_count` — R5, 2 vs 200 windows, equal peak
-- [ ] `test_sealed_and_developer_entries_are_skipped` — neither becomes a turn
-- [ ] `test_missing_replacement_history_falls_back` — R6
-- [ ] `test_reset_clears_pending_tool_calls` — a tool result from a superseded window must not attach to a carried turn
-- [ ] `test_transcript_without_compactions_is_unchanged` — no regression for short sessions
-- [ ] `test_read_claude_unchanged` — R7
-- [ ] Run `python -m unittest tests.test_bridge -v`
+- [x] `test_window_becomes_turns` — R1, single window, element-wise equality
+- [x] `test_window_replaces_earlier_turns` — content before a boundary does not survive it; content after does
+- [x] `test_exactly_one_boundary_marked` — R2/R3 across a multi-window transcript
+- [x] `test_from_last_compaction_is_a_noop` — R4
+- [x] `test_peak_is_independent_of_window_count` — R5, 2 vs 200 windows, equal peak
+- [x] `test_sealed_and_developer_entries_are_skipped` — neither becomes a turn
+- [x] `test_missing_replacement_history_falls_back` — R6
+- [x] `test_reset_clears_pending_tool_calls` — a tool result from a superseded window must not attach to a carried turn
+- [x] `test_transcript_without_compactions_is_unchanged` — no regression for short sessions
+- [x] `test_read_claude_unchanged` — R7
+- [x] Run `python -m unittest tests.test_bridge -v`
 
 **Verification**
 
@@ -110,10 +116,10 @@ uvx ruff@0.16.3 check . && uvx ruff@0.16.3 format --check .
 
 ## Phase 4: Doc Sync
 
-- [ ] Audit and update the repo `README.md` — the cross-harness section describes trimming behavior this phase changes
-- [ ] Update [`../NORTH_STAR.md`](../NORTH_STAR.md) — mark **P1** complete with the implementation SHA, add `### P1 observations`, update red flags, re-evaluate decisions
-- [ ] Regenerate the spec index: `python3 ~/.claude/skills/feature-specs/scripts/index.py ./specs` (`python` on Windows)
-- [ ] Commit: `docs(conversation-log): sync docs after codex-compaction-window`
+- [x] Audit and update the repo `README.md` — the cross-harness section describes trimming behavior this phase changes
+- [x] Update [`../NORTH_STAR.md`](../NORTH_STAR.md) — mark **P1** complete with the implementation SHA, add `### P1 observations`, update red flags, re-evaluate decisions
+- [x] Regenerate the spec index: `python3 ~/.claude/skills/feature-specs/scripts/index.py ./specs` (`python` on Windows)
+- [x] Commit: `docs(conversation-log): sync docs after codex-compaction-window`
 
 ---
 
@@ -124,3 +130,8 @@ After the phases pass, read one real Codex session that has compacted and confir
 ## Rollback
 
 Single-file change plus tests. Revert the `bridge.py` commit; no state schema, config, or provider data is touched. Copies already bridged under the new reader remain valid ordinary session files.
+
+
+---
+
+Implemented in . All phases complete.

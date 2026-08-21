@@ -1,7 +1,7 @@
 # Specifications
 
-*Auto-generated on 2026-08-21 15:34*
+*Auto-generated on 2026-08-21 16:05*
 
-## Planned
+## Completed
 
 - [Codex Compaction Window](conversation-log/codex-compaction-window/README.md)

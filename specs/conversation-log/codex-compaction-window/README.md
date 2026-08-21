@@ -1,6 +1,6 @@
 ---
 title: "Codex Compaction Window"
-status: planned
+status: completed
 date: 2026-08-21
 priority: 10
 ---
@@ -57,8 +57,8 @@ Every criterion is checkable on a generated transcript, on any machine, in CI. `
 
 ## Implementation Status
 
-- [ ] Phase 0 — Fixture generator and spike
-- [ ] Phase 1 — `_Conversation.reset()` and the `read_codex` boundary path
-- [ ] Phase 2 — Counter semantics and provenance note
-- [ ] Phase 3 — Invariant tests
-- [ ] Phase 4 — Doc Sync
+- [x] Phase 0 — Fixture generator and spike
+- [x] Phase 1 — `_Conversation.reset()` and the `read_codex` boundary path
+- [x] Phase 2 — Counter semantics and provenance note
+- [x] Phase 3 — Invariant tests
+- [x] Phase 4 — Doc Sync

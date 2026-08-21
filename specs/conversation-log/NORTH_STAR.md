@@ -33,13 +33,30 @@ Observed on one real Codex session (530 MB, 366 compactions). Cited as the evide
 
 ## Ordered priorities
 
-### P1 — Read the Codex compaction window
+### P1 — Read the Codex compaction window **(COMPLETE as of 5a8c8f3)**
 
 `read_codex` emits the compacted window's `replacement_history` as turns and marks a real boundary, instead of calling `opaque_compaction()` and skipping the record. `from_last_compaction` then does the job it was written for.
 
 Done when, for **any** Codex transcript containing compactions: the reader carries the newest window's plaintext spine plus the live tail, exactly one turn is marked as a boundary, `from_last_compaction` is a verified no-op, and peak turns held during the read is independent of how many times the session compacted. Verified on generated transcripts, so it holds on any machine and in CI.
 
 Self-contained. No architecture. Highest evidence-to-effort ratio in the set.
+
+### P1 observations — what shipping the compaction window taught us
+
+Measured on a real 366-compaction session, before and after:
+
+| | before | after |
+|---|---|---|
+| turns carried | 10,077 | **470** |
+| boundaries the selector can use | 0 | **1** |
+| characters | 7,570,464 | **132,762** |
+| turns dropped by  | 8,860 | **0** |
+| read time | ~6s | ~7.3s |
+
+- **The spec was initially written against that one session, and that was a defect.** Success criteria phrased as "reading  yields ~470 turns" are unverifiable on any other machine and untestable in CI. Restated as invariants over the format, with generated fixtures, they became both.
+- **R5 — peak turns independent of compaction count — is the load-bearing invariant**, and it is only expressible as an invariant. It is what rules out the obvious implementation (append every window, let  slice), and no single-session measurement would have caught that.
+- ** carries only the user side.** The assistant's own work in a window is inside the sealed blob. A carried window plus the live tail is therefore complete user intent plus recent two-sided detail — not a full two-sided history.
+- Reading is ~20% slower on a 530 MB file: the window is parsed 366 times and discarded 365 of them. Acceptable now; if it ever matters, option B (locate the final boundary first) is the escape hatch.
 
 ### P2 — Stop the round trip losing work
 
@@ -81,6 +98,7 @@ Done when: a Codex → Claude → Codex trip keeps the Codex-origin portion in n
 - **The Codex writer is the risky surface.** Constructing valid records means honouring the `response_item` versus `user_message`/`agent_message` split and the `task_started`/`task_complete` framing. Getting it wrong produces a session that resumes with full context and a blank screen — indistinguishable from a failed bridge. Verify visually, not by asking the model what it remembers.
 - **Window alignment is asymmetric.** 366 boundaries in Codex versus one in a 5,397-record Claude session. P3 is transformative for Codex sources and close to a no-op for Claude ones. It demotes the character budget; it does not retire it.
 - **Session proliferation.** Each hop writes a new native session. Superseded members are marked, not hidden — whether a long chain should ever be collapsed is unresolved.
+- **Specs written against one machine's data.** The P1 spec initially defined done in terms of a single local 530 MB rollout. Invariants over the format, verified on generated fixtures, are the correct shape — a criterion nobody else can check is not a criterion.
 - **A failed load leaks its SQLite connection.** The exception traceback keeps the frame alive, so on Windows the file stays handle-locked until garbage collection. Wants a `finally: connection.close()`.
 
 ## Open questions
