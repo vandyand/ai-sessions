@@ -7,11 +7,23 @@ Depends on **P1** (`codex-compaction-window`, shipped v3.1.4/3.1.5).
 
 Two changes the north star bundled together. They turn out to be independent, and the evidence below argues they should be judged separately.
 
-## Part A — the budget is in the wrong unit
+## Part A — one budget, in characters, for every target
 
-`DEFAULT_MAX_CHARS = 950_000` counts **characters**. The copy is replayed into the *target's* context window, which is measured in tokens. At roughly 3.5–4 characters per token that budget is ~240–270k tokens, against harnesses whose models carry 1M-token context windows.
+`DEFAULT_MAX_CHARS = 950_000` counts **characters**. The copy is replayed into the *target's* context window, which is measured in tokens.
 
-The number also reads like a 1M-token budget written down in the wrong unit, which is how it ends up both mis-typed and ~4x conservative at once.
+**Correction (adversarial review, 2026-08-21).** An earlier draft of this spec claimed the number "reads like a 1M-token budget written down in the wrong unit," making it both mis-typed and ~4x too conservative. That was asserted without checking, and it is probably false. Five lines below it sits `CODEX_CONTEXT_WINDOW = 258_400` (`src/ai_sessions/bridge.py:46`), and:
+
+```
+950,000 chars / 258,400 tokens = 3.68 chars/token
+```
+
+which is a very plausible deliberate derivation. The comment above the constant already says "the ceiling is a context budget rather than a storage one" — so it *was* meant as a context budget, and its magnitude looks right for a Codex-bound copy.
+
+The defensible problems are narrower, and different:
+
+1. **The unit is not named.** A budget whose comment says "context" and whose value says "characters" forces the next reader to measure it to find out. That is how the earlier draft of this spec got it wrong.
+2. **One global ceiling is applied regardless of target.** A Claude-bound copy is capped at roughly Codex's context window. That is the real defect: the ceiling should follow the target.
+3. **`CODEX_CONTEXT_WINDOW` is currently only session metadata** (`bridge.py:806`), not an input to budgeting, so the relationship between the two constants is implicit and undocumented.
 
 ### What the budget must actually respect
 
@@ -74,15 +86,16 @@ Invariants over an arbitrary transcript, in the style established by P1.
 |---|---|
 | T1 | The budget names its unit. Config carries a token-denominated key |
 | T2 | An existing `max_chars` config keeps working, converted, with no silent change of meaning |
-| T3 | The effective ceiling is derived per target harness, not one global constant |
-| T4 | Trimming happens at message boundaries, never mid-message |
+| T3 | The effective ceiling is derived **per target harness**, not one global constant |
+| T4 | **Selection** drops whole messages; a message is truncated only when it alone exceeds the budget, and then carries the existing marker |
 | T5 | The opening request survives trimming whenever anything survives |
 | T6 | The note states the budget and unit actually applied |
-| U1 | Carried content is the deduplicated union of all readable windows, in a deterministic order |
-| U2 | Peak turns held does not grow with the number of windows — measured, per P1's corrected R5 |
-| U3 | A message present in any window is present in the output, budget permitting |
-| U4 | `latest_window=False` still replays the whole transcript (P1's R10 holds) |
-| U5 | Existing P1 invariants R1–R10 continue to hold |
+| T7 | The conversion is exercised **end to end** — `prepare_launch` → `bridge` → `fit` → `handoff_note` — not just at the config boundary |
+| T8 | Existing P1 invariants R1–R10 continue to hold, including R10 (`latest_window=False`) |
+
+**T4 was wrong in the first draft.** It said "never trim mid-message." `fit()` already caps any turn at `max(1000, max_chars // 2)` and truncates with a `[... message truncated ...]` marker (`src/ai_sessions/bridge.py:601-608`), and `test_oversized_single_turn_is_truncated_not_dropped` (`tests/test_bridge.py:261`) blesses that deliberately — a truncated oversized message beats an absent one. As written, T4 contradicted shipped behavior *and* T5, since an oversized opening request cannot both survive whole and be under budget. Restated above to say what actually matters: whole-message granularity for the *selection* decision, truncation only as the single-message escape hatch.
+
+**T7 exists because of a named mutation.** Adding a `max_tokens` key, printing it in the note, and leaving the character path active would pass every config-level and note-level test while behavior stayed in characters. That is the same shape as P1's proxy-tested R5, so the invariant is written to forbid it.
 
 ## Options Considered
 
@@ -92,18 +105,23 @@ Invariants over an arbitrary transcript, in the style established by P1.
 - **A2 — keep characters, fix only the value.** Cheapest, but leaves the config lying about what it measures and leaves the next person to rediscover it.
 - **A3 — ship a tokenizer.** Rejected: dependency weight, provider disagreement, and it would still be an estimate for the target harness's overhead.
 
-### Part B
+### Part B — decided against
 
-- **B1 — deduplicated union (recommended, contingent on review).** Recovers the 10–41%, memory bounded by unique content. Cost: a merge-order rule that can produce a conversation ordering no window actually had.
-- **B2 — leave P1's replace-on-boundary alone.** Zero risk, zero recovery. Defensible: the newest window is what the *source itself* is holding, and a copy that matches the source is easy to reason about.
-- **B3 — carry older windows verbatim as an appendix** below the main conversation, clearly labelled, rather than merging. Recovers content without inventing an order. Ugly, but honest.
+- **B1 — deduplicated union.** **Rejected on review.** It creates a transcript no harness ever held, promoting stale and superseded user text back into live context.
+- **B2 — leave P1's replace-on-boundary alone. Chosen.** `replacement_history` is explicitly the context Codex resumes from, and P1 adopted it as replacement semantics deliberately. A copy that matches the source is correct by construction.
+- **B3 — a labelled appendix of older windows.** Acceptable only as an explicit, clearly-marked export, never as merged conversation context. Out of scope here.
+
+Two further objections made B1 unsalvageable even setting the semantics aside:
+
+- **U2 and U3 were mutually false.** Given N windows each holding one unique older-only message, recovering every message (U3) requires O(N) retained turns, so peak-independent-of-window-count (U2) fails. The local measurement that made the union look cheap is a property of *observed* sessions, not of arbitrary transcripts — exactly the machine-specific reasoning P1 was corrected for.
+- **There is no stable message identity to deduplicate on.** `Turn` carries role, text, calls, and a compaction flag; provenance is P4. Deduplicating by text collapses genuinely repeated messages — "yes", "continue", "retry" — and deduplicating by position fails across the rewrites that make windows non-nested in the first place.
 
 ## Open Questions
 
-1. **Is Part B worth its risk at all?** B2 has a real argument: the newest window is what Codex itself resumes from, so a copy that matches it is *correct by construction*, and recovering superseded messages may reintroduce content the source deliberately dropped. The 41% case argues the other way. **This is the main thing the adversarial review should decide.**
-2. **What default token budget?** Fixing only the unit gives ~240k tokens. Anything higher is a separate judgement about target-harness headroom, and should be argued rather than assumed.
-3. **Which characters-per-token ratio per harness**, and does it need measuring rather than assuming 4?
-4. **Does U3 conflict with U2?** If the union is large for some session shape not present locally, budget-bounded recovery has to degrade predictably.
+1. ~~**Is Part B worth its risk?**~~ **Answered: no.** B2 chosen. Recorded in the north star's *explicitly decided NOT to do* section.
+2. **What default budget per target?** Not "fix the unit and maybe raise later" — a derivation: `target model context − harness overhead − compaction margin`. Phase 0 produces it or Part A does not proceed.
+3. **Which characters-per-token ratio?** Per-harness is likely not enough. Engineering transcripts mix prose, code, JSON, paths, UUIDs, diffs, and tool output; a prose-derived ratio can overfill the target and trigger immediate compaction. Measure the spread, and prefer a conservative ratio over a mean.
+4. **Where does the estimate cause real harm** rather than mild imprecision, and does the failure mode need to be one-sided (underfill rather than overfill)?
 
 ## References
 

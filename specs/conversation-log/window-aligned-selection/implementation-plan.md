@@ -4,7 +4,9 @@ See [README.md](README.md) for decisions and [research.md](research.md) for meas
 
 ## Overview
 
-Six phases. Part A (Phases 0–2) ships independently. Part B (Phase 4) is gated on Phase 3.
+Part A only. Part B was closed by the Phase 3 review before any code was written — see the findings below.
+
+The plan review ran **first**, not after Phases 0–2 as originally sequenced. That was itself a review finding: gating only Part B left the budget, default, and trimming decisions — all Part A, and all wrong in the first draft — behind no gate at all.
 
 ## Prerequisites
 
@@ -51,10 +53,10 @@ Nothing is designed on an assumed constant.
 
 ## Phase 2: Boundary-aligned trimming (Part A)
 
-- [ ] `fit` trims at message boundaries, never mid-message (T4)
+- [ ] Selection drops **whole messages**; truncation with the existing marker remains the escape hatch for a single message that alone exceeds the budget (T4)
 - [ ] The opening request survives whenever anything survives (T5)
 - [ ] Confirm behavior is unchanged for transcripts that fit the budget — this phase must be a no-op for the common case
-- [ ] Tests on generated transcripts, including one where a single message alone exceeds the budget
+- [ ] Tests on generated transcripts, including one where a single message alone exceeds the budget — and an end-to-end test through `prepare_launch` → `bridge` → `fit` → `handoff_note` that fails if the character path is still live (T7)
 
 **Verification**
 
@@ -65,34 +67,31 @@ Nothing is designed on an assumed constant.
 
 ---
 
-## Phase 3: Adversarial review gate on Part B
+## Phase 3: Adversarial review of the plan — COMPLETE
 
-**Part B does not proceed until this phase returns an answer.** This is the process fix from P1, where the review that would have caught three regressions ran only after release.
+- [x] Put the Part B question to the reviewer with the measurements
+- [x] Put the merge-ordering rule to the reviewer specifically
+- [x] Record the verdict and rationale below
+- [x] Close Part B as decided-against
 
-- [ ] Put Open Question 1 to the reviewer with the measurements: is recovering content from superseded windows correct, or does matching the source's own window make the copy correct by construction?
-- [ ] Put the merge-ordering rule to the reviewer specifically — it is the part most likely to be wrong
-- [ ] Record the verdict and rationale under `### Phase 3 findings`
-- [ ] If the answer is no, close Part B as decided-against in the north star's *explicitly decided NOT to do* section and skip to Phase 5
+### Phase 3 findings
+
+**Verdict: HIGH=4 MEDIUM=6.** Ran 6m11s with no timeout, before any implementation.
+
+- **Part B closed.** `replacement_history` is the context the source resumes from; merging windows creates a transcript no harness ever held and promotes superseded user text back into live context. B2 chosen; B3 acceptable only as a labelled export, never as merged context.
+- **U2 and U3 were mutually false.** N windows each holding one unique older-only message force O(N) retained turns to satisfy U3, breaking U2. The local measurement that made the union look cheap describes observed sessions, not arbitrary ones — the same machine-specific reasoning P1 was corrected for.
+- **No stable message identity exists to deduplicate on.** `Turn` has no provenance (that is P4); text-dedup collapses genuine repeats like "yes" or "continue".
+- **T4 contradicted shipped behavior and T5.** `fit()` already truncates oversized turns with a marker (`bridge.py:601-608`) and a test blesses it (`tests/test_bridge.py:261`). Restated.
+- **The Part A premise was wrong.** `CODEX_CONTEXT_WINDOW = 258_400` sits five lines below `DEFAULT_MAX_CHARS = 950_000`, and 950,000/258,400 = 3.68 chars/token. The budget was probably derived deliberately for a Codex-bound copy, not mis-typed from a 1M-token window. The real defect is one global ceiling for every target.
+- **Token estimation is not merely imprecise.** Engineering transcripts mix prose, code, JSON, diffs, and tool output; a prose-derived ratio can overfill a target and trigger its compaction on arrival.
+- **T1/T2/T3/T6 were proxy-prone.** Named mutation: add `max_tokens`, print it in the note, leave the character path live — config and note tests pass, behavior unchanged. Now forbidden by T7.
+- **The gate was mis-placed.** Fixed: this review ran before Phase 1.
 
 ---
 
-## Phase 4: Deduplicated union (Part B, gated)
+## Phase 4: Deduplicated union — CLOSED, NOT IMPLEMENTED
 
-Only if Phase 3 says yes.
-
-- [ ] Accumulate a deduplicated, order-preserving union of carried window messages instead of replacing on every boundary
-- [ ] Implement the merge rule Phase 3 endorsed; anchor on the newest window's order
-- [ ] Peak measured with `PeakRecorder`, asserted independent of window count (U2, P1's corrected R5)
-- [ ] `latest_window=False` still replays everything (U4)
-- [ ] All P1 invariants still hold (U5)
-- [ ] Tests: a message present only in an older window is recovered (U3); ordering is deterministic across runs
-
-**Verification**
-
-```python
-# peak(2 windows) == peak(200 windows) with equal spans
-# a message unique to window 1 of 200 appears in the output
-```
+Decided against in Phase 3. Recorded in the north star's *explicitly decided NOT to do* section so it is not rediscovered as an idea.
 
 ---
 
