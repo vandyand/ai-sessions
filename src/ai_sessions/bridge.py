@@ -133,9 +133,8 @@ class BudgetPolicy:
             raise ValueError("budget chars_per_token must be positive")
         if not self.source.strip():
             raise ValueError("budget policy source must not be empty")
-        default_chars = math.floor(
-            self.context_tokens * self.usable_fraction * self.chars_per_token
-        )
+        default_tokens = math.floor(self.context_tokens * self.usable_fraction)
+        default_chars = math.floor(default_tokens * self.chars_per_token)
         if default_chars < MIN_BRIDGE_CHARS:
             raise ValueError("budget policy default is too small for bridge metadata")
 
@@ -272,7 +271,27 @@ def scrub(value: Any) -> str:
 
 def _clip(value: str, limit: int) -> str:
     text = value.strip()
-    return text if len(text) <= limit else text[:limit].rstrip() + " …"
+    suffix = " …"
+    return text if len(text) <= limit else text[: limit - len(suffix)].rstrip() + suffix
+
+
+def _bounded_json_value(value: str, limit: int) -> str:
+    """Clip a string by its rendered JSON size while keeping the JSON valid."""
+    text = value.strip()
+    if len(json.dumps(text, ensure_ascii=False)) <= limit:
+        return text
+    low = 0
+    high = len(text)
+    best = "…"
+    while low <= high:
+        middle = (low + high) // 2
+        candidate = text[:middle].rstrip() + " …"
+        if len(json.dumps(candidate, ensure_ascii=False)) <= limit:
+            best = candidate
+            low = middle + 1
+        else:
+            high = middle - 1
+    return best
 
 
 def _block_text(
@@ -751,6 +770,7 @@ def select_messages(
     suffix_reversed = [newest]
     suffix_first = newest
     suffix_cost = metric.item_cost(newest)
+    head_cost = metric.item_cost(head)
     for index in range(len(turns) - 2, 0, -1):
         turn = turns[index]
         item = metric.item_cost(turn)
@@ -758,7 +778,7 @@ def select_messages(
         if item < 0 or joined < 0:
             raise BridgeError("selection metric returned a negative cost")
         candidate_suffix_cost = item + joined + suffix_cost
-        total = metric.item_cost(head) + metric.join_cost(head, turn) + candidate_suffix_cost
+        total = head_cost + metric.join_cost(head, turn) + candidate_suffix_cost
         if total > max_chars:
             break
         suffix_reversed.append(turn)
@@ -802,11 +822,13 @@ def handoff_note(
     """The opening message that tells the target where this came from."""
     source = harness(source_tool).label
     target = harness(target_tool).label
-    title = _clip(title, 500)
-    cwd = _clip(cwd, 500)
-    session_id = _clip(session_id, 200)
-    conversation_id = _clip(conversation_id, 100)
-    label = f" titled {title!r}" if title else ""
+    title = _bounded_json_value(_clip(title, 500), 600)
+    cwd = _bounded_json_value(_clip(cwd, 500), 600)
+    session_id = _bounded_json_value(_clip(session_id, 200), 250)
+    conversation_id = _bounded_json_value(_clip(conversation_id, 100), 150)
+    label = f" titled {json.dumps(title, ensure_ascii=False)}" if title else ""
+    display_session_id = json.dumps(session_id, ensure_ascii=False)
+    display_cwd = json.dumps(cwd, ensure_ascii=False) if cwd else "unknown"
     lines = [
         f"[ai-sessions] This conversation started in {source} and is being continued in {target}.",
     ]
@@ -823,8 +845,8 @@ def handoff_note(
         )
     lines += [
         "",
-        f"Source session{label}: {session_id} ({source})",
-        f"Working directory: {cwd or 'unknown'}",
+        f"Source session{label}: {display_session_id} ({source})",
+        f"Working directory: {display_cwd}",
         "",
         (
             f"The {kept} source message(s) below were assembled into "

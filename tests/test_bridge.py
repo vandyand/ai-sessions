@@ -391,13 +391,14 @@ class ShapingTests(unittest.TestCase):
                 budget.chars - HANDOFF_NOTE_RESERVE_CHARS,
             )
             self.assertLessEqual(selection_cost(selected.turns), maximum - 4_096)
+        hostile = '\\"\n\t\x00' * 2_000
         note = handoff_note(
             source_tool="codex",
             target_tool="claude",
-            session_id="s" * 10_000,
-            title="t" * 10_000,
-            cwd="c" * 10_000,
-            conversation_id="v" * 10_000,
+            session_id=hostile,
+            title=hostile,
+            cwd=hostile,
+            conversation_id=hostile,
             kept=2,
             assembled=1,
             calls=999_999,
@@ -410,6 +411,10 @@ class ShapingTests(unittest.TestCase):
             budget=resolve_budget("claude", max_tokens=1),
         )
         self.assertLessEqual(len(note) + 2, HANDOFF_NOTE_RESERVE_CHARS)
+        provenance = next(
+            line for line in note.splitlines() if line.startswith("[ai-sessions-provenance v1]")
+        )
+        json.loads(provenance.split("] ", 1)[1])
 
     def test_selection_shape_is_deterministic_monotone_and_contiguous(self) -> None:
         turns = [
@@ -507,18 +512,24 @@ class ShapingTests(unittest.TestCase):
     def test_truncation_does_not_report_cut_tool_calls(self) -> None:
         calls = (
             ToolCall("one", "request", "result"),
-            ToolCall("two", "request", "result" * 100),
+            ToolCall("two", "request", "result"),
+            ToolCall("three", "request", "result"),
+            ToolCall("four", "request", "result" * 100),
         )
         turn = flatten([Turn("assistant", "prefix", calls)])[0]
-        second_call = turn.text.index("⟦two⟧")
-        selected = select_messages([turn], second_call + 5 + len(TRUNCATION_MARKER))
-        self.assertEqual(selected.turns[0].calls, calls[:1])
-        self.assertIn(render_calls(calls[:1]), selected.turns[0].text)
-        self.assertNotIn(render_calls(calls[1:]), selected.turns[0].text)
+        rendered_start = turn.text.rfind(render_calls(calls))
+        first_three = [render_calls((call,)) for call in calls[:3]]
+        third_end = rendered_start + sum(map(len, first_three)) + 2
+        prefix = third_end - 2
+        selected = select_messages([turn], prefix + len(TRUNCATION_MARKER))
+        self.assertEqual(selected.turns[0].calls, calls[:2])
+        self.assertIn(render_calls(calls[:2]), selected.turns[0].text)
+        self.assertNotIn(render_calls(calls[2:3]), selected.turns[0].text)
 
     def test_oversized_newest_anchor_is_truncated_and_disclosed(self) -> None:
         selected = select_messages([Turn("user", "short"), Turn("assistant", "x" * 50_000)], 2_000)
         self.assertEqual((selected.dropped, selected.truncated), (0, 1))
+        self.assertEqual(len(selected.turns[-1].text), 2_000 - 2 - len("short"))
         self.assertIn("message truncated", selected.turns[-1].text)
 
     def test_budget_policy_rejects_invalid_registration(self) -> None:
@@ -1172,6 +1183,24 @@ class LaunchIntegrationTests(unittest.TestCase):
         self.assertNotIn("dropped to fit", stderr.getvalue())
         self.assertIn("2 anchor message(s) truncated to fit", stderr.getvalue())
         self.assertIn("2 anchor message(s) were truncated", handoff)
+
+    def test_launch_reports_a_short_head_and_truncated_newest_anchor(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            item = session(directory, launch_tool="claude")
+            Path(item.storage).write_text(
+                "\n".join([codex_line("user", "short"), codex_line("assistant", "x" * 20_000)])
+                + "\n",
+                encoding="utf-8",
+            )
+            with patch.object(bridge, "CLAUDE_HOME", Path(directory) / "claude"):
+                prepared, notice = prepare_launch(
+                    item,
+                    config=LaunchConfig(bridge_max_tokens=4_096),
+                )
+            handoff = read_turns("claude", prepared.storage)[0].text
+        self.assertNotIn("dropped to fit", notice)
+        self.assertIn("1 anchor message(s) truncated to fit", notice)
+        self.assertIn("1 anchor message(s) were truncated", handoff)
 
     def test_command_for_refuses_an_unbridged_cross_harness_launch(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
