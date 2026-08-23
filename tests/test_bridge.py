@@ -5,7 +5,13 @@ from pathlib import Path
 from unittest.mock import patch
 
 from ai_sessions import bridge
-from ai_sessions.app import Session, UserState, command_for, prepare_launch
+from ai_sessions.app import (
+    Session,
+    UserState,
+    command_for,
+    load_claude_sessions,
+    prepare_launch,
+)
 from ai_sessions.bridge import (
     HARNESSES,
     BridgeError,
@@ -581,6 +587,25 @@ def session(directory: str, **overrides: object) -> Session:
 
 
 class LaunchIntegrationTests(unittest.TestCase):
+    @staticmethod
+    def claude_copy(
+        source: Session, prepared: Session, storage: str, *, launch_tool: str = "codex"
+    ) -> Session:
+        return Session(
+            tool="claude",
+            session_id=prepared.launch_target("claude") or prepared.session_id,
+            title=source.title,
+            cwd=source.cwd,
+            updated=source.updated,
+            created=source.created,
+            preview="",
+            named=True,
+            storage=storage,
+            origin="cross",
+            launch_targets={"claude": prepared.launch_target("claude") or prepared.session_id},
+            launch_tool=launch_tool,
+        )
+
     def test_a_session_with_a_transcript_offers_both_harnesses(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             item = session(directory)
@@ -662,6 +687,8 @@ class LaunchIntegrationTests(unittest.TestCase):
                 self.assertEqual(first.launch_target("claude"), second.launch_target("claude"))
                 self.assertIn("Continuing the Claude copy", note)
 
+                with Path(item.storage).open("a", encoding="utf-8") as handle:
+                    handle.write(codex_line("user", "The source moved") + "\n")
                 moved = session(directory, launch_tool="claude", updated=200.0)
                 third, note = prepare_launch(moved, state=state)
             self.assertNotEqual(third.launch_target("claude"), first.launch_target("claude"))
@@ -677,6 +704,189 @@ class LaunchIntegrationTests(unittest.TestCase):
                 second, note = prepare_launch(item, state=state)
             self.assertNotEqual(second.launch_target("claude"), first.launch_target("claude"))
             self.assertIn("Copied", note)
+
+    def test_codex_to_claude_work_to_codex_follows_the_newest_head(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            source = session(directory, launch_tool="claude")
+            state = UserState(path=Path(directory) / "state.json")
+            claude_home = Path(directory) / "claude"
+            codex_home = Path(directory) / "codex"
+            with patch.object(bridge, "CLAUDE_HOME", claude_home):
+                claude_prepared, _ = prepare_launch(source, state=state)
+            copy = self.claude_copy(
+                source, claude_prepared, state.bridges[source.key]["claude"]["storage"]
+            )
+            with Path(copy.storage).open("a", encoding="utf-8") as handle:
+                handle.write(claude_line("user", "Work completed in Claude") + "\n")
+                handle.write(claude_line("assistant", "Claude result") + "\n")
+            original_row = session(directory)
+            state.apply([original_row, copy])
+            self.assertTrue(original_row.superseded)
+            self.assertFalse(copy.superseded)
+
+            with patch.object(bridge, "CODEX_HOME", codex_home):
+                codex_prepared, note = prepare_launch(original_row, state=state)
+            self.assertIn("Copied", note)
+            self.assertEqual(codex_prepared.tool, "codex")
+            self.assertNotEqual(codex_prepared.session_id, source.session_id)
+            self.assertIn("Work completed in Claude", Path(codex_prepared.storage).read_text("utf-8"))
+
+            # Either historical row now resolves to the same current Codex copy.
+            state.apply([original_row, copy, codex_prepared])
+            copy.launch_tool = "codex"
+            again, _ = prepare_launch(copy, state=state)
+            self.assertEqual(again.session_id, codex_prepared.session_id)
+
+    def test_switching_harnesses_without_new_work_reuses_an_equivalent_frontier(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            source = session(directory, launch_tool="claude")
+            state = UserState(path=Path(directory) / "state.json")
+            with patch.object(bridge, "CLAUDE_HOME", Path(directory) / "claude"):
+                claude_prepared, _ = prepare_launch(source, state=state)
+            copy = self.claude_copy(
+                source, claude_prepared, state.bridges[source.key]["claude"]["storage"]
+            )
+            state.apply([source, copy])
+            copy.launch_tool = "codex"
+
+            prepared, _ = prepare_launch(copy, state=state)
+            self.assertEqual(prepared.tool, "codex")
+            self.assertEqual(prepared.session_id, source.session_id)
+
+    def test_two_members_advancing_from_one_frontier_is_reported_as_divergence(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            source = session(directory, launch_tool="claude")
+            state = UserState(path=Path(directory) / "state.json")
+            with patch.object(bridge, "CLAUDE_HOME", Path(directory) / "claude"):
+                claude_prepared, _ = prepare_launch(source, state=state)
+            copy = self.claude_copy(
+                source, claude_prepared, state.bridges[source.key]["claude"]["storage"]
+            )
+            with Path(source.storage).open("a", encoding="utf-8") as handle:
+                handle.write(codex_line("user", "Codex branch") + "\n")
+            with Path(copy.storage).open("a", encoding="utf-8") as handle:
+                handle.write(claude_line("user", "Claude branch") + "\n")
+            state.apply([source, copy])
+            copy.launch_tool = "codex"
+
+            with self.assertRaisesRegex(BridgeError, "divergent heads"):
+                prepare_launch(source, state=state)
+            self.assertTrue(source.diverged)
+            self.assertTrue(copy.diverged)
+
+    def test_renaming_a_copy_does_not_advance_the_conversation(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            source = session(directory, launch_tool="claude")
+            state = UserState(path=Path(directory) / "state.json")
+            with patch.object(bridge, "CLAUDE_HOME", Path(directory) / "claude"):
+                claude_prepared, _ = prepare_launch(source, state=state)
+            copy = self.claude_copy(
+                source, claude_prepared, state.bridges[source.key]["claude"]["storage"]
+            )
+            with Path(copy.storage).open("a", encoding="utf-8") as handle:
+                handle.write(json.dumps({"type": "custom-title", "customTitle": "renamed"}) + "\n")
+            state.apply([source, copy])
+            copy.launch_tool = "codex"
+
+            prepared, _ = prepare_launch(copy, state=state)
+            self.assertEqual(prepared.session_id, source.session_id)
+
+    def test_uuid_shaped_text_is_not_treated_as_a_launch_target(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            claude_home = Path(directory) / "claude"
+            project = claude_home / "projects" / "test"
+            project.mkdir(parents=True)
+            session_id = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa"
+            pasted = "019f59af-e300-7bd1-be75-e47599b5b593"
+            (project / f"{session_id}.jsonl").write_text(
+                claude_line("user", f"ordinary correlation id: {pasted}") + "\n",
+                encoding="utf-8",
+            )
+            refs: dict[str, list[str]] = {}
+            with patch("ai_sessions.app.CLAUDE_HOME", claude_home):
+                items = load_claude_sessions(use_cache=False, codex_refs=refs)
+            self.assertEqual(len(items), 1)
+            self.assertEqual(items[0].launch_targets, {"claude": session_id})
+            self.assertEqual(refs[session_id], [pasted])
+
+    def test_state_v6_round_trips_conversation_members_and_cursors(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            source = session(directory, launch_tool="claude")
+            state_path = Path(directory) / "state.json"
+            state = UserState(state_path)
+            with patch.object(bridge, "CLAUDE_HOME", Path(directory) / "claude"):
+                prepared, _ = prepare_launch(source, state=state)
+            conversation_id = state.conversation_id_for(source)
+            reloaded = UserState(state_path)
+            self.assertEqual(reloaded.conversation_id_for(source), conversation_id)
+            members = reloaded.conversations[conversation_id]["members"]
+            self.assertEqual(set(members), {source.key, prepared.key})
+            self.assertTrue(all(isinstance(member["cursor"], int) for member in members.values()))
+
+    def test_v5_bridge_state_migrates_without_resuming_the_stale_ancestor(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            source = session(directory)
+            target_path = Path(directory) / "claude-copy.jsonl"
+            target_path.write_text(
+                claude_line("user", "Imported history")
+                + "\n"
+                + claude_line("user", "Later Claude work")
+                + "\n",
+                encoding="utf-8",
+            )
+            target = Session(
+                tool="claude",
+                session_id="claude-copy",
+                title=source.title,
+                cwd=source.cwd,
+                updated=200,
+                created=100,
+                preview="",
+                named=True,
+                storage=str(target_path),
+                launch_tool="codex",
+            )
+            state_path = Path(directory) / "state.json"
+            state_path.write_text(
+                json.dumps(
+                    {
+                        "version": 5,
+                        "names": {},
+                        "original_names": {},
+                        "hidden": [],
+                        "launch_tools": {},
+                        "bridges": {
+                            source.key: {
+                                "claude": {
+                                    "session_id": target.session_id,
+                                    "storage": str(target_path),
+                                    "source_updated": source.updated,
+                                }
+                            }
+                        },
+                    }
+                ),
+                encoding="utf-8",
+            )
+            state = UserState(state_path)
+            state.apply([source, target])
+            self.assertTrue(source.superseded)
+            self.assertFalse(target.superseded)
+
+            with patch.object(bridge, "CODEX_HOME", Path(directory) / "codex"):
+                prepared, _ = prepare_launch(source, state=state)
+            self.assertNotEqual(prepared.session_id, source.session_id)
+            self.assertIn("Later Claude work", Path(prepared.storage).read_text("utf-8"))
+
+    def test_bridge_writes_machine_readable_conversation_provenance(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            source = session(directory, launch_tool="claude")
+            state = UserState(Path(directory) / "state.json")
+            with patch.object(bridge, "CLAUDE_HOME", Path(directory) / "claude"):
+                prepared, _ = prepare_launch(source, state=state)
+            text = Path(prepared.storage).read_text(encoding="utf-8")
+            self.assertIn("[ai-sessions-provenance v1]", text)
+            self.assertIn(state.conversation_id_for(source), text)
 
     def test_claude_subagent_bridges_as_a_plain_codex_session(self) -> None:
         with tempfile.TemporaryDirectory() as directory:

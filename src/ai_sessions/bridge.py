@@ -144,6 +144,7 @@ class Harness:
     read: Callable[..., Transcript]
     write: Callable[..., tuple[str, Path]]
     locate: Callable[[str], bool]
+    changed_since: Callable[[Path, int], bool]
 
 
 def append_jsonl(path: Path, payload: dict[str, Any]) -> None:
@@ -635,6 +636,7 @@ def handoff_note(
     opaque_compactions: int = 0,
     sealed_summary: bool = False,
     resumes_at_last_summary: bool = True,
+    conversation_id: str = "",
 ) -> str:
     """The opening message that tells the target where this came from."""
     source = harness(source_tool).label
@@ -642,6 +644,19 @@ def handoff_note(
     label = f" titled {title!r}" if title else ""
     lines = [
         f"[ai-sessions] This conversation started in {source} and is being continued in {target}.",
+    ]
+    if conversation_id:
+        lines.append(
+            "[ai-sessions-provenance v1] "
+            + json.dumps(
+                {
+                    "conversation_id": conversation_id,
+                    "source": {"harness": source_tool, "session_id": session_id},
+                },
+                separators=(",", ":"),
+            )
+        )
+    lines += [
         "",
         f"Source session{label}: {session_id} ({source})",
         f"Working directory: {cwd or 'unknown'}",
@@ -893,6 +908,64 @@ def _codex_exists(session_id: str) -> bool:
     return any((CODEX_HOME / "sessions").rglob(f"rollout-*-{session_id}.jsonl"))
 
 
+def _records_after(path: Path, offset: int) -> Iterator[dict[str, Any]]:
+    """Yield complete JSONL records appended after a recorded byte frontier."""
+    try:
+        size = path.stat().st_size
+        if offset < 0 or size < offset:
+            # Provider transcripts are append-only. Shrinking means the native
+            # history was replaced, which is necessarily a new revision.
+            yield {"type": "ai_sessions_replaced"}
+            return
+        with path.open("rb") as handle:
+            handle.seek(offset)
+            for raw in handle:
+                try:
+                    item = json.loads(raw)
+                except (json.JSONDecodeError, UnicodeDecodeError):
+                    continue
+                if isinstance(item, dict):
+                    yield item
+    except OSError:
+        yield {"type": "ai_sessions_missing"}
+
+
+def _codex_changed_since(path: Path, offset: int) -> bool:
+    """Whether Codex appended model-visible conversation after ``offset``."""
+    for record in _records_after(path, offset):
+        if record.get("type") in ("ai_sessions_replaced", "ai_sessions_missing"):
+            return True
+        if record.get("type") != "response_item":
+            continue
+        payload = record.get("payload")
+        if not isinstance(payload, dict):
+            continue
+        kind = payload.get("type")
+        if kind == "message" and payload.get("role") in ("user", "assistant"):
+            return True
+        if kind in (
+            "function_call",
+            "custom_tool_call",
+            "function_call_output",
+            "custom_tool_call_output",
+        ):
+            return True
+    return False
+
+
+def _claude_changed_since(path: Path, offset: int) -> bool:
+    """Whether Claude appended a real turn, ignoring title and metadata records."""
+    for record in _records_after(path, offset):
+        if record.get("type") in ("ai_sessions_replaced", "ai_sessions_missing"):
+            return True
+        if record.get("type") not in ("user", "assistant") or record.get("isMeta"):
+            continue
+        message = record.get("message")
+        if isinstance(message, dict) and message.get("content") not in (None, "", []):
+            return True
+    return False
+
+
 HARNESSES: dict[str, Harness] = {
     "codex": Harness(
         name="codex",
@@ -900,6 +973,7 @@ HARNESSES: dict[str, Harness] = {
         read=read_codex,
         write=write_codex_session,
         locate=_codex_exists,
+        changed_since=_codex_changed_since,
     ),
     "claude": Harness(
         name="claude",
@@ -907,6 +981,7 @@ HARNESSES: dict[str, Harness] = {
         read=read_claude,
         write=write_claude_session,
         locate=_claude_exists,
+        changed_since=_claude_changed_since,
     ),
 }
 BRIDGE_TOOLS = tuple(HARNESSES)
@@ -937,6 +1012,14 @@ def native_session_exists(tool: str, session_id: str) -> bool:
         return False
 
 
+def conversation_changed_since(tool: str, storage: str | Path, offset: int) -> bool:
+    """Whether a native transcript advanced beyond a materialized frontier."""
+    path = Path(storage)
+    if not storage or not path.is_file():
+        return True
+    return harness(tool).changed_since(path, offset)
+
+
 def bridged_title(title: str, source_tool: str) -> str:
     """Name the copy so the list never shows two identical rows."""
     source = harness(source_tool).label.split()[0]
@@ -956,6 +1039,7 @@ def bridge(
     max_chars: int = DEFAULT_MAX_CHARS,
     tool_calls: bool = True,
     latest_window: bool = True,
+    conversation_id: str = "",
 ) -> BridgeResult:
     """Materialise a conversation as a new native session in ``target_tool``."""
     target = harness(target_tool)
@@ -986,6 +1070,7 @@ def bridge(
         opaque_compactions=source.opaque_compactions,
         sealed_summary=source.sealed_summary,
         resumes_at_last_summary=source.resumes_at_last_summary or not source.carried_windows,
+        conversation_id=conversation_id,
     )
     payload = merge_runs([Turn("user", note), *kept])
     new_id, path = target.write(cwd=cwd, turns=payload, title=bridged_title(title, source_tool))
