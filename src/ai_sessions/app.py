@@ -938,6 +938,9 @@ def reconcile_evidence(sessions: list[Session], context: HarnessContext) -> None
     by_id: dict[str, list[Session]] = {}
     for item in sessions:
         by_id.setdefault(item.session_id, []).append(item)
+    by_folded_id: dict[str, list[Session]] = {}
+    for item in sessions:
+        by_folded_id.setdefault(item.session_id.casefold(), []).append(item)
     for key in context.origin_hints:
         target = by_key.get(key)
         if target is not None and target.source is SourceKind.NON_INTERACTIVE:
@@ -974,7 +977,23 @@ def reconcile_evidence(sessions: list[Session], context: HarnessContext) -> None
                 "negative counterpart conclusions were suppressed"
             )
         for token in tokens:
+            # Native writers always mint a fresh target id. An own-id token is
+            # therefore transcript metadata, not evidence that an unrelated
+            # harness with the same namespaced id is a causal counterpart.
+            if token.casefold() == publisher_id.casefold():
+                continue
             discovered = [item for item in by_id.get(token, []) if item.tool != publisher_tool]
+            if not discovered:
+                raw = token.encode("ascii", errors="ignore")
+                discovered = [
+                    item
+                    for item in by_folded_id.get(token.casefold(), [])
+                    if item.tool != publisher_tool
+                    and any(
+                        pattern.flags & re.I and pattern.fullmatch(raw)
+                        for pattern in REGISTRY.get(item.tool).id_patterns
+                    )
+                ]
             resolved: list[tuple[str, str, Session | None]] = [
                 (item.tool, item.session_id, item) for item in discovered
             ]
