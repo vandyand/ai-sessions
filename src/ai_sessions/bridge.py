@@ -935,9 +935,23 @@ def _records_after(path: Path, offset: int) -> Iterator[dict[str, Any]]:
         yield {"type": "ai_sessions_missing"}
 
 
+def _jsonl_tail_complete(path: Path, offset: int) -> bool:
+    """Whether the append-only file currently ends on a record boundary."""
+    try:
+        size = path.stat().st_size
+        if offset < 0 or size < offset:
+            return False
+        if size == 0:
+            return True
+        with path.open("rb") as handle:
+            handle.seek(-1, os.SEEK_END)
+            return handle.read(1) == b"\n"
+    except OSError:
+        return False
+
+
 def _codex_change_status(path: Path, offset: int) -> str:
     """Classify Codex activity after ``offset`` without trusting unstable tails."""
-    changed = False
     for record in _records_after(path, offset):
         if record.get("type") in (
             "ai_sessions_replaced",
@@ -952,20 +966,19 @@ def _codex_change_status(path: Path, offset: int) -> str:
             continue
         kind = payload.get("type")
         if kind == "message" and payload.get("role") in ("user", "assistant"):
-            changed = True
+            return "changed" if _jsonl_tail_complete(path, offset) else "unstable"
         if kind in (
             "function_call",
             "custom_tool_call",
             "function_call_output",
             "custom_tool_call_output",
         ):
-            changed = True
-    return "changed" if changed else "unchanged"
+            return "changed" if _jsonl_tail_complete(path, offset) else "unstable"
+    return "unchanged" if _jsonl_tail_complete(path, offset) else "unstable"
 
 
 def _claude_change_status(path: Path, offset: int) -> str:
     """Classify Claude activity after ``offset`` while ignoring metadata."""
-    changed = False
     for record in _records_after(path, offset):
         if record.get("type") in (
             "ai_sessions_replaced",
@@ -977,8 +990,8 @@ def _claude_change_status(path: Path, offset: int) -> str:
             continue
         message = record.get("message")
         if isinstance(message, dict) and message.get("content") not in (None, "", []):
-            changed = True
-    return "changed" if changed else "unchanged"
+            return "changed" if _jsonl_tail_complete(path, offset) else "unstable"
+    return "unchanged" if _jsonl_tail_complete(path, offset) else "unstable"
 
 
 HARNESSES: dict[str, Harness] = {

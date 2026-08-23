@@ -892,6 +892,22 @@ class LaunchIntegrationTests(unittest.TestCase):
                         bridge.conversation_change_status(tool, path, cursor), "unstable"
                     )
 
+    def test_changed_status_does_not_reparse_the_full_valid_tail(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "codex.jsonl"
+            path.write_text(codex_line("user", "Earlier") + "\n", encoding="utf-8")
+            cursor = path.stat().st_size
+            with path.open("a", encoding="utf-8") as handle:
+                handle.write(codex_line("user", "Changed") + "\n")
+                for index in range(100):
+                    handle.write(json.dumps({"type": "metadata", "index": index}) + "\n")
+
+            with patch.object(bridge.json, "loads", wraps=json.loads) as loads:
+                self.assertEqual(
+                    bridge.conversation_change_status("codex", path, cursor), "changed"
+                )
+            self.assertEqual(loads.call_count, 1)
+
     def test_retry_after_partial_tail_uses_the_last_complete_cursor(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             source = session(directory, launch_tool="claude")
