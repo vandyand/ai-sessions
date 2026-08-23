@@ -22,6 +22,7 @@ import sqlite3
 import subprocess
 import sys
 import textwrap
+import uuid
 from dataclasses import asdict, dataclass, field, replace
 from pathlib import Path
 from typing import Any, Iterable
@@ -33,6 +34,8 @@ from .bridge import (
     BridgeError,
     append_jsonl,
     bridge,
+    complete_jsonl_cursor,
+    conversation_change_status,
     native_session_exists,
 )
 from .config import LAUNCH_MODES, LaunchConfig
@@ -98,6 +101,9 @@ class Session:
     agent_nickname: str = ""
     launch_targets: dict[str, str] = field(default_factory=dict)
     launch_tool: str = ""
+    conversation_id: str = ""
+    superseded: bool = False
+    diverged: bool = False
 
     @property
     def key(self) -> str:
@@ -202,14 +208,19 @@ class UserState:
         self.hidden: set[str] = set()
         self.launch_tools: dict[str, str] = {}
         self.bridges: dict[str, dict[str, dict[str, Any]]] = {}
+        self.conversations: dict[str, dict[str, Any]] = {}
+        self.session_conversations: dict[str, str] = {}
+        self._sessions_by_key: dict[str, Session] = {}
         try:
             payload = json.loads(path.read_text(encoding="utf-8"))
-            if payload.get("version") in (1, 2, 3, 4, 5):
+            if payload.get("version") in (1, 2, 3, 4, 5, 6):
                 names = payload.get("names", {})
                 original_names = payload.get("original_names", {})
                 hidden = payload.get("hidden", [])
                 launch_tools = payload.get("launch_tools", {})
                 bridges = payload.get("bridges", {})
+                conversations = payload.get("conversations", {})
+                session_conversations = payload.get("session_conversations", {})
                 if isinstance(bridges, dict):
                     for key, value in bridges.items():
                         if not isinstance(value, dict):
@@ -223,6 +234,30 @@ class UserState:
                         }
                         if entries:
                             self.bridges[self.stable_key(str(key))] = entries
+                if isinstance(conversations, dict):
+                    for conversation_id, value in conversations.items():
+                        if not isinstance(value, dict) or not isinstance(
+                            value.get("members"), dict
+                        ):
+                            continue
+                        members = {
+                            self.stable_key(str(key)): member
+                            for key, member in value["members"].items()
+                            if isinstance(member, dict)
+                            and member.get("tool") in TOOL_LABELS
+                            and isinstance(member.get("session_id"), str)
+                        }
+                        if members:
+                            self.conversations[str(conversation_id)] = {"members": members}
+                if isinstance(session_conversations, dict):
+                    self.session_conversations = {
+                        self.stable_key(str(key)): str(value)
+                        for key, value in session_conversations.items()
+                        if str(value) in self.conversations
+                    }
+                for conversation_id, conversation in self.conversations.items():
+                    for key in conversation["members"]:
+                        self.session_conversations.setdefault(key, conversation_id)
                 if isinstance(names, dict):
                     self.names = {
                         self.stable_key(str(key)): normalize_space(value)
@@ -257,8 +292,293 @@ class UserState:
             return f"{parts[0]}:{parts[2]}"
         return value
 
-    def apply(self, sessions: Iterable[Session]) -> None:
+    @staticmethod
+    def _cursor(storage: str) -> int:
+        try:
+            return complete_jsonl_cursor(Path(storage))
+        except (BridgeError, OSError):
+            return -1
+
+    @staticmethod
+    def _member_key(tool: str, session_id: str) -> str:
+        return f"{tool}:{session_id}"
+
+    def _member_from_session(
+        self,
+        item: Session,
+        *,
+        generation: int,
+        frontier: str,
+        cursor: int | None = None,
+    ) -> dict[str, Any]:
+        return {
+            "tool": item.tool,
+            "session_id": item.session_id,
+            "storage": item.storage,
+            "cwd": item.cwd,
+            "title": item.title,
+            "updated": item.updated,
+            "generation": generation,
+            "frontier": frontier,
+            "cursor": self._cursor(item.storage) if cursor is None else cursor,
+        }
+
+    def _ensure_conversation(self, item: Session) -> tuple[str, dict[str, Any]]:
+        key = self.stable_key(item.key)
+        conversation_id = self.session_conversations.get(key, "")
+        if conversation_id and conversation_id in self.conversations:
+            conversation = self.conversations[conversation_id]
+            member = conversation["members"].get(key)
+            if member is not None:
+                member.update(
+                    storage=item.storage,
+                    cwd=item.cwd,
+                    title=item.title,
+                    updated=item.updated,
+                )
+                return conversation_id, member
+        conversation_id = str(uuid.uuid4())
+        frontier = str(uuid.uuid4())
+        member = self._member_from_session(item, generation=0, frontier=frontier)
+        self.conversations[conversation_id] = {"members": {key: member}}
+        self.session_conversations[key] = conversation_id
+        return conversation_id, member
+
+    def conversation_id_for(self, item: Session, *, create: bool = False) -> str:
+        conversation_id = self.session_conversations.get(self.stable_key(item.key), "")
+        if conversation_id or not create:
+            return conversation_id
+        return self._ensure_conversation(item)[0]
+
+    def _member_changed(self, member: dict[str, Any]) -> bool:
+        return self._member_change_status(member) != "unchanged"
+
+    def _member_change_status(self, member: dict[str, Any]) -> str:
+        cursor = member.get("cursor")
+        if not isinstance(cursor, int):
+            return "unstable"
+        return conversation_change_status(
+            str(member.get("tool", "")), str(member.get("storage", "")), cursor
+        )
+
+    def _conversation_status(self, conversation_id: str) -> dict[str, Any]:
+        conversation = self.conversations[conversation_id]
+        all_members = list(conversation["members"].items())
+        members = [
+            (key, member)
+            for key, member in all_members
+            if Path(str(member.get("storage", ""))).is_file()
+        ]
+        maximum = max((int(member.get("generation", 0)) for _, member in all_members), default=0)
+        current = [
+            (key, member) for key, member in members if int(member.get("generation", 0)) == maximum
+        ]
+        current_frontiers = {str(member.get("frontier", "")) for _, member in current}
+        unavailable = [
+            (key, member)
+            for key, member in all_members
+            if int(member.get("generation", 0)) == maximum
+            and not Path(str(member.get("storage", ""))).is_file()
+            and str(member.get("frontier", "")) not in current_frontiers
+        ]
+        if unavailable:
+            return {
+                "conflict": False,
+                "heads": current,
+                "advanced": [],
+                "unavailable": unavailable,
+                "unstable": [],
+            }
+        if not members:
+            return {
+                "conflict": False,
+                "heads": [],
+                "advanced": [],
+                "unavailable": [],
+                "unstable": [],
+            }
+        changes = {key: self._member_change_status(member) for key, member in members}
+        unstable = [pair for pair in members if changes[pair[0]] == "unstable"]
+        if unstable:
+            return {
+                "conflict": False,
+                "heads": current,
+                "advanced": [],
+                "unavailable": [],
+                "unstable": unstable,
+            }
+        advanced = [(key, member) for key, member in members if changes[key] == "changed"]
+        if not advanced:
+            return {
+                "conflict": False,
+                "heads": current,
+                "advanced": [],
+                "unavailable": [],
+                "unstable": [],
+            }
+        if len(advanced) == 1 and int(advanced[0][1].get("generation", 0)) == maximum:
+            return {
+                "conflict": False,
+                "heads": advanced,
+                "advanced": advanced,
+                "unavailable": [],
+                "unstable": [],
+            }
+        # Two members changed independently, or an older materialization moved
+        # after a newer frontier existed. Either is a fork, never a timestamp race.
+        heads = list(advanced)
+        advanced_keys = {key for key, _ in advanced}
+        heads.extend((key, member) for key, member in current if key not in advanced_keys)
+        return {
+            "conflict": True,
+            "heads": heads,
+            "advanced": advanced,
+            "unavailable": [],
+            "unstable": [],
+        }
+
+    def _session_for_member(self, member: dict[str, Any], template: Session) -> Session:
+        key = self._member_key(str(member["tool"]), str(member["session_id"]))
+        actual = self._sessions_by_key.get(key)
+        if actual is not None:
+            return actual
+        return replace(
+            template,
+            tool=str(member["tool"]),
+            session_id=str(member["session_id"]),
+            storage=str(member.get("storage", "")),
+            cwd=str(member.get("cwd", template.cwd)),
+            title=str(member.get("title", template.title)),
+            updated=float(member.get("updated", template.updated)),
+            source="interactive",
+            auxiliary=False,
+            origin="cross",
+            resume_id=str(member["session_id"]),
+            parent_id="",
+            launch_targets={str(member["tool"]): str(member["session_id"])},
+            launch_tool="",
+        )
+
+    def resolve_launch(
+        self, item: Session, target_tool: str
+    ) -> tuple[Session, Session | None, str]:
+        """Resolve a row to its conversation head and an equivalent target copy."""
+        conversation_id = self.conversation_id_for(item)
+        if not conversation_id:
+            return item, item if item.tool == target_tool else None, ""
+        status = self._conversation_status(conversation_id)
+        if status["unstable"]:
+            labels = ", ".join(key for key, _ in status["unstable"])
+            raise BridgeError(
+                f"conversation {conversation_id[:8]} has incomplete or unstable transcript "
+                f"data ({labels}); wait for the current write to finish and retry"
+            )
+        if status["unavailable"]:
+            labels = ", ".join(key for key, _ in status["unavailable"])
+            raise BridgeError(
+                f"conversation {conversation_id[:8]} has unavailable newest materialization(s) "
+                f"({labels}); refusing to resume an older generation"
+            )
+        if status["conflict"]:
+            labels = ", ".join(key for key, _ in status["heads"])
+            raise BridgeError(
+                f"conversation {conversation_id[:8]} has divergent heads ({labels}); "
+                "choose a branch explicitly before resuming"
+            )
+        heads: list[tuple[str, dict[str, Any]]] = status["heads"]
+        if not heads:
+            return item, item if item.tool == target_tool else None, conversation_id
+        # Equivalent materializations share a frontier. Prefer one already in
+        # the requested harness, then the selected row, then a stable key order.
+        requested = next((pair for pair in heads if pair[1].get("tool") == target_tool), None)
+        selected = next((pair for pair in heads if pair[0] == item.key), None)
+        _, source_member = requested or selected or sorted(heads, key=lambda pair: pair[0])[0]
+        source = self._session_for_member(source_member, item)
+        frontier = source_member.get("frontier")
+        generation = int(source_member.get("generation", 0))
+        target_member: dict[str, Any] | None = None
+        if not status["advanced"]:
+            for _, member in self.conversations[conversation_id]["members"].items():
+                if (
+                    member.get("tool") == target_tool
+                    and member.get("frontier") == frontier
+                    and int(member.get("generation", 0)) == generation
+                    and not self._member_changed(member)
+                ):
+                    target_member = member
+                    break
+        if source_member.get("tool") == target_tool:
+            target_member = source_member
+        target = (
+            self._session_for_member(target_member, item) if target_member is not None else None
+        )
+        return source, target, conversation_id
+
+    def _apply_conversation_status(self, sessions: list[Session]) -> None:
         for item in sessions:
+            item.conversation_id = ""
+            item.superseded = False
+            item.diverged = False
+        by_key = {item.key: item for item in sessions}
+        for conversation_id, conversation in self.conversations.items():
+            status = self._conversation_status(conversation_id)
+            head_keys = {key for key, _ in status["heads"]}
+            for key in conversation["members"]:
+                item = by_key.get(key)
+                if item is None:
+                    continue
+                item.conversation_id = conversation_id
+                item.diverged = bool(status["conflict"] and key in head_keys)
+                item.superseded = key not in head_keys
+
+    def _migrate_legacy_bridges(self, sessions: list[Session]) -> None:
+        by_key = {item.key: item for item in sessions}
+        for source_key, targets in self.bridges.items():
+            if source_key in self.session_conversations:
+                continue
+            source = by_key.get(source_key)
+            if source is None:
+                continue
+            conversation_id, source_member = self._ensure_conversation(source)
+            source_updated = max(
+                (
+                    float(entry.get("source_updated", 0))
+                    for entry in targets.values()
+                    if isinstance(entry.get("source_updated"), (int, float))
+                ),
+                default=0.0,
+            )
+            if source_updated and source.updated > source_updated + 1:
+                # The old schema did not store a byte frontier. Zero is a safe
+                # migration: it reports the source as advanced rather than stale.
+                source_member["cursor"] = 0
+            for tool, entry in targets.items():
+                session_id = str(entry.get("session_id", ""))
+                if not session_id:
+                    continue
+                key = self._member_key(tool, session_id)
+                member = {
+                    "tool": tool,
+                    "session_id": session_id,
+                    "storage": str(entry.get("storage", "")),
+                    "cwd": source.cwd,
+                    "title": source.title,
+                    "updated": 0.0,
+                    "generation": 0,
+                    "frontier": source_member["frontier"],
+                    # v5 cannot distinguish imported content from later work.
+                    # Treat the copy as advanced so migration never resumes an
+                    # older ancestor and silently loses possible work.
+                    "cursor": 0,
+                }
+                self.conversations[conversation_id]["members"][key] = member
+                self.session_conversations[key] = conversation_id
+
+    def apply(self, sessions: Iterable[Session]) -> None:
+        items = list(sessions)
+        self._sessions_by_key = {item.key: item for item in items}
+        self._migrate_legacy_bridges(items)
+        for item in items:
             remembered = self.original_names.get(item.key)
             if remembered is not None:
                 item.original_title = str(remembered["title"])
@@ -278,6 +598,7 @@ class UserState:
                 item.named = True
                 item.renamed = True
             item.hidden = item.key in self.hidden
+        self._apply_conversation_status(items)
 
     def save(self) -> None:
         self.path.parent.mkdir(parents=True, exist_ok=True)
@@ -285,12 +606,14 @@ class UserState:
         temp.write_text(
             json.dumps(
                 {
-                    "version": 5,
+                    "version": 6,
                     "names": self.names,
                     "original_names": self.original_names,
                     "hidden": sorted(self.hidden),
                     "launch_tools": self.launch_tools,
                     "bridges": self.bridges,
+                    "conversations": self.conversations,
+                    "session_conversations": self.session_conversations,
                 },
                 indent=2,
                 ensure_ascii=False,
@@ -359,13 +682,63 @@ class UserState:
             return ""
         return str(entry["session_id"])
 
-    def set_bridge(self, item: Session, tool: str, session_id: str, storage: str) -> None:
+    def set_bridge(
+        self,
+        item: Session,
+        tool: str,
+        session_id: str,
+        storage: str,
+        *,
+        source_cursor: int,
+    ) -> None:
         key = self.stable_key(item.key)
         self.bridges.setdefault(key, {})[tool] = {
             "session_id": session_id,
             "storage": storage,
             "source_updated": item.updated,
         }
+        conversation_id, source_member = self._ensure_conversation(item)
+        conversation = self.conversations[conversation_id]
+        if self._member_changed(source_member):
+            generation = (
+                max(int(member.get("generation", 0)) for member in conversation["members"].values())
+                + 1
+            )
+            frontier = str(uuid.uuid4())
+        else:
+            generation = int(source_member.get("generation", 0))
+            frontier = str(source_member.get("frontier", "")) or str(uuid.uuid4())
+        source_member.update(
+            self._member_from_session(
+                item,
+                generation=generation,
+                frontier=frontier,
+                cursor=source_cursor,
+            )
+        )
+        target_key = self._member_key(tool, session_id)
+        target = replace(
+            item,
+            tool=tool,
+            session_id=session_id,
+            storage=storage,
+            resume_id=session_id,
+            source="interactive",
+            auxiliary=False,
+            origin="cross",
+            parent_id="",
+            launch_targets={tool: session_id},
+            launch_tool="",
+        )
+        conversation["members"][target_key] = self._member_from_session(
+            target,
+            generation=generation,
+            frontier=frontier,
+            cursor=self._cursor(storage),
+        )
+        self.session_conversations[target_key] = conversation_id
+        self._sessions_by_key[item.key] = item
+        self._sessions_by_key[target_key] = target
         self.save()
 
 
@@ -542,6 +915,17 @@ def display_list_title(session: Session) -> str:
     """Make generated/unnamed titles explicit without a separate flag column."""
     title = display_title(session)
     return agent_tag(session) + (title if session.named else f"*- {title}")
+
+
+def conversation_status(session: Session) -> str:
+    """A stable, non-title label for the session's conversation position."""
+    if session.diverged:
+        return "diverged"
+    if session.superseded:
+        return "superseded"
+    if session.conversation_id:
+        return "current"
+    return ""
 
 
 def load_codex_history() -> dict[str, dict[str, Any]]:
@@ -1115,9 +1499,6 @@ def load_claude_sessions(
         message_count = int(hist.get("message_count") or meta.get("user_messages") or 0)
         programmatic = meta.get("entrypoint") == "sdk-cli" or meta.get("prompt_source") == "sdk"
         launch_targets = {"claude": sid}
-        refs = codex_refs.get(sid, []) if codex_refs is not None else []
-        if refs:
-            launch_targets["codex"] = str(refs[-1])
         result.append(
             Session(
                 tool="claude",
@@ -1956,8 +2337,14 @@ class Browser:
                 segment(f"{item.message_count:<{messages_width}}", "messages")
                 segment(f"{relative_time(item.created):<{time_width}}", "muted")
                 segment(f"{relative_time(item.updated):<{time_width}}", "timestamp")
+                status = conversation_status(item)
+                if status:
+                    badge = f"[{status}] "
+                    segment(badge, "warning" if status != "current" else "success", curses.A_BOLD)
                 tag = agent_tag(item)
                 remaining = title_width
+                if status:
+                    remaining = max(0, remaining - len(badge))
                 if tag:
                     segment(tag, item.origin, curses.A_BOLD)
                     remaining = max(0, remaining - len(tag))
@@ -2556,6 +2943,19 @@ def prepare_launch(
     than spawning a new snapshot each time.
     """
     tool = session.active_launch_tool
+    conversation_id = ""
+    if state is not None:
+        source, target, conversation_id = state.resolve_launch(session, tool)
+        if target is not None:
+            target.launch_tool = ""
+            if target.key == session.key:
+                return target, ""
+            return target, (
+                f"Continuing the {TOOL_LABELS[tool]} copy—the current materialization of "
+                f"conversation {conversation_id[:8]} ({target.session_id})."
+            )
+        session = source
+        session.launch_tool = tool
     if tool == session.tool:
         return session, ""
     stale = ""
@@ -2570,19 +2970,34 @@ def prepare_launch(
             "copying the conversation across instead. "
         )
 
-    def attach(session_id: str) -> Session:
+    def attach(session_id: str, storage: str = "") -> Session:
+        if storage:
+            return replace(
+                session,
+                tool=tool,
+                session_id=session_id,
+                storage=storage,
+                source="interactive",
+                auxiliary=False,
+                origin="cross",
+                resume_id=session_id,
+                parent_id="",
+                launch_targets={tool: session_id},
+                launch_tool="",
+            )
         return replace(
             session,
             launch_targets={**session.launch_targets, tool: session_id},
             launch_tool=tool,
         )
 
-    if state is not None:
+    if state is not None and not conversation_id:
         existing = state.bridge_for(session, tool)
         if existing:
             return attach(existing), (
                 f"{stale}Continuing the {TOOL_LABELS[tool]} copy of this session ({existing})."
             )
+        conversation_id = state.conversation_id_for(session, create=True)
     result = bridge(
         source_tool=session.tool,
         target_tool=tool,
@@ -2593,9 +3008,16 @@ def prepare_launch(
         max_chars=max_chars or DEFAULT_MAX_CHARS,
         tool_calls=tool_calls,
         latest_window=latest_window,
+        conversation_id=conversation_id,
     )
     if state is not None:
-        state.set_bridge(session, tool, result.session_id, str(result.path))
+        state.set_bridge(
+            session,
+            tool,
+            result.session_id,
+            str(result.path),
+            source_cursor=result.source_cursor,
+        )
     carried = f"{result.turns} message(s)"
     if result.calls:
         carried += f" and {result.calls} summarised tool call(s)"
@@ -2604,7 +3026,7 @@ def prepare_launch(
         f"{stale}Copied {carried} into a new {TOOL_LABELS[tool]} session "
         f"{result.session_id}{dropped}."
     )
-    return attach(result.session_id), note
+    return attach(result.session_id, str(result.path)), note
 
 
 def launch(
@@ -2671,10 +3093,12 @@ def list_output(items: list[Session], as_json: bool = False) -> None:
         terminal_width = os.get_terminal_size().columns if sys.stdout.isatty() else 120
     except OSError:
         terminal_width = 120
-    title_width = max(24, terminal_width - 100)
+    conversation_width = 11
+    title_width = max(24, terminal_width - 112)
     print(
         f"{'TOOL':<8} {'RUN':<6} {'ORIGIN':<7} {'OPEN':<5} {'MSGS':>5} {'STATE':<8} "
-        f"{'STARTED':<12} {'UPDATED':<12} {'TITLE':<{title_width}} DIRECTORY"
+        f"{'HEAD':<{conversation_width}} {'STARTED':<12} {'UPDATED':<12} "
+        f"{'TITLE':<{title_width}} DIRECTORY"
     )
     for item in items:
         paused = item.is_open and process_state(item.open_pid) in ("T", "t")
@@ -2683,6 +3107,7 @@ def list_output(items: list[Session], as_json: bool = False) -> None:
             f"{TOOL_LABELS[item.tool]:<8} {TOOL_LABELS[item.active_launch_tool]:<6} "
             f"{ORIGIN_LABELS[item.origin]:<7} {open_symbol:<5} {item.message_count:>5} "
             f"{('hidden' if item.hidden else 'visible'):<8} "
+            f"{conversation_status(item):<{conversation_width}} "
             f"{relative_time(item.created):<12} {relative_time(item.updated):<12} "
             f"{ellipsize(display_list_title(item), title_width):<{title_width}} {short_path(item.cwd)}"
         )

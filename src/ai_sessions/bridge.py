@@ -24,6 +24,7 @@ part worth having, without inventing structure the target cannot honour.
 from __future__ import annotations
 
 import datetime as dt
+import functools
 import json
 import os
 import re
@@ -112,6 +113,7 @@ class BridgeResult:
     turns: int
     calls: int
     dropped: int
+    source_cursor: int
 
 
 @dataclass(frozen=True, slots=True)
@@ -144,6 +146,7 @@ class Harness:
     read: Callable[..., Transcript]
     write: Callable[..., tuple[str, Path]]
     locate: Callable[[str], bool]
+    change_status: Callable[[Path, int], str]
 
 
 def append_jsonl(path: Path, payload: dict[str, Any]) -> None:
@@ -635,6 +638,7 @@ def handoff_note(
     opaque_compactions: int = 0,
     sealed_summary: bool = False,
     resumes_at_last_summary: bool = True,
+    conversation_id: str = "",
 ) -> str:
     """The opening message that tells the target where this came from."""
     source = harness(source_tool).label
@@ -642,6 +646,19 @@ def handoff_note(
     label = f" titled {title!r}" if title else ""
     lines = [
         f"[ai-sessions] This conversation started in {source} and is being continued in {target}.",
+    ]
+    if conversation_id:
+        lines.append(
+            "[ai-sessions-provenance v1] "
+            + json.dumps(
+                {
+                    "conversation_id": conversation_id,
+                    "source": {"harness": source_tool, "session_id": session_id},
+                },
+                separators=(",", ":"),
+            )
+        )
+    lines += [
         "",
         f"Source session{label}: {session_id} ({source})",
         f"Working directory: {cwd or 'unknown'}",
@@ -893,6 +910,78 @@ def _codex_exists(session_id: str) -> bool:
     return any((CODEX_HOME / "sessions").rglob(f"rollout-*-{session_id}.jsonl"))
 
 
+def _records_after(path: Path, offset: int) -> Iterator[dict[str, Any]]:
+    """Yield complete JSONL records appended after a recorded byte frontier."""
+    try:
+        size = path.stat().st_size
+        if offset < 0 or size < offset:
+            # Provider transcripts are append-only. Shrinking means the native
+            # history was replaced, which is necessarily a new revision.
+            yield {"type": "ai_sessions_replaced"}
+            return
+        with path.open("rb") as handle:
+            handle.seek(offset)
+            for raw in handle:
+                if not raw.endswith(b"\n"):
+                    yield {"type": "ai_sessions_incomplete"}
+                    continue
+                try:
+                    item = json.loads(raw)
+                except (json.JSONDecodeError, UnicodeDecodeError):
+                    yield {"type": "ai_sessions_incomplete"}
+                    continue
+                if isinstance(item, dict):
+                    yield item
+    except OSError:
+        yield {"type": "ai_sessions_missing"}
+
+
+def _codex_change_status(path: Path, offset: int) -> str:
+    """Classify Codex activity after ``offset`` without trusting unstable tails."""
+    changed = False
+    for record in _records_after(path, offset):
+        if record.get("type") in (
+            "ai_sessions_replaced",
+            "ai_sessions_missing",
+            "ai_sessions_incomplete",
+        ):
+            return "unstable"
+        if record.get("type") != "response_item":
+            continue
+        payload = record.get("payload")
+        if not isinstance(payload, dict):
+            continue
+        kind = payload.get("type")
+        if kind == "message" and payload.get("role") in ("user", "assistant"):
+            changed = True
+        if kind in (
+            "function_call",
+            "custom_tool_call",
+            "function_call_output",
+            "custom_tool_call_output",
+        ):
+            changed = True
+    return "changed" if changed else "unchanged"
+
+
+def _claude_change_status(path: Path, offset: int) -> str:
+    """Classify Claude activity after ``offset`` while ignoring metadata."""
+    changed = False
+    for record in _records_after(path, offset):
+        if record.get("type") in (
+            "ai_sessions_replaced",
+            "ai_sessions_missing",
+            "ai_sessions_incomplete",
+        ):
+            return "unstable"
+        if record.get("type") not in ("user", "assistant") or record.get("isMeta"):
+            continue
+        message = record.get("message")
+        if isinstance(message, dict) and message.get("content") not in (None, "", []):
+            changed = True
+    return "changed" if changed else "unchanged"
+
+
 HARNESSES: dict[str, Harness] = {
     "codex": Harness(
         name="codex",
@@ -900,6 +989,7 @@ HARNESSES: dict[str, Harness] = {
         read=read_codex,
         write=write_codex_session,
         locate=_codex_exists,
+        change_status=_codex_change_status,
     ),
     "claude": Harness(
         name="claude",
@@ -907,6 +997,7 @@ HARNESSES: dict[str, Harness] = {
         read=read_claude,
         write=write_claude_session,
         locate=_claude_exists,
+        change_status=_claude_change_status,
     ),
 }
 BRIDGE_TOOLS = tuple(HARNESSES)
@@ -937,12 +1028,90 @@ def native_session_exists(tool: str, session_id: str) -> bool:
         return False
 
 
+@functools.lru_cache(maxsize=2048)
+def _snapshot_change_status(
+    tool: str,
+    storage: str,
+    offset: int,
+    device: int,
+    inode: int,
+    size: int,
+    mtime_ns: int,
+) -> str:
+    """Classify one immutable file snapshot once per process."""
+    del device, inode, size, mtime_ns
+    status = harness(tool).change_status(Path(storage), offset)
+    if status == "unstable":
+        # lru_cache does not retain exceptions. A sharing violation or other
+        # transient read failure must be retried even if file metadata did not
+        # change while access was unavailable.
+        raise _UnstableSnapshot
+    return status
+
+
+class _UnstableSnapshot(RuntimeError):
+    """Internal signal that a snapshot must not enter the status cache."""
+
+
+def conversation_change_status(tool: str, storage: str | Path, offset: int) -> str:
+    """Return ``unchanged``, ``changed``, or ``unstable`` after a frontier."""
+    path = Path(storage)
+    if not storage or not path.is_file():
+        return "unstable"
+    try:
+        stat = path.stat()
+    except OSError:
+        return "unstable"
+    try:
+        return _snapshot_change_status(
+            tool,
+            str(path),
+            offset,
+            stat.st_dev,
+            stat.st_ino,
+            stat.st_size,
+            stat.st_mtime_ns,
+        )
+    except _UnstableSnapshot:
+        return "unstable"
+
+
+def conversation_changed_since(tool: str, storage: str | Path, offset: int) -> bool:
+    """Compatibility predicate for callers that do not need instability detail."""
+    return conversation_change_status(tool, storage, offset) != "unchanged"
+
+
 def bridged_title(title: str, source_tool: str) -> str:
     """Name the copy so the list never shows two identical rows."""
     source = harness(source_tool).label.split()[0]
     base = (title or "untitled session").strip()
     suffix = f" (from {source})"
     return base[: 200 - len(suffix)] + suffix
+
+
+def complete_jsonl_cursor(path: Path) -> int:
+    """Return the byte offset after the last complete record currently on disk."""
+    try:
+        with path.open("rb") as handle:
+            handle.seek(0, os.SEEK_END)
+            size = handle.tell()
+            if not size:
+                return 0
+            handle.seek(size - 1)
+            if handle.read(1) == b"\n":
+                return size
+            position = size
+            while position:
+                start = max(0, position - 64 * 1024)
+                handle.seek(start)
+                block = handle.read(position - start)
+                newline = block.rfind(b"\n")
+                if newline >= 0:
+                    return start + newline + 1
+                position = start
+            return 0
+    except OSError as error:
+        raise BridgeError(f"could not inspect {path}: {error}") from error
 
 
 def bridge(
@@ -956,15 +1125,27 @@ def bridge(
     max_chars: int = DEFAULT_MAX_CHARS,
     tool_calls: bool = True,
     latest_window: bool = True,
+    conversation_id: str = "",
 ) -> BridgeResult:
     """Materialise a conversation as a new native session in ``target_tool``."""
     target = harness(target_tool)
     if target_tool == source_tool:
         raise BridgeError("that session already belongs to this harness")
     harness(source_tool)
+    # This is deliberately captured before reading and aligned to a complete
+    # JSONL record. If the live source is appended while the bridge is
+    # materialising it, an earlier frontier may cause one conservative
+    # re-copy; a later or partial EOF could mark unread work as already carried.
+    source_cursor = complete_jsonl_cursor(Path(storage))
     source = read_transcript(
         source_tool, storage, tool_calls=tool_calls, latest_window=latest_window
     )
+    change_status = conversation_change_status(source_tool, storage, source_cursor)
+    if change_status != "unchanged":
+        raise BridgeError(
+            "the source transcript changed or became incomplete while it was being read; "
+            "wait for the current write to finish and retry"
+        )
     turns = source.turns
     if not turns:
         raise BridgeError("the source transcript holds no conversation to carry over")
@@ -986,6 +1167,7 @@ def bridge(
         opaque_compactions=source.opaque_compactions,
         sealed_summary=source.sealed_summary,
         resumes_at_last_summary=source.resumes_at_last_summary or not source.carried_windows,
+        conversation_id=conversation_id,
     )
     payload = merge_runs([Turn("user", note), *kept])
     new_id, path = target.write(cwd=cwd, turns=payload, title=bridged_title(title, source_tool))
@@ -996,4 +1178,5 @@ def bridge(
         turns=len(kept),
         calls=summarised,
         dropped=dropped,
+        source_cursor=source_cursor,
     )

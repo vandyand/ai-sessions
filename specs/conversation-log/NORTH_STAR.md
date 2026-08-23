@@ -10,12 +10,12 @@ Priorities are ordered by evidence strength and independence, not by architectur
 
 ## Current state
 
-`ai-sessions` 3.1.3. Bridging exists and works session-to-session: a neutral `Turn` model, per-harness readers and writers, and a `HARNESSES` registry in `bridge.py`. The conversion layer is largely right. What is missing sits above it — identity — and what is broken sits beside it — selection.
+`ai-sessions` 3.1.5 plus the P2 branch. Bridging has a neutral `Turn` model, per-harness readers and writers, and a `HARNESSES` registry in `bridge.py`. P1 fixed selection at Codex compaction boundaries. P2 adds utility-owned conversation ids, native members, equivalence frontiers, append cursors, head routing, and explicit divergence. The remaining identity work is finer-grained provenance: ordered live segments and original-form projection.
 
-Two failures are live today:
+The two failures that started this effort were:
 
-- **Round trips lose work.** Codex → Claude → Codex resumes the pre-bridge state. `prepare_launch` short-circuits when the target harness matches the session's own, and a bridged copy's provenance note makes `codex_refs` record the copy's own *ancestor* as its counterpart.
-- **Selection is a character count.** `read_codex` skips every `compacted` record as unreadable, so no turn is marked as a boundary, `from_last_compaction` drops nothing, and `fit()` falls back to head-and-tail truncation.
+- **Round trips lost work (fixed by P2).** Codex → Claude → Codex resumed the pre-bridge state. `prepare_launch` short-circuited when the target harness matched the selected row, and UUID-shaped transcript text could point back to an ancestor.
+- **Selection was a character count (fixed by P1).** `read_codex` skipped every `compacted` record as unreadable, so no turn was marked as a boundary, `from_last_compaction` dropped nothing, and `fit()` fell back to head-and-tail truncation.
 
 Observed on one real Codex session (530 MB, 366 compactions). Cited as the evidence that motivated P1 — the priorities themselves are stated as format-level invariants, not as properties of this session:
 
@@ -60,13 +60,36 @@ Measured on a real 366-compaction session, before and after:
 - **`replacement_history` carries only the user side.** The assistant's own work in a window is inside the sealed blob. A carried window plus the live tail is therefore complete user intent plus recent two-sided detail — not a full two-sided history.
 - Reading is ~20% slower on a 530 MB file: the window is parsed 366 times and discarded 365 of them. Acceptable now; if it ever matters, option B (locate the final boundary first) is the escape hatch.
 
-### P2 — Stop the round trip losing work
+### P2 — Stop the round trip losing work **(COMPLETE as of 6593173)**
 
 Ignore bridge-ancestor back-references when resolving launch targets, and resume from whichever member of a bridge group carries the newest work. Mark non-head members superseded rather than hiding them.
 
 Done when: Codex → Claude → work → Codex continues the Claude work, and selecting the copy's row no longer resumes the session it was copied from.
 
-A bridge group is a poor conversation id, but it is the migration path to a real one.
+The implementation goes beyond the original bridge-group migration: it assigns a real
+utility-owned conversation UUID, records every native materialization with a generation,
+equivalence frontier, storage path, and append cursor, and writes structured provenance
+into new copies. Selecting any historical row follows the group head. UUID-shaped prose is
+never routing authority.
+
+### P2 observations — what shipping head routing taught us
+
+- **Timestamps cannot establish causal order.** Provider timestamps and filesystem mtimes
+  can tie, skew, or move for metadata. Head selection uses only generations, shared
+  frontiers, and semantic records appended after a byte cursor.
+- **The safe cursor is captured before reading.** A live transcript can grow during a
+  large bridge. An earlier cursor may cause a conservative re-copy; a later EOF can mark
+  unread work consumed and lose it. Both persisted and provisional cursors stop after the
+  last complete JSONL record, so a partial provider write remains safely retryable.
+- **A copy and its source can both be current.** Immediately after a bridge they are
+  equivalent native materializations of one frontier. `superseded` means a member is
+  behind the active frontier, not merely that another file was created later.
+- **Divergence is a stop condition, not a sorting problem.** Two independently advanced
+  members, or an older generation that advances after a newer one exists, produce multiple
+  heads. The browser marks them and launch refuses to guess.
+- **Migration should prefer duplicate work over lost work.** Version 5 had no byte cursor.
+  Its target copy is conservatively treated as advanced until it is re-materialized under
+  the new schema.
 
 ### P3 — Window-aligned selection and a token budget
 
@@ -74,9 +97,12 @@ Replace head-and-tail character trimming with whole-window selection: always car
 
 Done when: the budget names its unit, is derived per target harness, and truncation is a documented backstop rather than the primary mechanism.
 
-### P4 — The conversation log
+### P4 — The full conversation log
 
-Our own conversation id. Ordered segments held as live references, not snapshots. Per-message provenance, so a message is projected at most once and always from its original form. Verbatim carry-forward for same-origin runs. Fork and resume-from-a-point fall out.
+The utility-owned conversation id and live native members now exist at materialization
+granularity. Complete the model with ordered segments and per-message provenance, so a
+message is projected at most once and always from its original form. Verbatim carry-forward
+for same-origin runs, fork resolution, and resume-from-a-point then fall out.
 
 Done when: a Codex → Claude → Codex trip keeps the Codex-origin portion in native form, and `specs/` records how a third harness would be added.
 
@@ -108,7 +134,7 @@ Done when: a Codex → Claude → Codex trip keeps the Codex-origin portion in n
 - The reader currently projects straight to text and discards native record references. Verbatim carry-forward (P4) needs them, and changing that contract touches every adapter.
 - A Codex window whose spine is unreadable carries nothing across. Silently skipping it is wrong; the copy should say what is missing and where.
 - Characters-per-token differs by harness and content. Worth measuring once per harness rather than assuming 4.
-- Two harnesses resuming the same conversation concurrently produces two heads. Detectable; the resolution is not designed.
+- Two harnesses resuming the same conversation concurrently produces two heads. Detection and safe refusal now exist; user-directed branch selection or merge is not designed.
 
 ## Doc-sync protocol
 
@@ -124,6 +150,7 @@ Every `/feature plan` generated from this doc ends with a final Doc Sync phase t
 
 - Design pass, rendered: https://claude.ai/code/artifact/d3dc3a4d-fbc8-48f5-bc7f-6fe2e26f8d17
 - `src/ai_sessions/bridge.py` — `Turn`, `read_codex`, `read_claude`, `from_last_compaction`, `fit`, `HARNESSES`
-- `src/ai_sessions/app.py` — `prepare_launch`, `command_for`, `UserState.bridge_for`, `codex_refs`
+- `src/ai_sessions/app.py` — `prepare_launch`, `command_for`, `UserState.resolve_launch`, `UserState.set_bridge`
+- [`HARNESS_CONTRACT.md`](HARNESS_CONTRACT.md) — current adapter seam and the complete target contract
 - Measured against `~/.codex/sessions/2026/07/13/rollout-…-019f59af-….jsonl` and `~/.claude/projects/…/776daa15-….jsonl`
-- Released through 3.1.3: PRs #1, #2, #3, #5, #6, #7, #8, #9
+- Released through 3.1.5; P2 is implemented on `conversation-log/round-trip-heads`

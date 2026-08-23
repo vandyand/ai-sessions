@@ -1,15 +1,25 @@
+import io
 import json
 import tempfile
 import unittest
+from contextlib import redirect_stdout
 from pathlib import Path
 from unittest.mock import patch
 
 from ai_sessions import bridge
-from ai_sessions.app import Session, UserState, command_for, prepare_launch
+from ai_sessions.app import (
+    Session,
+    UserState,
+    command_for,
+    list_output,
+    load_claude_sessions,
+    prepare_launch,
+)
 from ai_sessions.bridge import (
     HARNESSES,
     BridgeError,
     ToolCall,
+    Transcript,
     Turn,
     bridged_title,
     fit,
@@ -381,7 +391,7 @@ class HarnessRegistryTests(unittest.TestCase):
         for name, entry in HARNESSES.items():
             self.assertEqual(name, entry.name)
             self.assertTrue(entry.label)
-            for hook in (entry.read, entry.write, entry.locate):
+            for hook in (entry.read, entry.write, entry.locate, entry.change_status):
                 self.assertTrue(callable(hook))
 
     def test_an_unknown_harness_is_reported_rather_than_guessed(self) -> None:
@@ -581,6 +591,25 @@ def session(directory: str, **overrides: object) -> Session:
 
 
 class LaunchIntegrationTests(unittest.TestCase):
+    @staticmethod
+    def claude_copy(
+        source: Session, prepared: Session, storage: str, *, launch_tool: str = "codex"
+    ) -> Session:
+        return Session(
+            tool="claude",
+            session_id=prepared.launch_target("claude") or prepared.session_id,
+            title=source.title,
+            cwd=source.cwd,
+            updated=source.updated,
+            created=source.created,
+            preview="",
+            named=True,
+            storage=storage,
+            origin="cross",
+            launch_targets={"claude": prepared.launch_target("claude") or prepared.session_id},
+            launch_tool=launch_tool,
+        )
+
     def test_a_session_with_a_transcript_offers_both_harnesses(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             item = session(directory)
@@ -662,6 +691,8 @@ class LaunchIntegrationTests(unittest.TestCase):
                 self.assertEqual(first.launch_target("claude"), second.launch_target("claude"))
                 self.assertIn("Continuing the Claude copy", note)
 
+                with Path(item.storage).open("a", encoding="utf-8") as handle:
+                    handle.write(codex_line("user", "The source moved") + "\n")
                 moved = session(directory, launch_tool="claude", updated=200.0)
                 third, note = prepare_launch(moved, state=state)
             self.assertNotEqual(third.launch_target("claude"), first.launch_target("claude"))
@@ -677,6 +708,380 @@ class LaunchIntegrationTests(unittest.TestCase):
                 second, note = prepare_launch(item, state=state)
             self.assertNotEqual(second.launch_target("claude"), first.launch_target("claude"))
             self.assertIn("Copied", note)
+
+    def test_an_append_during_bridge_aborts_before_writing_a_copy(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            source = session(directory, launch_tool="claude")
+            source_path = Path(source.storage)
+            cursor_before_bridge = source_path.stat().st_size
+            arriving = codex_line("user", "Arrived during the bridge") + "\n"
+            split = len(arriving) // 2
+            with source_path.open("a", encoding="utf-8") as handle:
+                handle.write(arriving[:split])
+            state = UserState(path=Path(directory) / "state.json")
+
+            def append_while_reading(*args: object, **kwargs: object) -> Transcript:
+                with source_path.open("a", encoding="utf-8") as handle:
+                    handle.write(arriving[split:])
+                return Transcript([Turn("user", "Ship it"), Turn("assistant", "Shipped.")])
+
+            with (
+                patch.object(bridge, "CLAUDE_HOME", Path(directory) / "claude"),
+                patch.object(bridge, "read_transcript", side_effect=append_while_reading),
+            ):
+                with self.assertRaisesRegex(BridgeError, "changed or became incomplete"):
+                    prepare_launch(source, state=state)
+
+            self.assertGreater(source_path.stat().st_size, cursor_before_bridge)
+            self.assertFalse((Path(directory) / "claude").exists())
+
+    def test_codex_to_claude_work_to_codex_follows_the_newest_head(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            source = session(directory, launch_tool="claude")
+            state = UserState(path=Path(directory) / "state.json")
+            claude_home = Path(directory) / "claude"
+            codex_home = Path(directory) / "codex"
+            with patch.object(bridge, "CLAUDE_HOME", claude_home):
+                claude_prepared, _ = prepare_launch(source, state=state)
+            copy = self.claude_copy(
+                source, claude_prepared, state.bridges[source.key]["claude"]["storage"]
+            )
+            with Path(copy.storage).open("a", encoding="utf-8") as handle:
+                handle.write(claude_line("user", "Work completed in Claude") + "\n")
+                handle.write(claude_line("assistant", "Claude result") + "\n")
+            original_row = session(directory)
+            state.apply([original_row, copy])
+            self.assertTrue(original_row.superseded)
+            self.assertFalse(copy.superseded)
+            output = io.StringIO()
+            with redirect_stdout(output):
+                list_output([original_row, copy])
+            self.assertIn("HEAD", output.getvalue().splitlines()[0])
+            self.assertIn("superseded", output.getvalue().splitlines()[1])
+
+            with patch.object(bridge, "CODEX_HOME", codex_home):
+                codex_prepared, note = prepare_launch(original_row, state=state)
+            self.assertIn("Copied", note)
+            self.assertEqual(codex_prepared.tool, "codex")
+            self.assertNotEqual(codex_prepared.session_id, source.session_id)
+            self.assertIn(
+                "Work completed in Claude", Path(codex_prepared.storage).read_text("utf-8")
+            )
+
+            # Either historical row now resolves to the same current Codex copy.
+            state.apply([original_row, copy, codex_prepared])
+            copy.launch_tool = "codex"
+            again, _ = prepare_launch(copy, state=state)
+            self.assertEqual(again.session_id, codex_prepared.session_id)
+
+    def test_switching_harnesses_without_new_work_reuses_an_equivalent_frontier(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            source = session(directory, launch_tool="claude")
+            state = UserState(path=Path(directory) / "state.json")
+            with patch.object(bridge, "CLAUDE_HOME", Path(directory) / "claude"):
+                claude_prepared, _ = prepare_launch(source, state=state)
+            copy = self.claude_copy(
+                source, claude_prepared, state.bridges[source.key]["claude"]["storage"]
+            )
+            state.apply([source, copy])
+            copy.launch_tool = "codex"
+
+            prepared, _ = prepare_launch(copy, state=state)
+            self.assertEqual(prepared.tool, "codex")
+            self.assertEqual(prepared.session_id, source.session_id)
+
+    def test_two_members_advancing_from_one_frontier_is_reported_as_divergence(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            source = session(directory, launch_tool="claude")
+            state = UserState(path=Path(directory) / "state.json")
+            with patch.object(bridge, "CLAUDE_HOME", Path(directory) / "claude"):
+                claude_prepared, _ = prepare_launch(source, state=state)
+            copy = self.claude_copy(
+                source, claude_prepared, state.bridges[source.key]["claude"]["storage"]
+            )
+            with Path(source.storage).open("a", encoding="utf-8") as handle:
+                handle.write(codex_line("user", "Codex branch") + "\n")
+            with Path(copy.storage).open("a", encoding="utf-8") as handle:
+                handle.write(claude_line("user", "Claude branch") + "\n")
+            state.apply([source, copy])
+            copy.launch_tool = "codex"
+
+            with self.assertRaisesRegex(BridgeError, "divergent heads"):
+                prepare_launch(source, state=state)
+            self.assertTrue(source.diverged)
+            self.assertTrue(copy.diverged)
+
+    def test_older_generations_remain_superseded_during_divergence(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            original = session(directory, launch_tool="claude")
+            state = UserState(path=Path(directory) / "state.json")
+            with patch.object(bridge, "CLAUDE_HOME", Path(directory) / "claude"):
+                claude_prepared, _ = prepare_launch(original, state=state)
+            copy = self.claude_copy(
+                original, claude_prepared, state.bridges[original.key]["claude"]["storage"]
+            )
+            with Path(copy.storage).open("a", encoding="utf-8") as handle:
+                handle.write(claude_line("user", "Advance one generation") + "\n")
+            state.apply([original, copy])
+            with patch.object(bridge, "CODEX_HOME", Path(directory) / "codex"):
+                newest, _ = prepare_launch(original, state=state)
+
+            with Path(copy.storage).open("a", encoding="utf-8") as handle:
+                handle.write(claude_line("user", "Claude fork") + "\n")
+            with Path(newest.storage).open("a", encoding="utf-8") as handle:
+                handle.write(codex_line("user", "Codex fork") + "\n")
+            state.apply([original, copy, newest])
+
+            self.assertTrue(original.superseded)
+            self.assertFalse(original.diverged)
+            self.assertTrue(copy.diverged)
+            self.assertTrue(newest.diverged)
+
+    def test_missing_newest_generation_never_promotes_an_older_session(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            original = session(directory, launch_tool="claude")
+            state = UserState(path=Path(directory) / "state.json")
+            with patch.object(bridge, "CLAUDE_HOME", Path(directory) / "claude"):
+                claude_prepared, _ = prepare_launch(original, state=state)
+            copy = self.claude_copy(
+                original, claude_prepared, state.bridges[original.key]["claude"]["storage"]
+            )
+            with Path(copy.storage).open("a", encoding="utf-8") as handle:
+                handle.write(claude_line("user", "Newest work") + "\n")
+            state.apply([original, copy])
+            with patch.object(bridge, "CODEX_HOME", Path(directory) / "codex"):
+                newest, _ = prepare_launch(original, state=state)
+
+            Path(copy.storage).unlink()
+            Path(newest.storage).unlink()
+            state.apply([original])
+            with self.assertRaisesRegex(BridgeError, "unavailable newest"):
+                prepare_launch(original, state=state)
+
+    def test_partial_appended_jsonl_is_conservatively_changed(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            source = session(directory)
+            path = Path(source.storage)
+            cursor = path.stat().st_size
+            with path.open("ab") as handle:
+                handle.write(b'{"type":"response_item","payload":')
+
+            self.assertTrue(bridge.conversation_changed_since("codex", path, cursor))
+            self.assertEqual(bridge.conversation_change_status("codex", path, cursor), "unstable")
+
+            source.launch_tool = "claude"
+            state = UserState(path=Path(directory) / "state.json")
+            with patch.object(bridge, "CLAUDE_HOME", Path(directory) / "claude"):
+                with self.assertRaisesRegex(BridgeError, "changed or became incomplete"):
+                    prepare_launch(source, state=state)
+
+    def test_semantic_append_does_not_hide_a_later_partial_record(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            cases = (
+                ("codex", codex_line("user", "Complete work")),
+                ("claude", claude_line("user", "Complete work")),
+            )
+            for tool, complete in cases:
+                with self.subTest(tool=tool):
+                    path = Path(directory) / f"{tool}.jsonl"
+                    path.write_text(codex_line("user", "Earlier") + "\n", encoding="utf-8")
+                    cursor = path.stat().st_size
+                    with path.open("a", encoding="utf-8") as handle:
+                        handle.write(complete + "\n" + '{"type":"unfinished"')
+                    self.assertEqual(
+                        bridge.conversation_change_status(tool, path, cursor), "unstable"
+                    )
+
+    def test_unchanged_snapshot_does_not_reparse_the_full_valid_tail(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "codex.jsonl"
+            path.write_text(codex_line("user", "Earlier") + "\n", encoding="utf-8")
+            cursor = path.stat().st_size
+            with path.open("a", encoding="utf-8") as handle:
+                handle.write(codex_line("user", "Changed") + "\n")
+                for index in range(100):
+                    handle.write(json.dumps({"type": "metadata", "index": index}) + "\n")
+
+            with patch.object(bridge.json, "loads", wraps=json.loads) as loads:
+                self.assertEqual(
+                    bridge.conversation_change_status("codex", path, cursor), "changed"
+                )
+                parsed = loads.call_count
+                self.assertEqual(
+                    bridge.conversation_change_status("codex", path, cursor), "changed"
+                )
+            self.assertGreater(parsed, 1)
+            self.assertEqual(loads.call_count, parsed)
+
+    def test_malformed_newline_terminated_record_after_work_is_unstable(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "codex.jsonl"
+            path.write_text(codex_line("user", "Earlier") + "\n", encoding="utf-8")
+            cursor = path.stat().st_size
+            with path.open("a", encoding="utf-8") as handle:
+                handle.write(codex_line("user", "Changed") + "\n")
+                handle.write('{"type":"malformed"\n')
+
+            self.assertEqual(bridge.conversation_change_status("codex", path, cursor), "unstable")
+
+    def test_transient_unstable_snapshot_is_retried_without_metadata_change(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "codex.jsonl"
+            path.write_text(codex_line("user", "Earlier") + "\n", encoding="utf-8")
+            outcomes = iter(("unstable", "unchanged"))
+            entry = HARNESSES["codex"]
+            retrying = bridge.Harness(
+                name=entry.name,
+                label=entry.label,
+                read=entry.read,
+                write=entry.write,
+                locate=entry.locate,
+                change_status=lambda *_: next(outcomes),
+            )
+
+            with patch.dict(HARNESSES, {"codex": retrying}):
+                self.assertEqual(bridge.conversation_change_status("codex", path, 0), "unstable")
+                self.assertEqual(bridge.conversation_change_status("codex", path, 0), "unchanged")
+
+    def test_retry_after_partial_tail_uses_the_last_complete_cursor(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            source = session(directory, launch_tool="claude")
+            source_path = Path(source.storage)
+            complete_cursor = source_path.stat().st_size
+            arriving = codex_line("user", "Completed after retry")
+            split = len(arriving) // 2
+            with source_path.open("a", encoding="utf-8") as handle:
+                handle.write(arriving[:split])
+            state = UserState(path=Path(directory) / "state.json")
+
+            with patch.object(bridge, "CLAUDE_HOME", Path(directory) / "claude"):
+                with self.assertRaisesRegex(BridgeError, "changed or became incomplete"):
+                    prepare_launch(source, state=state)
+
+                conversation_id = state.conversation_id_for(source)
+                member = state.conversations[conversation_id]["members"][source.key]
+                self.assertEqual(member["cursor"], complete_cursor)
+
+                with source_path.open("a", encoding="utf-8") as handle:
+                    handle.write(arriving[split:] + "\n")
+                prepared, note = prepare_launch(source, state=state)
+
+            self.assertEqual(prepared.tool, "claude")
+            self.assertIn("Copied", note)
+
+    def test_renaming_a_copy_does_not_advance_the_conversation(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            source = session(directory, launch_tool="claude")
+            state = UserState(path=Path(directory) / "state.json")
+            with patch.object(bridge, "CLAUDE_HOME", Path(directory) / "claude"):
+                claude_prepared, _ = prepare_launch(source, state=state)
+            copy = self.claude_copy(
+                source, claude_prepared, state.bridges[source.key]["claude"]["storage"]
+            )
+            with Path(copy.storage).open("a", encoding="utf-8") as handle:
+                handle.write(json.dumps({"type": "custom-title", "customTitle": "renamed"}) + "\n")
+            state.apply([source, copy])
+            copy.launch_tool = "codex"
+
+            prepared, _ = prepare_launch(copy, state=state)
+            self.assertEqual(prepared.session_id, source.session_id)
+
+    def test_uuid_shaped_text_is_not_treated_as_a_launch_target(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            claude_home = Path(directory) / "claude"
+            project = claude_home / "projects" / "test"
+            project.mkdir(parents=True)
+            session_id = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa"
+            pasted = "019f59af-e300-7bd1-be75-e47599b5b593"
+            (project / f"{session_id}.jsonl").write_text(
+                claude_line("user", f"ordinary correlation id: {pasted}") + "\n",
+                encoding="utf-8",
+            )
+            refs: dict[str, list[str]] = {}
+            with patch("ai_sessions.app.CLAUDE_HOME", claude_home):
+                items = load_claude_sessions(use_cache=False, codex_refs=refs)
+            self.assertEqual(len(items), 1)
+            self.assertEqual(items[0].launch_targets, {"claude": session_id})
+            self.assertEqual(refs[session_id], [pasted])
+
+    def test_state_v6_round_trips_conversation_members_and_cursors(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            source = session(directory, launch_tool="claude")
+            state_path = Path(directory) / "state.json"
+            state = UserState(state_path)
+            with patch.object(bridge, "CLAUDE_HOME", Path(directory) / "claude"):
+                prepared, _ = prepare_launch(source, state=state)
+            conversation_id = state.conversation_id_for(source)
+            reloaded = UserState(state_path)
+            self.assertEqual(reloaded.conversation_id_for(source), conversation_id)
+            members = reloaded.conversations[conversation_id]["members"]
+            self.assertEqual(set(members), {source.key, prepared.key})
+            self.assertTrue(all(isinstance(member["cursor"], int) for member in members.values()))
+
+    def test_v5_bridge_state_migrates_without_resuming_the_stale_ancestor(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            source = session(directory)
+            target_path = Path(directory) / "claude-copy.jsonl"
+            target_path.write_text(
+                claude_line("user", "Imported history")
+                + "\n"
+                + claude_line("user", "Later Claude work")
+                + "\n",
+                encoding="utf-8",
+            )
+            target = Session(
+                tool="claude",
+                session_id="claude-copy",
+                title=source.title,
+                cwd=source.cwd,
+                updated=200,
+                created=100,
+                preview="",
+                named=True,
+                storage=str(target_path),
+                launch_tool="codex",
+            )
+            state_path = Path(directory) / "state.json"
+            state_path.write_text(
+                json.dumps(
+                    {
+                        "version": 5,
+                        "names": {},
+                        "original_names": {},
+                        "hidden": [],
+                        "launch_tools": {},
+                        "bridges": {
+                            source.key: {
+                                "claude": {
+                                    "session_id": target.session_id,
+                                    "storage": str(target_path),
+                                    "source_updated": source.updated,
+                                }
+                            }
+                        },
+                    }
+                ),
+                encoding="utf-8",
+            )
+            state = UserState(state_path)
+            state.apply([source, target])
+            self.assertTrue(source.superseded)
+            self.assertFalse(target.superseded)
+
+            with patch.object(bridge, "CODEX_HOME", Path(directory) / "codex"):
+                prepared, _ = prepare_launch(source, state=state)
+            self.assertNotEqual(prepared.session_id, source.session_id)
+            self.assertIn("Later Claude work", Path(prepared.storage).read_text("utf-8"))
+
+    def test_bridge_writes_machine_readable_conversation_provenance(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            source = session(directory, launch_tool="claude")
+            state = UserState(Path(directory) / "state.json")
+            with patch.object(bridge, "CLAUDE_HOME", Path(directory) / "claude"):
+                prepared, _ = prepare_launch(source, state=state)
+            text = Path(prepared.storage).read_text(encoding="utf-8")
+            self.assertIn("[ai-sessions-provenance v1]", text)
+            self.assertIn(state.conversation_id_for(source), text)
 
     def test_claude_subagent_bridges_as_a_plain_codex_session(self) -> None:
         with tempfile.TemporaryDirectory() as directory:

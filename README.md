@@ -162,24 +162,38 @@ target's context window in full. The opening request and the most recent exchang
 and the middle gives way; the note says how many messages were dropped. Set `max_chars` in
 `config.toml` to change the budget, or `tool_calls = false` for a conversation-only copy.
 
-Bridged copies are remembered, so launching the same pairing again continues that copy
-rather than making a new one. Once the source session picks up new messages, the next
-launch bridges again from the current state.
+Every first bridge creates a utility-owned conversation id. The original and each native
+copy are materializations of that conversation. Equivalent copies share a frontier; byte
+cursors on their append-only transcripts reveal which materialization received real work
+after that frontier. Timestamps are display data only and never decide which history wins.
+
+Selecting an older row therefore does not resume an older history. `ai-sessions` follows
+the conversation head, reuses an equivalent copy in the requested harness when one exists,
+or creates a new native session from the head. Historical rows remain visible and are
+labelled `superseded`. If two materializations advance independently, both are labelled
+`diverged` and automatic resume stops instead of silently choosing one branch.
+
+The conversation id is stored in `state.json` and included in new copies as a structured
+`[ai-sessions-provenance v1]` marker. State is authoritative today; the marker makes copies
+auditable and provides a future recovery path, but state reconstruction from transcripts is
+not implemented yet. Version 5 bridge records migrate conservatively: a possibly edited
+copy wins over its ancestor so old state cannot silently discard work.
 
 ### Adding a harness
 
 Conversions run through a harness-neutral conversation rather than pairwise, so support
-for another CLI costs one reader and one writer rather than a converter per existing
-harness. Register it in `HARNESSES` in `bridge.py` with four things: a name, a display
-label, a reader that turns a transcript file into `Turn` objects, a writer that turns
-`Turn` objects into a resumable session file, and a check for whether a session id still
-exists on disk. Bridging in both directions then works for free.
+for another CLI costs one adapter rather than a converter per existing harness. The current
+bridge registry requires a name and label plus four operations: read a transcript into
+`Turn` objects, write `Turn` objects as a resumable native session, locate a native id, and
+detect meaningful transcript changes after a byte cursor. Bridging and head tracking in
+both directions then work without pairwise logic.
 
-This seam covers bridging only. Listing, message counts, and open-session detection are
-still provider-specific in `app.py`, because each CLI records them differently — Codex in a
-SQLite state database and lock files, Claude Code in a PID registry and per-project
-transcript directories. That side is the larger job and is deliberately left concrete until
-a third harness makes the right abstraction obvious.
+This seam covers bridging and conversation advancement. Discovery, resume commands,
+naming, message counts, and open-session detection are still provider-specific in
+`app.py`, because each CLI records them differently — Codex in a SQLite state database and
+lock files, Claude Code in a PID registry and per-project transcript directories. The
+target adapter contract and the migration sequence are specified in
+[`specs/conversation-log/HARNESS_CONTRACT.md`](specs/conversation-log/HARNESS_CONTRACT.md).
 
 A Codex writer has one non-obvious obligation. Codex records the model's context
 (`response_item`) separately from what its TUI redraws (`user_message` and `agent_message`
@@ -247,9 +261,9 @@ latest_window = true
 ```
 
 Rename/hide state is kept alongside the configuration as `state.json`. Per-session
-launch-harness preferences are stored there too, with unset sessions defaulting to
-the harness where the session was started, along with the bridged copy made for each
-cross-harness pairing. Caches use `~/.cache/ai-sessions` on
+launch-harness preferences, conversation ids, native members, equivalence frontiers, and
+byte cursors are stored there too. Unset sessions default to the harness where they were
+started. Caches use `~/.cache/ai-sessions` on
 Linux and `%LOCALAPPDATA%\ai-sessions` on Windows. Environment overrides are available
 through `AI_SESSIONS_CONFIG_FILE`, `AI_SESSIONS_STATE_FILE`, `CODEX_HOME`, and
 `CLAUDE_CONFIG_DIR`.
