@@ -1,8 +1,14 @@
+import io
 import json
+import tempfile
 import unittest
+from contextlib import redirect_stdout
 from dataclasses import replace
+from pathlib import Path
 
-from ai_sessions.app import Session
+from ai_sessions import bridge
+from ai_sessions.app import Browser, Session, UserState, build_parser, list_output
+from ai_sessions.capabilities import Unsupported
 from ai_sessions.harnesses import install
 from ai_sessions.model import SourceKind
 from ai_sessions.registry import REGISTRY, Registry
@@ -26,6 +32,21 @@ class RegistryTests(unittest.TestCase):
             with self.subTest(name=name):
                 with self.assertRaisesRegex(ValueError, "invalid harness name"):
                     registry.register(replace(base, name=name))
+
+    def test_incomplete_adapter_metadata_is_rejected(self) -> None:
+        base = REGISTRY.get("codex")
+        mutations = (
+            {"label": ""},
+            {"short_label": "x" * 17},
+            {"default_command": ()},
+            {"source_kinds": frozenset()},
+            {"id_patterns": ()},
+            {"read": "not callable"},
+            {"change_status": Unsupported("")},
+        )
+        for mutation in mutations:
+            with self.subTest(mutation=mutation), self.assertRaises(ValueError):
+                replace(base, **mutation)
 
     def test_every_mutation_advances_generation_monotonically(self) -> None:
         registry = Registry()
@@ -59,6 +80,101 @@ class RegistryTests(unittest.TestCase):
         with REGISTRY.temporary(fake):
             self.assertIn("late", row.available_launch_tools)
         self.assertNotIn("late", row.available_launch_tools)
+
+    def test_late_registration_is_visible_in_rendering_and_browser_styles(self) -> None:
+        base = REGISTRY.get("codex")
+        fake = replace(
+            base,
+            name="late",
+            label="Late Harness",
+            short_label="LateHarness12",
+            order=30,
+        )
+        row = Session(
+            tool="late",
+            session_id="late-1",
+            title="late title",
+            cwd="/tmp",
+            updated=0,
+            created=0,
+            preview="",
+            named=True,
+            storage="",
+        )
+        with REGISTRY.temporary(fake), redirect_stdout(io.StringIO()) as output:
+            list_output([row])
+            self.assertIn("LateHarness12", output.getvalue())
+            self.assertIn("late", Browser._pair_layout())
+            self.assertIn("late", build_parser()._option_string_actions["--tool"].choices)
+        self.assertNotIn("late", Browser._pair_layout())
+
+    def test_registry_generation_changes_semantic_snapshot_cache_identity(self) -> None:
+        base = REGISTRY.get("codex")
+        replacement = replace(base, change_status=lambda *_: "changed")
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "snapshot.jsonl"
+            path.write_text("{}\n", encoding="utf-8")
+            bridge._snapshot_change_status.cache_clear()
+            self.assertEqual(bridge.conversation_change_status("codex", path, 0), "unchanged")
+            with REGISTRY.temporary(replacement):
+                self.assertEqual(bridge.conversation_change_status("codex", path, 0), "changed")
+            self.assertEqual(bridge.conversation_change_status("codex", path, 0), "unchanged")
+
+    def test_unknown_and_unsupported_change_status_are_explicit(self) -> None:
+        base = REGISTRY.get("codex")
+        unsupported = replace(base, name="limited", change_status=Unsupported("no tail reader"))
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "snapshot.jsonl"
+            path.write_text("{}\n", encoding="utf-8")
+            self.assertEqual(bridge.conversation_change_status("future", path, 0), "unknown")
+            with REGISTRY.temporary(unsupported):
+                self.assertEqual(
+                    bridge.conversation_change_status("limited", path, 0), "unsupported"
+                )
+
+    def test_unknown_state_survives_and_blocks_head_promotion(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            transcript = root / "future.jsonl"
+            transcript.write_text("{}\n", encoding="utf-8")
+            state_path = root / "state.json"
+            payload = {
+                "version": 6,
+                "names": {},
+                "original_names": {},
+                "hidden": [],
+                "launch_tools": {"codex:known": "future"},
+                "bridges": {
+                    "codex:known": {
+                        "future": {"session_id": "future-1", "storage": str(transcript)}
+                    }
+                },
+                "conversations": {
+                    "conversation": {
+                        "members": {
+                            "future:future-1": {
+                                "tool": "future",
+                                "session_id": "future-1",
+                                "storage": str(transcript),
+                                "generation": 1,
+                                "frontier": "future-frontier",
+                                "cursor": 0,
+                            }
+                        }
+                    }
+                },
+                "session_conversations": {"future:future-1": "conversation"},
+            }
+            state_path.write_text(json.dumps(payload), encoding="utf-8")
+            state = UserState(state_path)
+            self.assertEqual(
+                state._conversation_status("conversation")["unknown"][0][0], "future:future-1"
+            )
+            state.save()
+            reloaded = UserState(state_path)
+            self.assertIn("future", reloaded.bridges["codex:known"])
+            self.assertEqual(reloaded.launch_tools["codex:known"], "future")
+            self.assertIn("future:future-1", reloaded.conversations["conversation"]["members"])
 
     def test_source_kind_is_string_json_serializable(self) -> None:
         self.assertEqual(SourceKind.NON_INTERACTIVE, "non-interactive")

@@ -131,3 +131,4 @@ class NativeSession:
     resume_id: str = ""
     parent_id: str = ""
     message_count: int = 0
+    agent_nickname: str = ""

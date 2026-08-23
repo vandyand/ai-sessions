@@ -17,6 +17,19 @@ from ..capabilities import HarnessAdapter
 from ..model import BudgetPolicy, SourceKind
 from ..paths import CLAUDE_HOME
 
+
+def resume_args(
+    *,
+    session_id: str,
+    source: SourceKind,
+    resume_id: str,
+    parent_id: str,
+    native: bool,
+) -> list[str]:
+    del source, resume_id, parent_id, native
+    return ["--resume", session_id]
+
+
 ADAPTER = HarnessAdapter(
     name="claude",
     label="Claude Code",
@@ -25,7 +38,7 @@ ADAPTER = HarnessAdapter(
     home=CLAUDE_HOME,
     default_command=("claude",),
     dangerous_args=("--dangerously-skip-permissions",),
-    source_kinds=frozenset(SourceKind),
+    source_kinds=frozenset((SourceKind.INTERACTIVE, SourceKind.SDK, SourceKind.SUBAGENT)),
     id_patterns=(
         re.compile(
             rb"[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}",
@@ -36,6 +49,7 @@ ADAPTER = HarnessAdapter(
     write=write_claude_session,
     locate=_claude_exists,
     change_status=_claude_change_status,
+    resume_args=resume_args,
     budget=BudgetPolicy(
         context_tokens=CLAUDE_BUDGET_CONTEXT_TOKENS,
         usable_fraction=DEFAULT_USABLE_FRACTION,

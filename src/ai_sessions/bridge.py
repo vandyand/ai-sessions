@@ -1197,7 +1197,7 @@ def _snapshot_change_status(
     del generation, device, inode, size, mtime_ns
     classifier = harness(tool).change_status
     if isinstance(classifier, Unsupported):
-        return "unstable"
+        return "unsupported"
     status = classifier(Path(storage), offset)
     if status == "unstable":
         # lru_cache does not retain exceptions. A sharing violation or other
@@ -1213,6 +1213,8 @@ class _UnstableSnapshot(RuntimeError):
 
 def conversation_change_status(tool: str, storage: str | Path, offset: int) -> str:
     """Return ``unchanged``, ``changed``, or ``unstable`` after a frontier."""
+    if tool not in REGISTRY:
+        return "unknown"
     path = Path(storage)
     if not storage or not path.is_file():
         return "unstable"
@@ -1242,7 +1244,7 @@ def conversation_changed_since(tool: str, storage: str | Path, offset: int) -> b
 
 def bridged_title(title: str, source_tool: str) -> str:
     """Name the copy so the list never shows two identical rows."""
-    source = harness(source_tool).label.split()[0]
+    source = harness(source_tool).short_label
     base = (title or "untitled session").strip()
     suffix = f" (from {source})"
     return base[: 200 - len(suffix)] + suffix

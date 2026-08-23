@@ -38,9 +38,11 @@ from .bridge import (
     native_session_exists,
     resolve_budget,
 )
+from .capabilities import Unsupported
 from .config import LAUNCH_MODES, LaunchConfig
 from .diagnostics import clear_warnings, record_warning
 from .diagnostics import warnings as load_warnings
+from .model import SourceKind
 from .paths import (
     CACHE_FILE,
     CLAUDE_HOME,
@@ -50,9 +52,8 @@ from .paths import (
     IS_WINDOWS,
     STATE_FILE,
 )
+from .registry import REGISTRY
 
-TOOL_LABELS = {"codex": "Codex", "claude": "Claude"}
-TOOL_ORDER = ("all", "codex", "claude")
 ORIGIN_ORDER = ("human", "cross", "agent", "all")
 ORIGIN_LABELS = {
     "human": "Human",
@@ -73,6 +74,22 @@ CODEX_ID_PATTERN = re.compile(
     rb"019[0-9a-f]{5}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}",
     re.I,
 )
+
+
+def tool_label(name: str, *, short: bool = True) -> str:
+    """Return a current registry label, preserving unknown forward-compatible names."""
+    try:
+        return REGISTRY.label(name, short=short)
+    except KeyError:
+        return name
+
+
+def tool_order() -> tuple[str, ...]:
+    return ("all", *REGISTRY.names())
+
+
+def tool_column_width(minimum: int) -> int:
+    return max((minimum, *(len(adapter.short_label) for adapter in REGISTRY.adapters())))
 
 
 @dataclass(slots=True)
@@ -174,7 +191,7 @@ class Session:
         return " ".join(
             (
                 self.tool,
-                TOOL_LABELS.get(self.tool, self.tool),
+                tool_label(self.tool),
                 self.session_id,
                 self.active_launch_tool,
                 *self.available_launch_tools,
@@ -228,7 +245,8 @@ class UserState:
                         entries = {
                             tool: entry
                             for tool, entry in value.items()
-                            if tool in TOOL_LABELS
+                            if isinstance(tool, str)
+                            and tool
                             and isinstance(entry, dict)
                             and isinstance(entry.get("session_id"), str)
                         }
@@ -244,7 +262,8 @@ class UserState:
                             self.stable_key(str(key)): member
                             for key, member in value["members"].items()
                             if isinstance(member, dict)
-                            and member.get("tool") in TOOL_LABELS
+                            and isinstance(member.get("tool"), str)
+                            and member.get("tool")
                             and isinstance(member.get("session_id"), str)
                         }
                         if members:
@@ -279,7 +298,7 @@ class UserState:
                         if not isinstance(value, str):
                             continue
                         value = value.strip().lower()
-                        if value in TOOL_LABELS:
+                        if value:
                             self.launch_tools[self.stable_key(str(key))] = value
         except (OSError, json.JSONDecodeError, AttributeError):
             pass
@@ -388,6 +407,7 @@ class UserState:
                 "advanced": [],
                 "unavailable": unavailable,
                 "unstable": [],
+                "unknown": [],
             }
         if not members:
             return {
@@ -396,8 +416,19 @@ class UserState:
                 "advanced": [],
                 "unavailable": [],
                 "unstable": [],
+                "unknown": [],
             }
         changes = {key: self._member_change_status(member) for key, member in members}
+        unknown = [pair for pair in members if changes[pair[0]] in ("unknown", "unsupported")]
+        if unknown:
+            return {
+                "conflict": False,
+                "heads": current,
+                "advanced": [],
+                "unavailable": [],
+                "unstable": [],
+                "unknown": unknown,
+            }
         unstable = [pair for pair in members if changes[pair[0]] == "unstable"]
         if unstable:
             return {
@@ -406,6 +437,7 @@ class UserState:
                 "advanced": [],
                 "unavailable": [],
                 "unstable": unstable,
+                "unknown": [],
             }
         advanced = [(key, member) for key, member in members if changes[key] == "changed"]
         if not advanced:
@@ -415,6 +447,7 @@ class UserState:
                 "advanced": [],
                 "unavailable": [],
                 "unstable": [],
+                "unknown": [],
             }
         if len(advanced) == 1 and int(advanced[0][1].get("generation", 0)) == maximum:
             return {
@@ -423,6 +456,7 @@ class UserState:
                 "advanced": advanced,
                 "unavailable": [],
                 "unstable": [],
+                "unknown": [],
             }
         # Two members changed independently, or an older materialization moved
         # after a newer frontier existed. Either is a fork, never a timestamp race.
@@ -435,6 +469,7 @@ class UserState:
             "advanced": advanced,
             "unavailable": [],
             "unstable": [],
+            "unknown": [],
         }
 
     def _session_for_member(self, member: dict[str, Any], template: Session) -> Session:
@@ -467,6 +502,12 @@ class UserState:
         if not conversation_id:
             return item, item if item.tool == target_tool else None, ""
         status = self._conversation_status(conversation_id)
+        if status["unknown"]:
+            labels = ", ".join(key for key, _ in status["unknown"])
+            raise BridgeError(
+                f"conversation {conversation_id[:8]} has newest materialization(s) owned by "
+                f"an unavailable harness ({labels}); refusing to resume an older generation"
+            )
         if status["unstable"]:
             labels = ", ".join(key for key, _ in status["unstable"])
             raise BridgeError(
@@ -786,7 +827,7 @@ def publish_name(
     except OSError as error:
         return f"could not update the provider title: {error}"
     if restored_generated:
-        label = TOOL_LABELS.get(item.tool, item.tool)
+        label = tool_label(item.tool)
         return f"restored {name!r}; {label} now records it as an explicit title"
     return ""
 
@@ -891,7 +932,7 @@ def short_path(value: str) -> str:
 def display_title(session: Session) -> str:
     title = clean_prompt(session.title)
     if not title:
-        title = f"Untitled {TOOL_LABELS.get(session.tool, session.tool)} session"
+        title = f"Untitled {tool_label(session.tool)} session"
     return title
 
 
@@ -2089,23 +2130,6 @@ def ellipsize(value: str, width: int) -> str:
 
 
 class Browser:
-    PAIRS = {
-        "accent": 1,
-        "codex": 2,
-        "claude": 3,
-        "selected": 4,
-        "primary": 5,
-        "warning": 6,
-        "success": 7,
-        "muted": 8,
-        "human": 9,
-        "cross": 10,
-        "agent": 11,
-        "hidden": 12,
-        "timestamp": 13,
-        "messages": 14,
-    }
-
     def __init__(
         self,
         screen: Any,
@@ -2130,7 +2154,27 @@ class Browser:
         self.searching = False
         self.message = ""
         self.result: Session | None = None
+        self.pairs = self._pair_layout()
         self.setup_colors()
+
+    @staticmethod
+    def _pair_layout() -> dict[str, int]:
+        names = [
+            "accent",
+            *(adapter.name for adapter in REGISTRY.adapters()),
+            "selected",
+            "primary",
+            "warning",
+            "success",
+            "muted",
+            "human",
+            "cross",
+            "agent",
+            "hidden",
+            "timestamp",
+            "messages",
+        ]
+        return {name: number for number, name in enumerate(names, 1)}
 
     def setup_colors(self) -> None:
         try:
@@ -2151,29 +2195,40 @@ class Browser:
             curses.use_default_colors()
         except curses.error:
             pass
+        provider_count = len(REGISTRY.adapters())
         if getattr(curses, "COLORS", 0) >= 256:
-            # Theme-friendly xterm-256 colors: cool provider hues, green live
-            # state, amber cross-provider state, and quiet neutral metadata.
-            colors = (45, 75, 176, 16, -1, 214, 82, 245, 114, 215, 141, 245, 110, 223)
-            backgrounds = (-1, -1, -1, 45, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1)
-        else:
-            colors = (
-                curses.COLOR_CYAN,
-                curses.COLOR_BLUE,
-                curses.COLOR_MAGENTA,
-                curses.COLOR_BLACK,
-                -1,
-                curses.COLOR_YELLOW,
-                curses.COLOR_GREEN,
-                curses.COLOR_WHITE,
-                curses.COLOR_GREEN,
-                curses.COLOR_YELLOW,
-                curses.COLOR_CYAN,
-                curses.COLOR_WHITE,
-                curses.COLOR_CYAN,
-                curses.COLOR_YELLOW,
+            provider_palette = (75, 176, 39, 208, 111, 141, 45)
+            colors = [45]
+            colors.extend(
+                provider_palette[index % len(provider_palette)] for index in range(provider_count)
             )
-            backgrounds = (-1, -1, -1, curses.COLOR_CYAN) + (-1,) * 10
+            colors.extend((-1, -1, 214, 82, 245, 114, 215, 141, 245, 110, 223))
+            backgrounds = [-1] * len(colors)
+            backgrounds[self.pairs["selected"] - 1] = 45
+            colors[self.pairs["selected"] - 1] = 16
+        else:
+            provider_palette = (curses.COLOR_BLUE, curses.COLOR_MAGENTA, curses.COLOR_CYAN)
+            colors = [curses.COLOR_CYAN]
+            colors.extend(
+                provider_palette[index % len(provider_palette)] for index in range(provider_count)
+            )
+            colors.extend(
+                (
+                    curses.COLOR_BLACK,
+                    -1,
+                    curses.COLOR_YELLOW,
+                    curses.COLOR_GREEN,
+                    curses.COLOR_WHITE,
+                    curses.COLOR_GREEN,
+                    curses.COLOR_YELLOW,
+                    curses.COLOR_CYAN,
+                    curses.COLOR_WHITE,
+                    curses.COLOR_CYAN,
+                    curses.COLOR_YELLOW,
+                )
+            )
+            backgrounds = [-1] * len(colors)
+            backgrounds[self.pairs["selected"] - 1] = curses.COLOR_CYAN
         for number, (foreground, background) in enumerate(zip(colors, backgrounds), 1):
             if number >= getattr(curses, "COLOR_PAIRS", 0):
                 break
@@ -2184,7 +2239,7 @@ class Browser:
                 pass
 
     def style(self, name: str = "primary", attrs: int = 0, selected: bool = False) -> int:
-        pair = self.PAIRS["selected" if selected else name]
+        pair = self.pairs.get("selected" if selected else name, self.pairs["primary"])
         if self.colors_enabled and pair in self.initialized_pairs:
             return attrs | curses.color_pair(pair)
         if selected:
@@ -2251,7 +2306,7 @@ class Browser:
         count_text = f"{open_count} open · {len(items)} shown · {len(self.sessions)} indexed"
         self.add(0, max(1, width - len(count_text) - 2), count_text, self.style("muted"))
 
-        tool_text = "All tools" if self.tool == "all" else TOOL_LABELS[self.tool]
+        tool_text = "All tools" if self.tool == "all" else tool_label(self.tool)
         dir_text = "All directories" if not self.directory else short_path(self.directory)
         filters = (
             f"{tool_text}  ·  {ORIGIN_LABELS[self.origin]}  ·  "
@@ -2279,7 +2334,8 @@ class Browser:
         self.offset = min(self.offset, max(0, len(items) - visible_rows))
 
         show_directory = width >= 100
-        tool_width, origin_width, open_width, messages_width, time_width = 8, 7, 6, 6, 10
+        tool_width = tool_column_width(8)
+        origin_width, open_width, messages_width, time_width = 7, 6, 6, 10
         directory_width = min(34, max(16, width // 4)) if show_directory else 0
         title_width = (
             width
@@ -2312,7 +2368,7 @@ class Browser:
                 y = list_top + row
                 selected = index == self.selected
                 marker = "›" if selected else ("⊘" if item.hidden else " ")
-                tool_label = TOOL_LABELS[item.tool]
+                item_tool_label = tool_label(item.tool)
                 origin_label = ORIGIN_LABELS[item.origin]
                 directory = short_path(item.cwd)
                 paused = item.is_open and process_state(item.open_pid) in ("T", "t")
@@ -2326,7 +2382,7 @@ class Browser:
 
                 marker_color = "hidden" if item.hidden else "primary"
                 segment(f"{marker} ", marker_color, curses.A_BOLD if marker.strip() else 0)
-                segment(f"{tool_label:<{tool_width}}", item.tool, curses.A_BOLD)
+                segment(f"{item_tool_label:<{tool_width}}", item.tool, curses.A_BOLD)
                 segment(f"{origin_label:<{origin_width}}", item.origin, curses.A_BOLD)
                 open_symbol = "Ⅱ" if paused else ("●" if item.is_open else "")
                 segment(
@@ -2368,7 +2424,7 @@ class Browser:
             name_badge = " · utility name" if item.renamed else (" · named" if item.named else "")
             source_badge = f" · {item.source}" if item.source != "interactive" else ""
             hidden_badge = " · hidden" if item.hidden else ""
-            launch_tool = TOOL_LABELS[item.active_launch_tool]
+            launch_tool = tool_label(item.active_launch_tool)
             if item.needs_bridge():
                 launch_tool += " (bridged copy)"
             if item.is_open and process_state(item.open_pid) in ("T", "t"):
@@ -2378,7 +2434,7 @@ class Browser:
             self.add(
                 detail_top + 1,
                 2,
-                f"{TOOL_LABELS[item.tool]} · {ORIGIN_LABELS[item.origin]} · launch via {launch_tool} · "
+                f"{tool_label(item.tool)} · {ORIGIN_LABELS[item.origin]} · launch via {launch_tool} · "
                 f"{item.message_count} user msgs{name_badge}{source_badge}{hidden_badge}{open_badge}",
                 self.style(item.origin, curses.A_BOLD),
                 width - 4,
@@ -2445,8 +2501,9 @@ class Browser:
 
     def cycle_tool(self, backwards: bool = False) -> None:
         previous = self.selected_id()
-        index = TOOL_ORDER.index(self.tool)
-        self.tool = TOOL_ORDER[(index + (-1 if backwards else 1)) % len(TOOL_ORDER)]
+        order = tool_order()
+        index = order.index(self.tool) if self.tool in order else 0
+        self.tool = order[(index + (-1 if backwards else 1)) % len(order)]
         if self.directory and not any(
             item.cwd == self.directory and (self.tool == "all" or item.tool == self.tool)
             for item in self.sessions
@@ -2484,11 +2541,11 @@ class Browser:
             )
         elif item.needs_bridge(selected):
             self.message = (
-                f"Launching {TOOL_LABELS[selected]}: a copy of this conversation will be "
+                f"Launching {tool_label(selected)}: a copy of this conversation will be "
                 "created there, with tool calls summarised inline."
             )
         else:
-            self.message = f"Launching {TOOL_LABELS[selected]} for this session."
+            self.message = f"Launching {tool_label(selected)} for this session."
 
     def cycle_sort(self) -> None:
         previous = self.selected_id()
@@ -2881,8 +2938,8 @@ class Browser:
 
 def custom_mode_notice(config: LaunchConfig, provider: str | None = None) -> str:
     """Explain why custom launch mode is adding nothing to the provider command."""
-    if provider in TOOL_LABELS:
-        provider_label = TOOL_LABELS[provider]
+    if provider is not None:
+        provider_label = tool_label(provider)
         setting = f"launch.custom.{provider}_args"
         return (
             f"sessions: custom launch mode has no arguments configured for {provider_label}, "
@@ -2905,26 +2962,32 @@ def command_for(session: Session, config: LaunchConfig) -> list[str]:
     tool = session.active_launch_tool
     if session.needs_bridge(tool):
         raise BridgeError(
-            f"{TOOL_LABELS.get(tool, tool)} cannot resume a "
-            f"{TOOL_LABELS.get(session.tool, session.tool)} session id directly; "
+            f"{tool_label(tool)} cannot resume a "
+            f"{tool_label(session.tool)} session id directly; "
             "bridge a copy across first"
         )
     native = tool == session.tool
+    try:
+        adapter = REGISTRY.get(tool)
+    except KeyError:
+        raise BridgeError(f"unknown harness: {tool}") from None
+    resume = adapter.resume_args
+    if isinstance(resume, Unsupported):
+        raise BridgeError(f"{adapter.label} cannot resume sessions: {resume.reason}")
+    try:
+        source = SourceKind(session.source)
+    except ValueError:
+        raise BridgeError(f"invalid source kind for {session.tool}: {session.source!r}") from None
+    if source not in REGISTRY.get(session.tool).source_kinds:
+        raise BridgeError(f"{session.tool} does not declare source kind {source.value!r}")
     argv = config.provider_prefix(tool)
-    if tool == "codex" and native and session.source == "subagent":
-        resume_target = session.resume_target
-    else:
-        resume_target = session.launch_target(tool)
-    if tool == "claude":
-        argv += ["--resume", resume_target]
-    else:
-        argv += ["resume"]
-        if native and (
-            session.source == "non-interactive"
-            or (session.source == "subagent" and session.resume_target == session.session_id)
-        ):
-            argv.append("--include-non-interactive")
-        argv.append(resume_target)
+    argv += resume(
+        session_id=session.launch_target(tool),
+        source=source,
+        resume_id=session.resume_target,
+        parent_id=session.parent_id,
+        native=native,
+    )
     return argv
 
 
@@ -2951,7 +3014,7 @@ def prepare_launch(
             if target.key == session.key:
                 return target, ""
             return target, (
-                f"Continuing the {TOOL_LABELS[tool]} copy—the current materialization of "
+                f"Continuing the {tool_label(tool)} copy—the current materialization of "
                 f"conversation {conversation_id[:8]} ({target.session_id})."
             )
         session = source
@@ -2966,7 +3029,7 @@ def prepare_launch(
         # The reference was matched out of transcript text, so it may never
         # have been a session at all.  Fall through and make a real one.
         stale = (
-            f"The recorded {TOOL_LABELS[tool]} counterpart {recorded} does not exist; "
+            f"The recorded {tool_label(tool)} counterpart {recorded} does not exist; "
             "copying the conversation across instead. "
         )
 
@@ -2995,7 +3058,7 @@ def prepare_launch(
         existing = state.bridge_for(session, tool)
         if existing:
             return attach(existing), (
-                f"{stale}Continuing the {TOOL_LABELS[tool]} copy of this session ({existing})."
+                f"{stale}Continuing the {tool_label(tool)} copy of this session ({existing})."
             )
         conversation_id = state.conversation_id_for(session, create=True)
     budget = resolve_budget(
@@ -3052,7 +3115,7 @@ def prepare_launch(
             "max_tokens to change this."
         )
     note = (
-        f"{stale}Copied {carried} into a new {TOOL_LABELS[tool]} session "
+        f"{stale}Copied {carried} into a new {tool_label(tool)} session "
         f"{result.session_id}{dropped}{truncated}.{budget_notice}"
     )
     return attach(result.session_id, str(result.path)), note
@@ -3123,9 +3186,12 @@ def list_output(items: list[Session], as_json: bool = False) -> None:
     except OSError:
         terminal_width = 120
     conversation_width = 11
-    title_width = max(24, terminal_width - 112)
+    tool_width = tool_column_width(8)
+    run_width = tool_column_width(6)
+    title_width = max(24, terminal_width - 112 - (tool_width - 8) - (run_width - 6))
     print(
-        f"{'TOOL':<8} {'RUN':<6} {'ORIGIN':<7} {'OPEN':<5} {'MSGS':>5} {'STATE':<8} "
+        f"{'TOOL':<{tool_width}} {'RUN':<{run_width}} {'ORIGIN':<7} "
+        f"{'OPEN':<5} {'MSGS':>5} {'STATE':<8} "
         f"{'HEAD':<{conversation_width}} {'STARTED':<12} {'UPDATED':<12} "
         f"{'TITLE':<{title_width}} DIRECTORY"
     )
@@ -3133,7 +3199,8 @@ def list_output(items: list[Session], as_json: bool = False) -> None:
         paused = item.is_open and process_state(item.open_pid) in ("T", "t")
         open_symbol = "Ⅱ" if paused else ("●" if item.is_open else "")
         print(
-            f"{TOOL_LABELS[item.tool]:<8} {TOOL_LABELS[item.active_launch_tool]:<6} "
+            f"{tool_label(item.tool):<{tool_width}} "
+            f"{tool_label(item.active_launch_tool):<{run_width}} "
             f"{ORIGIN_LABELS[item.origin]:<7} {open_symbol:<5} {item.message_count:>5} "
             f"{('hidden' if item.hidden else 'visible'):<8} "
             f"{conversation_status(item):<{conversation_width}} "
@@ -3169,7 +3236,7 @@ def build_parser() -> argparse.ArgumentParser:
         "--list", action="store_true", help="print matching sessions instead of opening the browser"
     )
     parser.add_argument("--json", action="store_true", help="emit JSON (implies --list)")
-    parser.add_argument("--tool", choices=TOOL_ORDER, default="all", help="initial tool filter")
+    parser.add_argument("--tool", choices=tool_order(), default="all", help="initial tool filter")
     parser.add_argument(
         "--origin", choices=ORIGIN_ORDER, default="human", help="filter by who launched the session"
     )
@@ -3193,7 +3260,7 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument(
         "--launch-tool",
-        choices=TOOL_ORDER[1:],
+        choices=REGISTRY.names(),
         help=(
             "resume in this harness instead of the recording one; a session from the "
             "other CLI is copied across first"
@@ -3320,14 +3387,7 @@ def main(argv: list[str] | None = None) -> int:
         if item is None:
             return 2
         if args.launch_tool and not item.supports_launch_tool(args.launch_tool):
-            tools = ", ".join(
-                sorted(
-                    {
-                        TOOL_LABELS[tool] if tool in TOOL_LABELS else tool
-                        for tool in item.available_launch_tools
-                    }
-                )
-            )
+            tools = ", ".join(sorted({tool_label(tool) for tool in item.available_launch_tools}))
             print(
                 f"sessions: --launch-tool={args.launch_tool} is not available for "
                 f"that session (available: {tools})",

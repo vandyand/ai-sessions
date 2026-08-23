@@ -1,11 +1,13 @@
 import io
 import unittest
 from contextlib import redirect_stderr, redirect_stdout
+from dataclasses import replace
 from unittest.mock import patch
 
 from ai_sessions import app
 from ai_sessions.app import Session, codex_resume_target, command_for, launch
 from ai_sessions.config import LaunchConfig
+from ai_sessions.registry import REGISTRY
 
 
 def session(
@@ -97,6 +99,26 @@ class LaunchCommandTests(unittest.TestCase):
                 "session-id",
             ],
         )
+
+    def test_registered_adapter_owns_resume_syntax(self) -> None:
+        base = REGISTRY.get("codex")
+        fake = replace(
+            base,
+            name="other",
+            label="Other",
+            short_label="Other",
+            default_command=("other-cli",),
+            resume_args=lambda **values: ["continue-thread", values["session_id"]],
+        )
+        with REGISTRY.temporary(fake):
+            self.assertEqual(
+                command_for(session("other"), LaunchConfig()),
+                ["other-cli", "continue-thread", "session-id"],
+            )
+
+    def test_invalid_source_kind_is_rejected(self) -> None:
+        with self.assertRaisesRegex(Exception, "invalid source kind"):
+            command_for(session("codex", "invented"), LaunchConfig())
 
 
 class LaunchDirectoryTests(unittest.TestCase):
