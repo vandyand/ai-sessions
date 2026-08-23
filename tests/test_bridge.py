@@ -1,8 +1,11 @@
+import inspect
 import io
 import json
 import tempfile
+import time
+import tracemalloc
 import unittest
-from contextlib import redirect_stdout
+from contextlib import redirect_stderr, redirect_stdout
 from pathlib import Path
 from unittest.mock import patch
 
@@ -11,22 +14,38 @@ from ai_sessions.app import (
     Session,
     UserState,
     command_for,
+    launch,
     list_output,
     load_claude_sessions,
     prepare_launch,
 )
 from ai_sessions.bridge import (
+    CODEX_BUDGET_CONTEXT_TOKENS,
+    CODEX_CONTEXT_WINDOW,
+    HANDOFF_NOTE_RESERVE_CHARS,
     HARNESSES,
+    MIN_BRIDGE_CHARS,
+    TRUNCATION_MARKER,
     BridgeError,
+    Budget,
+    BudgetPolicy,
+    SelectionMetric,
+    SelectionResult,
     ToolCall,
     Transcript,
     Turn,
     bridged_title,
     fit,
+    flatten,
     from_last_compaction,
+    handoff_note,
     merge_runs,
     prepare,
     read_turns,
+    render_calls,
+    resolve_budget,
+    select_messages,
+    selection_cost,
     write_claude_session,
     write_codex_session,
 )
@@ -273,6 +292,287 @@ class ShapingTests(unittest.TestCase):
         self.assertEqual(dropped, 0)
         self.assertIn("message truncated", kept[0].text)
 
+    def test_target_defaults_and_legacy_override_resolve_distinctly(self) -> None:
+        claude = resolve_budget("claude")
+        codex = resolve_budget("codex")
+        self.assertEqual((claude.tokens, claude.chars), (150_000, 300_000))
+        self.assertEqual((codex.tokens, codex.chars), (192_000, 384_000))
+        self.assertEqual(resolve_budget("claude", max_chars=950_000).chars, 950_000)
+        self.assertTrue(resolve_budget("claude", max_chars=950_000).over_policy)
+        self.assertEqual(resolve_budget("claude", migrated=True).origin, "target-default-migrated")
+
+    def test_token_budget_applies_ratio_and_precedence(self) -> None:
+        budget = resolve_budget("claude", max_tokens=5_000, max_chars=950_000)
+        self.assertEqual(
+            (budget.tokens, budget.chars, budget.origin),
+            (5_000, 10_000, "config.max_tokens"),
+        )
+
+    def test_non_integer_policy_ratio_applies_in_both_directions(self) -> None:
+        base = HARNESSES["claude"]
+        ratio_harness = bridge.Harness(
+            name="ratio",
+            label="Ratio",
+            read=base.read,
+            write=base.write,
+            locate=base.locate,
+            change_status=base.change_status,
+            budget=BudgetPolicy(10_000, 1.0, 2.5, "test ratio"),
+        )
+        with patch.dict(HARNESSES, {"ratio": ratio_harness}):
+            from_tokens = resolve_budget("ratio", max_tokens=10_000)
+            from_chars = resolve_budget("ratio", max_chars=25_001)
+        self.assertEqual((from_tokens.tokens, from_tokens.chars), (10_000, 25_000))
+        self.assertEqual((from_chars.tokens, from_chars.chars), (10_001, 25_001))
+
+    def test_too_small_legacy_character_budget_fails(self) -> None:
+        with self.assertRaisesRegex(BridgeError, "must be at least"):
+            resolve_budget("claude", max_chars=100)
+
+    def test_invalid_resolver_values_are_unset_and_huge_values_are_reported(self) -> None:
+        expected = resolve_budget("claude")
+        for value in (0, -1, True, "5000"):
+            self.assertEqual(resolve_budget("claude", max_tokens=value), expected)  # type: ignore[arg-type]
+            self.assertEqual(resolve_budget("claude", max_chars=value), expected)  # type: ignore[arg-type]
+        with self.assertRaisesRegex(BridgeError, "max_tokens is too large"):
+            resolve_budget("claude", max_tokens=10**400)
+        with self.assertRaisesRegex(BridgeError, "max_chars is too large"):
+            resolve_budget("claude", max_chars=10**400)
+
+    def test_fit_through_prices_same_role_joins(self) -> None:
+        turns = [Turn("user", "x" * 10) for _ in range(10)]
+        self.assertEqual(selection_cost(turns), 118)
+        selected = select_messages(turns, 117)
+        self.assertGreater(selected.dropped, 0)
+        self.assertLessEqual(selection_cost(selected.turns), 117)
+
+    def test_overflow_keeps_first_and_contiguous_newest_suffix(self) -> None:
+        turns = [
+            Turn("user", "a" * 10),
+            Turn("user", "b" * 10),
+            Turn("user", "c" * 100),
+            Turn("user", "d" * 10),
+            Turn("user", "e" * 10),
+        ]
+        selected = select_messages(turns, 60)
+        self.assertEqual(selected.turns[0].text, turns[0].text)
+        self.assertEqual(selected.turns, [turns[0], turns[3], turns[4]])
+
+    def test_same_role_anchors_fit_at_the_exact_bridge_floor(self) -> None:
+        self.assertEqual(MIN_BRIDGE_CHARS, 4_158)
+        selected = select_messages(
+            [Turn("user", "a" * 100), Turn("user", "b" * 100)],
+            MIN_BRIDGE_CHARS - 4_096,
+        )
+        self.assertEqual(selected.dropped, 0)
+        self.assertEqual(selected.truncated, 2)
+        self.assertEqual(selection_cost(selected.turns), 62)
+        self.assertTrue(all(turn.text.endswith(TRUNCATION_MARKER) for turn in selected.turns))
+
+    def test_survivors_do_not_decrease_at_the_anchor_cap_boundary(self) -> None:
+        turns = [
+            Turn("user", "a" * 1_000),
+            Turn("assistant", "mmm"),
+            Turn("user", "b" * 1_000),
+        ]
+        below = select_messages(turns, 2_001)
+        above = select_messages(turns, 2_002)
+        self.assertEqual((len(below.turns), below.dropped), (2, 1))
+        self.assertGreaterEqual(len(above.turns), len(below.turns))
+        self.assertLessEqual(above.dropped, below.dropped)
+
+    def test_tail_pricing_uses_the_truncated_head_cost(self) -> None:
+        turns = [
+            Turn("user", "a" * 1_000),
+            Turn("assistant", "m" * 10),
+            Turn("user", "b" * 50),
+        ]
+        selected = select_messages(turns, 202)
+        self.assertEqual(selected.turns[1:], turns[1:])
+        self.assertEqual((selected.dropped, selected.truncated), (0, 1))
+
+    def test_bridge_floor_and_note_reserve_bound_maximal_metadata(self) -> None:
+        with self.assertRaises(BridgeError):
+            resolve_budget("claude", max_chars=MIN_BRIDGE_CHARS - 1)
+        for maximum in (MIN_BRIDGE_CHARS, MIN_BRIDGE_CHARS + 1):
+            budget = resolve_budget("claude", max_chars=maximum)
+            selected = select_messages(
+                [Turn("user", "a" * 10_000), Turn("user", "b" * 10_000)],
+                budget.chars - HANDOFF_NOTE_RESERVE_CHARS,
+            )
+            self.assertLessEqual(selection_cost(selected.turns), maximum - 4_096)
+        hostile = '界\\"\n\t\x00' * 2_000
+        note = handoff_note(
+            source_tool="codex",
+            target_tool="claude",
+            session_id=hostile,
+            title=hostile,
+            cwd=hostile,
+            conversation_id=hostile,
+            kept=2,
+            assembled=1,
+            calls=999_999,
+            dropped=999_999,
+            truncated=2,
+            compacted=999_999,
+            opaque_compactions=999_999,
+            sealed_summary=True,
+            resumes_at_last_summary=False,
+            budget=resolve_budget("claude", max_tokens=1),
+        )
+        self.assertLessEqual(len(note) + 2, HANDOFF_NOTE_RESERVE_CHARS)
+        provenance = next(
+            line for line in note.splitlines() if line.startswith("[ai-sessions-provenance v1]")
+        )
+        json.loads(provenance.split("] ", 1)[1])
+
+    def test_selection_shape_is_deterministic_monotone_and_contiguous(self) -> None:
+        turns = [
+            Turn("user" if index % 3 else "assistant", f"{index:02d}:" + "x" * (20 + index))
+            for index in range(30)
+        ]
+
+        def matches(candidate: Turn, original: Turn) -> bool:
+            return candidate == original or (
+                candidate.role == original.role
+                and candidate.text.endswith(TRUNCATION_MARKER)
+                and original.text.startswith(candidate.text[: -len(TRUNCATION_MARKER)])
+            )
+
+        survivor_counts: list[int] = []
+        for maximum in range(62, 1_600, 31):
+            selected = select_messages(turns, maximum)
+            repeated = select_messages(turns, maximum)
+            self.assertEqual(selected, repeated)
+            self.assertLessEqual(selection_cost(selected.turns), maximum)
+            self.assertEqual(selected.dropped, len(turns) - len(selected.turns))
+            survivor_counts.append(len(selected.turns))
+            if selected.dropped:
+                self.assertTrue(matches(selected.turns[0], turns[0]))
+                suffix = selected.turns[1:]
+                originals = turns[-len(suffix) :] if suffix else []
+                self.assertTrue(all(matches(got, want) for got, want in zip(suffix, originals)))
+        self.assertEqual(survivor_counts, sorted(survivor_counts))
+        self.assertEqual(select_messages([], 100).turns, [])
+        single = select_messages([Turn("user", "z" * 1_000)], 100)
+        self.assertEqual((single.dropped, single.truncated), (0, 1))
+
+    def test_large_same_role_selection_prices_real_assembly(self) -> None:
+        turns = [Turn("user", f"{index:04d}" + "x" * 96) for index in range(2_000)]
+        conversation_limit = 190_000
+        selected = select_messages(turns, conversation_limit)
+        oracle = sum(len(turn.text) for turn in selected.turns) + 2 * (len(selected.turns) - 1)
+        self.assertEqual(selection_cost(selected.turns), oracle)
+        self.assertGreater(len(selected.turns), 1_500)
+        self.assertEqual(selected.turns[1:], turns[-(len(selected.turns) - 1) :])
+        budget = Budget(
+            "claude",
+            100_000,
+            conversation_limit + HANDOFF_NOTE_RESERVE_CHARS,
+            "test",
+        )
+        note = handoff_note(
+            source_tool="codex",
+            target_tool="claude",
+            session_id="source",
+            title="stress",
+            cwd="/tmp",
+            kept=len(selected.turns),
+            assembled=1,
+            calls=0,
+            dropped=selected.dropped,
+            budget=budget,
+        )
+        payload = merge_runs([Turn("user", note), *selected.turns])
+        self.assertLessEqual(sum(len(turn.text) for turn in payload), budget.chars)
+        self.assertGreater(
+            2 * (len(selected.turns) - 1),
+            HANDOFF_NOTE_RESERVE_CHARS - len(note) - 2,
+        )
+
+    def test_million_character_selection_is_linear_and_memory_bounded(self) -> None:
+        turns = [Turn("user", f"{index:05d}" + "x" * 95) for index in range(10_000)]
+        calls = {"item": 0, "join": 0, "truncate": 0}
+
+        def item_cost(turn: Turn) -> int:
+            calls["item"] += 1
+            return len(turn.text)
+
+        def join_cost(left: Turn, right: Turn) -> int:
+            calls["join"] += 1
+            return 2 if left.role == right.role else 0
+
+        def truncate(turn: Turn, limit: int) -> Turn:
+            calls["truncate"] += 1
+            return Turn(turn.role, turn.text[: limit - len(TRUNCATION_MARKER)] + TRUNCATION_MARKER)
+
+        metric = SelectionMetric(item_cost, join_cost, truncate)
+        maximum = 300_000
+        tracemalloc.start()
+        started = time.perf_counter()
+        selected = select_messages(turns, maximum, metric)
+        elapsed = time.perf_counter() - started
+        _, peak = tracemalloc.get_traced_memory()
+        tracemalloc.stop()
+        self.assertLess(elapsed, 5.0)
+        self.assertLessEqual(sum(calls.values()), 6 * len(turns) + 10)
+        self.assertLessEqual(peak, maximum + 16 * len(turns) + 262_144)
+        self.assertLessEqual(selection_cost(selected.turns), maximum)
+
+    def test_truncation_does_not_report_cut_tool_calls(self) -> None:
+        calls = (
+            ToolCall("one", "request", "result"),
+            ToolCall("two", "request", "result"),
+            ToolCall("three", "request", "result"),
+            ToolCall("four", "request", "result" * 100),
+        )
+        turn = flatten([Turn("assistant", "prefix", calls)])[0]
+        rendered_start = turn.text.rfind(render_calls(calls))
+        first_three = [render_calls((call,)) for call in calls[:3]]
+        third_end = rendered_start + sum(map(len, first_three)) + 2
+        prefix = third_end - 2
+        selected = select_messages([turn], prefix + len(TRUNCATION_MARKER))
+        self.assertEqual(selected.turns[0].calls, calls[:2])
+        self.assertIn(render_calls(calls[:2]), selected.turns[0].text)
+        self.assertNotIn(render_calls(calls[2:3]), selected.turns[0].text)
+
+    def test_oversized_newest_anchor_is_truncated_and_disclosed(self) -> None:
+        selected = select_messages([Turn("user", "short"), Turn("assistant", "x" * 50_000)], 2_000)
+        self.assertEqual((selected.dropped, selected.truncated), (0, 1))
+        self.assertEqual(len(selected.turns[-1].text), 2_000 - 2 - len("short"))
+        self.assertIn("message truncated", selected.turns[-1].text)
+
+    def test_budget_policy_rejects_invalid_registration(self) -> None:
+        invalid = (
+            (0, 0.75, 2.0, "source"),
+            (10_000, 0.0, 2.0, "source"),
+            (10_000, 1.1, 2.0, "source"),
+            (10_000, 0.75, 0.0, "source"),
+            (10_000, 0.75, 2.0, ""),
+            (2_000, 1.0, 2.0, "too small"),
+        )
+        for values in invalid:
+            with self.subTest(values=values), self.assertRaises(ValueError):
+                BudgetPolicy(*values)
+        with self.assertRaises(ValueError):
+            Budget("claude", 1, 1, "target-default")
+
+    def test_selection_metric_guard_clauses_reject_invalid_hooks(self) -> None:
+        turn = Turn("user", "x" * 100)
+        negative_item = SelectionMetric(lambda _: -1, lambda _a, _b: 0, lambda value, _: value)
+        with self.assertRaisesRegex(BridgeError, "negative item"):
+            selection_cost([turn], negative_item)
+        negative_join = SelectionMetric(lambda _: 1, lambda _a, _b: -1, lambda value, _: value)
+        with self.assertRaisesRegex(BridgeError, "negative join"):
+            selection_cost([turn, turn], negative_join)
+        wrong_role = SelectionMetric(
+            lambda value: len(value.text),
+            lambda _a, _b: 0,
+            lambda value, limit: Turn("assistant", value.text[:limit]),
+        )
+        with self.assertRaisesRegex(BridgeError, "invalid truncated anchor"):
+            select_messages([turn], 50, wrong_role)
+
     def test_bridged_title_names_the_origin(self) -> None:
         self.assertEqual(
             bridged_title("ai-sessions-cli-util", "codex"), "ai-sessions-cli-util (from Codex)"
@@ -388,6 +688,12 @@ class CompactionTests(unittest.TestCase):
 
 class HarnessRegistryTests(unittest.TestCase):
     def test_every_harness_is_self_consistent(self) -> None:
+        for entry in HARNESSES.values():
+            self.assertGreater(entry.budget.context_tokens, 0)
+            self.assertGreater(entry.budget.usable_fraction, 0)
+            self.assertLessEqual(entry.budget.usable_fraction, 1)
+            self.assertGreater(entry.budget.chars_per_token, 0)
+            self.assertTrue(entry.budget.source)
         for name, entry in HARNESSES.items():
             self.assertEqual(name, entry.name)
             self.assertTrue(entry.label)
@@ -398,6 +704,16 @@ class HarnessRegistryTests(unittest.TestCase):
         with self.assertRaises(BridgeError):
             read_turns("opencode", __file__)
         self.assertFalse(bridge.native_session_exists("opencode", "whatever"))
+
+    def test_codex_budget_floor_is_not_writer_context_metadata(self) -> None:
+        self.assertEqual(
+            HARNESSES["codex"].budget.context_tokens,
+            CODEX_BUDGET_CONTEXT_TOKENS,
+        )
+        self.assertNotEqual(CODEX_BUDGET_CONTEXT_TOKENS, CODEX_CONTEXT_WINDOW)
+        registry_source = inspect.getsource(bridge)
+        self.assertIn("context_tokens=CODEX_BUDGET_CONTEXT_TOKENS", registry_source)
+        self.assertIn("context_tokens=CLAUDE_BUDGET_CONTEXT_TOKENS", registry_source)
 
 
 class WriteSessionTests(unittest.TestCase):
@@ -543,6 +859,137 @@ class BridgeTests(unittest.TestCase):
             self.assertEqual(source.read_bytes(), before)
             self.assertNotEqual(result.path, source)
 
+    def test_explicit_token_budget_changes_written_payload_end_to_end(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            source = Path(directory) / "source.jsonl"
+            source.write_text(
+                "\n".join(
+                    codex_line("user" if index % 2 == 0 else "assistant", str(index) * 2_000)
+                    for index in range(20)
+                )
+                + "\n",
+                encoding="utf-8",
+            )
+            budget = resolve_budget("claude", max_tokens=5_000)
+            with patch.object(bridge, "CLAUDE_HOME", Path(directory) / "claude"):
+                result = bridge.bridge(
+                    source_tool="codex",
+                    target_tool="claude",
+                    session_id="source-session",
+                    storage=str(source),
+                    cwd=directory,
+                    budget=budget,
+                )
+            written = read_turns("claude", result.path)
+        self.assertEqual((result.budget.tokens, result.budget.chars), (5_000, 10_000))
+        self.assertGreater(result.dropped, 0)
+        self.assertLessEqual(sum(len(turn.text) for turn in written), 10_000)
+        self.assertIn("approximately 5,000 tokens / 10,000 projected characters", written[0].text)
+
+    def test_bridge_reports_source_and_assembled_message_counts(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            source = Path(directory) / "source.jsonl"
+            source.write_text(
+                "\n".join(codex_line("user", text) for text in ("one", "two", "three")) + "\n",
+                encoding="utf-8",
+            )
+            with patch.object(bridge, "CLAUDE_HOME", Path(directory) / "claude"):
+                result = bridge.bridge(
+                    source_tool="codex",
+                    target_tool="claude",
+                    session_id="source-session",
+                    storage=str(source),
+                    cwd=directory,
+                )
+            handoff = read_turns("claude", result.path)[0].text
+        self.assertEqual((result.turns, result.written_turns), (3, 1))
+        self.assertIn("3 source message(s) below were assembled into 1 target message(s)", handoff)
+
+    def test_bridge_refuses_a_handoff_note_that_exceeds_its_reserve(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            source = self.source(directory)
+            with (
+                patch.object(bridge, "CLAUDE_HOME", Path(directory) / "claude"),
+                patch.object(
+                    bridge,
+                    "handoff_note",
+                    return_value="x" * (HANDOFF_NOTE_RESERVE_CHARS - 1),
+                ),
+                self.assertRaisesRegex(BridgeError, "handoff note exceeds"),
+            ):
+                bridge.bridge(
+                    source_tool="codex",
+                    target_tool="claude",
+                    session_id="source-session",
+                    storage=str(source),
+                    cwd=directory,
+                )
+
+    def test_bridge_refuses_a_selected_payload_above_the_applied_ceiling(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            source = self.source(directory)
+            selected = SelectionResult(
+                [Turn("user", "x" * MIN_BRIDGE_CHARS)],
+                dropped=0,
+                truncated=0,
+            )
+            with (
+                patch.object(bridge, "CLAUDE_HOME", Path(directory) / "claude"),
+                patch.object(bridge, "select_messages", return_value=selected),
+                self.assertRaisesRegex(BridgeError, "payload exceeds"),
+            ):
+                bridge.bridge(
+                    source_tool="codex",
+                    target_tool="claude",
+                    session_id="source-session",
+                    storage=str(source),
+                    cwd=directory,
+                    budget=resolve_budget("claude", max_chars=MIN_BRIDGE_CHARS),
+                )
+
+    def test_unset_target_policies_diverge_on_a_340k_transcript(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            codex_source = Path(directory) / "codex-source.jsonl"
+            claude_source = Path(directory) / "claude-source.jsonl"
+            messages = [f"{index:03d}:" + "x" * 1_996 for index in range(170)]
+            codex_source.write_text(
+                "\n".join(
+                    codex_line("user" if index % 2 == 0 else "assistant", text)
+                    for index, text in enumerate(messages)
+                )
+                + "\n",
+                encoding="utf-8",
+            )
+            claude_source.write_text(
+                "\n".join(
+                    claude_line("user" if index % 2 == 0 else "assistant", text)
+                    for index, text in enumerate(messages)
+                )
+                + "\n",
+                encoding="utf-8",
+            )
+            with (
+                patch.object(bridge, "CLAUDE_HOME", Path(directory) / "claude-home"),
+                patch.object(bridge, "CODEX_HOME", Path(directory) / "codex-home"),
+            ):
+                into_claude = bridge.bridge(
+                    source_tool="codex",
+                    target_tool="claude",
+                    session_id="codex-source",
+                    storage=str(codex_source),
+                    cwd=directory,
+                )
+                into_codex = bridge.bridge(
+                    source_tool="claude",
+                    target_tool="codex",
+                    session_id="claude-source",
+                    storage=str(claude_source),
+                    cwd=directory,
+                )
+        self.assertGreater(into_claude.dropped, 0)
+        self.assertEqual(into_codex.dropped, 0)
+        self.assertEqual(into_codex.turns, len(messages))
+
     def test_bridging_into_the_recording_harness_is_refused(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             with self.assertRaises(BridgeError):
@@ -610,6 +1057,39 @@ class LaunchIntegrationTests(unittest.TestCase):
             launch_tool=launch_tool,
         )
 
+    @staticmethod
+    def loaded_dry_run(
+        directory: str, config_text: str, *, long_transcript: bool = False
+    ) -> tuple[Session, UserState, str, str]:
+        item = session(directory, launch_tool="claude")
+        if long_transcript:
+            Path(item.storage).write_text(
+                "\n".join(
+                    codex_line(
+                        "user" if index % 2 == 0 else "assistant",
+                        f"message-{index}:" + (str(index) * 2_000),
+                    )
+                    for index in range(20)
+                )
+                + "\n",
+                encoding="utf-8",
+            )
+        config_path = Path(directory) / "config.toml"
+        config_path.write_text(config_text, encoding="utf-8")
+        config = LaunchConfig.load(config_path)
+        state = UserState(path=Path(directory) / "state.json")
+        stdout = io.StringIO()
+        stderr = io.StringIO()
+        with (
+            patch.object(bridge, "CLAUDE_HOME", Path(directory) / "claude"),
+            redirect_stdout(stdout),
+            redirect_stderr(stderr),
+        ):
+            result = launch(item, config, dry_run=True, state=state)
+        if result != 0:
+            raise AssertionError(stderr.getvalue())
+        return item, state, stdout.getvalue(), stderr.getvalue()
+
     def test_a_session_with_a_transcript_offers_both_harnesses(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             item = session(directory)
@@ -620,6 +1100,118 @@ class LaunchIntegrationTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             item = session(directory, storage="")
             self.assertEqual(item.available_launch_tools, ("codex",))
+
+    def test_loaded_token_budget_drives_the_real_dry_run_bridge(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            item, state, stdout, stderr = self.loaded_dry_run(
+                directory,
+                "version = 2\n[bridge]\nmax_tokens = 5000\n",
+                long_transcript=True,
+            )
+            target_path = Path(state.bridges[item.key]["claude"]["storage"])
+            written = read_turns("claude", target_path)
+        self.assertIn("claude --resume", stdout)
+        self.assertLessEqual(sum(len(turn.text) for turn in written), 10_000)
+        self.assertIn("older message(s) dropped to fit", stderr)
+        self.assertIn("5,000 tokens / 10,000 projected characters", stderr)
+        self.assertIn("5,000 tokens / 10,000 projected characters", written[0].text)
+
+    def test_loaded_missing_budget_keeps_the_same_long_transcript(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            item, state, _, stderr = self.loaded_dry_run(
+                directory,
+                "version = 2\n[bridge]\n",
+                long_transcript=True,
+            )
+            target_path = Path(state.bridges[item.key]["claude"]["storage"])
+            written = read_turns("claude", target_path)
+        self.assertNotIn("dropped to fit", stderr)
+        self.assertIn("150,000 tokens / 300,000 projected characters", stderr)
+        self.assertIn("replaces the previous global 950,000-character ceiling", stderr)
+        self.assertIn("replaces the previous global 950,000-character ceiling", written[0].text)
+        self.assertIn("message-10:", "\n".join(turn.text for turn in written))
+
+    def test_launch_explains_migrated_explicit_and_clamped_budgets(self) -> None:
+        cases = (
+            (
+                "version = 1\n[bridge]\nmax_chars = 950000\n",
+                "target-default-migrated",
+                "Migrated the legacy 950,000-character default to target policy",
+                "legacy version-1 950,000-character machine default was replaced",
+            ),
+            (
+                "version = 2\n[bridge]\nmax_chars = 950000\n",
+                "config.max_chars",
+                "legacy max_chars override exceeds target policy",
+                "legacy character override exceeds the target policy",
+            ),
+            (
+                "version = 2\n[bridge]\nmax_tokens = 1\n",
+                "config.max_tokens",
+                "raised to the safe bridge minimum",
+                "raised to the safe bridge minimum",
+            ),
+        )
+        for config_text, origin, launch_explanation, handoff_explanation in cases:
+            with self.subTest(origin=origin), tempfile.TemporaryDirectory() as directory:
+                item, state, _, stderr = self.loaded_dry_run(directory, config_text)
+                target_path = Path(state.bridges[item.key]["claude"]["storage"])
+                handoff = read_turns("claude", target_path)[0].text
+                self.assertIn(f"({origin})", stderr)
+                self.assertIn(launch_explanation, stderr)
+                self.assertIn(f"({origin})", handoff)
+                self.assertIn(handoff_explanation, handoff)
+
+    def test_launch_reports_truncated_anchor_without_claiming_a_drop(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            item = session(directory, launch_tool="claude")
+            Path(item.storage).write_text(
+                "\n".join(
+                    [
+                        codex_line("user", "x" * 20_000),
+                        codex_line("assistant", "y" * 20_000),
+                    ]
+                )
+                + "\n",
+                encoding="utf-8",
+            )
+            state = UserState(path=Path(directory) / "state.json")
+            stderr = io.StringIO()
+            with (
+                patch.object(bridge, "CLAUDE_HOME", Path(directory) / "claude"),
+                redirect_stdout(io.StringIO()),
+                redirect_stderr(stderr),
+            ):
+                code = launch(
+                    item,
+                    LaunchConfig(bridge_max_tokens=4_096),
+                    dry_run=True,
+                    state=state,
+                )
+            target = Path(state.bridges[item.key]["claude"]["storage"])
+            handoff = read_turns("claude", target)[0].text
+        self.assertEqual(code, 0)
+        self.assertNotIn("dropped to fit", stderr.getvalue())
+        self.assertIn("2 anchor message(s) truncated to fit", stderr.getvalue())
+        self.assertIn("2 anchor message(s) were truncated", handoff)
+
+    def test_launch_reports_a_short_head_and_truncated_newest_anchor(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            item = session(directory, launch_tool="claude")
+            Path(item.storage).write_text(
+                "\n".join([codex_line("user", "short"), codex_line("assistant", "x" * 20_000)])
+                + "\n",
+                encoding="utf-8",
+            )
+            with patch.object(bridge, "CLAUDE_HOME", Path(directory) / "claude"):
+                prepared, notice = prepare_launch(
+                    item,
+                    config=LaunchConfig(bridge_max_tokens=4_096),
+                )
+            handoff = read_turns("claude", prepared.storage)[0].text
+        self.assertNotIn("dropped to fit", notice)
+        self.assertIn("1 anchor message(s) truncated to fit", notice)
+        self.assertIn("1 anchor message(s) were truncated", handoff)
 
     def test_command_for_refuses_an_unbridged_cross_harness_launch(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -632,7 +1224,7 @@ class LaunchIntegrationTests(unittest.TestCase):
             item = session(directory, launch_tool="claude")
             with patch.object(bridge, "CLAUDE_HOME", Path(directory) / "claude"):
                 prepared, note = prepare_launch(item)
-            self.assertIn("Copied 2 message(s)", note)
+                self.assertIn("Copied 2 source message(s), assembled as 2 target message(s)", note)
             argv = command_for(prepared, LaunchConfig())
             self.assertEqual(argv[:2], ["claude", "--resume"])
             self.assertNotEqual(argv[2], item.session_id)
@@ -937,6 +1529,7 @@ class LaunchIntegrationTests(unittest.TestCase):
                 write=entry.write,
                 locate=entry.locate,
                 change_status=lambda *_: next(outcomes),
+                budget=entry.budget,
             )
 
             with patch.dict(HARNESSES, {"codex": retrying}):

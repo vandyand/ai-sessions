@@ -39,6 +39,7 @@ read(path, options) -> Transcript
 write(cwd, turns, title) -> (native_id, path)
 locate(native_id) -> bool
 change_status(path, byte_cursor) -> unchanged | changed | unstable
+budget -> BudgetPolicy(context_tokens, usable_fraction, chars_per_token, source)
 ```
 
 `read` projects native records into the shared `Turn` model. `write` must produce a truly
@@ -59,6 +60,23 @@ Validated status is cached only for an unchanged native file snapshot. `unstable
 are never cached, because a sharing violation or other temporary read failure must remain
 retryable without requiring the provider to modify the transcript first.
 
+The budget policy is target-owned because context assumptions are adapter capabilities, not
+core routing rules. It is a conservative unknown-model default, not a claim that the bridge
+can inspect the model, system prompt, tools, or compaction threshold that will exist at
+resume time. Core resolves optional `max_tokens` / legacy `max_chars` configuration into one
+immutable applied `Budget`, then uses that same object for selection and the handoff note.
+Adding a harness must not add target-name conditionals to budget resolution.
+
+Selection reserves 4,096 projected characters for bounded handoff metadata. It flattens
+tool summaries without merging source messages, prices both message text and same-role
+assembly joins through one `SelectionMetric`, selects, and only then merges surviving runs.
+A fitting conversation is unchanged. On overflow the first message takes an initial capped
+share, the newest takes the remaining anchor allowance, and any additional survivors form
+one contiguous newest suffix. The allocation must be monotone: increasing a budget cannot
+decrease survivor count or increase dropped-message count. `BridgeResult` and both notices
+distinguish selected source-message count, assembled target-message count, dropped messages,
+and marker-truncated anchors.
+
 ## Complete adapter target
 
 The remaining provider branches in `app.py` should move behind the same adapter in this
@@ -71,7 +89,8 @@ order:
 5. `focus(process) -> FocusResult` — optional platform capability, never required to resume.
 6. The existing `read`, `write`, `locate`, and `change_status` conversion operations.
 
-Capabilities should be explicit (`rename`, `focus`, `subagents`, `compaction`, and so on)
+Capabilities should be explicit (`rename`, `focus`, `subagents`, `compaction`, budget policy,
+and so on)
 rather than detected with `if tool == ...` in core code. Provider-specific caches and
 database schemas belong inside the adapter. The core owns filtering, display, conversation
 state, head resolution, launch policy, and error presentation.
@@ -85,6 +104,18 @@ Adding a third harness is complete when its adapter passes shared contract fixtu
 - round trips through each existing harness without pairwise code;
 - rename/liveness capabilities when declared; and
 - concurrent append safety and explicit divergence.
+
+Shared budget fixtures additionally require `context_tokens > 0`,
+`0 < usable_fraction <= 1`, `chars_per_token > 0`, non-empty provenance, and a derived default
+at or above `MIN_BRIDGE_CHARS`. Unset config resolves through target policy. An explicit legacy
+`max_chars` other than schema-1 `950000` remains identical across targets; that exact schema-1
+machine default migrates to each target's policy. A bare per-message cost is insufficient because
+same-role merge separators depend on adjacency, so `SelectionMetric` supplies
+`item_cost(turn)`, `join_cost(left, right)`, and `truncate(turn, limit)` in `Budget.chars`.
+Core validates non-negative costs and truncated anchors against their shares; the selector
+scans once with a running total rather than repricing whole candidates. P3's default uses
+`len(text)` plus a conservative two-character same-role join, which upper-bounds the text
+produced by `merge_runs`; P4 can replace the complete metric.
 
 ## Persistence and recovery
 
