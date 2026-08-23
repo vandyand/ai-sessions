@@ -1,7 +1,7 @@
 # Round-trip heads
 
 Status: complete on `conversation-log/round-trip-heads` (`7520b47`, hardened by
-`014b3ff`, `aef9129`, `43ba4c1`, and `855c3bf`).
+`014b3ff`, `aef9129`, `43ba4c1`, `855c3bf`, and `af15fa9`).
 
 This phase prevents Codex → Claude → Codex from returning to the original Codex ancestor.
 It introduces utility-owned conversation identity and follows the newest native
@@ -24,9 +24,9 @@ materialization regardless of which historical row the user selected.
 Generated tests cover a complete Codex → Claude → work → Codex trip, equivalent-copy reuse,
 two-head divergence, metadata-only Claude renames, arbitrary UUID text, schema 6 round-trip,
 schema 5 migration, structured provenance, visible status labels, a transcript append that
-races a bridge, and completion/retry of a partial JSONL tail. The full Windows suite passes
-with the checkout forced onto `src/`, and the repository's pinned Ruff lint and format
-checks pass.
+races a bridge, completion/retry of a partial JSONL tail, and bounded detection of a large
+valid append. The full Windows suite passes with the checkout forced onto `src/`, and the
+repository's pinned Ruff lint and format checks pass.
 
 The implementation was also applied read-only to the two real local bridge pairs that
 motivated the work. Each migrated to one current head and one superseded ancestor with no
