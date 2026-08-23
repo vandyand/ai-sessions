@@ -77,18 +77,22 @@ class PublishNameTests(unittest.TestCase):
         self.assertEqual(calls, [("session-id", "new")])
 
     def test_unsupported_title_publication_stays_local(self) -> None:
-        base = REGISTRY.get("codex")
-        fake = replace(
-            base,
-            name="limited",
-            label="Limited",
-            short_label="Limited",
-            publish_name=Unsupported("native titles are unavailable"),
-        )
-        with REGISTRY.temporary(fake):
-            note = publish_name(session(tool="limited"), "new")
-        self.assertIn("cannot publish titles", note)
-        self.assertIn("kept local", note)
+        with TemporaryDirectory() as directory:
+            home = Path(directory)
+            base = REGISTRY.get("codex")
+            fake = replace(
+                base,
+                name="limited",
+                label="Limited",
+                short_label="Limited",
+                home=home,
+                publish_name=Unsupported("native titles are unavailable"),
+            )
+            with REGISTRY.temporary(fake):
+                note = publish_name(session(tool="limited"), "new")
+            self.assertIn("cannot publish titles", note)
+            self.assertIn("kept local", note)
+            self.assertEqual(list(home.iterdir()), [])
 
     def test_claude_rename_appends_custom_title(self) -> None:
         with TemporaryDirectory() as directory:

@@ -36,10 +36,11 @@ from ..diagnostics import record_warning
 from ..discovery import HarnessContext, clean_prompt, normalize_space, prompt_text, timestamp
 from ..liveness import LivenessContext
 from ..model import BudgetPolicy, LivenessSession, NativeSession, SourceKind, Transcript, Turn
-from ..paths import APP_CACHE_DIR, CODEX_HOME
+from ..paths import APP_CACHE_DIR, HOME, env_path
 from ..registry import REGISTRY
 
 CODEX_CLI_VERSION = "0.147.0"
+CODEX_HOME = env_path("CODEX_HOME", HOME / ".codex")
 _RESULT_NOISE = re.compile(r"^Script completed\s*(Wall time[^\n]*)?\s*Output:\s*", re.I)
 DISCOVERY_CACHE_VERSION = 5
 DISCOVERY_CACHE_FILE = APP_CACHE_DIR / f"codex-discovery-v{DISCOVERY_CACHE_VERSION}.json"

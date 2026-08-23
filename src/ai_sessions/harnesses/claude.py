@@ -30,10 +30,11 @@ from ..diagnostics import record_warning
 from ..discovery import HarnessContext, clean_prompt, normalize_space, prompt_text, timestamp
 from ..liveness import LivenessContext, ProcessInfo
 from ..model import BudgetPolicy, LivenessSession, NativeSession, SourceKind, Transcript, Turn
-from ..paths import APP_CACHE_DIR, CLAUDE_HOME
+from ..paths import APP_CACHE_DIR, HOME, env_path
 from ..registry import REGISTRY
 
 CLAUDE_VERSION = "2.1.227"
+CLAUDE_HOME = env_path("CLAUDE_CONFIG_DIR", HOME / ".claude")
 DISCOVERY_CACHE_VERSION = 5
 DISCOVERY_CACHE_FILE = APP_CACHE_DIR / f"claude-discovery-v{DISCOVERY_CACHE_VERSION}.json"
 

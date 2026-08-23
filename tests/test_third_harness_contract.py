@@ -76,6 +76,10 @@ class ThirdHarnessContractTests(unittest.TestCase):
         assert not isinstance(writer, Unsupported)
         return writer(cwd="/fixture/work", turns=list(turns), title=title)
 
+    def test_unknown_harness_has_no_budget_fallback(self) -> None:
+        with self.assertRaisesRegex(BridgeError, "unknown harness: not-registered"):
+            resolve_budget("not-registered")
+
     def test_late_registered_adapter_participates_in_every_runtime_surface(self) -> None:
         self.assertNotIn("fixture", REGISTRY)
         with isolated_registry(self.root, self.fixture):

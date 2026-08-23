@@ -61,6 +61,35 @@ def find_violations(source: str, relative: str) -> list[str]:
 
 
 class SourceStructureTests(unittest.TestCase):
+    def test_provider_home_constants_only_feed_adapter_registration(self) -> None:
+        self.assertNotIn("CODEX_HOME", (SOURCE_ROOT / "paths.py").read_text(encoding="utf-8"))
+        self.assertNotIn("CLAUDE_HOME", (SOURCE_ROOT / "paths.py").read_text(encoding="utf-8"))
+        for provider, constant in (("codex", "CODEX_HOME"), ("claude", "CLAUDE_HOME")):
+            path = SOURCE_ROOT / "harnesses" / f"{provider}.py"
+            for other in SOURCE_ROOT.rglob("*.py"):
+                if other != path:
+                    self.assertNotIn(constant, other.read_text(encoding="utf-8"))
+            tree = ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
+            parents: dict[ast.AST, ast.AST] = {}
+            for parent in ast.walk(tree):
+                for child in ast.iter_child_nodes(parent):
+                    parents[child] = parent
+            uses = [
+                node
+                for node in ast.walk(tree)
+                if isinstance(node, ast.Name)
+                and isinstance(node.ctx, ast.Load)
+                and node.id == constant
+            ]
+            self.assertEqual(len(uses), 1)
+            keyword = parents[uses[0]]
+            self.assertIsInstance(keyword, ast.keyword)
+            self.assertEqual(keyword.arg, "home")
+            call = parents[keyword]
+            self.assertIsInstance(call, ast.Call)
+            self.assertIsInstance(call.func, ast.Name)
+            self.assertEqual(call.func.id, "HarnessAdapter")
+
     def test_detector_catches_direct_and_indirect_provider_branches(self) -> None:
         violating = """
 PROVIDERS = ("claude", "codex")

@@ -79,6 +79,8 @@ class RegistryTests(unittest.TestCase):
         for mutation in mutations:
             with self.subTest(mutation=mutation), self.assertRaises(ValueError):
                 replace(base, **mutation)
+        with self.assertRaisesRegex(ValueError, "budget must be a BudgetPolicy"):
+            replace(base, budget=Unsupported("budget policy is unavailable"))
 
     def test_every_mutation_advances_generation_monotonically(self) -> None:
         registry = Registry()
