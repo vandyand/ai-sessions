@@ -28,7 +28,7 @@ class RegistryTests(unittest.TestCase):
         before = REGISTRY.generation
         install()
         install()
-        self.assertEqual(REGISTRY.names(), ("codex", "claude"))
+        self.assertEqual(REGISTRY.names(), ("codex", "claude", "opencode"))
         self.assertEqual(REGISTRY.generation, before)
 
     def test_equal_time_sort_is_independent_of_discovery_order(self) -> None:

@@ -34,18 +34,31 @@ backups or databases owned by a different binary/channel. When the command is un
 discovery falls back only to an explicit `OPENCODE_DB` or the stable default and reports that the
 binding is inferred.
 
-Relevant current tables are:
+The isolated 1.18.21 database was inspected directly. Its relevant columns were:
 
 ```text
-session(id, project_id, parent_id, directory, path, title, version,
-        time_created, time_updated, time_archived, ...)
+session(id, project_id, workspace_id, parent_id, slug, directory, path, title,
+        version, summary_additions, summary_deletions, summary_files, summary_diffs,
+        revert, permission, agent, model, time_created, time_updated, time_compacting,
+        time_archived)
 message(id, session_id, time_created, time_updated, data JSON)
 part(id, message_id, session_id, time_created, time_updated, data JSON)
 ```
 
+`session.agent` is present in that capture but is discovery-only display metadata, so the adapter
+reads it opportunistically rather than making it a compatibility gate. The semantic columns and
+tables needed to identify and read a session remain mandatory.
+
 The repository also contains newer `session_message` work, but current CLI export/import and
 runtime `MessageV2` still read/write `message` and `part`. The adapter must verify the required
 tables/columns and report an incompatible schema rather than silently returning an empty list.
+
+OpenCode's `Session.isDefaultTitle` source defines the exact generated forms `New session -
+<ISO timestamp>` and `Child session - <ISO timestamp>`. Its row mapper treats every non-null
+`time_archived` value as an archived timestamp. Discovery mirrors those native predicates rather
+than inventing a title or archive heuristic. `xdg-basedir` supplies `Global.Path.data`: on Linux
+the fallback is `~/.local/share`, while native Windows uses its local application-data directory;
+non-empty platform overrides take precedence.
 
 Direct discovery is necessary: the supported session-list command deliberately requests
 `roots: true` and excludes archived sessions. Direct writes are avoided except for the bounded

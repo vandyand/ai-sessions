@@ -90,43 +90,63 @@
 
 ## Phase 1: OpenCode storage and discovery
 
-- [ ] Add `harnesses/opencode.py`, install it at order 30, and define `OPENCODE_HOME` from non-empty
+- [x] Add `harnesses/opencode.py`, install it at order 30, and define `OPENCODE_HOME` from non-empty
   `XDG_DATA_HOME` / Windows `LOCALAPPDATA` / `~/.local/share`, plus `/opencode`.
-- [ ] Put configured maintenance command argv in the shared discovery context. Resolve the one
+- [x] Put configured maintenance command argv in the shared discovery context. Resolve the one
   authoritative database by invoking `<command> db path` with the same cwd/environment contract as
   resume/import. If the command is unavailable, fall back only to explicit `OPENCODE_DB` or stable
   `opencode.db`, exclude `:memory:`, and mark the binding inferred. Never glob adjacent channel or
   backup databases into the active harness.
-- [ ] Route discovery-time `db path` through one bounded subprocess helper: `shell=False`,
+- [x] Route discovery-time `db path` through one bounded subprocess helper: `shell=False`,
   `stdin=DEVNULL`, captured bounded output, explicit timeout, and no interactive console. Resolve
   and memoize it once per discovery pass. Missing command, timeout/hang, nonzero exit, or
   unparseable output all yield the inferred binding plus one provider notice; none abort or delay
   Claude/Codex discovery.
-- [ ] Reuse that helper for every writer/preparation subprocess (`models`, `db path`, `import`) with
+- [x] Reuse that helper for every writer/preparation subprocess (`models`, `db path`, `import`) with
   `stdin=DEVNULL`, bounded output, no interactive console, and operation-specific timeouts. Hanging
   model/import fakes must fail actionably without freezing `prepare_launch`.
-- [ ] Open WAL-aware, query-only connections with bounded busy timeout. Verify required
+- [x] Open WAL-aware, query-only connections with bounded busy timeout. Verify required
   `session/message/part` tables and columns and surface one provider warning on incompatible DBs.
-- [ ] Classify storage before connecting: a stat-proven missing main DB with an accessible parent is
+- [x] Classify storage before connecting: a stat-proven missing main DB with an accessible parent is
   UNAVAILABLE; an existing but unreadable/locked/corrupt DB or inaccessible parent is UNKNOWN.
   Never silently rebind an exact member. A missing newest member remains conservatively blocked,
   matching existing deleted-JSONL behavior, until the user resolves that routing authority.
-- [ ] Query sessions and aggregate first/latest user preview and counts without materializing the
+- [x] Query sessions and aggregate first/latest user preview and counts without materializing the
   whole DB. Parse JSON defensively. Evidence scans retain bounded bytes/IDs per session and mark
   truncation so an incomplete scan cannot support a negative cross-origin conclusion.
-- [ ] Emit roots as interactive and `parent_id` rows as subagents, retaining archived evidence.
+- [x] Emit roots as interactive and `parent_id` rows as subagents, retaining archived evidence.
   Derive native default-title status, first/latest user preview, user-message count, timestamps,
   cwd, parent, and actual DB storage.
-- [ ] Scan message/part JSON bytes through the pass's registry-sensitive bounded evidence
+- [x] Scan message/part JSON bytes through the pass's registry-sensitive bounded evidence
   accumulator and publish per-session evidence without provider-name coupling.
-- [ ] Implement `resolve(id)` in the one authoritative/inferred DB and exact `availability(ref)`
+- [x] Implement `resolve(id)` in the one authoritative/inferred DB and exact `availability(ref)`
   against only the referenced canonical DB. Missing row is unavailable; BUSY/CANTOPEN/permissions/corruption/schema
   mismatch are unknown with a diagnostic and retained routing authority.
-- [ ] Add SQLite fixtures covering roots, children, archive, malformed JSON, missing schema,
+- [x] Add SQLite fixtures covering roots, children, archive, malformed JSON, missing schema,
   authoritative path versus adjacent backup/channel DBs, WAL-visible rows, OPENCODE_DB overrides,
   evidence overlap/truncation, empty env values, and both Windows/Linux home resolution in fresh
   interpreters. Add a large-store query/peak-memory gate; bounded evidence may trade completeness
   only by setting its persisted truncation flag.
+
+### Phase 1 validation
+
+- Eleven focused Claude Opus 5 implementation reviews drove the phase from five HIGH findings to a
+  final **GO (HIGH=0, MEDIUM=0, LOW=1)**. Every accepted authority/cache/process finding has
+  mutation-sensitive regression coverage; the sole final LOW records that WSL is the enforcement
+  signal for one redundant Windows descendant-pipe guard and requires no code change.
+- Discovery cache validity is checked before snapshot pinning, after pinning, and after scanning.
+  Its store signature includes main/WAL headers and both SQLite WAL-index header copies, so a live
+  WAL restart or same-size/same-mtime update cannot return a stale session list.
+- Identifier columns are read as bytes and decoded strictly; evidence and JSON payload reads are
+  bounded and streaming. Large-store peak-memory tests scale with retained session data, not total
+  database payload size.
+- Maintenance commands have bounded output/time, isolated process-tree cleanup, and reader-owned
+  pipe lifetime. Cold-start `db path` failures are memoized for the same command, cwd, and inferred
+  path; a transient failure after success retains the proven authoritative path and retries on the
+  next refresh. Existing clean WAL stores may gain derived sidecars—an empty WAL and initialized
+  shared index—but the main DB is unchanged; a missing main DB and its sidecars are never created.
+- Final pre-commit gate: 338 tests pass on native Windows (one skip) and Ubuntu WSL (two skips), and
+  Ruff 0.16.3 lint/format checks pass. *(Recorded after the full phase gate.)*
 
 ## Phase 2: Reader, compaction, and semantic cursor
 

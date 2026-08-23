@@ -722,22 +722,31 @@ class HarnessRegistryTests(unittest.TestCase):
             self.assertLessEqual(entry.budget.usable_fraction, 1)
             self.assertGreater(entry.budget.chars_per_token, 0)
             self.assertTrue(entry.budget.source)
-        for entry in REGISTRY.adapters():
+        targets = REGISTRY.bridge_targets()
+        self.assertIn("codex", targets)
+        self.assertIn("claude", targets)
+        self.assertNotIn("opencode", targets)
+        for name in targets:
+            entry = REGISTRY.get(name)
             self.assertTrue(entry.label)
-            for hook in (
-                entry.read,
-                entry.write,
-                entry.resolve,
-                entry.availability,
-                entry.checkpoint,
-                entry.change_status,
-            ):
-                self.assertTrue(callable(hook))
+            self.assertTrue(
+                all(
+                    callable(hook)
+                    for hook in (
+                        entry.read,
+                        entry.write,
+                        entry.resolve,
+                        entry.availability,
+                        entry.checkpoint,
+                        entry.change_status,
+                    )
+                )
+            )
 
     def test_an_unknown_harness_is_reported_rather_than_guessed(self) -> None:
         with self.assertRaises(BridgeError):
-            read_turns("opencode", native(__file__))
-        self.assertFalse(bridge.native_session_exists("opencode", "whatever"))
+            read_turns("not-a-harness", native(__file__))
+        self.assertFalse(bridge.native_session_exists("not-a-harness", "whatever"))
 
     def test_codex_budget_floor_is_not_writer_context_metadata(self) -> None:
         self.assertEqual(

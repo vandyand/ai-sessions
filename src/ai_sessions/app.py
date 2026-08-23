@@ -2,9 +2,10 @@
 """Browse and resume local Claude Code and Codex CLI sessions.
 
 Core browsing uses only Python's standard library. Desktop focusing optionally
-uses local tmux/wmctrl/xdotool commands. Browsing never modifies provider data.
-Renaming is the one exception: it appends a title entry to the provider's own
-append-only index so the new name also shows up in Claude Code and Codex.
+uses local tmux/wmctrl/xdotool commands. Browsing never modifies provider records;
+SQLite may create derived WAL sidecars—an empty write-ahead log and initialized
+shared index—while opening an existing OpenCode store read-only. Renaming is the
+one content exception: it publishes a title when that harness supports it.
 """
 
 from __future__ import annotations
@@ -108,7 +109,13 @@ def available_launch_tools(item: Session) -> tuple[str, ...]:
 
 
 def can_bridge(item: Session) -> bool:
-    return bool(item.storage)
+    if not item.storage:
+        return False
+    try:
+        reader = REGISTRY.get(item.tool).read
+    except KeyError:
+        return False
+    return not isinstance(reader, Unsupported)
 
 
 def active_launch_tool(item: Session) -> str:
@@ -980,6 +987,7 @@ def reconcile_evidence(sessions: list[Session], context: HarnessContext) -> None
     locate_cache: dict[tuple[str, str], bool] = {}
     probes = 0
     probe_limit_reported = False
+    incomplete_publishers: list[str] = []
 
     def evidence_rank(
         entry: tuple[tuple[str, str], tuple[list[str], bool]],
@@ -1004,10 +1012,7 @@ def reconcile_evidence(sessions: list[Session], context: HarnessContext) -> None
             )
             continue
         if truncated:
-            record_warning(
-                f"ID evidence was truncated or incomplete for {publisher_tool}:{publisher_id}; "
-                "negative counterpart conclusions were suppressed"
-            )
+            incomplete_publishers.append(f"{publisher_tool}:{publisher_id}")
         for token in tokens:
             # Native writers always mint a fresh target id. An own-id token is
             # therefore transcript metadata, not evidence that an unrelated
@@ -1073,6 +1078,15 @@ def reconcile_evidence(sessions: list[Session], context: HarnessContext) -> None
                     target.origin = "cross"
                 if publisher is not None:
                     target.launch_targets.setdefault(publisher_tool, publisher.session_id)
+    if incomplete_publishers:
+        examples = ", ".join(incomplete_publishers[:3])
+        remainder = len(incomplete_publishers) - 3
+        if remainder > 0:
+            examples += f", and {remainder} more"
+        record_warning(
+            f"ID evidence was truncated or incomplete for {len(incomplete_publishers)} "
+            f"session(s) ({examples}); negative counterpart conclusions were suppressed"
+        )
 
 
 def collect_scratch_origin_hints(sessions: list[Session], context: HarnessContext) -> None:
@@ -1104,9 +1118,18 @@ def dedupe_sessions(sessions: Iterable[Session]) -> list[Session]:
     return list(unique.values())
 
 
-def load_sessions(use_cache: bool = True, state: UserState | None = None) -> list[Session]:
+def load_sessions(
+    use_cache: bool = True,
+    state: UserState | None = None,
+    config: LaunchConfig | None = None,
+) -> list[Session]:
     clear_warnings()
-    context = HarnessContext.create(use_cache=use_cache)
+    commands = (
+        {name: tuple(config.provider_command(name)) for name in REGISTRY.names()}
+        if config is not None
+        else None
+    )
+    context = HarnessContext.create(use_cache=use_cache, provider_commands=commands)
     sessions: list[Session] = []
     for adapter in REGISTRY.adapters():
         discover = adapter.discover
@@ -2402,7 +2425,11 @@ class Browser:
                 previous = self.selected_id()
                 self.message = "Refreshing…"
                 self.draw()
-                self.sessions = load_sessions(use_cache=self.use_cache, state=self.state)
+                self.sessions = load_sessions(
+                    use_cache=self.use_cache,
+                    state=self.state,
+                    config=self.launch_config,
+                )
                 self.message = "; ".join(load_warnings())
                 self.keep_selection(previous)
             elif key == "\x06" or (not self.searching and key == "/"):  # Ctrl-F or /
@@ -2814,7 +2841,11 @@ def main(argv: list[str] | None = None) -> int:
         return 0
     if args.launch_mode:
         launch_config.mode = args.launch_mode
-    sessions = load_sessions(use_cache=not args.no_cache, state=state)
+    sessions = load_sessions(
+        use_cache=not args.no_cache,
+        state=state,
+        config=launch_config,
+    )
     for note in load_warnings():
         print(f"sessions: {note}", file=sys.stderr)
 

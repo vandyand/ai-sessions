@@ -17,6 +17,7 @@ from ai_sessions.app import (
     reconcile_evidence,
     session_from_native,
 )
+from ai_sessions.capabilities import Unsupported
 from ai_sessions.discovery import (
     MAX_EVIDENCE_IDS,
     MAX_EXISTENCE_PROBES_PER_PASS,
@@ -26,6 +27,8 @@ from ai_sessions.discovery import (
 from ai_sessions.harnesses import claude as claude_harness
 from ai_sessions.model import NativeRef, NativeSession, SourceKind
 from ai_sessions.registry import REGISTRY
+
+LARGE_EVIDENCE_BYTES = 1_048_576
 
 
 class EvidenceAccumulatorTests(unittest.TestCase):
@@ -42,6 +45,24 @@ class EvidenceAccumulatorTests(unittest.TestCase):
         self.assertEqual(evidence.tokens[-1], "x4095")
         self.assertTrue(evidence.truncated)
 
+    def test_contiguous_chunks_preserve_ids_that_cross_a_boundary(self) -> None:
+        token = b"id-12345"
+        evidence = EvidenceAccumulator((re.compile(rb"id-[0-9]{5}"),), max_bytes=100)
+        evidence.scan_contiguous(b"prefix id-12", reset=True)
+        evidence.scan_contiguous(b"345 suffix", final=True)
+        self.assertEqual(evidence.tokens, [token.decode()])
+        self.assertEqual(evidence.bytes_scanned, len(b"prefix id-12345 suffix"))
+        self.assertFalse(evidence.truncated)
+
+    def test_contiguous_scan_waits_for_right_boundary_before_accepting_an_id(self) -> None:
+        candidate = b"ses_" + b"A" * 26
+        evidence = EvidenceAccumulator(
+            (re.compile(rb"(?<![0-9A-Za-z])ses_[0-9A-Za-z]{26}(?![0-9A-Za-z])"),)
+        )
+        evidence.scan_contiguous(candidate, reset=True)
+        evidence.scan_contiguous(b"MOREALPHANUMERIC", final=True)
+        self.assertEqual(evidence.tokens, [])
+
     def test_pattern_signature_changes_with_registry_generation(self) -> None:
         before = HarnessContext.create().pattern_signature
         base = REGISTRY.get("codex")
@@ -51,6 +72,20 @@ class EvidenceAccumulatorTests(unittest.TestCase):
         after = HarnessContext.create().pattern_signature
         self.assertNotEqual(during, before)
         self.assertEqual(after, before)
+
+    def test_provider_commands_reject_bare_strings_and_invalid_elements(self) -> None:
+        invalid = (
+            {"opencode": "opencode"},
+            {"opencode": ()},
+            {"opencode": ("opencode", "")},
+            {"": ("opencode",)},
+        )
+        for commands in invalid:
+            with (
+                self.subTest(commands=commands),
+                self.assertRaisesRegex(ValueError, "provider command"),
+            ):
+                HarnessContext.create(provider_commands=commands)  # type: ignore[arg-type]
 
     def test_cache_signature_change_rescans_historical_bytes(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -264,6 +299,14 @@ class GenericDiscoveryTests(unittest.TestCase):
             (project / f"{claude_id}.jsonl").write_text(
                 json.dumps(
                     {
+                        "type": "assistant",
+                        "sessionId": claude_id,
+                        "message": {"content": "x" * (LARGE_EVIDENCE_BYTES + 1)},
+                    }
+                )
+                + "\n"
+                + json.dumps(
+                    {
                         "type": "user",
                         "sessionId": claude_id,
                         "cwd": "/project",
@@ -288,6 +331,13 @@ class GenericDiscoveryTests(unittest.TestCase):
             with (
                 REGISTRY.temporary(replace(REGISTRY.get("claude"), home=claude_home)),
                 REGISTRY.temporary(replace(REGISTRY.get("codex"), home=codex_home)),
+                REGISTRY.temporary(
+                    replace(
+                        REGISTRY.get("opencode"),
+                        home=root / "opencode",
+                        discover=Unsupported("isolated discovery test"),
+                    )
+                ),
             ):
                 rows = load_sessions(use_cache=False)
         by_tool = {row.tool: row for row in rows}
@@ -609,6 +659,12 @@ class GenericDiscoveryTests(unittest.TestCase):
         with (
             REGISTRY.temporary(codex),
             REGISTRY.temporary(claude),
+            REGISTRY.temporary(
+                replace(
+                    REGISTRY.get("opencode"),
+                    discover=Unsupported("isolated discovery test"),
+                )
+            ),
             patch("ai_sessions.app.detect_open_sessions"),
         ):
             rows = load_sessions(use_cache=False)

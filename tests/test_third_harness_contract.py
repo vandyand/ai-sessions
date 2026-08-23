@@ -40,17 +40,27 @@ from ai_sessions.registry import REGISTRY
 
 
 @contextmanager
-def isolated_registry(root: Path, fixture: HarnessAdapter):
+def isolated_registry(
+    root: Path,
+    fixture: HarnessAdapter,
+    *,
+    preserve_discovery: frozenset[str] = frozenset(),
+):
     """Keep conversion hooks real while suppressing discovery of user sessions."""
     with ExitStack() as stack:
-        for name in ("codex", "claude"):
+        for name in REGISTRY.names():
             adapter = REGISTRY.get(name)
+            discovery = (
+                adapter.discover
+                if name in preserve_discovery
+                else Unsupported("isolated contract test")
+            )
             stack.enter_context(
                 REGISTRY.temporary(
                     replace(
                         adapter,
                         home=root / name,
-                        discover=Unsupported("isolated contract test"),
+                        discover=discovery,
                         inspect_liveness=Unsupported("isolated contract test"),
                     )
                 )
@@ -176,30 +186,14 @@ class ThirdHarnessContractTests(unittest.TestCase):
         self.assertNotIn("fixture", Browser._pair_layout())
 
     def test_overlapping_native_id_is_not_misattributed_between_discovered_harnesses(self) -> None:
-        with ExitStack() as stack:
-            codex = REGISTRY.get("codex")
-            stack.enter_context(
-                REGISTRY.temporary(
-                    replace(
-                        codex,
-                        home=self.root / "codex",
-                        discover=Unsupported("isolated contract test"),
-                        inspect_liveness=Unsupported("isolated contract test"),
-                    )
-                )
-            )
+        with isolated_registry(
+            self.root,
+            self.fixture,
+            preserve_discovery=frozenset(("claude",)),
+        ):
             claude_home = self.root / "claude"
             claude = REGISTRY.get("claude")
-            stack.enter_context(
-                REGISTRY.temporary(
-                    replace(
-                        claude,
-                        home=claude_home,
-                        inspect_liveness=Unsupported("isolated contract test"),
-                    )
-                )
-            )
-            stack.enter_context(REGISTRY.temporary(self.fixture))
+            self.assertEqual(claude.home, claude_home)
             shared_id, fixture_path = self.write_fixture(
                 Turn("user", "fixture's own id is metadata")
             )

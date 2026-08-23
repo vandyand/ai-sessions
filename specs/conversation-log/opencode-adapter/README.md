@@ -1,6 +1,6 @@
 ---
 title: "OpenCode Native Harness Adapter"
-status: planned
+status: in-progress
 date: 2026-08-23
 priority: 40
 ---
@@ -83,7 +83,8 @@ an opaque, JSON-serializable semantic checkpoint before the OpenCode adapter is 
 - [x] Revision-5 verdict *(REVISE: HIGH=0, MEDIUM=1; revert semantics added from source)*
 - [x] Final Opus 5 plan verdict *(GO: HIGH=0, MEDIUM=0)*
 - [x] Storage-neutral cursor/reference refinement *(273-test Windows/WSL gate; final Opus 5 GO)*
-- [ ] OpenCode discovery/read/write/resume/rename/liveness adapter
+- [x] OpenCode authoritative storage and discovery *(11 reviews; final GO: HIGH=0, MEDIUM=0)*
+- [ ] OpenCode read/write/resume/rename/liveness adapter
 - [ ] Six-direction and real-CLI validation
 - [ ] Final Opus 5 reviews, documentation, PR/CI, and completion audit
 
