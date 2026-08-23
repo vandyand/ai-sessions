@@ -1,7 +1,7 @@
 # Round-trip heads
 
 Status: complete on `conversation-log/round-trip-heads` (`7520b47`, hardened by
-`014b3ff`).
+`014b3ff` and `aef9129`).
 
 This phase prevents Codex → Claude → Codex from returning to the original Codex ancestor.
 It introduces utility-owned conversation identity and follows the newest native
