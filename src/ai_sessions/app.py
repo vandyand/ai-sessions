@@ -42,6 +42,10 @@ from .conversion import (
 from .conversion import append_jsonl as append_jsonl
 from .diagnostics import clear_warnings, record_warning
 from .diagnostics import warnings as load_warnings
+from .discovery import clean_prompt as clean_prompt
+from .discovery import normalize_space as normalize_space
+from .discovery import prompt_text as prompt_text
+from .discovery import timestamp as timestamp
 from .model import Session, SourceKind
 from .paths import (
     CACHE_FILE,
@@ -794,60 +798,6 @@ def rename_session(state: UserState, item: Session, name: str) -> str:
     )
     state.set_name(item, value)
     return note
-
-
-def normalize_space(value: Any) -> str:
-    if not isinstance(value, str):
-        return ""
-    return re.sub(r"\s+", " ", value).strip()
-
-
-def clean_prompt(value: Any) -> str:
-    """Turn a first prompt or generated title into a useful one-line label."""
-    text = normalize_space(value)
-    if not text:
-        return ""
-    # Codex sessions often prefix the actual request with machine context.
-    text = re.sub(r"<environment_context>.*?</environment_context>", " ", text, flags=re.I | re.S)
-    text = re.sub(
-        r"<permissions instructions>.*?</permissions instructions>", " ", text, flags=re.I | re.S
-    )
-    text = normalize_space(text)
-    for prefix in ("<user>", "Human:", "User:"):
-        if text.startswith(prefix):
-            text = text[len(prefix) :].lstrip()
-    return text
-
-
-def prompt_text(message: Any) -> str:
-    if isinstance(message, str):
-        return message
-    if not isinstance(message, dict):
-        return ""
-    content = message.get("content", "")
-    if isinstance(content, str):
-        return content
-    if isinstance(content, list):
-        parts: list[str] = []
-        for block in content:
-            if isinstance(block, dict) and block.get("type") in ("text", "input_text"):
-                value = block.get("text", "")
-                if isinstance(value, str):
-                    parts.append(value)
-        return " ".join(parts)
-    return ""
-
-
-def timestamp(value: Any) -> float:
-    if isinstance(value, (int, float)):
-        result = float(value)
-        return result / 1000 if result > 100_000_000_000 else result
-    if isinstance(value, str) and value:
-        try:
-            return dt.datetime.fromisoformat(value.replace("Z", "+00:00")).timestamp()
-        except ValueError:
-            return 0.0
-    return 0.0
 
 
 def strip_extended_prefix(value: str) -> str:
