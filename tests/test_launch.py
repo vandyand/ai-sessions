@@ -201,6 +201,25 @@ class CustomModeNoticeTests(unittest.TestCase):
             launch(session("codex"), LaunchConfig(), dry_run=True)
         self.assertEqual(errors.getvalue(), "")
 
+    def test_third_harness_notice_names_the_keyed_profile(self) -> None:
+        base = REGISTRY.get("codex")
+        fake = replace(
+            base,
+            name="other",
+            label="Other",
+            short_label="Other",
+            default_command=("other-cli",),
+            resume_args=lambda **values: ["continue-thread", values["session_id"]],
+        )
+        errors = io.StringIO()
+        with (
+            REGISTRY.temporary(fake),
+            redirect_stdout(io.StringIO()),
+            redirect_stderr(errors),
+        ):
+            launch(session("other"), LaunchConfig(mode="custom"), dry_run=True)
+        self.assertIn("[launch.providers.other] custom_args", errors.getvalue())
+
 
 if __name__ == "__main__":
     unittest.main()

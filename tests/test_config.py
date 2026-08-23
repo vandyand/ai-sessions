@@ -208,6 +208,33 @@ custom_args = ["--future"]
         self.assertIn('codex_command = ["codex-custom"]', saved)
         self.assertIn("[launch.providers.future]", saved)
 
+    def test_incomplete_and_extended_unknown_profiles_survive_rewrite(self) -> None:
+        with TemporaryDirectory() as directory:
+            path = Path(directory) / "config.toml"
+            path.write_text(
+                """version = 3
+[launch]
+[launch.providers.only_custom]
+custom_args = ["--only"]
+[launch.providers.extended]
+command = ["extended"]
+custom_args = []
+env_passthrough = true
+metadata = { owner = "future", levels = [1, 2] }
+""",
+                encoding="utf-8",
+            )
+            loaded = LaunchConfig.load(path)
+            loaded.save()
+            reloaded = LaunchConfig.load(path)
+            saved = path.read_text(encoding="utf-8")
+        self.assertIsNone(reloaded.providers["only_custom"].command)
+        self.assertEqual(reloaded.providers["only_custom"].custom_args, ["--only"])
+        self.assertTrue(reloaded.providers["extended"].extra["env_passthrough"])
+        self.assertEqual(reloaded.providers["extended"].extra["metadata"]["levels"], [1, 2])
+        self.assertIn("[launch.providers.only_custom]", saved)
+        self.assertIn("env_passthrough = true", saved)
+
 
 if __name__ == "__main__":
     unittest.main()

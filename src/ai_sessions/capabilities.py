@@ -101,6 +101,8 @@ class HarnessAdapter:
             isinstance(pattern.pattern, bytes) for pattern in self.id_patterns
         ):
             raise ValueError("harness id_patterns must contain compiled byte patterns")
+        if not isinstance(self.budget, BudgetPolicy):
+            raise ValueError("harness budget must be a BudgetPolicy")
         required = (self.read, self.write, self.locate, self.change_status)
         optional = (self.discover, self.resume_args, self.publish_name, self.inspect_liveness)
         if not all(callable(hook) or isinstance(hook, Unsupported) for hook in required + optional):

@@ -9,6 +9,7 @@ from __future__ import annotations
 import os
 import tomllib
 from dataclasses import dataclass, field
+from datetime import date, datetime, time
 from pathlib import Path
 from typing import Any
 
@@ -21,8 +22,9 @@ LAUNCH_MODES = ("safe", "dangerous", "custom")
 
 @dataclass(slots=True)
 class ProviderProfile:
-    command: list[str]
+    command: list[str] | None = None
     custom_args: list[str] = field(default_factory=list)
+    extra: dict[str, Any] = field(default_factory=dict)
 
 
 @dataclass(slots=True)
@@ -73,12 +75,16 @@ class LaunchConfig:
         provider_tables = launch.get("providers", {})
         if schema >= 3 and isinstance(provider_tables, dict):
             for name, profile in provider_tables.items():
-                if not isinstance(name, str) or not isinstance(profile, dict):
+                if not isinstance(name, str) or not name or not isinstance(profile, dict):
                     continue
                 command = _optional_string_list(profile.get("command"))
                 custom_args = _optional_string_list(profile.get("custom_args"))
+                extra = dict(profile)
                 if command is not None:
-                    result.providers[name] = ProviderProfile(command, custom_args or [])
+                    extra.pop("command", None)
+                if custom_args is not None:
+                    extra.pop("custom_args", None)
+                result.providers[name] = ProviderProfile(command, custom_args or [], extra)
         bridge = payload.get("bridge", {})
         if isinstance(bridge, dict):
             max_tokens = bridge.get("max_tokens")
@@ -136,7 +142,8 @@ class LaunchConfig:
             return ProviderProfile(list(self.codex_command), list(self.custom_codex_args))
         if provider in self.providers:
             profile = self.providers[provider]
-            return ProviderProfile(list(profile.command), list(profile.custom_args))
+            command = list(profile.command) if profile.command is not None else None
+            return ProviderProfile(command, list(profile.custom_args), dict(profile.extra))
         try:
             adapter = REGISTRY.get(provider)
         except KeyError:
@@ -149,7 +156,7 @@ class LaunchConfig:
         except KeyError:
             raise ValueError(f"unknown harness: {provider}") from None
         profile = self._profile(provider)
-        result = list(profile.command)
+        result = list(profile.command or adapter.default_command)
         if self.mode == "dangerous":
             result.extend(adapter.dangerous_args)
         elif self.mode == "custom":
@@ -175,11 +182,12 @@ class LaunchConfig:
         provider_tables = ""
         for name in sorted(self.providers):
             profile = self.providers[name]
-            provider_tables += (
-                f"\n[launch.providers.{_toml_key(name)}]\n"
-                f"command = {_toml_array(profile.command)}\n"
-                f"custom_args = {_toml_array(profile.custom_args)}\n"
-            )
+            provider_tables += f"\n[launch.providers.{_toml_key(name)}]\n"
+            if profile.command is not None:
+                provider_tables += f"command = {_toml_array(profile.command)}\n"
+            provider_tables += f"custom_args = {_toml_array(profile.custom_args)}\n"
+            for key, value in profile.extra.items():
+                provider_tables += f"{_toml_key(key)} = {_toml_value(value)}\n"
         version = 3 if self.providers else 2
         provider_separator = "\n" if provider_tables else ""
         return (
@@ -228,3 +236,22 @@ def _toml_array(values: list[str]) -> str:
 
 def _toml_key(value: str) -> str:
     return value if value.replace("_", "").replace("-", "").isalnum() else _toml_string(value)
+
+
+def _toml_value(value: Any) -> str:
+    if isinstance(value, str):
+        return _toml_string(value)
+    if isinstance(value, bool):
+        return str(value).lower()
+    if isinstance(value, (int, float)) and not isinstance(value, bool):
+        return repr(value)
+    if isinstance(value, (datetime, date, time)):
+        return value.isoformat()
+    if isinstance(value, list):
+        return "[" + ", ".join(_toml_value(item) for item in value) + "]"
+    if isinstance(value, dict):
+        fields = ", ".join(
+            f"{_toml_key(str(key))} = {_toml_value(item)}" for key, item in value.items()
+        )
+        return "{" + fields + "}"
+    return _toml_string(str(value))

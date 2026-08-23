@@ -389,8 +389,14 @@ class UserState:
             if Path(str(member.get("storage", ""))).is_file()
         ]
         maximum = max((int(member.get("generation", 0)) for _, member in all_members), default=0)
+        changes = {key: self._member_change_status(member) for key, member in members}
+        known_members = [
+            pair for pair in members if changes[pair[0]] not in ("unknown", "unsupported")
+        ]
         current = [
-            (key, member) for key, member in members if int(member.get("generation", 0)) == maximum
+            (key, member)
+            for key, member in known_members
+            if int(member.get("generation", 0)) == maximum
         ]
         current_frontiers = {str(member.get("frontier", "")) for _, member in current}
         unavailable = [
@@ -418,8 +424,13 @@ class UserState:
                 "unstable": [],
                 "unknown": [],
             }
-        changes = {key: self._member_change_status(member) for key, member in members}
-        unknown = [pair for pair in members if changes[pair[0]] in ("unknown", "unsupported")]
+        unknown = [
+            pair
+            for pair in members
+            if changes[pair[0]] in ("unknown", "unsupported")
+            and int(pair[1].get("generation", 0)) == maximum
+            and str(pair[1].get("frontier", "")) not in current_frontiers
+        ]
         if unknown:
             return {
                 "conflict": False,
@@ -429,7 +440,7 @@ class UserState:
                 "unstable": [],
                 "unknown": unknown,
             }
-        unstable = [pair for pair in members if changes[pair[0]] == "unstable"]
+        unstable = [pair for pair in known_members if changes[pair[0]] == "unstable"]
         if unstable:
             return {
                 "conflict": False,
@@ -439,7 +450,7 @@ class UserState:
                 "unstable": unstable,
                 "unknown": [],
             }
-        advanced = [(key, member) for key, member in members if changes[key] == "changed"]
+        advanced = [(key, member) for key, member in known_members if changes[key] == "changed"]
         if not advanced:
             return {
                 "conflict": False,
@@ -2940,7 +2951,11 @@ def custom_mode_notice(config: LaunchConfig, provider: str | None = None) -> str
     """Explain why custom launch mode is adding nothing to the provider command."""
     if provider is not None:
         provider_label = tool_label(provider)
-        setting = f"launch.custom.{provider}_args"
+        setting = (
+            f"launch.custom.{provider}_args"
+            if provider in ("claude", "codex")
+            else f"[launch.providers.{provider}] custom_args"
+        )
         return (
             f"sessions: custom launch mode has no arguments configured for {provider_label}, "
             f"so it starts with provider defaults; set {setting} in {config.path}"

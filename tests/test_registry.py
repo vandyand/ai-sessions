@@ -43,6 +43,7 @@ class RegistryTests(unittest.TestCase):
             {"id_patterns": ()},
             {"read": "not callable"},
             {"change_status": Unsupported("")},
+            {"budget": None},
         )
         for mutation in mutations:
             with self.subTest(mutation=mutation), self.assertRaises(ValueError):
@@ -175,6 +176,40 @@ class RegistryTests(unittest.TestCase):
             self.assertIn("future", reloaded.bridges["codex:known"])
             self.assertEqual(reloaded.launch_tools["codex:known"], "future")
             self.assertIn("future:future-1", reloaded.conversations["conversation"]["members"])
+
+    def test_older_unknown_member_does_not_veto_newer_known_head(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            unknown_path = root / "future.jsonl"
+            known_path = root / "codex.jsonl"
+            unknown_path.write_text("{}\n", encoding="utf-8")
+            known_path.write_text("{}\n", encoding="utf-8")
+            state = UserState(root / "missing-state.json")
+            state.conversations = {
+                "conversation": {
+                    "members": {
+                        "future:old": {
+                            "tool": "future",
+                            "session_id": "old",
+                            "storage": str(unknown_path),
+                            "generation": 1,
+                            "frontier": "old",
+                            "cursor": 0,
+                        },
+                        "codex:new": {
+                            "tool": "codex",
+                            "session_id": "new",
+                            "storage": str(known_path),
+                            "generation": 5,
+                            "frontier": "new",
+                            "cursor": 0,
+                        },
+                    }
+                }
+            }
+            status = state._conversation_status("conversation")
+        self.assertEqual(status["unknown"], [])
+        self.assertEqual(status["heads"][0][0], "codex:new")
 
     def test_source_kind_is_string_json_serializable(self) -> None:
         self.assertEqual(SourceKind.NON_INTERACTIVE, "non-interactive")
