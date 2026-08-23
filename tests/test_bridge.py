@@ -924,6 +924,25 @@ class LaunchIntegrationTests(unittest.TestCase):
 
             self.assertEqual(bridge.conversation_change_status("codex", path, cursor), "unstable")
 
+    def test_transient_unstable_snapshot_is_retried_without_metadata_change(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "codex.jsonl"
+            path.write_text(codex_line("user", "Earlier") + "\n", encoding="utf-8")
+            outcomes = iter(("unstable", "unchanged"))
+            entry = HARNESSES["codex"]
+            retrying = bridge.Harness(
+                name=entry.name,
+                label=entry.label,
+                read=entry.read,
+                write=entry.write,
+                locate=entry.locate,
+                change_status=lambda *_: next(outcomes),
+            )
+
+            with patch.dict(HARNESSES, {"codex": retrying}):
+                self.assertEqual(bridge.conversation_change_status("codex", path, 0), "unstable")
+                self.assertEqual(bridge.conversation_change_status("codex", path, 0), "unchanged")
+
     def test_retry_after_partial_tail_uses_the_last_complete_cursor(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             source = session(directory, launch_tool="claude")

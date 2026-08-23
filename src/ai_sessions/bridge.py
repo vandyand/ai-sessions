@@ -1040,7 +1040,17 @@ def _snapshot_change_status(
 ) -> str:
     """Classify one immutable file snapshot once per process."""
     del device, inode, size, mtime_ns
-    return harness(tool).change_status(Path(storage), offset)
+    status = harness(tool).change_status(Path(storage), offset)
+    if status == "unstable":
+        # lru_cache does not retain exceptions. A sharing violation or other
+        # transient read failure must be retried even if file metadata did not
+        # change while access was unavailable.
+        raise _UnstableSnapshot
+    return status
+
+
+class _UnstableSnapshot(RuntimeError):
+    """Internal signal that a snapshot must not enter the status cache."""
 
 
 def conversation_change_status(tool: str, storage: str | Path, offset: int) -> str:
@@ -1052,15 +1062,18 @@ def conversation_change_status(tool: str, storage: str | Path, offset: int) -> s
         stat = path.stat()
     except OSError:
         return "unstable"
-    return _snapshot_change_status(
-        tool,
-        str(path),
-        offset,
-        stat.st_dev,
-        stat.st_ino,
-        stat.st_size,
-        stat.st_mtime_ns,
-    )
+    try:
+        return _snapshot_change_status(
+            tool,
+            str(path),
+            offset,
+            stat.st_dev,
+            stat.st_ino,
+            stat.st_size,
+            stat.st_mtime_ns,
+        )
+    except _UnstableSnapshot:
+        return "unstable"
 
 
 def conversation_changed_since(tool: str, storage: str | Path, offset: int) -> bool:
