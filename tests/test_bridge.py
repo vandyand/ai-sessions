@@ -381,6 +381,16 @@ class ShapingTests(unittest.TestCase):
         self.assertGreaterEqual(len(above.turns), len(below.turns))
         self.assertLessEqual(above.dropped, below.dropped)
 
+    def test_tail_pricing_uses_the_truncated_head_cost(self) -> None:
+        turns = [
+            Turn("user", "a" * 1_000),
+            Turn("assistant", "m" * 10),
+            Turn("user", "b" * 50),
+        ]
+        selected = select_messages(turns, 202)
+        self.assertEqual(selected.turns[1:], turns[1:])
+        self.assertEqual((selected.dropped, selected.truncated), (0, 1))
+
     def test_bridge_floor_and_note_reserve_bound_maximal_metadata(self) -> None:
         with self.assertRaises(BridgeError):
             resolve_budget("claude", max_chars=MIN_BRIDGE_CHARS - 1)
@@ -391,7 +401,7 @@ class ShapingTests(unittest.TestCase):
                 budget.chars - HANDOFF_NOTE_RESERVE_CHARS,
             )
             self.assertLessEqual(selection_cost(selected.turns), maximum - 4_096)
-        hostile = '\\"\n\t\x00' * 2_000
+        hostile = '界\\"\n\t\x00' * 2_000
         note = handoff_note(
             source_tool="codex",
             target_tool="claude",
@@ -539,6 +549,7 @@ class ShapingTests(unittest.TestCase):
             (10_000, 1.1, 2.0, "source"),
             (10_000, 0.75, 0.0, "source"),
             (10_000, 0.75, 2.0, ""),
+            (2_000, 1.0, 2.0, "too small"),
         )
         for values in invalid:
             with self.subTest(values=values), self.assertRaises(ValueError):

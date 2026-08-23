@@ -765,12 +765,12 @@ def select_messages(
     # worst-case two-character anchor join. If both independent caps grew at once, their
     # combined cost could grow by two when the budget grew by one, making
     # selection non-monotone at the truncated/full boundary.
-    newest_share = max_chars - 2 - metric.item_cost(head)
+    head_cost = metric.item_cost(head)
+    newest_share = max_chars - 2 - head_cost
     newest, newest_truncated = _capped(turns[-1], newest_share, metric)
     suffix_reversed = [newest]
     suffix_first = newest
     suffix_cost = metric.item_cost(newest)
-    head_cost = metric.item_cost(head)
     for index in range(len(turns) - 2, 0, -1):
         turn = turns[index]
         item = metric.item_cost(turn)
@@ -840,6 +840,7 @@ def handoff_note(
                     "conversation_id": conversation_id,
                     "source": {"harness": source_tool, "session_id": session_id},
                 },
+                ensure_ascii=False,
                 separators=(",", ":"),
             )
         )
