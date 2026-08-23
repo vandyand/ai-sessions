@@ -892,7 +892,7 @@ class LaunchIntegrationTests(unittest.TestCase):
                         bridge.conversation_change_status(tool, path, cursor), "unstable"
                     )
 
-    def test_changed_status_does_not_reparse_the_full_valid_tail(self) -> None:
+    def test_unchanged_snapshot_does_not_reparse_the_full_valid_tail(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             path = Path(directory) / "codex.jsonl"
             path.write_text(codex_line("user", "Earlier") + "\n", encoding="utf-8")
@@ -906,7 +906,23 @@ class LaunchIntegrationTests(unittest.TestCase):
                 self.assertEqual(
                     bridge.conversation_change_status("codex", path, cursor), "changed"
                 )
-            self.assertEqual(loads.call_count, 1)
+                parsed = loads.call_count
+                self.assertEqual(
+                    bridge.conversation_change_status("codex", path, cursor), "changed"
+                )
+            self.assertGreater(parsed, 1)
+            self.assertEqual(loads.call_count, parsed)
+
+    def test_malformed_newline_terminated_record_after_work_is_unstable(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "codex.jsonl"
+            path.write_text(codex_line("user", "Earlier") + "\n", encoding="utf-8")
+            cursor = path.stat().st_size
+            with path.open("a", encoding="utf-8") as handle:
+                handle.write(codex_line("user", "Changed") + "\n")
+                handle.write('{"type":"malformed"\n')
+
+            self.assertEqual(bridge.conversation_change_status("codex", path, cursor), "unstable")
 
     def test_retry_after_partial_tail_uses_the_last_complete_cursor(self) -> None:
         with tempfile.TemporaryDirectory() as directory:

@@ -24,6 +24,7 @@ part worth having, without inventing structure the target cannot honour.
 from __future__ import annotations
 
 import datetime as dt
+import functools
 import json
 import os
 import re
@@ -935,23 +936,9 @@ def _records_after(path: Path, offset: int) -> Iterator[dict[str, Any]]:
         yield {"type": "ai_sessions_missing"}
 
 
-def _jsonl_tail_complete(path: Path, offset: int) -> bool:
-    """Whether the append-only file currently ends on a record boundary."""
-    try:
-        size = path.stat().st_size
-        if offset < 0 or size < offset:
-            return False
-        if size == 0:
-            return True
-        with path.open("rb") as handle:
-            handle.seek(-1, os.SEEK_END)
-            return handle.read(1) == b"\n"
-    except OSError:
-        return False
-
-
 def _codex_change_status(path: Path, offset: int) -> str:
     """Classify Codex activity after ``offset`` without trusting unstable tails."""
+    changed = False
     for record in _records_after(path, offset):
         if record.get("type") in (
             "ai_sessions_replaced",
@@ -966,19 +953,20 @@ def _codex_change_status(path: Path, offset: int) -> str:
             continue
         kind = payload.get("type")
         if kind == "message" and payload.get("role") in ("user", "assistant"):
-            return "changed" if _jsonl_tail_complete(path, offset) else "unstable"
+            changed = True
         if kind in (
             "function_call",
             "custom_tool_call",
             "function_call_output",
             "custom_tool_call_output",
         ):
-            return "changed" if _jsonl_tail_complete(path, offset) else "unstable"
-    return "unchanged" if _jsonl_tail_complete(path, offset) else "unstable"
+            changed = True
+    return "changed" if changed else "unchanged"
 
 
 def _claude_change_status(path: Path, offset: int) -> str:
     """Classify Claude activity after ``offset`` while ignoring metadata."""
+    changed = False
     for record in _records_after(path, offset):
         if record.get("type") in (
             "ai_sessions_replaced",
@@ -990,8 +978,8 @@ def _claude_change_status(path: Path, offset: int) -> str:
             continue
         message = record.get("message")
         if isinstance(message, dict) and message.get("content") not in (None, "", []):
-            return "changed" if _jsonl_tail_complete(path, offset) else "unstable"
-    return "unchanged" if _jsonl_tail_complete(path, offset) else "unstable"
+            changed = True
+    return "changed" if changed else "unchanged"
 
 
 HARNESSES: dict[str, Harness] = {
@@ -1040,12 +1028,39 @@ def native_session_exists(tool: str, session_id: str) -> bool:
         return False
 
 
+@functools.lru_cache(maxsize=2048)
+def _snapshot_change_status(
+    tool: str,
+    storage: str,
+    offset: int,
+    device: int,
+    inode: int,
+    size: int,
+    mtime_ns: int,
+) -> str:
+    """Classify one immutable file snapshot once per process."""
+    del device, inode, size, mtime_ns
+    return harness(tool).change_status(Path(storage), offset)
+
+
 def conversation_change_status(tool: str, storage: str | Path, offset: int) -> str:
     """Return ``unchanged``, ``changed``, or ``unstable`` after a frontier."""
     path = Path(storage)
     if not storage or not path.is_file():
         return "unstable"
-    return harness(tool).change_status(path, offset)
+    try:
+        stat = path.stat()
+    except OSError:
+        return "unstable"
+    return _snapshot_change_status(
+        tool,
+        str(path),
+        offset,
+        stat.st_dev,
+        stat.st_ino,
+        stat.st_size,
+        stat.st_mtime_ns,
+    )
 
 
 def conversation_changed_since(tool: str, storage: str | Path, offset: int) -> bool:
