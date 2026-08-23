@@ -93,7 +93,7 @@ never routing authority.
 
 ### P3 — Target-aware token budget and whole-message selection
 
-Replace the single global character ceiling with an explicit token-denominated policy owned by the target harness. Keep the source reader's newest carried window plus live tail unchanged, flatten tool summaries without merging same-role messages, then select at source-message boundaries. A conversation that fits remains byte-identical; on overflow, bounded anchor truncation may reserve room for both the first selected-context message and the newest message.
+Replace the single global character ceiling with an explicit token-denominated policy owned by the target harness. Keep the source reader's newest carried window plus live tail unchanged, flatten tool summaries without merging same-role messages, then select at source-message boundaries. A conversation that fits remains byte-identical; on overflow, both the first selected-context message and newest message are capped marker-inclusive to reserved shares before intervening messages are dropped whole.
 
 Do **not** merge older `replacement_history` windows. The newest replacement history is the context Codex itself resumes from; merging earlier windows could resurrect superseded instructions and create a transcript no harness ever held.
 

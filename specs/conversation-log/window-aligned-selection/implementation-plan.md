@@ -30,30 +30,33 @@ Direct `python -` against the working tree. Each phase states the expression and
 
 ### Phase 0 findings
 
-- `o200k_base` across prose, Python, JSON, diffs, paths/UUIDs, tool output, and Unicode measured 2.387 minimum, 2.572 p10, 3.788 median, and 6.996 maximum chars/token. Policy uses **2.5**.
+- `tiktoken==0.13.0` `o200k_base` across prose, Python, JSON, diffs, paths/UUIDs, tool output, Unicode, dense CJK, base64, Git hashes, and minified JSON measured 1.143 minimum, 2.696 median, and 6.996 maximum chars/token. Policy rounds the minimum down to **1.0** and discloses that Claude uses it as a proxy.
 - `usable_fraction = 0.75` is a declared safety factor, not a measurement of private harness state.
 - Claude policy uses a 200,000-token unknown-model baseline; Codex uses the smaller 258,400-token context recorded by supported rollouts. Current flagship model limits are larger, but the bridge cannot know the model selected at resume time.
-- Defaults: Claude **150,000 estimated tokens / 375,000 characters**; Codex **193,800 / 484,500**.
-- A saved legacy `max_chars` remains verbatim. A truly unset config intentionally adopts the smaller target default and the handoff/release documentation says so.
+- Defaults: Claude **150,000 estimated tokens / 150,000 characters**; Codex **193,800 / 193,800**.
+- Config schema 1 auto-wrote `max_chars = 950000`; that exact ambiguous machine default migrates to unset. Other positive schema-1 values remain verbatim, and schema 2 treats all positive values as explicit. Over-policy legacy values are reported in both notes.
 
 ---
 
 ## Phase 1: One resolved target budget (Part A)
 
-- [ ] Add immutable `BudgetPolicy` and `Budget`; put one policy on every `Harness` and extend the registry self-consistency test (T3/T10)
+- [ ] Add validated immutable `BudgetPolicy` and `Budget`; put one policy on every `Harness` and extend registry tests to require `context_tokens > 0`, `0 < usable_fraction <= 1`, `chars_per_token > 0`, and non-empty provenance (T3/T10)
+- [ ] Give Codex budget policy its own declared `CODEX_BUDGET_CONTEXT_TOKENS` constant and provenance; never reuse writer-only `CODEX_CONTEXT_WINDOW`, even while values coincide
 - [ ] Make `bridge_max_tokens` and `bridge_max_chars` independently optional so unset differs from explicit legacy configuration (T2/T2b)
-- [ ] Implement one pure resolver: positive `max_tokens` wins and is clamped to a documented 4,096-token minimum; otherwise positive `max_chars` is kept verbatim; otherwise use target policy. Invalid/bool/non-positive values are unset. No resolved budget is non-positive
-- [ ] `LaunchConfig.as_toml()` writes `max_tokens` when set, otherwise preserves an explicitly loaded `max_chars`, and writes neither for a target-default config; never write both
+- [ ] Implement one pure resolver: positive `max_tokens` wins and is clamped to `max(4096, ceil(MIN_BRIDGE_CHARS / chars_per_token))`; otherwise positive `max_chars` is kept verbatim; otherwise use target policy. Invalid/bool/non-positive values are unset. No resolved budget is non-positive
+- [ ] Bump saved config schema to 2. On schema 1 only, migrate exact `max_chars = 950000` to unset; preserve other positive values. `as_toml()` writes `max_tokens` when set, otherwise an explicit `max_chars`, and neither for target default; never write both
 - [ ] Add load → save → load tests that preserve the effective budget and do not resurrect `max_chars`
 - [ ] Replace `prepare_launch(max_chars=...)` and `bridge(max_chars=...)` with the resolved `Budget`; remove the `or DEFAULT_MAX_CHARS` fallback so there is one path
-- [ ] Render the handoff note from the same `Budget` object selection used; report origin, estimated tokens, character ceiling, and intentional target default (T6)
+- [ ] Render the handoff note and returned launch notice from the same `Budget`; report origin, estimate/ceiling, clamping, and any legacy value above target policy with migration guidance (T6)
+- [ ] Remove `fit`'s non-positive-means-unlimited sentinel. Invalid `Budget`/policy construction and non-positive selection limits raise rather than replay everything
 - [ ] Document `max_tokens`, precedence, legacy preservation, and default migration in the repo README
 
 **Verification**
 
 ```python
 # missing config resolves differently for Claude and Codex at documented defaults
-# max_chars=950000 resolves to exactly 950000 chars for both targets
+# schema-1 max_chars=950000 migrates to target default; schema-2 950000 stays exact
+# a different legacy max_chars stays exact and warns when it exceeds Claude policy
 # max_tokens resolves through the target policy and wins if both keys exist
 # load(max_tokens only) -> save -> load preserves the same Budget and never adds max_chars
 # the note is rendered from the applied Budget, including a deliberately clamped case
@@ -65,12 +68,14 @@ Direct `python -` against the working tree. Each phase states the expression and
 
 - [ ] Split preparation into `flatten(turns)` → selection → `merge_runs(survivors)` so source messages remain the selection/counting unit (T4/T9)
 - [ ] If the complete flattened conversation fits, return it byte-identical with zero drops; only the overflow path applies the half-budget anchor cap (T4/K9)
-- [ ] On overflow keep the first message of selected source context and a contiguous newest tail in source order. Cap an anchor, marker included, only as needed to reserve room for both ends
+- [ ] On overflow cap **both** anchors — first selected-context message and newest message — marker-inclusive to their reserved shares before the tail loop. Keep both even for `[short, oversized-newest]`; drop only intervening messages whole while preserving a contiguous newest tail
 - [ ] Count dropped pre-merge source messages exactly; summarised tool-call count comes only from surviving messages
-- [ ] Include the exact rendered note and merge separators in total projected-payload cost. Bound displayed title/cwd fields, then use a monotone fixed-point/reservation loop so selection can only shrink until payload fits; raise `BridgeError` when an explicit legacy character ceiling cannot hold the required note (T6/K8)
-- [ ] Give the selector a `cost: Callable[[Turn], int]` seam for P4 without adding provenance or native projection in P3 (T10)
-- [ ] Add property-style cases for membership/truncation shape, order, head/tail, fit-through, exact count, monotonicity, determinism, empty/single/all-oversized inputs, and consecutive same-role runs
-- [ ] Add an end-to-end test beginning at `LaunchConfig.load`, using the production launch budget path through the target writer, and assert the written projected payload plus note is within the applied ceiling (T7)
+- [ ] Bound displayed title/cwd fields and reserve `HANDOFF_NOTE_RESERVE_CHARS = 4096`; assert the rendered note plus assembly separator fits the reserve. Require a legacy character floor of `reserve + 2 × (len(marker) + 1)` and test floor−1/floor/floor+1 (T6/K8)
+- [ ] Give the selector a `cost: Callable[[Sequence[Turn]], int]` seam denominated in `Budget.chars`, so adjacency/assembly cost can change in P4 without rewriting selection (T10)
+- [ ] Replace the handoff claim "opening request" with "first message of the selected source context"
+- [ ] Add property-style cases for membership/truncation shape, order, head/tail, fit-through, exact count, monotonicity, determinism, empty/single/all-oversized inputs, `[short, oversized-newest]`, and consecutive same-role runs
+- [ ] Add an end-to-end test beginning at `LaunchConfig.load` and calling `launch(session, config, dry_run=True, state=...)`; assert the target writer's projected payload plus note is within the applied ceiling without spawning a CLI (T7)
+- [ ] On one ~170,000-character generated transcript with unset config, assert Claude drops messages while Codex keeps them; this kills any hidden `DEFAULT_MAX_CHARS` selector path
 
 **Verification**
 
@@ -115,6 +120,20 @@ Direct `python -` against the working tree. Each phase states the expression and
 - [x] Move selection before `merge_runs` and count real source messages
 - [x] Correct fit-through, note-cost, note-honesty, adapter-policy, unknown-model, verification, compaction wording, production-call-path, content-variance, and P4-seam findings
 - [ ] Re-run Opus 5 against the revised plan and require no HIGH or MEDIUM findings before Phase 1 implementation
+
+### Phase 3c — Opus 5 second review
+
+**Verdict: NOT CLEAN — HIGH=2 MEDIUM=6.** Claude Opus 5 (`claude-opus-5`, max effort) reviewed `183c6b8` read-only on 2026-08-23. Full local artifact: `C:\Users\vandy\.claude\plans\perform-the-second-adversarial-glimmering-iverson.md`.
+
+- [x] Cap and retain an oversized newest anchor before the tail loop
+- [x] Migrate the exact schema-1 machine-written 950,000 default; surface other over-policy legacy values
+- [x] Add dense corpus classes, pin measurement version, govern on minimum, and disclose Claude proxy status
+- [x] Separate Codex budget policy from writer metadata
+- [x] Remove non-positive unlimited behavior and validate policy ranges
+- [x] Define note reserve and legacy character floor
+- [x] Change the P4 seam to sequence-cost and name its unit
+- [x] Name `launch(..., dry_run=True)` and restore the cross-target kept-count differential
+- [ ] Re-run Opus 5 and require no HIGH or MEDIUM findings before Phase 1 implementation
 
 ---
 

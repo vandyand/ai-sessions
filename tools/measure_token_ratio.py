@@ -11,6 +11,8 @@ import json
 import statistics
 import textwrap
 import uuid
+from base64 import b64encode
+from hashlib import sha1
 
 try:
     import tiktoken
@@ -74,6 +76,19 @@ def corpus() -> dict[str, str]:
         )
         * 180,
         "unicode": "Claude → Codex → OpenCode — résumé naïve 東京 🧪⚙️ “quoted” café\n" * 300,
+        "dense_cjk": "漢字東京京都大阪技術開発人工知能会話履歴継続検証" * 600,
+        "base64": b64encode(bytes(range(256)) * 80).decode("ascii"),
+        "git_hashes": "\n".join(
+            sha1(str(index).encode("ascii"), usedforsecurity=False).hexdigest()
+            for index in range(800)
+        ),
+        "minified_json": json.dumps(
+            [
+                {"sha": f"{index:040x}", "ok": index % 2 == 0, "values": list(range(12))}
+                for index in range(240)
+            ],
+            separators=(",", ":"),
+        ),
     }
 
 
@@ -88,10 +103,9 @@ def main() -> None:
             f"{name:12} chars={len(sample):7} tokens={tokens:7} "
             f"chars/token={ratio:.3f}"
         )
-    p10 = statistics.quantiles(ratios, n=10, method="inclusive")[0]
     print(
-        f"min={min(ratios):.3f} p10={p10:.3f} "
-        f"median={statistics.median(ratios):.3f} max={max(ratios):.3f}"
+        f"min={min(ratios):.3f} median={statistics.median(ratios):.3f} "
+        f"max={max(ratios):.3f} tiktoken={tiktoken.__version__} encoding=o200k_base"
     )
 
 

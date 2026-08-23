@@ -95,11 +95,14 @@ Adding a third harness is complete when its adapter passes shared contract fixtu
 - rename/liveness capabilities when declared; and
 - concurrent append safety and explicit divergence.
 
-Shared budget fixtures additionally require every adapter policy to be positive and sourced,
+Shared budget fixtures additionally require `context_tokens > 0`,
+`0 < usable_fraction <= 1`, `chars_per_token > 0`, and non-empty provenance,
 an unset configuration to resolve through that policy, and the same explicit legacy
 `max_chars` value to remain identical across all targets. Selection accepts a cost callback so
-the full conversation-log phase can account for native-versus-projected forms without
-rewriting the selection algorithm.
+the full conversation-log phase can account for native-versus-projected forms and assembly
+overhead without rewriting the selection algorithm. That callback prices a complete candidate
+sequence in the applied budget's character unit; a per-message callback is insufficient because
+same-role merge separators depend on adjacency.
 
 ## Persistence and recovery
 
