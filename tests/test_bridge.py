@@ -11,7 +11,6 @@ from ai_sessions.app import (
     Session,
     UserState,
     command_for,
-    conversation_status,
     list_output,
     load_claude_sessions,
     prepare_launch,
@@ -710,7 +709,7 @@ class LaunchIntegrationTests(unittest.TestCase):
             self.assertNotEqual(second.launch_target("claude"), first.launch_target("claude"))
             self.assertIn("Copied", note)
 
-    def test_an_append_during_bridge_remains_unconsumed(self) -> None:
+    def test_an_append_during_bridge_aborts_before_writing_a_copy(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             source = session(directory, launch_tool="claude")
             source_path = Path(source.storage)
@@ -730,19 +729,11 @@ class LaunchIntegrationTests(unittest.TestCase):
                 patch.object(bridge, "CLAUDE_HOME", Path(directory) / "claude"),
                 patch.object(bridge, "read_transcript", side_effect=append_while_reading),
             ):
-                prepared, _ = prepare_launch(source, state=state)
+                with self.assertRaisesRegex(BridgeError, "changed or became incomplete"):
+                    prepare_launch(source, state=state)
 
-            conversation_id = state.conversation_id_for(source)
-            source_member = state.conversations[conversation_id]["members"][source.key]
-            self.assertEqual(source_member["cursor"], cursor_before_bridge)
-            self.assertGreater(source_path.stat().st_size, source_member["cursor"])
-
-            copy = self.claude_copy(
-                source, prepared, state.bridges[source.key]["claude"]["storage"]
-            )
-            state.apply([source, copy])
-            self.assertEqual(conversation_status(source), "current")
-            self.assertEqual(conversation_status(copy), "superseded")
+            self.assertGreater(source_path.stat().st_size, cursor_before_bridge)
+            self.assertFalse((Path(directory) / "claude").exists())
 
     def test_codex_to_claude_work_to_codex_follows_the_newest_head(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -876,6 +867,13 @@ class LaunchIntegrationTests(unittest.TestCase):
                 handle.write(b'{"type":"response_item","payload":')
 
             self.assertTrue(bridge.conversation_changed_since("codex", path, cursor))
+            self.assertEqual(bridge.conversation_change_status("codex", path, cursor), "unstable")
+
+            source.launch_tool = "claude"
+            state = UserState(path=Path(directory) / "state.json")
+            with patch.object(bridge, "CLAUDE_HOME", Path(directory) / "claude"):
+                with self.assertRaisesRegex(BridgeError, "changed or became incomplete"):
+                    prepare_launch(source, state=state)
 
     def test_renaming_a_copy_does_not_advance_the_conversation(self) -> None:
         with tempfile.TemporaryDirectory() as directory:

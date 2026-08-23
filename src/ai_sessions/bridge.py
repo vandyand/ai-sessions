@@ -145,7 +145,7 @@ class Harness:
     read: Callable[..., Transcript]
     write: Callable[..., tuple[str, Path]]
     locate: Callable[[str], bool]
-    changed_since: Callable[[Path, int], bool]
+    change_status: Callable[[Path, int], str]
 
 
 def append_jsonl(path: Path, payload: dict[str, Any]) -> None:
@@ -935,15 +935,15 @@ def _records_after(path: Path, offset: int) -> Iterator[dict[str, Any]]:
         yield {"type": "ai_sessions_missing"}
 
 
-def _codex_changed_since(path: Path, offset: int) -> bool:
-    """Whether Codex appended model-visible conversation after ``offset``."""
+def _codex_change_status(path: Path, offset: int) -> str:
+    """Classify Codex activity after ``offset`` without trusting unstable tails."""
     for record in _records_after(path, offset):
         if record.get("type") in (
             "ai_sessions_replaced",
             "ai_sessions_missing",
             "ai_sessions_incomplete",
         ):
-            return True
+            return "unstable"
         if record.get("type") != "response_item":
             continue
         payload = record.get("payload")
@@ -951,32 +951,32 @@ def _codex_changed_since(path: Path, offset: int) -> bool:
             continue
         kind = payload.get("type")
         if kind == "message" and payload.get("role") in ("user", "assistant"):
-            return True
+            return "changed"
         if kind in (
             "function_call",
             "custom_tool_call",
             "function_call_output",
             "custom_tool_call_output",
         ):
-            return True
-    return False
+            return "changed"
+    return "unchanged"
 
 
-def _claude_changed_since(path: Path, offset: int) -> bool:
-    """Whether Claude appended a real turn, ignoring title and metadata records."""
+def _claude_change_status(path: Path, offset: int) -> str:
+    """Classify Claude activity after ``offset`` while ignoring metadata."""
     for record in _records_after(path, offset):
         if record.get("type") in (
             "ai_sessions_replaced",
             "ai_sessions_missing",
             "ai_sessions_incomplete",
         ):
-            return True
+            return "unstable"
         if record.get("type") not in ("user", "assistant") or record.get("isMeta"):
             continue
         message = record.get("message")
         if isinstance(message, dict) and message.get("content") not in (None, "", []):
-            return True
-    return False
+            return "changed"
+    return "unchanged"
 
 
 HARNESSES: dict[str, Harness] = {
@@ -986,7 +986,7 @@ HARNESSES: dict[str, Harness] = {
         read=read_codex,
         write=write_codex_session,
         locate=_codex_exists,
-        changed_since=_codex_changed_since,
+        change_status=_codex_change_status,
     ),
     "claude": Harness(
         name="claude",
@@ -994,7 +994,7 @@ HARNESSES: dict[str, Harness] = {
         read=read_claude,
         write=write_claude_session,
         locate=_claude_exists,
-        changed_since=_claude_changed_since,
+        change_status=_claude_change_status,
     ),
 }
 BRIDGE_TOOLS = tuple(HARNESSES)
@@ -1025,12 +1025,17 @@ def native_session_exists(tool: str, session_id: str) -> bool:
         return False
 
 
-def conversation_changed_since(tool: str, storage: str | Path, offset: int) -> bool:
-    """Whether a native transcript advanced beyond a materialized frontier."""
+def conversation_change_status(tool: str, storage: str | Path, offset: int) -> str:
+    """Return ``unchanged``, ``changed``, or ``unstable`` after a frontier."""
     path = Path(storage)
     if not storage or not path.is_file():
-        return True
-    return harness(tool).changed_since(path, offset)
+        return "unstable"
+    return harness(tool).change_status(path, offset)
+
+
+def conversation_changed_since(tool: str, storage: str | Path, offset: int) -> bool:
+    """Compatibility predicate for callers that do not need instability detail."""
+    return conversation_change_status(tool, storage, offset) != "unchanged"
 
 
 def bridged_title(title: str, source_tool: str) -> str:
@@ -1092,6 +1097,12 @@ def bridge(
     source = read_transcript(
         source_tool, storage, tool_calls=tool_calls, latest_window=latest_window
     )
+    change_status = conversation_change_status(source_tool, storage, source_cursor)
+    if change_status != "unchanged":
+        raise BridgeError(
+            "the source transcript changed or became incomplete while it was being read; "
+            "wait for the current write to finish and retry"
+        )
     turns = source.turns
     if not turns:
         raise BridgeError("the source transcript holds no conversation to carry over")

@@ -38,12 +38,12 @@ name, label
 read(path, options) -> Transcript
 write(cwd, turns, title) -> (native_id, path)
 locate(native_id) -> bool
-changed_since(path, byte_cursor) -> bool
+change_status(path, byte_cursor) -> unchanged | changed | unstable
 ```
 
 `read` projects native records into the shared `Turn` model. `write` must produce a truly
 resumable native transcript, including any separate records needed for both model context
-and visible scrollback. `changed_since` recognizes conversation/tool activity and ignores
+and visible scrollback. `change_status` recognizes conversation/tool activity and ignores
 metadata-only appends such as renames. Missing, replaced, truncated, or partially written
 append-only storage counts as changed so the core fails conservatively. If the newest
 generation is unavailable and no equivalent native member survives, launch refuses to
@@ -64,7 +64,7 @@ order:
 3. `publish_name(session, title) -> PublishResult` — append the provider-supported name.
 4. `inspect_liveness(sessions) -> Mapping[id, NativeProcess]` — identify open sessions.
 5. `focus(process) -> FocusResult` — optional platform capability, never required to resume.
-6. The existing `read`, `write`, `locate`, and `changed_since` conversion operations.
+6. The existing `read`, `write`, `locate`, and `change_status` conversion operations.
 
 Capabilities should be explicit (`rename`, `focus`, `subagents`, `compaction`, and so on)
 rather than detected with `if tool == ...` in core code. Provider-specific caches and

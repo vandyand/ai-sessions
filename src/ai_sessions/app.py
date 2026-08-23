@@ -34,7 +34,7 @@ from .bridge import (
     BridgeError,
     append_jsonl,
     bridge,
-    conversation_changed_since,
+    conversation_change_status,
     native_session_exists,
 )
 from .config import LAUNCH_MODES, LaunchConfig
@@ -350,10 +350,13 @@ class UserState:
         return self._ensure_conversation(item)[0]
 
     def _member_changed(self, member: dict[str, Any]) -> bool:
+        return self._member_change_status(member) != "unchanged"
+
+    def _member_change_status(self, member: dict[str, Any]) -> str:
         cursor = member.get("cursor")
         if not isinstance(cursor, int):
-            return True
-        return conversation_changed_since(
+            return "unstable"
+        return conversation_change_status(
             str(member.get("tool", "")), str(member.get("storage", "")), cursor
         )
 
@@ -383,25 +386,55 @@ class UserState:
                 "heads": current,
                 "advanced": [],
                 "unavailable": unavailable,
+                "unstable": [],
             }
         if not members:
-            return {"conflict": False, "heads": [], "advanced": [], "unavailable": []}
-        advanced = [(key, member) for key, member in members if self._member_changed(member)]
+            return {
+                "conflict": False,
+                "heads": [],
+                "advanced": [],
+                "unavailable": [],
+                "unstable": [],
+            }
+        changes = {key: self._member_change_status(member) for key, member in members}
+        unstable = [pair for pair in members if changes[pair[0]] == "unstable"]
+        if unstable:
+            return {
+                "conflict": False,
+                "heads": current,
+                "advanced": [],
+                "unavailable": [],
+                "unstable": unstable,
+            }
+        advanced = [(key, member) for key, member in members if changes[key] == "changed"]
         if not advanced:
-            return {"conflict": False, "heads": current, "advanced": [], "unavailable": []}
+            return {
+                "conflict": False,
+                "heads": current,
+                "advanced": [],
+                "unavailable": [],
+                "unstable": [],
+            }
         if len(advanced) == 1 and int(advanced[0][1].get("generation", 0)) == maximum:
             return {
                 "conflict": False,
                 "heads": advanced,
                 "advanced": advanced,
                 "unavailable": [],
+                "unstable": [],
             }
         # Two members changed independently, or an older materialization moved
         # after a newer frontier existed. Either is a fork, never a timestamp race.
         heads = list(advanced)
         advanced_keys = {key for key, _ in advanced}
         heads.extend((key, member) for key, member in current if key not in advanced_keys)
-        return {"conflict": True, "heads": heads, "advanced": advanced, "unavailable": []}
+        return {
+            "conflict": True,
+            "heads": heads,
+            "advanced": advanced,
+            "unavailable": [],
+            "unstable": [],
+        }
 
     def _session_for_member(self, member: dict[str, Any], template: Session) -> Session:
         key = self._member_key(str(member["tool"]), str(member["session_id"]))
@@ -433,6 +466,12 @@ class UserState:
         if not conversation_id:
             return item, item if item.tool == target_tool else None, ""
         status = self._conversation_status(conversation_id)
+        if status["unstable"]:
+            labels = ", ".join(key for key, _ in status["unstable"])
+            raise BridgeError(
+                f"conversation {conversation_id[:8]} has incomplete or unstable transcript "
+                f"data ({labels}); wait for the current write to finish and retry"
+            )
         if status["unavailable"]:
             labels = ", ".join(key for key, _ in status["unavailable"])
             raise BridgeError(
