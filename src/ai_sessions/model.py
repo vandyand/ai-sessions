@@ -5,8 +5,15 @@ from __future__ import annotations
 import math
 from dataclasses import dataclass, field
 from enum import StrEnum
-from pathlib import Path
 from typing import Callable
+
+Checkpoint = int | str
+
+
+def is_checkpoint(value: object) -> bool:
+    """Whether a value is an opaque, JSON-safe native checkpoint."""
+    return not isinstance(value, bool) and isinstance(value, (int, str))
+
 
 LEGACY_DEFAULT_MAX_CHARS = 950_000
 DEFAULT_MAX_CHARS = LEGACY_DEFAULT_MAX_CHARS
@@ -21,6 +28,26 @@ class SourceKind(StrEnum):
     NON_INTERACTIVE = "non-interactive"
     SUBAGENT = "subagent"
     SDK = "sdk"
+
+
+class Availability(StrEnum):
+    AVAILABLE = "available"
+    UNAVAILABLE = "unavailable"
+    UNKNOWN = "unknown"
+
+
+@dataclass(frozen=True, slots=True)
+class NativeRef:
+    """One native session in its adapter-owned storage."""
+
+    session_id: str
+    storage: str
+
+    def __post_init__(self) -> None:
+        if not self.session_id:
+            raise ValueError("native session id must not be empty")
+        if not self.storage:
+            raise ValueError("native session storage must not be empty")
 
 
 @dataclass(frozen=True, slots=True)
@@ -93,15 +120,24 @@ class SelectionMetric:
 @dataclass(frozen=True, slots=True)
 class BridgeResult:
     tool: str
-    session_id: str
-    path: Path
+    native: NativeRef
     turns: int
     written_turns: int
     calls: int
     dropped: int
     truncated: int
-    source_cursor: int
+    source_checkpoint: Checkpoint
+    target_checkpoint: Checkpoint | None
     budget: Budget
+    notices: tuple[str, ...] = ()
+
+    @property
+    def session_id(self) -> str:
+        return self.native.session_id
+
+    @property
+    def storage(self) -> str:
+        return self.native.storage
 
 
 @dataclass(frozen=True, slots=True)
@@ -111,6 +147,34 @@ class Transcript:
     carried_windows: int = 0
     sealed_summary: bool = False
     resumes_at_last_summary: bool = False
+
+
+@dataclass(frozen=True, slots=True)
+class ReadSnapshot:
+    transcript: Transcript
+    checkpoint: Checkpoint
+
+
+@dataclass(frozen=True, slots=True)
+class PreparedTarget:
+    command: tuple[str, ...]
+    budget_policy: BudgetPolicy
+    writer_options: tuple[tuple[str, str], ...] = ()
+    notices: tuple[str, ...] = ()
+
+    def __post_init__(self) -> None:
+        if not self.command or not all(isinstance(item, str) and item for item in self.command):
+            raise ValueError("prepared target command must contain non-empty strings")
+
+    def option(self, name: str, default: str = "") -> str:
+        return next((value for key, value in self.writer_options if key == name), default)
+
+
+@dataclass(frozen=True, slots=True)
+class NativeWrite:
+    native: NativeRef
+    checkpoint: Checkpoint | None
+    notices: tuple[str, ...] = ()
 
 
 @dataclass(slots=True)

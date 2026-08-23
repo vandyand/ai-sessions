@@ -24,7 +24,7 @@ from ai_sessions.discovery import (
     HarnessContext,
 )
 from ai_sessions.harnesses import claude as claude_harness
-from ai_sessions.model import NativeSession, SourceKind
+from ai_sessions.model import NativeRef, NativeSession, SourceKind
 from ai_sessions.registry import REGISTRY
 
 
@@ -336,7 +336,7 @@ class GenericDiscoveryTests(unittest.TestCase):
             base,
             name="native",
             id_patterns=(re.compile(rb"native-[0-9]+"),),
-            locate=lambda token: calls.append(token) or False,
+            resolve=lambda token: calls.append(token) or None,
         )
         publisher = Session("claude", "publisher", "", "", 0, 0, "", False, "source")
         context = HarnessContext.create()
@@ -358,7 +358,10 @@ class GenericDiscoveryTests(unittest.TestCase):
             base,
             name="native",
             id_patterns=(re.compile(rb"native-[0-9]+"),),
-            locate=lambda token: calls.append(token) or token == "native-0",
+            resolve=lambda token: (
+                calls.append(token)
+                or (NativeRef(token, "native-store") if token == "native-0" else None)
+            ),
         )
         first = Session("claude", "first", "", "", 0, 0, "", False, "first")
         second = Session("claude", "second", "", "", 0, 0, "", False, "second")
@@ -385,7 +388,7 @@ class GenericDiscoveryTests(unittest.TestCase):
             base,
             name="native",
             id_patterns=(re.compile(rb"native-[0-9]+"),),
-            locate=lambda token: calls.append(token) or False,
+            resolve=lambda token: calls.append(token) or None,
         )
         older = Session("claude", "aaa", "", "", 1, 0, "", False, "older")
         newer = Session("claude", "zzz", "", "", 2, 0, "", False, "newer")
@@ -402,7 +405,10 @@ class GenericDiscoveryTests(unittest.TestCase):
     def test_overlapping_publisher_pattern_does_not_suppress_native_probe(self) -> None:
         token = "019f59af-e300-7bd1-be75-e47599b5b593"
         calls: list[str] = []
-        codex = replace(REGISTRY.get("codex"), locate=lambda value: calls.append(value) or True)
+        codex = replace(
+            REGISTRY.get("codex"),
+            resolve=lambda value: calls.append(value) or NativeRef(value, "native-store"),
+        )
         publisher = Session("claude", "publisher", "", "", 0, 0, "", False, "source")
         context = HarnessContext.create()
         context.evidence[("claude", "publisher")] = ([token], False)

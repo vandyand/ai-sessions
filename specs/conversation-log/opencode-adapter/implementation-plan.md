@@ -2,49 +2,49 @@
 
 ## Phase 0: Characterize and generalize native identity
 
-- [ ] Add tests proving the current JSONL reference/cursor behavior before changing signatures.
-- [ ] Add immutable `NativeRef(session_id, storage)`, opaque JSON-safe `Checkpoint = int | str`,
+- [x] Add tests proving the current JSONL reference/cursor behavior before changing signatures.
+- [x] Add immutable `NativeRef(session_id, storage)`, opaque JSON-safe `Checkpoint = int | str`,
   `ReadSnapshot(transcript, checkpoint)`, tri-state `Availability`, and
   `NativeWrite(ref, checkpoint | None, notices)`
   to the neutral model. Core must never compare, order, increment, subtract, or test checkpoint
   truthiness. `BridgeResult` exposes `native` and `source_checkpoint`; remove `.path` and
   `.source_cursor` so every call site must migrate.
-- [ ] Split adapter hooks deliberately: `read_snapshot(ref, latest_window)` atomically returns
+- [x] Split adapter hooks deliberately: `read_snapshot(ref, latest_window)` atomically returns
   content plus its checkpoint; `checkpoint(ref)` polls current semantic state; `resolve(id)` may
   search native stores; `availability(ref)` checks only that exact store and returns
   available/unavailable/unknown; `change_status(ref, checkpoint)` compares within the adapter.
   Writers return `NativeWrite` and accept a configured command argv. Required hooks remain explicit
   `Unsupported` where absent.
-- [ ] Adapt Claude, Codex, and the independent fixture with no behavior change: complete JSONL
+- [x] Adapt Claude, Codex, and the independent fixture with no behavior change: complete JSONL
   byte cursor, exact transcript path, and existing semantic-tail classifiers.
-- [ ] Replace every core `Path(storage).is_file()` authority decision with exact adapter
+- [x] Replace every core `Path(storage).is_file()` authority decision with exact adapter
   `availability(ref)`. UNKNOWN (I/O, lock, schema, unavailable adapter) retains authority and blocks
   promotion; only proven UNAVAILABLE removes a candidate. Unknown preserved harnesses remain
   unknown and continue blocking unsafe promotion.
-- [ ] Change `read_transcript`, `conversation_change_status`, `bridge`, member creation/status,
+- [x] Change `read_transcript`, `conversation_change_status`, `bridge`, member creation/status,
   migration, bridge reuse, and target recording to carry `NativeRef` and opaque checkpoints. Delete
   the generic file-stat status cache; adapters may cache only successfully validated snapshots with
   adapter-correct tokens, and never cache unknown/unstable results.
-- [ ] Keep utility state schema 6 for rollback. Preserve legacy integer `cursor` for existing JSONL
+- [x] Keep utility state schema 6 for rollback. Preserve legacy integer `cursor` for existing JSONL
   members; add an unknown-to-old-code `checkpoint` member field for new writes (int or string).
   New code prefers `checkpoint` and falls back to legacy `cursor`; rollback code preserves the
   unknown field and treats OpenCode's missing/non-integer legacy cursor as unstable.
-- [ ] Add `LaunchConfig.provider_command(provider)` as the single configured/default argv source;
+- [x] Add `LaunchConfig.provider_command(provider)` as the single configured/default argv source;
   define `provider_prefix` only as that command plus launch-mode flags. Thread only
   `provider_command` to writers, resolve executables with `shutil.which`/Windows `PATHEXT`, execute
   with `shell=False`, and structurally forbid maintenance code from calling `provider_prefix`.
   Preserve schema-2 Claude/Codex fields and schema-3 unknown profiles exactly.
-- [ ] Add optional adapter `prepare_target(command, cwd)` returning a neutral
+- [x] Add optional adapter `prepare_target(command, cwd)` returning a neutral
   `PreparedTarget(budget_policy, writer_options, notices)`. `prepare_launch` invokes it before
   `resolve_budget`; `bridge()` reuses the same immutable result for selection and write. Existing
   adapters return their static policy with empty options. OpenCode carries the exact selected model
   and authoritative command/DB evidence so selection and import cannot disagree.
   A direct `bridge()` without a prepared target invokes the hook exactly once using the adapter's
   default command; it never silently falls back to a different static policy/model.
-- [ ] Add a minimal shared mutable-storage fixture in Phase 0: two IDs in one store with exact
+- [x] Add a minimal shared mutable-storage fixture in Phase 0: two IDs in one store with exact
   availability, edit/delete, independent semantic checkpoints, and atomic read snapshots. Run
   bridge/head/state/cache behavior against it before any OpenCode adapter code.
-- [ ] Before choosing the member layout, run the previous merged build against a schema-6 state
+- [x] Before choosing the member layout, run the previous merged build against a schema-6 state
   fixture containing an unknown OpenCode member. Prove it preserves the new `checkpoint` field,
   offers no unavailable-adapter resume, attempts no JSONL read of the DB, and blocks promotion. Let
   observed rollback behavior—not an assertion—decide whether legacy `cursor` is absent or sentinel.
@@ -72,6 +72,21 @@
 12. A maintenance writer calls `provider_prefix` and receives dangerous/custom launch flags.
 13. An unverified committed write records an expected checkpoint and a later partial/mismatched
     import is misclassified as unchanged.
+
+### Phase 0 validation
+
+- The shared WAL fixture proves exact `(session id, store)` identity, row deletion, same-ID rows in
+  another store, unrelated-session isolation, in-place edits, one-transaction content/checkpoint
+  capture, head routing, opaque checkpoint persistence, and no duplicate creation on UNKNOWN.
+- The previous merged build (`3485239`) was run in a detached temporary worktree against a schema-6
+  state containing a newer unknown OpenCode member. Observed result: checkpoint preserved, legacy
+  cursor absent, OpenCode not offered, zero JSONL reads of the database, and promotion blocked.
+- Claude Opus 5 implementation reviews progressed `REVISE` → `REVISE` → `REVISE` → `GO`. Every
+  accepted HIGH/MEDIUM finding has a focused regression test; two proposed UNKNOWN fallbacks were
+  rejected because they contradicted the reviewed authority-preservation rule, and the final
+  reviewer accepted that disposition.
+- Final gate: 273 tests pass on native Windows (one Windows-only focus skip) and 273 on Ubuntu WSL;
+  Ruff 0.16.3 lint and format checks pass.
 
 ## Phase 1: OpenCode storage and discovery
 

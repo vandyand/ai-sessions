@@ -2,7 +2,6 @@
 
 from .conversion import *  # noqa: F403
 from .conversion import _Conversation as _Conversation
-from .conversion import _snapshot_change_status as _snapshot_change_status
 from .harnesses.claude import (
     claude_project_dir as claude_project_dir,
 )

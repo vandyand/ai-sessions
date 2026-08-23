@@ -8,25 +8,55 @@ from re import Pattern
 from typing import Any, Iterable, Mapping, Protocol
 
 from .liveness import LivenessContext
-from .model import BudgetPolicy, LivenessSession, NativeSession, SourceKind, Transcript, Turn
+from .model import (
+    Availability,
+    BudgetPolicy,
+    Checkpoint,
+    LivenessSession,
+    NativeRef,
+    NativeSession,
+    NativeWrite,
+    PreparedTarget,
+    ReadSnapshot,
+    SourceKind,
+    Turn,
+)
 
 
 class ReadHook(Protocol):
-    def __call__(self, path: Path, *, latest_window: bool = True) -> Transcript: ...
+    def __call__(self, ref: NativeRef, *, latest_window: bool = True) -> ReadSnapshot: ...
 
 
 class WriteHook(Protocol):
     def __call__(
-        self, *, cwd: str, turns: list[Turn], title: str = "", created: float | None = None
-    ) -> tuple[str, Path]: ...
+        self,
+        *,
+        cwd: str,
+        turns: list[Turn],
+        prepared: PreparedTarget,
+        title: str = "",
+        created: float | None = None,
+    ) -> NativeWrite: ...
 
 
-class LocateHook(Protocol):
-    def __call__(self, session_id: str) -> bool: ...
+class ResolveHook(Protocol):
+    def __call__(self, session_id: str) -> NativeRef | None: ...
+
+
+class AvailabilityHook(Protocol):
+    def __call__(self, ref: NativeRef) -> Availability: ...
+
+
+class CheckpointHook(Protocol):
+    def __call__(self, ref: NativeRef) -> Checkpoint: ...
 
 
 class ChangeStatusHook(Protocol):
-    def __call__(self, path: Path, offset: int) -> str: ...
+    def __call__(self, ref: NativeRef, checkpoint: Checkpoint) -> str: ...
+
+
+class PrepareTargetHook(Protocol):
+    def __call__(self, command: tuple[str, ...], cwd: str) -> PreparedTarget: ...
 
 
 class DiscoverHook(Protocol):
@@ -73,7 +103,9 @@ class HarnessAdapter:
     id_patterns: tuple[Pattern[bytes], ...]
     read: ReadHook | Unsupported
     write: WriteHook | Unsupported
-    locate: LocateHook | Unsupported
+    resolve: ResolveHook | Unsupported
+    availability: AvailabilityHook | Unsupported
+    checkpoint: CheckpointHook | Unsupported
     change_status: ChangeStatusHook | Unsupported
     budget: BudgetPolicy
     scratch_patterns: tuple[Pattern[str], ...] = ()
@@ -81,6 +113,9 @@ class HarnessAdapter:
     resume_args: ResumeArgsHook | Unsupported = Unsupported("resume is not installed")
     publish_name: PublishNameHook | Unsupported = Unsupported("rename is not supported")
     inspect_liveness: LivenessHook | Unsupported = Unsupported("liveness is not installed")
+    prepare_target: PrepareTargetHook | Unsupported = Unsupported(
+        "dynamic target preparation is not installed"
+    )
 
     def __post_init__(self) -> None:
         if not self.label.strip() or not self.short_label.strip():
@@ -117,8 +152,21 @@ class HarnessAdapter:
             raise ValueError("harness scratch_patterns must contain compiled text patterns")
         if not isinstance(self.budget, BudgetPolicy):
             raise ValueError("harness budget must be a BudgetPolicy")
-        required = (self.read, self.write, self.locate, self.change_status)
-        optional = (self.discover, self.resume_args, self.publish_name, self.inspect_liveness)
+        required = (
+            self.read,
+            self.write,
+            self.resolve,
+            self.availability,
+            self.checkpoint,
+            self.change_status,
+        )
+        optional = (
+            self.discover,
+            self.resume_args,
+            self.publish_name,
+            self.inspect_liveness,
+            self.prepare_target,
+        )
         if not all(callable(hook) or isinstance(hook, Unsupported) for hook in required + optional):
             raise ValueError("harness capabilities must be callable or Unsupported")
         for hook in required + optional:

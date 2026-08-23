@@ -53,6 +53,8 @@ from ai_sessions.bridge import (
 )
 from ai_sessions.capabilities import HarnessAdapter
 from ai_sessions.config import LaunchConfig
+from ai_sessions.harnesses import codex as codex_harness
+from ai_sessions.model import NativeRef
 from ai_sessions.registry import REGISTRY
 
 
@@ -60,6 +62,10 @@ from ai_sessions.registry import REGISTRY
 def harness_home(name: str, home: Path):
     with REGISTRY.temporary(replace(REGISTRY.get(name), home=home)):
         yield
+
+
+def native(path: str | Path, session_id: str = "test-session") -> NativeRef:
+    return NativeRef(session_id, str(path))
 
 
 def codex_line(role: str, text: str) -> str:
@@ -112,7 +118,7 @@ class ReadTurnsTests(unittest.TestCase):
                 encoding="utf-8",
             )
             self.assertEqual(
-                read_turns("codex", path),
+                read_turns("codex", native(path)),
                 [Turn("user", "Ship it"), Turn("assistant", "Shipped.")],
             )
 
@@ -151,7 +157,7 @@ class ReadTurnsTests(unittest.TestCase):
 
     def test_claude_transcript_keeps_tool_calls_and_drops_thinking(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
-            turns = read_turns("claude", self.claude_with_a_tool_call(directory))
+            turns = read_turns("claude", native(self.claude_with_a_tool_call(directory)))
             self.assertEqual([turn.role for turn in turns], ["user", "assistant", "assistant"])
             self.assertEqual(turns[0].text, "Find the bug")
             self.assertEqual(turns[1].text, "Looking now.")
@@ -163,12 +169,14 @@ class ReadTurnsTests(unittest.TestCase):
 
     def test_tool_calls_can_be_left_behind(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
-            turns = read_turns("claude", self.claude_with_a_tool_call(directory), tool_calls=False)
+            turns = read_turns(
+                "claude", native(self.claude_with_a_tool_call(directory)), tool_calls=False
+            )
             self.assertTrue(all(turn.calls == () for turn in turns))
 
     def test_prepare_renders_calls_into_the_turn_that_made_them(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
-            turns = prepare(read_turns("claude", self.claude_with_a_tool_call(directory)))
+            turns = prepare(read_turns("claude", native(self.claude_with_a_tool_call(directory))))
             self.assertEqual([turn.role for turn in turns], ["user", "assistant"])
             self.assertEqual(
                 turns[1].text,
@@ -216,7 +224,7 @@ class ReadTurnsTests(unittest.TestCase):
                 + "\n",
                 encoding="utf-8",
             )
-            turns = read_turns("codex", path)
+            turns = read_turns("codex", native(path))
             self.assertEqual(len(turns), 1)
             # Codex's fixed result preamble carries no information the rest of
             # the transcript does not already give.
@@ -246,7 +254,7 @@ class ReadTurnsTests(unittest.TestCase):
                 + "\n",
                 encoding="utf-8",
             )
-            turns = read_turns("codex", path)
+            turns = read_turns("codex", native(path))
             self.assertEqual(turns[0].role, "assistant")
             self.assertEqual(turns[0].text, "")
             self.assertEqual(turns[0].calls[0].name, "exec")
@@ -269,13 +277,13 @@ class ReadTurnsTests(unittest.TestCase):
                 encoding="utf-8",
             )
             self.assertEqual(
-                read_turns("claude", path),
+                read_turns("claude", native(path)),
                 [Turn("user", "Search the repo"), Turn("assistant", "Done.")],
             )
 
     def test_missing_transcript_is_reported(self) -> None:
         with self.assertRaises(BridgeError):
-            read_turns("codex", "")
+            read_turns("codex", NativeRef("missing", "missing.jsonl"))
 
 
 class ShapingTests(unittest.TestCase):
@@ -333,7 +341,9 @@ class ShapingTests(unittest.TestCase):
             scratch_patterns=base.scratch_patterns,
             read=base.read,
             write=base.write,
-            locate=base.locate,
+            resolve=base.resolve,
+            availability=base.availability,
+            checkpoint=base.checkpoint,
             change_status=base.change_status,
             budget=BudgetPolicy(10_000, 1.0, 2.5, "test ratio"),
         )
@@ -619,14 +629,14 @@ class CompactionTests(unittest.TestCase):
 
     def test_compaction_summaries_are_marked(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
-            turns = read_turns("claude", self.compacted_claude(directory))
+            turns = read_turns("claude", native(self.compacted_claude(directory)))
             self.assertEqual(
                 [turn.compaction for turn in turns], [False, False, True, False, True, False]
             )
 
     def test_only_the_newest_window_survives(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
-            turns = read_turns("claude", self.compacted_claude(directory))
+            turns = read_turns("claude", native(self.compacted_claude(directory)))
             kept, count = from_last_compaction(turns)
             self.assertEqual(count, 2)
             self.assertEqual([turn.text for turn in kept], ["summary two", "recent work"])
@@ -645,7 +655,7 @@ class CompactionTests(unittest.TestCase):
                     storage=str(self.compacted_claude(directory)),
                     cwd="/home/andrew",
                 )
-            body = result.path.read_text(encoding="utf-8")
+            body = Path(result.storage).read_text(encoding="utf-8")
             self.assertIn("ran out of context 2 time(s)", body)
             self.assertIn("summary two", body)
             self.assertNotIn("original request", body)
@@ -661,7 +671,7 @@ class CompactionTests(unittest.TestCase):
                     cwd="/home/andrew",
                     latest_window=False,
                 )
-            self.assertIn("original request", result.path.read_text(encoding="utf-8"))
+            self.assertIn("original request", Path(result.storage).read_text(encoding="utf-8"))
 
     def test_codex_compactions_are_counted_but_never_truncate(self) -> None:
         # Codex stores its summaries encrypted, so there is nothing to resume
@@ -688,7 +698,7 @@ class CompactionTests(unittest.TestCase):
                 + "\n",
                 encoding="utf-8",
             )
-            source = bridge.read_transcript("codex", path)
+            source = bridge.read_transcript("codex", native(path))
             self.assertEqual(source.opaque_compactions, 1)
             self.assertEqual(from_last_compaction(source.turns)[1], 0)
             with harness_home("claude", Path(directory) / "claude"):
@@ -699,7 +709,7 @@ class CompactionTests(unittest.TestCase):
                     storage=str(path),
                     cwd="/home/andrew",
                 )
-            body = result.path.read_text(encoding="utf-8")
+            body = Path(result.storage).read_text(encoding="utf-8")
             self.assertIn("original request", body)
             self.assertIn("stores those summaries encrypted", body)
 
@@ -714,12 +724,19 @@ class HarnessRegistryTests(unittest.TestCase):
             self.assertTrue(entry.budget.source)
         for entry in REGISTRY.adapters():
             self.assertTrue(entry.label)
-            for hook in (entry.read, entry.write, entry.locate, entry.change_status):
+            for hook in (
+                entry.read,
+                entry.write,
+                entry.resolve,
+                entry.availability,
+                entry.checkpoint,
+                entry.change_status,
+            ):
                 self.assertTrue(callable(hook))
 
     def test_an_unknown_harness_is_reported_rather_than_guessed(self) -> None:
         with self.assertRaises(BridgeError):
-            read_turns("opencode", __file__)
+            read_turns("opencode", native(__file__))
         self.assertFalse(bridge.native_session_exists("opencode", "whatever"))
 
     def test_codex_budget_floor_is_not_writer_context_metadata(self) -> None:
@@ -850,9 +867,10 @@ class BridgeTests(unittest.TestCase):
                 )
             self.assertEqual(result.tool, "claude")
             self.assertEqual(result.turns, 2)
-            self.assertTrue(result.path.is_file())
+            result_path = Path(result.storage)
+            self.assertTrue(result_path.is_file())
             records = [
-                json.loads(line) for line in result.path.read_text(encoding="utf-8").splitlines()
+                json.loads(line) for line in result_path.read_text(encoding="utf-8").splitlines()
             ]
             preamble = records[0]["message"]["content"]
             self.assertIn("[ai-sessions]", preamble)
@@ -876,7 +894,7 @@ class BridgeTests(unittest.TestCase):
                     title="whatever",
                 )
             self.assertEqual(source.read_bytes(), before)
-            self.assertNotEqual(result.path, source)
+            self.assertNotEqual(Path(result.storage), source)
 
     def test_explicit_token_budget_changes_written_payload_end_to_end(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -899,7 +917,7 @@ class BridgeTests(unittest.TestCase):
                     cwd=directory,
                     budget=budget,
                 )
-            written = read_turns("claude", result.path)
+            written = read_turns("claude", result.native)
         self.assertEqual((result.budget.tokens, result.budget.chars), (5_000, 10_000))
         self.assertGreater(result.dropped, 0)
         self.assertLessEqual(sum(len(turn.text) for turn in written), 10_000)
@@ -920,7 +938,7 @@ class BridgeTests(unittest.TestCase):
                     storage=str(source),
                     cwd=directory,
                 )
-            handoff = read_turns("claude", result.path)[0].text
+            handoff = read_turns("claude", result.native)[0].text
         self.assertEqual((result.turns, result.written_turns), (3, 1))
         self.assertIn("3 source message(s) below were assembled into 1 target message(s)", handoff)
 
@@ -1128,7 +1146,7 @@ class LaunchIntegrationTests(unittest.TestCase):
                 long_transcript=True,
             )
             target_path = Path(state.bridges[item.key]["claude"]["storage"])
-            written = read_turns("claude", target_path)
+            written = read_turns("claude", native(target_path))
         self.assertIn("claude --resume", stdout)
         self.assertLessEqual(sum(len(turn.text) for turn in written), 10_000)
         self.assertIn("older message(s) dropped to fit", stderr)
@@ -1143,7 +1161,7 @@ class LaunchIntegrationTests(unittest.TestCase):
                 long_transcript=True,
             )
             target_path = Path(state.bridges[item.key]["claude"]["storage"])
-            written = read_turns("claude", target_path)
+            written = read_turns("claude", native(target_path))
         self.assertNotIn("dropped to fit", stderr)
         self.assertIn("150,000 tokens / 300,000 projected characters", stderr)
         self.assertIn("replaces the previous global 950,000-character ceiling", stderr)
@@ -1175,7 +1193,7 @@ class LaunchIntegrationTests(unittest.TestCase):
             with self.subTest(origin=origin), tempfile.TemporaryDirectory() as directory:
                 item, state, _, stderr = self.loaded_dry_run(directory, config_text)
                 target_path = Path(state.bridges[item.key]["claude"]["storage"])
-                handoff = read_turns("claude", target_path)[0].text
+                handoff = read_turns("claude", native(target_path))[0].text
                 self.assertIn(f"({origin})", stderr)
                 self.assertIn(launch_explanation, stderr)
                 self.assertIn(f"({origin})", handoff)
@@ -1208,7 +1226,7 @@ class LaunchIntegrationTests(unittest.TestCase):
                     state=state,
                 )
             target = Path(state.bridges[item.key]["claude"]["storage"])
-            handoff = read_turns("claude", target)[0].text
+            handoff = read_turns("claude", native(target))[0].text
         self.assertEqual(code, 0)
         self.assertNotIn("dropped to fit", stderr.getvalue())
         self.assertIn("2 anchor message(s) truncated to fit", stderr.getvalue())
@@ -1227,7 +1245,7 @@ class LaunchIntegrationTests(unittest.TestCase):
                     item,
                     config=LaunchConfig(bridge_max_tokens=4_096),
                 )
-            handoff = read_turns("claude", prepared.storage)[0].text
+            handoff = read_turns("claude", native(prepared.storage, prepared.session_id))[0].text
         self.assertNotIn("dropped to fit", notice)
         self.assertIn("1 anchor message(s) truncated to fit", notice)
         self.assertIn("1 anchor message(s) were truncated", handoff)
@@ -1477,8 +1495,10 @@ class LaunchIntegrationTests(unittest.TestCase):
             with path.open("ab") as handle:
                 handle.write(b'{"type":"response_item","payload":')
 
-            self.assertTrue(bridge.conversation_changed_since("codex", path, cursor))
-            self.assertEqual(bridge.conversation_change_status("codex", path, cursor), "unstable")
+            self.assertTrue(bridge.conversation_changed_since("codex", native(path), cursor))
+            self.assertEqual(
+                bridge.conversation_change_status("codex", native(path), cursor), "unstable"
+            )
 
             source.launch_tool = "claude"
             state = UserState(path=Path(directory) / "state.json")
@@ -1500,7 +1520,7 @@ class LaunchIntegrationTests(unittest.TestCase):
                     with path.open("a", encoding="utf-8") as handle:
                         handle.write(complete + "\n" + '{"type":"unfinished"')
                     self.assertEqual(
-                        bridge.conversation_change_status(tool, path, cursor), "unstable"
+                        bridge.conversation_change_status(tool, native(path), cursor), "unstable"
                     )
 
     def test_unchanged_snapshot_does_not_reparse_the_full_valid_tail(self) -> None:
@@ -1515,14 +1535,78 @@ class LaunchIntegrationTests(unittest.TestCase):
 
             with patch.object(bridge.json, "loads", wraps=json.loads) as loads:
                 self.assertEqual(
-                    bridge.conversation_change_status("codex", path, cursor), "changed"
+                    bridge.conversation_change_status("codex", native(path), cursor), "changed"
                 )
                 parsed = loads.call_count
                 self.assertEqual(
-                    bridge.conversation_change_status("codex", path, cursor), "changed"
+                    bridge.conversation_change_status("codex", native(path), cursor), "changed"
                 )
             self.assertGreater(parsed, 1)
             self.assertEqual(loads.call_count, parsed)
+
+    def test_registry_generation_invalidates_jsonl_snapshot_cache(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "codex.jsonl"
+            path.write_text(codex_line("user", "Earlier") + "\n", encoding="utf-8")
+            cursor = path.stat().st_size
+            with path.open("a", encoding="utf-8") as handle:
+                handle.write(codex_line("user", "Changed") + "\n")
+            ref = native(path)
+            base = REGISTRY.get("codex")
+            with patch.object(bridge.json, "loads", wraps=json.loads) as loads:
+                self.assertEqual(bridge.conversation_change_status("codex", ref, cursor), "changed")
+                parsed = loads.call_count
+                with REGISTRY.temporary(replace(base, label="Same Hook, New Generation")):
+                    self.assertEqual(
+                        bridge.conversation_change_status("codex", ref, cursor), "changed"
+                    )
+            self.assertGreater(parsed, 0)
+            self.assertGreater(loads.call_count, parsed)
+
+    def test_racing_jsonl_classification_is_unstable_and_never_cached(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "codex.jsonl"
+            path.write_text(codex_line("user", "Earlier") + "\n", encoding="utf-8")
+            cursor = path.stat().st_size
+            ref = native(path)
+            original = codex_harness._classify_codex_tail
+            calls = 0
+
+            def racing(native_ref: NativeRef, checkpoint: int | str, end: int) -> str:
+                nonlocal calls
+                calls += 1
+                status = original(native_ref, checkpoint, end)
+                if calls == 1:
+                    with path.open("a", encoding="utf-8") as handle:
+                        handle.write(codex_line("user", "Arrived during classification") + "\n")
+                return status
+
+            with patch.object(codex_harness, "_classify_codex_tail", side_effect=racing):
+                self.assertEqual(
+                    bridge.conversation_change_status("codex", ref, cursor), "unstable"
+                )
+                self.assertEqual(bridge.conversation_change_status("codex", ref, cursor), "changed")
+            self.assertEqual(calls, 2)
+
+    def test_bounded_jsonl_reader_uses_byte_not_character_frontier(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "codex.jsonl"
+            first = (json.dumps({"record": "first"}) + "\n").encode()
+            second = (json.dumps({"record": "ą😀" * 20}, ensure_ascii=False) + "\n").encode("utf-8")
+            path.write_bytes(first + second)
+            character_limit = len(second.decode("utf-8"))
+            self.assertLess(character_limit, len(second))
+            records = list(conversion._records(path, end=len(first) + character_limit))
+            self.assertEqual(records, [{"record": "first"}])
+
+    def test_binary_jsonl_reader_preserves_invalid_utf8_as_replacement_text(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "records.jsonl"
+            path.write_bytes(b'{"text":"before\xffafter"}\n')
+            self.assertEqual(
+                list(conversion._records(path, end=path.stat().st_size)),
+                [{"text": "before\ufffdafter"}],
+            )
 
     def test_malformed_newline_terminated_record_after_work_is_unstable(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -1533,7 +1617,9 @@ class LaunchIntegrationTests(unittest.TestCase):
                 handle.write(codex_line("user", "Changed") + "\n")
                 handle.write('{"type":"malformed"\n')
 
-            self.assertEqual(bridge.conversation_change_status("codex", path, cursor), "unstable")
+            self.assertEqual(
+                bridge.conversation_change_status("codex", native(path), cursor), "unstable"
+            )
 
     def test_transient_unstable_snapshot_is_retried_without_metadata_change(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -1554,14 +1640,20 @@ class LaunchIntegrationTests(unittest.TestCase):
                 scratch_patterns=entry.scratch_patterns,
                 read=entry.read,
                 write=entry.write,
-                locate=entry.locate,
+                resolve=entry.resolve,
+                availability=entry.availability,
+                checkpoint=entry.checkpoint,
                 change_status=lambda *_: next(outcomes),
                 budget=entry.budget,
             )
 
             with REGISTRY.temporary(retrying):
-                self.assertEqual(bridge.conversation_change_status("codex", path, 0), "unstable")
-                self.assertEqual(bridge.conversation_change_status("codex", path, 0), "unchanged")
+                self.assertEqual(
+                    bridge.conversation_change_status("codex", native(path), 0), "unstable"
+                )
+                self.assertEqual(
+                    bridge.conversation_change_status("codex", native(path), 0), "unchanged"
+                )
 
     def test_retry_after_partial_tail_uses_the_last_complete_cursor(self) -> None:
         with tempfile.TemporaryDirectory() as directory:

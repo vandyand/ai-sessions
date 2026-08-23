@@ -18,6 +18,11 @@ from ai_sessions.bridge import (
     handoff_note,
     read_transcript,
 )
+from ai_sessions.model import NativeRef
+
+
+def native(path: Path) -> NativeRef:
+    return NativeRef("window-fixture", str(path))
 
 
 class PeakRecorder:
@@ -120,38 +125,44 @@ class CodexCompactionWindowTests(unittest.TestCase):
     def test_window_becomes_turns(self) -> None:
         """R1: the newest window's carried context plus the live tail, exactly."""
         path = self.rollout(windows=3, per_window=5, tail=4)
-        turns = read_transcript("codex", path).turns
+        turns = read_transcript("codex", native(path)).turns
         expected = [f"w2 carried {i}" for i in range(5)] + [f"live {i}" for i in range(4)]
         self.assertEqual([turn.text for turn in turns], expected)
 
     def test_window_replaces_earlier_turns(self) -> None:
         path = self.rollout(windows=2, per_window=3, tail=1)
-        texts = [turn.text for turn in read_transcript("codex", path).turns]
+        texts = [turn.text for turn in read_transcript("codex", native(path)).turns]
         self.assertFalse(any("superseded" in text for text in texts))
         self.assertFalse(any(text.startswith("w0 ") for text in texts))
 
     def test_exactly_one_boundary_marked(self) -> None:
         """R2/R3: one boundary, on the first carried turn, however many windows."""
-        turns = read_transcript("codex", self.rollout(windows=7, per_window=4, tail=2)).turns
+        turns = read_transcript(
+            "codex", native(self.rollout(windows=7, per_window=4, tail=2))
+        ).turns
         self.assertEqual(count_compactions(turns), 1)
         self.assertTrue(turns[0].compaction)
 
     def test_from_last_compaction_is_a_noop(self) -> None:
         """R4: the reader already starts at the boundary."""
-        turns = read_transcript("codex", self.rollout(windows=4, per_window=3, tail=2)).turns
+        turns = read_transcript(
+            "codex", native(self.rollout(windows=4, per_window=3, tail=2))
+        ).turns
         sliced, boundaries = from_last_compaction(list(turns))
         self.assertEqual(sliced, turns)
         self.assertEqual(boundaries, 1)
 
     def test_peak_is_independent_of_window_count(self) -> None:
         """R5: the invariant that rules out appending every window."""
-        few = read_transcript("codex", self.rollout(windows=2, per_window=6, tail=3)).turns
-        many = read_transcript("codex", self.rollout(windows=200, per_window=6, tail=3)).turns
+        few = read_transcript("codex", native(self.rollout(windows=2, per_window=6, tail=3))).turns
+        many = read_transcript(
+            "codex", native(self.rollout(windows=200, per_window=6, tail=3))
+        ).turns
         self.assertEqual(len(few), len(many))
         self.assertEqual(len(many), 6 + 3)
 
     def test_sealed_and_developer_entries_are_skipped(self) -> None:
-        transcript = read_transcript("codex", self.rollout(windows=1, per_window=2, tail=0))
+        transcript = read_transcript("codex", native(self.rollout(windows=1, per_window=2, tail=0)))
         texts = " ".join(turn.text for turn in transcript.turns)
         self.assertNotIn("permissions instructions", texts)
         self.assertNotIn("gAAAAAB", texts)
@@ -160,7 +171,7 @@ class CodexCompactionWindowTests(unittest.TestCase):
     def test_missing_replacement_history_falls_back(self) -> None:
         """R6: an unreadable compaction leaves the surrounding history alone."""
         path = self.rollout(windows=1, per_window=4, tail=2, replacement_history=False)
-        transcript = read_transcript("codex", path)
+        transcript = read_transcript("codex", native(path))
         self.assertEqual(transcript.opaque_compactions, 1)
         self.assertEqual(transcript.carried_windows, 0)
         self.assertTrue(any("superseded" in turn.text for turn in transcript.turns))
@@ -203,13 +214,13 @@ class CodexCompactionWindowTests(unittest.TestCase):
             },
         ]
         path.write_text("\n".join(json.dumps(r) for r in records) + "\n", encoding="utf-8")
-        turns = read_transcript("codex", path).turns
+        turns = read_transcript("codex", native(path)).turns
         self.assertEqual([turn.text for turn in turns], ["carried"])
         self.assertEqual(turns[0].calls, ())
 
     def test_transcript_without_compactions_is_unchanged(self) -> None:
         path = self.rollout(windows=0, per_window=0, tail=3, superseded_per_window=0)
-        transcript = read_transcript("codex", path)
+        transcript = read_transcript("codex", native(path))
         self.assertEqual(count_compactions(transcript.turns), 0)
         self.assertEqual(transcript.carried_windows, 0)
         self.assertEqual(len(transcript.turns), 3)
@@ -227,7 +238,7 @@ class CodexCompactionWindowTests(unittest.TestCase):
             {"type": "user", "message": {"role": "user", "content": "after"}},
         ]
         path.write_text("\n".join(json.dumps(r) for r in records) + "\n", encoding="utf-8")
-        turns = read_transcript("claude", path).turns
+        turns = read_transcript("claude", native(path)).turns
         self.assertEqual(count_compactions(turns), 1)
         sliced, _ = from_last_compaction(list(turns))
         self.assertEqual([turn.text for turn in sliced], ["SUMMARY", "after"])
@@ -308,20 +319,22 @@ class AdversarialReviewFindingsTests(unittest.TestCase):
                 self.item("user", "recent"),
             ]
         )
-        whole = read_transcript("codex", path, latest_window=False).turns
+        whole = read_transcript("codex", native(path), latest_window=False).turns
         self.assertIn("original", [turn.text for turn in whole])
-        newest = read_transcript("codex", path, latest_window=True).turns
+        newest = read_transcript("codex", native(path), latest_window=True).turns
         self.assertNotIn("original", [turn.text for turn in newest])
 
     def test_peak_does_not_grow_with_compaction_count(self) -> None:
         """R5 measured where it happens, not inferred from output length."""
         with PeakRecorder() as few:
             read_transcript(
-                "codex", self.rollout(windows=2, per_window=3, tail=2, superseded_per_window=5)
+                "codex",
+                native(self.rollout(windows=2, per_window=3, tail=2, superseded_per_window=5)),
             )
         with PeakRecorder() as many:
             read_transcript(
-                "codex", self.rollout(windows=200, per_window=3, tail=2, superseded_per_window=5)
+                "codex",
+                native(self.rollout(windows=200, per_window=3, tail=2, superseded_per_window=5)),
             )
         self.assertEqual(few.peak, many.peak)
         self.assertLess(many.peak, 30)
@@ -330,7 +343,8 @@ class AdversarialReviewFindingsTests(unittest.TestCase):
         """The honest bound: the largest run between boundaries, not the file."""
         with PeakRecorder() as recorder:
             read_transcript(
-                "codex", self.rollout(windows=3, per_window=2, tail=1, superseded_per_window=40)
+                "codex",
+                native(self.rollout(windows=3, per_window=2, tail=1, superseded_per_window=40)),
             )
         self.assertGreaterEqual(recorder.peak, 40)
         self.assertLess(recorder.peak, 60)
@@ -346,7 +360,7 @@ class AdversarialReviewFindingsTests(unittest.TestCase):
                 self.item("user", "c"),
             ]
         )
-        transcript = read_transcript("codex", path)
+        transcript = read_transcript("codex", native(path))
         self.assertFalse(transcript.resumes_at_last_summary)
         note = handoff_note(
             source_tool="codex",
@@ -378,7 +392,7 @@ class AdversarialReviewFindingsTests(unittest.TestCase):
         path = self.custom(
             [self.item("user", "stale"), self.compaction([developer]), self.item("user", "after")]
         )
-        transcript = read_transcript("codex", path)
+        transcript = read_transcript("codex", native(path))
         self.assertEqual(transcript.opaque_compactions, 1)
         self.assertEqual(transcript.carried_windows, 0)
         self.assertEqual([turn.text for turn in transcript.turns], ["stale", "after"])
@@ -388,7 +402,7 @@ class AdversarialReviewFindingsTests(unittest.TestCase):
         path = self.custom(
             [self.compaction([self.carried("asked"), self.carried("answered", "assistant")])]
         )
-        turns = read_transcript("codex", path).turns
+        turns = read_transcript("codex", native(path)).turns
         self.assertEqual(
             [(t.role, t.text) for t in turns], [("user", "asked"), ("assistant", "answered")]
         )
@@ -409,7 +423,7 @@ class AdversarialReviewFindingsTests(unittest.TestCase):
                 )
             ]
         )
-        turns = read_transcript("codex", path).turns
+        turns = read_transcript("codex", native(path)).turns
         self.assertEqual([turn.text for turn in turns], ["real"])
 
 

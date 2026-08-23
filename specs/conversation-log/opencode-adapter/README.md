@@ -82,7 +82,7 @@ an opaque, JSON-serializable semantic checkpoint before the OpenCode adapter is 
 - [x] Revision-4 verdict *(REVISE: HIGH=0, MEDIUM=1; bounded discovery invocation added)*
 - [x] Revision-5 verdict *(REVISE: HIGH=0, MEDIUM=1; revert semantics added from source)*
 - [x] Final Opus 5 plan verdict *(GO: HIGH=0, MEDIUM=0)*
-- [ ] Storage-neutral cursor/reference refinement
+- [x] Storage-neutral cursor/reference refinement *(273-test Windows/WSL gate; final Opus 5 GO)*
 - [ ] OpenCode discovery/read/write/resume/rename/liveness adapter
 - [ ] Six-direction and real-CLI validation
 - [ ] Final Opus 5 reviews, documentation, PR/CI, and completion audit

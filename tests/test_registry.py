@@ -19,7 +19,7 @@ from ai_sessions.app import (
 )
 from ai_sessions.capabilities import Unsupported
 from ai_sessions.harnesses import install
-from ai_sessions.model import SourceKind
+from ai_sessions.model import NativeRef, SourceKind
 from ai_sessions.registry import REGISTRY, Registry
 
 
@@ -115,6 +115,28 @@ class RegistryTests(unittest.TestCase):
             self.assertIn("late", available_launch_tools(row))
         self.assertNotIn("late", available_launch_tools(row))
 
+    def test_incomplete_adapter_is_not_offered_as_a_bridge_target(self) -> None:
+        base = REGISTRY.get("codex")
+        limited = replace(
+            base,
+            name="limited",
+            label="Limited Harness",
+            availability=Unsupported("exact availability is unavailable"),
+        )
+        row = Session(
+            tool="codex",
+            session_id="session-1",
+            title="title",
+            cwd="/tmp",
+            updated=0,
+            created=0,
+            preview="",
+            named=False,
+            storage="transcript.jsonl",
+        )
+        with REGISTRY.temporary(limited):
+            self.assertNotIn("limited", available_launch_tools(row))
+
     def test_late_registration_is_visible_in_rendering_and_browser_styles(self) -> None:
         base = REGISTRY.get("codex")
         fake = replace(
@@ -142,17 +164,17 @@ class RegistryTests(unittest.TestCase):
             self.assertIn("late", build_parser()._option_string_actions["--tool"].choices)
         self.assertNotIn("late", Browser._pair_layout())
 
-    def test_registry_generation_changes_semantic_snapshot_cache_identity(self) -> None:
+    def test_registry_replacement_changes_semantic_status_immediately(self) -> None:
         base = REGISTRY.get("codex")
         replacement = replace(base, change_status=lambda *_: "changed")
         with tempfile.TemporaryDirectory() as directory:
             path = Path(directory) / "snapshot.jsonl"
             path.write_text("{}\n", encoding="utf-8")
-            bridge._snapshot_change_status.cache_clear()
-            self.assertEqual(bridge.conversation_change_status("codex", path, 0), "unchanged")
+            ref = NativeRef("snapshot", str(path))
+            self.assertEqual(bridge.conversation_change_status("codex", ref, 0), "unchanged")
             with REGISTRY.temporary(replacement):
-                self.assertEqual(bridge.conversation_change_status("codex", path, 0), "changed")
-            self.assertEqual(bridge.conversation_change_status("codex", path, 0), "unchanged")
+                self.assertEqual(bridge.conversation_change_status("codex", ref, 0), "changed")
+            self.assertEqual(bridge.conversation_change_status("codex", ref, 0), "unchanged")
 
     def test_unknown_and_unsupported_change_status_are_explicit(self) -> None:
         base = REGISTRY.get("codex")
@@ -160,10 +182,11 @@ class RegistryTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             path = Path(directory) / "snapshot.jsonl"
             path.write_text("{}\n", encoding="utf-8")
-            self.assertEqual(bridge.conversation_change_status("future", path, 0), "unknown")
+            ref = NativeRef("snapshot", str(path))
+            self.assertEqual(bridge.conversation_change_status("future", ref, 0), "unknown")
             with REGISTRY.temporary(unsupported):
                 self.assertEqual(
-                    bridge.conversation_change_status("limited", path, 0), "unsupported"
+                    bridge.conversation_change_status("limited", ref, 0), "unsupported"
                 )
 
     def test_unknown_state_survives_and_blocks_head_promotion(self) -> None:

@@ -152,17 +152,23 @@ class LaunchConfig:
         return ProviderProfile(list(adapter.default_command))
 
     def provider_prefix(self, provider: str) -> list[str]:
-        try:
-            adapter = REGISTRY.get(provider)
-        except KeyError:
-            raise ValueError(f"unknown harness: {provider}") from None
+        result = self.provider_command(provider)
+        adapter = REGISTRY.get(provider)
         profile = self._profile(provider)
-        result = list(profile.command or adapter.default_command)
         if self.mode == "dangerous":
             result.extend(adapter.dangerous_args)
         elif self.mode == "custom":
             result.extend(profile.custom_args)
         return result
+
+    def provider_command(self, provider: str) -> list[str]:
+        """Configured maintenance-safe command argv without launch-mode flags."""
+        try:
+            adapter = REGISTRY.get(provider)
+        except KeyError:
+            raise ValueError(f"unknown harness: {provider}") from None
+        profile = self._profile(provider)
+        return list(profile.command or adapter.default_command)
 
     def save(self) -> None:
         self.path.parent.mkdir(parents=True, exist_ok=True)
