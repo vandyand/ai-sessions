@@ -42,6 +42,8 @@ surface reviews; in this phase it was stopped after ten minutes with no output.
 - Native Windows: 247 tests passed; one Linux-only focus test skipped.
 - Ubuntu WSL: 247 tests passed.
 - Ruff 0.16.3 lint and format checks passed across 49 files.
+- GitHub Actions: Ubuntu and Windows passed on Python 3.11, 3.12, and 3.13; package and
+  lint jobs passed.
 - Final focused Claude Opus 5 verdict: **CLEAN**.
 
 OpenCode is intentionally the next production adapter. It should validate the seam as designed,

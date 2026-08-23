@@ -1,6 +1,6 @@
 ---
 title: "Generic Harness Adapter Boundary"
-status: in-progress
+status: completed
 date: 2026-08-23
 priority: 30
 ---
@@ -151,5 +151,6 @@ The final focused Opus 5 verdict was **CLEAN**.
 
 The completed implementation spans `b66975b` through `ac16e41`. Its final tree passes 247 tests
 on native Windows and 247 on Ubuntu WSL (one intentional Windows-only focus skip) plus Ruff lint
-and format checks. OpenCode remains deliberately outside this phase and is now the production
-acceptance test for the completed seam.
+and format checks. GitHub Actions independently passed Ubuntu and Windows on Python 3.11–3.13,
+plus lint and package jobs. OpenCode remains deliberately outside this phase and is now the
+production acceptance test for the completed seam.

@@ -181,7 +181,7 @@ Every mutation below must fail at least one test:
 
 ## Phase 6: Adversarial review, verification, and doc sync
 
-- [ ] Run every existing test plus genuine-third-format/import-order/state/config/cache/liveness/UI
+- [x] Run every existing test plus genuine-third-format/import-order/state/config/cache/liveness/UI
   contract tests on Windows and Linux CI.
 - [x] Add a source-structure gate forbidding provider comparisons/maps in generic functions while
   allowing adapter registration and compatibility parsing.

@@ -10,7 +10,7 @@ Priorities are ordered by evidence strength and independence, not by architectur
 
 ## Current state
 
-`ai-sessions` 3.1.5 plus merged P2 (`5e5503e`), completed P3 (`e15f73f`), and the generic harness boundary implemented through `ac16e41` with CI validation pending. P1 fixed selection at Codex compaction boundaries. P2 adds utility-owned conversation ids, native members, equivalence frontiers, append cursors, head routing, and explicit divergence. P3 adds target-owned token budgets and whole-source-message selection. One dynamic registry now routes the complete Claude/Codex runtime surface through immutable `HarnessAdapter` objects, and an independent third-format fixture proves late registration without core edits. The remaining identity work is finer-grained provenance: ordered live segments and original-form projection.
+`ai-sessions` 3.1.5 plus merged P2 (`5e5503e`), completed P3 (`e15f73f`), and the generic harness boundary completed through `ac16e41`. P1 fixed selection at Codex compaction boundaries. P2 adds utility-owned conversation ids, native members, equivalence frontiers, append cursors, head routing, and explicit divergence. P3 adds target-owned token budgets and whole-source-message selection. One dynamic registry now routes the complete Claude/Codex runtime surface through immutable `HarnessAdapter` objects, and an independent third-format fixture proves late registration without core edits. The remaining identity work is finer-grained provenance: ordered live segments and original-form projection.
 
 The two failures that started this effort were:
 
@@ -135,7 +135,7 @@ for same-origin runs, fork resolution, and resume-from-a-point then fall out.
 
 Done when: a Codex → Claude → Codex trip keeps the Codex-origin portion in native form, and `specs/` records how a third harness would be added.
 
-### P4 prerequisite — generic harness boundary **(IMPLEMENTED as of ac16e41; CI pending)**
+### P4 prerequisite — generic harness boundary **(COMPLETE as of ac16e41)**
 
 Discovery, launch construction, configuration, naming, liveness, transcript conversion,
 semantic-tail detection, budgeting, filtering, and display now consume one ordered dynamic
@@ -199,4 +199,4 @@ Every `/feature plan` generated from this doc ends with a final Doc Sync phase t
 - `src/ai_sessions/app.py` — `prepare_launch`, `command_for`, `UserState.resolve_launch`, `UserState.set_bridge`
 - [`HARNESS_CONTRACT.md`](HARNESS_CONTRACT.md) — current adapter seam and the complete target contract
 - Measured against `~/.codex/sessions/2026/07/13/rollout-…-019f59af-….jsonl` and `~/.claude/projects/…/776daa15-….jsonl`
-- Released through 3.1.5; P2 merged to `main` as `5e5503e`; P3 completed as `e15f73f`; the generic harness prerequisite is implemented through `ac16e41` pending CI
+- Released through 3.1.5; P2 merged to `main` as `5e5503e`; P3 completed as `e15f73f`; the generic harness prerequisite completed as `ac16e41`
