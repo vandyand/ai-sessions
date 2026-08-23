@@ -67,6 +67,16 @@ resume time. Core resolves optional `max_tokens` / legacy `max_chars` configurat
 immutable applied `Budget`, then uses that same object for selection and the handoff note.
 Adding a harness must not add target-name conditionals to budget resolution.
 
+Selection reserves 4,096 projected characters for bounded handoff metadata. It flattens
+tool summaries without merging source messages, prices both message text and same-role
+assembly joins through one `SelectionMetric`, selects, and only then merges surviving runs.
+A fitting conversation is unchanged. On overflow the first message takes an initial capped
+share, the newest takes the remaining anchor allowance, and any additional survivors form
+one contiguous newest suffix. The allocation must be monotone: increasing a budget cannot
+decrease survivor count or increase dropped-message count. `BridgeResult` and both notices
+distinguish selected source-message count, assembled target-message count, dropped messages,
+and marker-truncated anchors.
+
 ## Complete adapter target
 
 The remaining provider branches in `app.py` should move behind the same adapter in this

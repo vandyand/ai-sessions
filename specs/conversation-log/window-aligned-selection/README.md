@@ -1,6 +1,6 @@
 ---
 title: "Target-Aware Token Budget and Whole-Message Selection"
-status: planned
+status: completed
 date: 2026-08-23
 priority: 20
 ---
@@ -71,8 +71,8 @@ P1's corrected **R5** still applies: any memory property must be **measured**, n
 
 - [x] Phase 3 — Adversarial review of the plan *(ran first; HIGH=4 MEDIUM=6, Part B closed)*
 - [x] Phase 0 — Derive the ratio and the per-target ceiling
-- [ ] Phase 1 — Per-target token budget (Part A)
-- [ ] Phase 2 — Whole-message selection (Part A)
-- [ ] ~~Phase 4 — Deduplicated union~~ *(decided against)*
-- [ ] Phase 5 — Adversarial review of the implementation; gates release
-- [ ] Phase 6 — Doc Sync
+- [x] Phase 1 — Per-target token budget (Part A)
+- [x] Phase 2 — Whole-message selection (Part A)
+- [x] ~~Phase 4 — Deduplicated union~~ *(decided against)*
+- [x] Phase 5 — Adversarial review of the implementation *(final verdict: CLEAN)*
+- [x] Phase 6 — Doc Sync

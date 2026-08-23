@@ -38,19 +38,19 @@ Direct `python -` against the working tree. Each phase states the expression and
 
 ---
 
-## Phase 1: One resolved target budget (Part A)
+## Phase 1: One resolved target budget (Part A) — COMPLETE
 
-- [ ] Add validated immutable `BudgetPolicy` and `Budget`; put one policy on every `Harness` and extend registry tests to require `context_tokens > 0`, `0 < usable_fraction <= 1`, `chars_per_token > 0`, and non-empty provenance (T3/T10)
-- [ ] Give Codex budget policy its own declared `CODEX_BUDGET_CONTEXT_TOKENS = 256_000` compatibility-floor constant and provenance; never reuse writer-only `CODEX_CONTEXT_WINDOW = 258_400`. Add a structural/source assertion that the registry policy names the budget constant
-- [ ] Make `bridge_max_tokens` and `bridge_max_chars` independently optional, plus `bridge_max_chars_migrated: bool`, so never-configured, explicit legacy, and migrated machine-default states remain distinguishable (T2/T2b)
-- [ ] Implement one pure resolver: positive `max_tokens` wins and is clamped; otherwise `migrated=True` uses target policy with its distinct origin; otherwise positive `max_chars` stays verbatim; otherwise use ordinary target policy. Invalid/bool/non-positive values are unset and no resolved budget is non-positive
-- [ ] Bump saved config schema to 2. Missing/non-integer version is schema 1; exact `max_chars = 950000` sets the migrated carrier, while other positive values remain explicit. `as_toml()` writes `max_tokens` when set, otherwise explicit `max_chars`, and neither default; never write both
-- [ ] Add load → save → load tests that preserve the effective budget and do not resurrect `max_chars`
-- [ ] Replace `prepare_launch(max_chars=...)` and `bridge(max_chars=...)` with the resolved `Budget`; remove the `or DEFAULT_MAX_CHARS` fallback so there is one path
-- [ ] Render the handoff note and returned launch notice from the same `Budget`; report origin, estimate/ceiling, clamping, and any legacy value above target policy with migration guidance (T6)
-- [ ] Define `TRUNCATION_MARKER`, `HANDOFF_NOTE_RESERVE_CHARS = 4096`, and `MIN_BRIDGE_CHARS = reserve + 2 × (len(marker) + 1) + 2` once. Remove `fit`'s unlimited sentinel. Validate every constructed `Budget` and every adapter default
-- [ ] Add a non-1.0 fixture policy (2.5 chars/token) proving both conversion directions apply the ratio and at least one shipped policy has `Budget.chars != Budget.tokens`
-- [ ] Document `max_tokens`, precedence, legacy preservation, and default migration in repo README prose and the copyable config example; the example gains `version = 2` and uses `max_tokens` rather than the old auto-default
+- [x] Add validated immutable `BudgetPolicy` and `Budget`; put one policy on every `Harness` and extend registry tests to require `context_tokens > 0`, `0 < usable_fraction <= 1`, `chars_per_token > 0`, and non-empty provenance (T3/T10)
+- [x] Give Codex budget policy its own declared `CODEX_BUDGET_CONTEXT_TOKENS = 256_000` compatibility-floor constant and provenance; never reuse writer-only `CODEX_CONTEXT_WINDOW = 258_400`. Add a structural/source assertion that the registry policy names the budget constant
+- [x] Make `bridge_max_tokens` and `bridge_max_chars` independently optional, plus `bridge_max_chars_migrated: bool`, so never-configured, explicit legacy, and migrated machine-default states remain distinguishable (T2/T2b)
+- [x] Implement one pure resolver: positive `max_tokens` wins and is clamped; otherwise `migrated=True` uses target policy with its distinct origin; otherwise positive `max_chars` stays verbatim; otherwise use ordinary target policy. Invalid/bool/non-positive values are unset and no resolved budget is non-positive
+- [x] Bump saved config schema to 2. Missing/non-integer version is schema 1; exact `max_chars = 950000` sets the migrated carrier, while other positive values remain explicit. `as_toml()` writes `max_tokens` when set, otherwise explicit `max_chars`, and neither default; never write both
+- [x] Add load → save → load tests that preserve the effective budget and do not resurrect `max_chars`
+- [x] Replace `prepare_launch(max_chars=...)` and `bridge(max_chars=...)` with the resolved `Budget`; remove the `or DEFAULT_MAX_CHARS` fallback so there is one path
+- [x] Render the handoff note and returned launch notice from the same `Budget`; report origin, estimate/ceiling, clamping, and any legacy value above target policy with migration guidance (T6)
+- [x] Define `TRUNCATION_MARKER`, `HANDOFF_NOTE_RESERVE_CHARS = 4096`, and `MIN_BRIDGE_CHARS = reserve + 2 × (len(marker) + 1) + 2` once. Remove `fit`'s unlimited sentinel. Validate every constructed `Budget` and every adapter default
+- [x] Add a non-1.0 fixture policy (2.5 chars/token) proving both conversion directions apply the ratio and at least one shipped policy has `Budget.chars != Budget.tokens`
+- [x] Document `max_tokens`, precedence, legacy preservation, and default migration in repo README prose and the copyable config example; the example gains `version = 2` and uses `max_tokens` rather than the old auto-default
 
 **Verification**
 
@@ -66,22 +66,22 @@ Direct `python -` against the working tree. Each phase states the expression and
 
 ---
 
-## Phase 2: Source-message selection before merging (Part A)
+## Phase 2: Source-message selection before merging (Part A) — COMPLETE
 
-- [ ] Split preparation into `flatten(turns)` → selection → `merge_runs(survivors)` so source messages remain the selection/counting unit (T4/T9)
-- [ ] Use the same `SelectionMetric` item-plus-join total for the fit-through check and overflow loop. If the complete flattened list fits the post-note allowance under that metric, return it byte-identical with zero drops; only overflow applies anchor shares (T4/K9)
-- [ ] On overflow set `conversation_limit = Budget.chars - HANDOFF_NOTE_RESERVE_CHARS` and `anchor_share = (conversation_limit - 2) // 2` with no old 1,000-character floor. Cap the head marker-inclusive at that share, give the newest anchor the remaining allowance after the capped head and the worst-case two-character anchor join, then scan the tail; survivors after the first must be one contiguous input suffix and survivor count must be monotone across the truncated/full boundary
-- [ ] Count dropped pre-merge source messages exactly. A truncated turn retains only `ToolCall` entries whose complete rendered blocks survive; the note count may never exceed summaries present in payload
-- [ ] Bound every interpolated note field; if `len(note) + 2 > 4096`, raise `BridgeError` rather than truncate metadata. Test the runtime error plus floor−1/floor/floor+1 with maximal metadata and two oversized **same-role** anchors (T6/K8)
-- [ ] Use a linear `SelectionMetric` with `item_cost(turn)`, `join_cost(left, right)`, and `truncate(turn, limit)`, all in `Budget.chars`. P3 uses `len(text)` plus conservative 2-character same-role joins, validates non-negative costs/truncation, and scans the tail once; P4 may replace all three operations (T10)
-- [ ] Replace the handoff claim "opening request" and report both units honestly: `N source message(s), assembled into M target message(s) below`; expose both counts in `BridgeResult`/launch notice. When anchors are capped, note and launch notice also report the truncated-anchor count even if dropped is zero
-- [ ] Add property-style cases for membership/truncation shape, order, head/tail, fit-through, exact count, monotonicity, determinism, empty/single/all-oversized inputs, `[short, oversized-newest]`, and consecutive same-role runs
-- [ ] Add an end-to-end test beginning at `LaunchConfig.load` and calling `launch(session, config, dry_run=True, state=...)`; force the opposite harness, read the member path from `state.set_bridge`, and use `max_tokens = 5000` on ~40,000 characters to assert payload ≤10,000, dropped notice, and note ≈5,000 tokens/10,000 chars. Without the key, the same fixture keeps every message (T7)
-- [ ] On one ~340,000-character generated transcript with unset config, assert Claude drops messages while Codex keeps them; this kills any hidden `DEFAULT_MAX_CHARS` selector path
-- [ ] Add two same-role stress fixtures dimensioned by survivors: a fits-through edge where raw text fits but item-plus-join cost does not, and an overflowing ≥2,000-message case retaining >1,500 survivors. A test-local oracle computes `sum(len) + 2 × same-role-adjacencies`, asserts selector agreement **and real merged `[note, *kept]` text ≤ `Budget.chars`**, and requires `2 × (len(kept) − 1) > reserve − len(note) − 2`; removing join cost must fail deterministically
-- [ ] On every overflow assert survivors are `[first] + input[j:]` for one index `j`; no gap-tail selection
-- [ ] Measure selection on a generated ~1M-character transcript with a counting `SelectionMetric` wrapper (calls bounded by a constant times input turns), a practical time bound, and `tracemalloc` peak `<= 2 × Budget.chars + 512 × len(turns) + 1 MiB`. `PeakRecorder` remains only for P1 reader-memory regressions; it cannot observe selection
-- [ ] Assert note and launch-notice text for `[short, oversized-newest]` (`dropped=0`, `truncated=1`) and for a consecutive same-role fixture where source-message count differs from assembled-target count
+- [x] Split preparation into `flatten(turns)` → selection → `merge_runs(survivors)` so source messages remain the selection/counting unit (T4/T9)
+- [x] Use the same `SelectionMetric` item-plus-join total for the fit-through check and overflow loop. If the complete flattened list fits the post-note allowance under that metric, return it byte-identical with zero drops; only overflow applies anchor shares (T4/K9)
+- [x] On overflow set `conversation_limit = Budget.chars - HANDOFF_NOTE_RESERVE_CHARS` and `anchor_share = (conversation_limit - 2) // 2` with no old 1,000-character floor. Cap the head marker-inclusive at that share, give the newest anchor the remaining allowance after the capped head and the worst-case two-character anchor join, then scan the tail; survivors after the first must be one contiguous input suffix and survivor count must be monotone across the truncated/full boundary
+- [x] Count dropped pre-merge source messages exactly. A truncated turn retains only `ToolCall` entries whose complete rendered blocks survive; the note count may never exceed summaries present in payload
+- [x] Bound every interpolated note field; if `len(note) + 2 > 4096`, raise `BridgeError` rather than truncate metadata. Test the runtime error plus floor−1/floor/floor+1 with maximal metadata and two oversized **same-role** anchors (T6/K8)
+- [x] Use a linear `SelectionMetric` with `item_cost(turn)`, `join_cost(left, right)`, and `truncate(turn, limit)`, all in `Budget.chars`. P3 uses `len(text)` plus conservative 2-character same-role joins, validates non-negative costs/truncation, and scans the tail once; P4 may replace all three operations (T10)
+- [x] Replace the handoff claim "opening request" and report both units honestly: `N source message(s), assembled into M target message(s) below`; expose both counts in `BridgeResult`/launch notice. When anchors are capped, note and launch notice also report the truncated-anchor count even if dropped is zero
+- [x] Add property-style cases for membership/truncation shape, order, head/tail, fit-through, exact count, monotonicity, determinism, empty/single/all-oversized inputs, `[short, oversized-newest]`, and consecutive same-role runs
+- [x] Add an end-to-end test beginning at `LaunchConfig.load` and calling `launch(session, config, dry_run=True, state=...)`; force the opposite harness, read the member path from `state.set_bridge`, and use `max_tokens = 5000` on ~40,000 characters to assert payload ≤10,000, dropped notice, and note ≈5,000 tokens/10,000 chars. Without the key, the same fixture keeps every message (T7)
+- [x] On one ~340,000-character generated transcript with unset config, assert Claude drops messages while Codex keeps them; this kills any hidden `DEFAULT_MAX_CHARS` selector path
+- [x] Add two same-role stress fixtures dimensioned by survivors: a fits-through edge where raw text fits but item-plus-join cost does not, and an overflowing ≥2,000-message case retaining >1,500 survivors. A test-local oracle computes `sum(len) + 2 × same-role-adjacencies`, asserts selector agreement **and real merged `[note, *kept]` text ≤ `Budget.chars`**, and requires `2 × (len(kept) − 1) > reserve − len(note) − 2`; removing join cost must fail deterministically
+- [x] On every overflow assert survivors are `[first] + input[j:]` for one index `j`; no gap-tail selection
+- [x] Measure selection on a generated ~1M-character transcript with a counting `SelectionMetric` wrapper (calls bounded by a constant times input turns), a practical time bound, and `tracemalloc` peak `<= 2 × Budget.chars + 512 × len(turns) + 1 MiB`. `PeakRecorder` remains only for P1 reader-memory regressions; it cannot observe selection
+- [x] Assert note and launch-notice text for `[short, oversized-newest]` (`dropped=0`, `truncated=1`) and for a consecutive same-role fixture where source-message count differs from assembled-target count
 
 **Verification**
 
@@ -125,7 +125,7 @@ Direct `python -` against the working tree. Each phase states the expression and
 - [x] Replace unreproducible private-overhead measurement with generated evidence plus a declared safety factor
 - [x] Move selection before `merge_runs` and count real source messages
 - [x] Correct fit-through, note-cost, note-honesty, adapter-policy, unknown-model, verification, compaction wording, production-call-path, content-variance, and P4-seam findings
-- [ ] Re-run Opus 5 against the revised plan and require no HIGH or MEDIUM findings before Phase 1 implementation
+- [x] Re-run Opus 5 against the revised plan and require no HIGH or MEDIUM findings before Phase 1 implementation
 
 ### Phase 3c — Opus 5 second review
 
@@ -139,7 +139,7 @@ Direct `python -` against the working tree. Each phase states the expression and
 - [x] Define note reserve and legacy character floor
 - [x] Change the P4 seam to sequence-cost and name its unit
 - [x] Name `launch(..., dry_run=True)` and restore the cross-target kept-count differential
-- [ ] Re-run Opus 5 and require no HIGH or MEDIUM findings before Phase 1 implementation
+- [x] Re-run Opus 5 and require no HIGH or MEDIUM findings before Phase 1 implementation
 
 ### Phase 3d — Opus 5 third review
 
@@ -154,7 +154,7 @@ Direct `python -` against the working tree. Each phase states the expression and
 - [x] Define/validate `MIN_BRIDGE_CHARS` for every origin and adapter default
 - [x] Make truncated tool-call counts reflect complete rendered blocks only
 - [x] Force a real opposite-harness dry-run bridge and bound every note field
-- [ ] Re-run Opus 5 and require no HIGH or MEDIUM findings before Phase 1 implementation
+- [x] Re-run Opus 5 and require no HIGH or MEDIUM findings before Phase 1 implementation
 
 ### Phase 3e — Opus 5 fourth review
 
@@ -167,7 +167,7 @@ Direct `python -` against the working tree. Each phase states the expression and
 - [x] Restore the contiguous newest-suffix invariant
 - [x] Replace whole-sequence repricing with a linear item/join/truncate metric
 - [x] Report source-message and assembled-target counts separately
-- [ ] Re-run Opus 5 and require no HIGH or MEDIUM findings before Phase 1 implementation
+- [x] Re-run Opus 5 and require no HIGH or MEDIUM findings before Phase 1 implementation
 
 ### Phase 3f — Opus 5 fifth review
 
@@ -179,7 +179,7 @@ Direct `python -` against the working tree. Each phase states the expression and
 - [x] Disclose truncated anchors even when no messages are dropped
 - [x] Remove the superseded whole-sequence callback from the harness contract
 - [x] Add the schema-1 carve-out and minimum default to shared adapter fixtures
-- [ ] Re-run Opus 5 and require no HIGH or MEDIUM findings before Phase 1 implementation
+- [x] Re-run Opus 5 and require no HIGH or MEDIUM findings before Phase 1 implementation
 
 ### Phase 3g — Opus 5 sixth review
 
@@ -189,7 +189,7 @@ Direct `python -` against the working tree. Each phase states the expression and
 - [x] Replace the inapplicable `PeakRecorder` selection gate with counting metric + `tracemalloc`
 - [x] Verify truncated-anchor and source/assembled note/launch text
 - [x] Correct success criteria to T1–T10 including T2b
-- [ ] Re-run Opus 5 and require no HIGH or MEDIUM findings before Phase 1 implementation
+- [x] Re-run Opus 5 and require no HIGH or MEDIUM findings before Phase 1 implementation
 
 ### Phase 3h — Opus 5 seventh review
 
@@ -207,25 +207,44 @@ Decided against in Phase 3. Recorded in the north star's *explicitly decided NOT
 
 ---
 
-## Phase 5: Adversarial review of the implementation
+## Phase 5: Adversarial review of the implementation — COMPLETE
 
 **Nothing is released until this returns.** Phase 3 reviews the plan; this reviews the code that came out of it. Both gates exist because P1 ran neither before shipping and paid for it: a documented option silently stopped working, and the invariant the design rested on was both mis-stated and proxy-tested.
 
-- [ ] Re-run the reviewer against the actual diff, with the spec as context, and with **no timeout** — the first P1 attempt died in a 340s wrapper and the completed run took 6m22s
-- [ ] Ask specifically for a mutation the test suite would not catch. That question found the proxy-tested invariant in P1 and is the highest-yield thing to ask
-- [ ] Ask whether the shipped behavior matches what the spec and the handoff note claim
-- [ ] Fix every HIGH and MEDIUM before release; record LOW items in the retro
-- [ ] Record the verdict under `### Phase 5 findings`
+- [x] Re-run the reviewer against the actual diff, with the spec as context, and with **no timeout** — the first P1 attempt died in a 340s wrapper and the completed run took 6m22s
+- [x] Ask specifically for a mutation the test suite would not catch. That question found the proxy-tested invariant in P1 and is the highest-yield thing to ask
+- [x] Ask whether the shipped behavior matches what the spec and the handoff note claim
+- [x] Fix every HIGH and MEDIUM before release; record LOW items in the retro
+- [x] Record the verdict under `### Phase 5 findings`
+
+### Phase 5 findings
+
+Claude Opus 5 (`claude-opus-5`, max effort) ran each pass read-only and without a timeout.
+
+1. The initial implementation review found **HIGH=2 MEDIUM=5**. The production
+   config-to-launch path was proxy-tested, and a uniform suffix fixture could not kill a
+   `break` → `continue` mutation. It also requested exact anchor-floor, tool-call retention,
+   source/assembled count, disclosure, reserve, cross-target, stress, and memory gates.
+2. The second pass against `6b78900` found **HIGH=1 MEDIUM=4**. Its concrete
+   `[1000, 3, 1000]` counterexample proved that two independent anchor caps were
+   non-monotone at budgets 2,001 and 2,002. It also found invalid resolver values, missing
+   head-truncation proof, incomplete default-reduction disclosure, and the format gate.
+3. The third pass against `521e7af` found **HIGH=0 MEDIUM=2**: retained newest-anchor length
+   and per-call separator accounting were correct but not pinned against exact mutations.
+4. The final focused pass against `2bc6a12` returned **CLEAN — HIGH=0 MEDIUM=0**. Its four
+   LOW observations were subsequently closed in `e15f73f`: truncated-head tail pricing,
+   too-small derived policy validation, non-ASCII provenance bounds, and duplicate head-cost
+   evaluation. Full details are in [retro.md](retro.md).
 
 ---
 
-## Phase 6: Doc Sync
+## Phase 6: Doc Sync — COMPLETE
 
-- [ ] Update the repo `README.md` — the Budget section states characters and will be wrong
-- [ ] Update [`../NORTH_STAR.md`](../NORTH_STAR.md) — mark P3 complete with the SHA, add `### P3 observations`, and record Part B's outcome either way
-- [ ] Update [`../HARNESS_CONTRACT.md`](../HARNESS_CONTRACT.md) with the adapter-owned budget policy and selector-cost seam
-- [ ] Regenerate the spec index
-- [ ] Commit: `docs(conversation-log): sync docs after window-aligned-selection`
+- [x] Update the repo `README.md` — the Budget section states characters and will be wrong
+- [x] Update [`../NORTH_STAR.md`](../NORTH_STAR.md) — mark P3 complete with the SHA, add `### P3 observations`, and record Part B's outcome either way
+- [x] Update [`../HARNESS_CONTRACT.md`](../HARNESS_CONTRACT.md) with the adapter-owned budget policy and selector-cost seam
+- [x] Regenerate the spec index
+- [x] Commit: `docs(conversation-log): sync docs after window-aligned-selection`
 
 ---
 

@@ -1,3 +1,9 @@
+---
+title: "Round-trip Heads"
+status: completed
+date: 2026-08-22
+priority: 15
+---
 # Round-trip heads
 
 Status: complete on `conversation-log/round-trip-heads` (`7520b47`, hardened through

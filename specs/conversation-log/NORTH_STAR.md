@@ -10,7 +10,7 @@ Priorities are ordered by evidence strength and independence, not by architectur
 
 ## Current state
 
-`ai-sessions` 3.1.5 plus merged P2 (`5e5503e`). Bridging has a neutral `Turn` model, per-harness readers and writers, and a `HARNESSES` registry in `bridge.py`. P1 fixed selection at Codex compaction boundaries. P2 adds utility-owned conversation ids, native members, equivalence frontiers, append cursors, head routing, and explicit divergence. The remaining identity work is finer-grained provenance: ordered live segments and original-form projection.
+`ai-sessions` 3.1.5 plus merged P2 (`5e5503e`) and completed P3 (`e15f73f`). Bridging has a neutral `Turn` model, per-harness readers and writers, and a `HARNESSES` registry in `bridge.py`. P1 fixed selection at Codex compaction boundaries. P2 adds utility-owned conversation ids, native members, equivalence frontiers, append cursors, head routing, and explicit divergence. P3 adds adapter-owned token budgets and whole-source-message selection. The remaining identity work is finer-grained provenance: ordered live segments and original-form projection.
 
 The two failures that started this effort were:
 
@@ -91,13 +91,40 @@ never routing authority.
   Its target copy is conservatively treated as advanced until it is re-materialized under
   the new schema.
 
-### P3 — Target-aware token budget and whole-message selection
+### P3 — Target-aware token budget and whole-message selection **(COMPLETE as of e15f73f)**
 
-Replace the single global character ceiling with an explicit token-denominated policy owned by the target harness. Keep the source reader's newest carried window plus live tail unchanged, flatten tool summaries without merging same-role messages, then select at source-message boundaries. A conversation that fits remains byte-identical; on overflow, both the first selected-context message and newest message are capped marker-inclusive to reserved shares before intervening messages are dropped whole.
+Replace the single global character ceiling with an explicit token-denominated policy owned by the target harness. Keep the source reader's newest carried window plus live tail unchanged, flatten tool summaries without merging same-role messages, then select at source-message boundaries. A conversation that fits remains byte-identical; on overflow, the first selected-context message is capped to an initial share and the newest message receives the remaining anchor allowance before intervening messages are dropped whole.
 
 Do **not** merge older `replacement_history` windows. The newest replacement history is the context Codex itself resumes from; merging earlier windows could resurrect superseded instructions and create a transcript no harness ever held.
 
 Done when: the budget names its unit, is derived per target harness, explicit legacy `max_chars` retains its meaning except for the documented version-1 auto-written default migration, and end-to-end tests prove selection drops complete messages rather than slicing arbitrary transcript text.
+
+### P3 observations — what target budgeting and selection taught us
+
+- **The target owns the safety policy.** The bridge cannot know which model, system prompt,
+  tools, or compaction threshold will exist at resume time. Claude therefore declares a
+  200,000-token compatibility floor and Codex an independent 256,000-token floor; both use
+  a visible 0.75 usable fraction rather than pretending private harness overhead is known.
+- **Token estimation is policy, not tokenization.** A deterministic mixed engineering corpus
+  measured 2.318 characters per token with `tiktoken` `o200k_base`. P3 rounds down to 2.0,
+  keeps runtime dependency-free, and identifies the Claude estimate as a proxy. The defaults
+  are 150,000 estimated tokens / 300,000 projected characters for Claude and 192,000 /
+  384,000 for Codex.
+- **Migration needs schema context.** Version 1 wrote `max_chars = 950000` automatically, so
+  that exact value was ambiguous. Schema 1 migrates it to target policy with a visible
+  origin; schema 2 preserves it as an explicit override. Other positive character values
+  remain exact, and `max_tokens` wins when both keys exist.
+- **Selection units must survive until after selection.** Tool calls are flattened to text,
+  messages are selected whole, and only then are same-role runs assembled. This makes the
+  dropped count truthful and requires pricing each possible `\n\n` merge separator.
+- **Two equal anchor caps were not monotone.** At the truncated/full boundary, two caps could
+  grow by two characters while the budget grew by one, causing a larger budget to drop a
+  message. The head now takes its initial share and the newest receives the remainder, so
+  combined anchor growth cannot outrun the ceiling.
+- **Adversarial mutation review was materially useful.** Three implementation passes found
+  proxy tests that ordinary green suites missed: the production config path, a nonuniform
+  suffix gap, the dual-cap monotonicity failure, retained newest length, and tool-call
+  separator accounting. The final Opus 5 verdict was CLEAN with zero HIGH or MEDIUM items.
 
 ### P4 — The full conversation log
 
@@ -127,7 +154,7 @@ Done when: a Codex → Claude → Codex trip keeps the Codex-origin portion in n
 ## Red flags
 
 - **The Codex writer is the risky surface.** Constructing valid records means honouring the `response_item` versus `user_message`/`agent_message` split and the `task_started`/`task_complete` framing. Getting it wrong produces a session that resumes with full context and a blank screen — indistinguishable from a failed bridge. Verify visually, not by asking the model what it remembers.
-- **Target budgets are estimates.** Engineering transcripts mix prose, code, JSON, diffs, and tool output, while provider tokenizers and harness overhead differ. P3 must fail toward underfilling, document its safety margin, and retain its bounded overflow-only anchor truncation.
+- **Target budgets are estimates.** Engineering transcripts mix prose, code, JSON, diffs, and tool output, while provider tokenizers and harness overhead differ. P3 fails toward underfilling, documents its safety margin, and retains bounded overflow-only anchor truncation.
 - **Session proliferation.** Each hop writes a new native session. Superseded members are marked, not hidden — whether a long chain should ever be collapsed is unresolved.
 - **Specs written against one machine's data.** The P1 spec initially defined done in terms of a single local 530 MB rollout. Invariants over the format, verified on generated fixtures, are the correct shape — a criterion nobody else can check is not a criterion.
 - **A failed load leaks its SQLite connection.** The exception traceback keeps the frame alive, so on Windows the file stays handle-locked until garbage collection. Wants a `finally: connection.close()`.
@@ -136,7 +163,7 @@ Done when: a Codex → Claude → Codex trip keeps the Codex-origin portion in n
 
 - The reader currently projects straight to text and discards native record references. Verbatim carry-forward (P4) needs them, and changing that contract touches every adapter.
 - A Codex window whose spine is unreadable carries nothing across. Silently skipping it is wrong; the copy should say what is missing and where.
-- Characters-per-token differs by harness and content. Worth measuring once per harness rather than assuming 4.
+- Provider-native token measurement may eventually replace P3's conservative character projection, but only if every target adapter can supply it without adding a heavyweight runtime dependency.
 - Two harnesses resuming the same conversation concurrently produces two heads. Detection and safe refusal now exist; user-directed branch selection or merge is not designed.
 
 ## Doc-sync protocol
@@ -156,4 +183,4 @@ Every `/feature plan` generated from this doc ends with a final Doc Sync phase t
 - `src/ai_sessions/app.py` — `prepare_launch`, `command_for`, `UserState.resolve_launch`, `UserState.set_bridge`
 - [`HARNESS_CONTRACT.md`](HARNESS_CONTRACT.md) — current adapter seam and the complete target contract
 - Measured against `~/.codex/sessions/2026/07/13/rollout-…-019f59af-….jsonl` and `~/.claude/projects/…/776daa15-….jsonl`
-- Released through 3.1.5; P2 merged to `main` as `5e5503e`
+- Released through 3.1.5; P2 merged to `main` as `5e5503e`; P3 implementation completed as `e15f73f`
