@@ -11,7 +11,7 @@ The plan review ran **first**, not after Phases 0–2 as originally sequenced. T
 ## Prerequisites
 
 - Branch off `main` at or after `5e5503e` (merged P2).
-- **No external fixture.** Generated transcripts only, per P1's K7. `make_codex_rollout` and `PeakRecorder` already exist in `tests/test_codex_window.py` and should be reused rather than reinvented.
+- **No external fixture.** Generated transcripts only, per P1's K7. Reuse `make_codex_rollout`; retain `PeakRecorder` for reader-memory regression only. Selection needs its own counting metric wrapper plus `tracemalloc` because it does not touch `_Conversation`.
 - Verification with `PYTHONPATH=$PWD/src`.
 
 ## Verification mechanism
@@ -78,9 +78,10 @@ Direct `python -` against the working tree. Each phase states the expression and
 - [ ] Add property-style cases for membership/truncation shape, order, head/tail, fit-through, exact count, monotonicity, determinism, empty/single/all-oversized inputs, `[short, oversized-newest]`, and consecutive same-role runs
 - [ ] Add an end-to-end test beginning at `LaunchConfig.load` and calling `launch(session, config, dry_run=True, state=...)`; force the opposite harness, read the member path from `state.set_bridge`, and use `max_tokens = 5000` on ~40,000 characters to assert payload ≤10,000, dropped notice, and note ≈5,000 tokens/10,000 chars. Without the key, the same fixture keeps every message (T7)
 - [ ] On one ~340,000-character generated transcript with unset config, assert Claude drops messages while Codex keeps them; this kills any hidden `DEFAULT_MAX_CHARS` selector path
-- [ ] Add two same-role stress fixtures dimensioned by survivors: a fits-through edge where raw text fits but item-plus-join cost does not, and an overflowing ≥2,000-message case retaining >1,500 survivors. Assert metric cost of `kept` ≤ conversation allowance and merged `[note, *kept]` text ≤ `Budget.chars`; both must fail if either branch drops join cost
+- [ ] Add two same-role stress fixtures dimensioned by survivors: a fits-through edge where raw text fits but item-plus-join cost does not, and an overflowing ≥2,000-message case retaining >1,500 survivors. A test-local oracle computes `sum(len) + 2 × same-role-adjacencies` independently of production metric, asserts selector agreement, and requires `2 × (len(kept) − 1) > reserve − len(note) − 2`; removing join cost must fail deterministically
 - [ ] On every overflow assert survivors are `[first] + input[j:]` for one index `j`; no gap-tail selection
-- [ ] Measure selection on a generated ~1M-character transcript with `PeakRecorder`; require linear metric calls/retained allocation and a practical time bound, not a whole-candidate reprice per tail step
+- [ ] Measure selection on a generated ~1M-character transcript with a counting `SelectionMetric` wrapper (calls bounded by a constant times input turns) plus `tracemalloc` retained-allocation peak and a practical time bound. `PeakRecorder` remains only for P1 reader-memory regressions; it cannot observe selection
+- [ ] Assert note and launch-notice text for `[short, oversized-newest]` (`dropped=0`, `truncated=1`) and for a consecutive same-role fixture where source-message count differs from assembled-target count
 
 **Verification**
 
@@ -178,6 +179,16 @@ Direct `python -` against the working tree. Each phase states the expression and
 - [x] Disclose truncated anchors even when no messages are dropped
 - [x] Remove the superseded whole-sequence callback from the harness contract
 - [x] Add the schema-1 carve-out and minimum default to shared adapter fixtures
+- [ ] Re-run Opus 5 and require no HIGH or MEDIUM findings before Phase 1 implementation
+
+### Phase 3g — Opus 5 sixth review
+
+**Verdict: NOT CLEAN — HIGH=1 MEDIUM=3.** Claude Opus 5 (`claude-opus-5`, max effort) reviewed `69f9e92` directly in read-only mode on 2026-08-23; no artifact was written.
+
+- [x] Make join-cost mutation tests independent of production metric and note slack
+- [x] Replace the inapplicable `PeakRecorder` selection gate with counting metric + `tracemalloc`
+- [x] Verify truncated-anchor and source/assembled note/launch text
+- [x] Correct success criteria to T1–T10 including T2b
 - [ ] Re-run Opus 5 and require no HIGH or MEDIUM findings before Phase 1 implementation
 
 ---
