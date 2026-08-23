@@ -163,7 +163,9 @@ for Claude Code and 192,000 / 384,000 for Codex. Selection happens at source-mes
 boundaries before same-role messages are assembled for the target. The first message of the
 selected context and one contiguous newest suffix survive; oversized anchors carry an
 explicit truncation marker, and the note reports dropped, truncated, source, and assembled
-counts.
+counts. These target defaults intentionally replace the previous global 950,000-character
+ceiling; they are smaller so an unknown target model is less likely to compact immediately
+on resume.
 
 Set `max_tokens` in `config.toml` for an explicit token-denominated ceiling, or
 `tool_calls = false` for a conversation-only copy. The deprecated `max_chars` remains an

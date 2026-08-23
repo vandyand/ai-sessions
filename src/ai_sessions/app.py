@@ -3025,8 +3025,7 @@ def prepare_launch(
             source_cursor=result.source_cursor,
         )
     carried = (
-        f"{result.turns} source message(s), assembled as "
-        f"{result.written_turns} target message(s)"
+        f"{result.turns} source message(s), assembled as {result.written_turns} target message(s)"
     )
     if result.calls:
         carried += f" and {result.calls} summarised tool call(s)"
@@ -3040,7 +3039,12 @@ def prepare_launch(
     )
     if result.budget.clamped:
         budget_notice += " The configured token budget was raised to the safe bridge minimum."
-    if result.budget.origin == "target-default-migrated":
+    if result.budget.origin == "target-default":
+        budget_notice += (
+            " This target policy replaces the previous global 950,000-character ceiling; "
+            "set bridge.max_tokens to choose a different ceiling."
+        )
+    elif result.budget.origin == "target-default-migrated":
         budget_notice += " Migrated the legacy 950,000-character default to target policy."
     elif result.budget.over_policy:
         budget_notice += (

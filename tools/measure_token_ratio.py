@@ -24,8 +24,7 @@ def corpus() -> dict[str, str]:
     return {
         "prose": (
             "The session bridge preserves identity while moving an engineering "
-            "conversation between native harnesses. "
-            * 120
+            "conversation between native harnesses. " * 120
         ),
         "python": textwrap.dedent(
             """\
@@ -100,10 +99,7 @@ def main() -> None:
         tokens = len(encoding.encode(sample))
         ratio = len(sample) / tokens
         ratios.append(ratio)
-        print(
-            f"{name:12} chars={len(sample):7} tokens={tokens:7} "
-            f"chars/token={ratio:.3f}"
-        )
+        print(f"{name:12} chars={len(sample):7} tokens={tokens:7} chars/token={ratio:.3f}")
     mixture = "\n".join(samples.values())
     mixture_ratio = len(mixture) / len(encoding.encode(mixture))
     print(

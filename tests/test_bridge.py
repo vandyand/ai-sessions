@@ -1,3 +1,4 @@
+import inspect
 import io
 import json
 import tempfile
@@ -29,6 +30,7 @@ from ai_sessions.bridge import (
     Budget,
     BudgetPolicy,
     SelectionMetric,
+    SelectionResult,
     ToolCall,
     Transcript,
     Turn,
@@ -297,9 +299,7 @@ class ShapingTests(unittest.TestCase):
         self.assertEqual((codex.tokens, codex.chars), (192_000, 384_000))
         self.assertEqual(resolve_budget("claude", max_chars=950_000).chars, 950_000)
         self.assertTrue(resolve_budget("claude", max_chars=950_000).over_policy)
-        self.assertEqual(
-            resolve_budget("claude", migrated=True).origin, "target-default-migrated"
-        )
+        self.assertEqual(resolve_budget("claude", migrated=True).origin, "target-default-migrated")
 
     def test_token_budget_applies_ratio_and_precedence(self) -> None:
         budget = resolve_budget("claude", max_tokens=5_000, max_chars=950_000)
@@ -329,6 +329,16 @@ class ShapingTests(unittest.TestCase):
         with self.assertRaisesRegex(BridgeError, "must be at least"):
             resolve_budget("claude", max_chars=100)
 
+    def test_invalid_resolver_values_are_unset_and_huge_values_are_reported(self) -> None:
+        expected = resolve_budget("claude")
+        for value in (0, -1, True, "5000"):
+            self.assertEqual(resolve_budget("claude", max_tokens=value), expected)  # type: ignore[arg-type]
+            self.assertEqual(resolve_budget("claude", max_chars=value), expected)  # type: ignore[arg-type]
+        with self.assertRaisesRegex(BridgeError, "max_tokens is too large"):
+            resolve_budget("claude", max_tokens=10**400)
+        with self.assertRaisesRegex(BridgeError, "max_chars is too large"):
+            resolve_budget("claude", max_chars=10**400)
+
     def test_fit_through_prices_same_role_joins(self) -> None:
         turns = [Turn("user", "x" * 10) for _ in range(10)]
         self.assertEqual(selection_cost(turns), 118)
@@ -355,8 +365,21 @@ class ShapingTests(unittest.TestCase):
             MIN_BRIDGE_CHARS - 4_096,
         )
         self.assertEqual(selected.dropped, 0)
+        self.assertEqual(selected.truncated, 2)
         self.assertEqual(selection_cost(selected.turns), 62)
         self.assertTrue(all(turn.text.endswith(TRUNCATION_MARKER) for turn in selected.turns))
+
+    def test_survivors_do_not_decrease_at_the_anchor_cap_boundary(self) -> None:
+        turns = [
+            Turn("user", "a" * 1_000),
+            Turn("assistant", "mmm"),
+            Turn("user", "b" * 1_000),
+        ]
+        below = select_messages(turns, 2_001)
+        above = select_messages(turns, 2_002)
+        self.assertEqual((len(below.turns), below.dropped), (2, 1))
+        self.assertGreaterEqual(len(above.turns), len(below.turns))
+        self.assertLessEqual(above.dropped, below.dropped)
 
     def test_bridge_floor_and_note_reserve_bound_maximal_metadata(self) -> None:
         with self.assertRaises(BridgeError):
@@ -423,9 +446,7 @@ class ShapingTests(unittest.TestCase):
         turns = [Turn("user", f"{index:04d}" + "x" * 96) for index in range(2_000)]
         conversation_limit = 190_000
         selected = select_messages(turns, conversation_limit)
-        oracle = sum(len(turn.text) for turn in selected.turns) + 2 * (
-            len(selected.turns) - 1
-        )
+        oracle = sum(len(turn.text) for turn in selected.turns) + 2 * (len(selected.turns) - 1)
         self.assertEqual(selection_cost(selected.turns), oracle)
         self.assertGreater(len(selected.turns), 1_500)
         self.assertEqual(selected.turns[1:], turns[-(len(selected.turns) - 1) :])
@@ -480,10 +501,7 @@ class ShapingTests(unittest.TestCase):
         tracemalloc.stop()
         self.assertLess(elapsed, 5.0)
         self.assertLessEqual(sum(calls.values()), 6 * len(turns) + 10)
-        self.assertLessEqual(
-            peak,
-            2 * maximum + 512 * len(turns) + 1_048_576,
-        )
+        self.assertLessEqual(peak, maximum + 16 * len(turns) + 262_144)
         self.assertLessEqual(selection_cost(selected.turns), maximum)
 
     def test_truncation_does_not_report_cut_tool_calls(self) -> None:
@@ -493,25 +511,45 @@ class ShapingTests(unittest.TestCase):
         )
         turn = flatten([Turn("assistant", "prefix", calls)])[0]
         second_call = turn.text.index("⟦two⟧")
-        selected = select_messages(
-            [turn], second_call + 5 + len(TRUNCATION_MARKER)
-        )
+        selected = select_messages([turn], second_call + 5 + len(TRUNCATION_MARKER))
         self.assertEqual(selected.turns[0].calls, calls[:1])
         self.assertIn(render_calls(calls[:1]), selected.turns[0].text)
         self.assertNotIn(render_calls(calls[1:]), selected.turns[0].text)
 
     def test_oversized_newest_anchor_is_truncated_and_disclosed(self) -> None:
-        selected = select_messages(
-            [Turn("user", "short"), Turn("assistant", "x" * 50_000)], 2_000
-        )
+        selected = select_messages([Turn("user", "short"), Turn("assistant", "x" * 50_000)], 2_000)
         self.assertEqual((selected.dropped, selected.truncated), (0, 1))
         self.assertIn("message truncated", selected.turns[-1].text)
 
     def test_budget_policy_rejects_invalid_registration(self) -> None:
-        with self.assertRaises(ValueError):
-            BudgetPolicy(1, 0.0, 2.0, "bad")
+        invalid = (
+            (0, 0.75, 2.0, "source"),
+            (10_000, 0.0, 2.0, "source"),
+            (10_000, 1.1, 2.0, "source"),
+            (10_000, 0.75, 0.0, "source"),
+            (10_000, 0.75, 2.0, ""),
+        )
+        for values in invalid:
+            with self.subTest(values=values), self.assertRaises(ValueError):
+                BudgetPolicy(*values)
         with self.assertRaises(ValueError):
             Budget("claude", 1, 1, "target-default")
+
+    def test_selection_metric_guard_clauses_reject_invalid_hooks(self) -> None:
+        turn = Turn("user", "x" * 100)
+        negative_item = SelectionMetric(lambda _: -1, lambda _a, _b: 0, lambda value, _: value)
+        with self.assertRaisesRegex(BridgeError, "negative item"):
+            selection_cost([turn], negative_item)
+        negative_join = SelectionMetric(lambda _: 1, lambda _a, _b: -1, lambda value, _: value)
+        with self.assertRaisesRegex(BridgeError, "negative join"):
+            selection_cost([turn, turn], negative_join)
+        wrong_role = SelectionMetric(
+            lambda value: len(value.text),
+            lambda _a, _b: 0,
+            lambda value, limit: Turn("assistant", value.text[:limit]),
+        )
+        with self.assertRaisesRegex(BridgeError, "invalid truncated anchor"):
+            select_messages([turn], 50, wrong_role)
 
     def test_bridged_title_names_the_origin(self) -> None:
         self.assertEqual(
@@ -651,6 +689,9 @@ class HarnessRegistryTests(unittest.TestCase):
             CODEX_BUDGET_CONTEXT_TOKENS,
         )
         self.assertNotEqual(CODEX_BUDGET_CONTEXT_TOKENS, CODEX_CONTEXT_WINDOW)
+        registry_source = inspect.getsource(bridge)
+        self.assertIn("context_tokens=CODEX_BUDGET_CONTEXT_TOKENS", registry_source)
+        self.assertIn("context_tokens=CLAUDE_BUDGET_CONTEXT_TOKENS", registry_source)
 
 
 class WriteSessionTests(unittest.TestCase):
@@ -827,8 +868,7 @@ class BridgeTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             source = Path(directory) / "source.jsonl"
             source.write_text(
-                "\n".join(codex_line("user", text) for text in ("one", "two", "three"))
-                + "\n",
+                "\n".join(codex_line("user", text) for text in ("one", "two", "three")) + "\n",
                 encoding="utf-8",
             )
             with patch.object(bridge, "CLAUDE_HOME", Path(directory) / "claude"):
@@ -841,9 +881,7 @@ class BridgeTests(unittest.TestCase):
                 )
             handoff = read_turns("claude", result.path)[0].text
         self.assertEqual((result.turns, result.written_turns), (3, 1))
-        self.assertIn(
-            "3 source message(s) below were assembled into 1 target message(s)", handoff
-        )
+        self.assertIn("3 source message(s) below were assembled into 1 target message(s)", handoff)
 
     def test_bridge_refuses_a_handoff_note_that_exceeds_its_reserve(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -863,6 +901,28 @@ class BridgeTests(unittest.TestCase):
                     session_id="source-session",
                     storage=str(source),
                     cwd=directory,
+                )
+
+    def test_bridge_refuses_a_selected_payload_above_the_applied_ceiling(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            source = self.source(directory)
+            selected = SelectionResult(
+                [Turn("user", "x" * MIN_BRIDGE_CHARS)],
+                dropped=0,
+                truncated=0,
+            )
+            with (
+                patch.object(bridge, "CLAUDE_HOME", Path(directory) / "claude"),
+                patch.object(bridge, "select_messages", return_value=selected),
+                self.assertRaisesRegex(BridgeError, "payload exceeds"),
+            ):
+                bridge.bridge(
+                    source_tool="codex",
+                    target_tool="claude",
+                    session_id="source-session",
+                    storage=str(source),
+                    cwd=directory,
+                    budget=resolve_budget("claude", max_chars=MIN_BRIDGE_CHARS),
                 )
 
     def test_unset_target_policies_diverge_on_a_340k_transcript(self) -> None:
@@ -1045,6 +1105,8 @@ class LaunchIntegrationTests(unittest.TestCase):
             written = read_turns("claude", target_path)
         self.assertNotIn("dropped to fit", stderr)
         self.assertIn("150,000 tokens / 300,000 projected characters", stderr)
+        self.assertIn("replaces the previous global 950,000-character ceiling", stderr)
+        self.assertIn("replaces the previous global 950,000-character ceiling", written[0].text)
         self.assertIn("message-10:", "\n".join(turn.text for turn in written))
 
     def test_launch_explains_migrated_explicit_and_clamped_budgets(self) -> None:
@@ -1083,7 +1145,10 @@ class LaunchIntegrationTests(unittest.TestCase):
             item = session(directory, launch_tool="claude")
             Path(item.storage).write_text(
                 "\n".join(
-                    [codex_line("user", "short"), codex_line("assistant", "x" * 20_000)]
+                    [
+                        codex_line("user", "x" * 20_000),
+                        codex_line("assistant", "y" * 20_000),
+                    ]
                 )
                 + "\n",
                 encoding="utf-8",
@@ -1105,8 +1170,8 @@ class LaunchIntegrationTests(unittest.TestCase):
             handoff = read_turns("claude", target)[0].text
         self.assertEqual(code, 0)
         self.assertNotIn("dropped to fit", stderr.getvalue())
-        self.assertIn("1 anchor message(s) truncated to fit", stderr.getvalue())
-        self.assertIn("1 anchor message(s) were truncated", handoff)
+        self.assertIn("2 anchor message(s) truncated to fit", stderr.getvalue())
+        self.assertIn("2 anchor message(s) were truncated", handoff)
 
     def test_command_for_refuses_an_unbridged_cross_harness_launch(self) -> None:
         with tempfile.TemporaryDirectory() as directory:

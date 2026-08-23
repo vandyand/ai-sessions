@@ -65,11 +65,7 @@ class LaunchConfig:
         bridge = payload.get("bridge", {})
         if isinstance(bridge, dict):
             max_tokens = bridge.get("max_tokens")
-            if (
-                isinstance(max_tokens, int)
-                and not isinstance(max_tokens, bool)
-                and max_tokens > 0
-            ):
+            if isinstance(max_tokens, int) and not isinstance(max_tokens, bool) and max_tokens > 0:
                 result.bridge_max_tokens = max_tokens
             max_chars = bridge.get("max_chars")
             if isinstance(max_chars, int) and not isinstance(max_chars, bool) and max_chars > 0:

@@ -60,6 +60,7 @@ class BudgetPolicy:
     chars_per_token: float
     source: str
 
+
 @dataclass(frozen=True, slots=True)
 class Budget:
     target: str
@@ -136,7 +137,7 @@ Invariants over an arbitrary transcript, in the style established by P1.
 | T2 | Except for the exact version-1 machine default, an existing positive `max_chars` keeps its exact character ceiling; it is estimated into tokens for reporting but never round-tripped through the estimate. Too-small or over-policy values are surfaced explicitly rather than silently changed |
 | T2b | With neither key set, each target receives the documented target default; the intentional default reduction is stated in the handoff note and release documentation |
 | T3 | The effective ceiling is derived **per target harness**, not one global constant |
-| T4 | Both fit-through and overflow use the same `SelectionMetric` item-plus-join cost. If the complete flattened list fits the conversation allowance under that metric it is byte-identical; otherwise both anchors are capped marker-inclusive with `anchor_share = (Budget.chars − HANDOFF_NOTE_RESERVE_CHARS − 2) // 2`, and survivors after the first are one contiguous suffix |
+| T4 | Both fit-through and overflow use the same `SelectionMetric` item-plus-join cost. If the complete flattened list fits the conversation allowance under that metric it is byte-identical; otherwise the head is capped marker-inclusive with `anchor_share = (Budget.chars − HANDOFF_NOTE_RESERVE_CHARS − 2) // 2`, the newest anchor receives the remaining allowance after the capped head and the worst-case two-character anchor join, and survivors after the first are one contiguous suffix |
 | T5 | The first message of the **selected source context** survives whenever anything survives; after compaction this is not necessarily the original conversation request |
 | T6 | The note is rendered from the resolved `Budget`, states the applied token estimate and character ceiling, fits its reserve including the possible join, distinguishes source/assembled counts, and discloses both dropped-message and truncated-anchor counts |
 | T7 | The conversion is exercised **end to end** — `LaunchConfig.load` → production launch path → `prepare_launch` → `bridge` → selection → note → written payload |
@@ -144,7 +145,7 @@ Invariants over an arbitrary transcript, in the style established by P1.
 | T9 | Selection preserves order, is deterministic and monotone with increasing budgets, and reports dropped source-message count before same-role merging |
 | T10 | Budget policy belongs to the target `Harness`; the core contains no target-name budget branches. Selection uses a linear `SelectionMetric` with non-negative `item_cost(turn)`, `join_cost(left, right)`, and matching `truncate(turn, limit)`, all denominated in `Budget.chars`; P3 validates hook results, and P4 may replace the metric for native projection/assembly sizing |
 
-**T4 was wrong twice in earlier drafts.** `fit()` currently caps every prepared run at `max(1000, max_chars // 2)` before it even knows whether the conversation fits, and it runs after `merge_runs`, where source messages no longer exist as units. P3 deliberately changes this: a fits-within-allowance conversation is untouched; overflow selection operates on `flatten(turns)` before same-role merging; both anchors use the post-note allowance minus their worst-case join so first and newest context can survive without exceeding the ceiling.
+**T4 was wrong twice in earlier drafts.** `fit()` currently caps every prepared run at `max(1000, max_chars // 2)` before it even knows whether the conversation fits, and it runs after `merge_runs`, where source messages no longer exist as units. P3 deliberately changes this: a fits-within-allowance conversation is untouched; overflow selection operates on `flatten(turns)` before same-role merging. The head begins with half the post-note allowance after reserving the worst-case two-character anchor join, and the newest receives the remainder. This keeps both anchors while ensuring their combined growth cannot make survivor count decrease as the total budget rises.
 
 **T7 exists because of a named mutation.** Adding a `max_tokens` key, printing it in the note, and leaving the character path active would pass every config-level and note-level test while behavior stayed in characters. That is the same shape as P1's proxy-tested R5, so the invariant is written to forbid it.
 

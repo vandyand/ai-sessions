@@ -141,6 +141,17 @@ class LaunchConfigTests(unittest.TestCase):
         self.assertEqual((before.tokens, before.chars), (after.tokens, after.chars))
         self.assertNotIn("max_chars", saved)
 
+    def test_invalid_budget_values_load_as_unset(self) -> None:
+        cases = ("0", "-1", "true", '"5000"')
+        for key in ("max_tokens", "max_chars"):
+            for value in cases:
+                with self.subTest(key=key, value=value), TemporaryDirectory() as directory:
+                    path = Path(directory) / "config.toml"
+                    path.write_text(f"version = 2\n[bridge]\n{key} = {value}\n", encoding="utf-8")
+                    loaded = LaunchConfig.load(path)
+                self.assertIsNone(loaded.bridge_max_tokens)
+                self.assertIsNone(loaded.bridge_max_chars)
+
 
 if __name__ == "__main__":
     unittest.main()

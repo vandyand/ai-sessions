@@ -620,7 +620,7 @@ def read_turns(tool: str, storage: str | Path, *, tool_calls: bool = True) -> li
 
 
 def prepare(turns: Iterable[Turn]) -> list[Turn]:
-    """Render tool summaries into text and restore alternating roles."""
+    """Compatibility shaping helper; production selects before calling ``merge_runs``."""
     return merge_runs(flatten(turns))
 
 
@@ -685,10 +685,13 @@ def _truncate_turn(turn: Turn, limit: int) -> Turn:
         start = turn.text.rfind(rendered)
         if start >= 0:
             count = 0
-            for index in range(1, len(turn.calls) + 1):
-                if start + len(render_calls(turn.calls[:index])) > prefix:
+            offset = start
+            for call in turn.calls:
+                block = render_calls((call,))
+                if offset + len(block) > prefix:
                     break
-                count = index
+                count += 1
+                offset += len(block) + 1
             retained_calls = turn.calls[:count]
     return Turn(turn.role, text, retained_calls, turn.compaction)
 
@@ -739,7 +742,12 @@ def select_messages(
 
     anchor_share = (max_chars - 2) // 2
     head, head_truncated = _capped(turns[0], anchor_share, metric)
-    newest, newest_truncated = _capped(turns[-1], anchor_share, metric)
+    # Give the newest anchor everything left after the capped head and the
+    # worst-case two-character anchor join. If both independent caps grew at once, their
+    # combined cost could grow by two when the budget grew by one, making
+    # selection non-monotone at the truncated/full boundary.
+    newest_share = max_chars - 2 - metric.item_cost(head)
+    newest, newest_truncated = _capped(turns[-1], newest_share, metric)
     suffix_reversed = [newest]
     suffix_first = newest
     suffix_cost = metric.item_cost(newest)
@@ -831,7 +839,12 @@ def handoff_note(
         ]
         if budget.clamped:
             lines.append("The configured token budget was raised to the safe bridge minimum.")
-        if budget.origin == "target-default-migrated":
+        if budget.origin == "target-default":
+            lines.append(
+                "This target policy replaces the previous global 950,000-character ceiling; "
+                "set bridge.max_tokens to choose a different ceiling."
+            )
+        elif budget.origin == "target-default-migrated":
             lines.append(
                 "The legacy version-1 950,000-character machine default was replaced by this "
                 "target policy; set bridge.max_tokens to choose a different ceiling."
@@ -1221,6 +1234,10 @@ def resolve_budget(
 ) -> Budget:
     """Resolve config into the one target budget used by the bridge."""
     policy = harness(target).budget
+    if not isinstance(max_tokens, int) or isinstance(max_tokens, bool) or max_tokens <= 0:
+        max_tokens = None
+    if not isinstance(max_chars, int) or isinstance(max_chars, bool) or max_chars <= 0:
+        max_chars = None
     default_tokens = math.floor(policy.context_tokens * policy.usable_fraction)
     default_chars = math.floor(default_tokens * policy.chars_per_token)
     if max_tokens is not None:
@@ -1229,10 +1246,14 @@ def resolve_budget(
             math.ceil(MIN_BRIDGE_CHARS / policy.chars_per_token),
         )
         tokens = max(max_tokens, minimum)
+        try:
+            chars = math.floor(tokens * policy.chars_per_token)
+        except (OverflowError, ValueError) as error:
+            raise BridgeError("bridge.max_tokens is too large to resolve") from error
         return Budget(
             target=target,
             tokens=tokens,
-            chars=math.floor(tokens * policy.chars_per_token),
+            chars=chars,
             origin="config.max_tokens",
             clamped=tokens != max_tokens,
         )
@@ -1244,9 +1265,13 @@ def resolve_budget(
                 f"bridge.max_chars must be at least {MIN_BRIDGE_CHARS} characters "
                 "to hold required handoff metadata"
             )
+        try:
+            tokens = math.ceil(max_chars / policy.chars_per_token)
+        except (OverflowError, ValueError) as error:
+            raise BridgeError("bridge.max_chars is too large to resolve") from error
         return Budget(
             target=target,
-            tokens=math.ceil(max_chars / policy.chars_per_token),
+            tokens=tokens,
             chars=max_chars,
             origin="config.max_chars",
             over_policy=max_chars > default_chars,
@@ -1402,7 +1427,9 @@ def bridge(
     conversation_limit = applied_budget.chars - HANDOFF_NOTE_RESERVE_CHARS
     selected = select_messages(flattened, conversation_limit)
     kept = selected.turns
-    assembled_turns = merge_runs(kept)
+    assembled_count = sum(
+        1 for index, turn in enumerate(kept) if index == 0 or turn.role != kept[index - 1].role
+    )
     summarised = sum(len(turn.calls) for turn in kept)
     note = handoff_note(
         source_tool=source_tool,
@@ -1411,7 +1438,7 @@ def bridge(
         title=title,
         cwd=cwd,
         kept=len(kept),
-        assembled=len(assembled_turns),
+        assembled=assembled_count,
         calls=summarised,
         dropped=selected.dropped,
         truncated=selected.truncated,
@@ -1433,7 +1460,7 @@ def bridge(
         session_id=new_id,
         path=path,
         turns=len(kept),
-        written_turns=len(assembled_turns),
+        written_turns=assembled_count,
         calls=summarised,
         dropped=selected.dropped,
         truncated=selected.truncated,
