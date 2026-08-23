@@ -39,6 +39,7 @@ read(path, options) -> Transcript
 write(cwd, turns, title) -> (native_id, path)
 locate(native_id) -> bool
 change_status(path, byte_cursor) -> unchanged | changed | unstable
+budget -> BudgetPolicy(context_tokens, usable_fraction, chars_per_token, source)
 ```
 
 `read` projects native records into the shared `Turn` model. `write` must produce a truly
@@ -59,6 +60,13 @@ Validated status is cached only for an unchanged native file snapshot. `unstable
 are never cached, because a sharing violation or other temporary read failure must remain
 retryable without requiring the provider to modify the transcript first.
 
+The budget policy is target-owned because context assumptions are adapter capabilities, not
+core routing rules. It is a conservative unknown-model default, not a claim that the bridge
+can inspect the model, system prompt, tools, or compaction threshold that will exist at
+resume time. Core resolves optional `max_tokens` / legacy `max_chars` configuration into one
+immutable applied `Budget`, then uses that same object for selection and the handoff note.
+Adding a harness must not add target-name conditionals to budget resolution.
+
 ## Complete adapter target
 
 The remaining provider branches in `app.py` should move behind the same adapter in this
@@ -71,7 +79,8 @@ order:
 5. `focus(process) -> FocusResult` — optional platform capability, never required to resume.
 6. The existing `read`, `write`, `locate`, and `change_status` conversion operations.
 
-Capabilities should be explicit (`rename`, `focus`, `subagents`, `compaction`, and so on)
+Capabilities should be explicit (`rename`, `focus`, `subagents`, `compaction`, budget policy,
+and so on)
 rather than detected with `if tool == ...` in core code. Provider-specific caches and
 database schemas belong inside the adapter. The core owns filtering, display, conversation
 state, head resolution, launch policy, and error presentation.
@@ -85,6 +94,12 @@ Adding a third harness is complete when its adapter passes shared contract fixtu
 - round trips through each existing harness without pairwise code;
 - rename/liveness capabilities when declared; and
 - concurrent append safety and explicit divergence.
+
+Shared budget fixtures additionally require every adapter policy to be positive and sourced,
+an unset configuration to resolve through that policy, and the same explicit legacy
+`max_chars` value to remain identical across all targets. Selection accepts a cost callback so
+the full conversation-log phase can account for native-versus-projected forms without
+rewriting the selection algorithm.
 
 ## Persistence and recovery
 

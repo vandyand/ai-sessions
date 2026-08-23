@@ -25,15 +25,59 @@ The defensible problems are narrower, and different:
 2. **One global ceiling is applied regardless of target.** A Claude-bound copy is capped at roughly Codex's context window. That is the real defect: the ceiling should follow the target.
 3. **`CODEX_CONTEXT_WINDOW` is currently only session metadata** (`bridge.py:806`), not an input to budgeting, so the relationship between the two constants is implicit and undocumented.
 
-### What the budget must actually respect
+### What the budget can honestly respect
 
-Not the model's raw context. The copy lands *inside* a harness that has already spent context on its own system prompt, tool definitions, and any project instructions, and that will run its own compaction when it gets close to full. A copy sized at the model's ceiling arrives pre-compacted, which defeats the point of choosing what crosses.
+The exact target model, injected system prompt, tool definitions, project instructions, and compaction threshold are not available at bridge time. They must not be presented as measurable inputs. The adapter instead declares a conservative operational policy:
 
-So the ceiling is: target model context, minus harness overhead, minus enough headroom that the copy does not immediately trigger the target's own compaction.
+```text
+context_tokens × usable_fraction × conservative_chars_per_token
+```
 
-### Counting tokens without a tokenizer
+`context_tokens` is the smallest supported or observed baseline the adapter is willing to promise for an unknown target model. `usable_fraction` is an explicit safety factor, not a measurement of private harness overhead. A user who knows the target model can override the default with `max_tokens`.
 
-`ai-sessions` is stdlib plus `psutil`. Shipping a tokenizer is out of scope, and per-provider tokenizers disagree anyway. The honest option is a documented characters-per-token ratio per harness, applied as an estimate, with the config naming its unit so the next reader does not have to measure it to find out.
+Current policy, dated 2026-08-23:
+
+| target | baseline | usable fraction | default tokens | chars/token | selection chars |
+|---|---:|---:|---:|---:|---:|
+| Claude Code | 200,000 | 0.75 | 150,000 | 2.5 | 375,000 |
+| Codex | 258,400 | 0.75 | 193,800 | 2.5 | 484,500 |
+
+Claude Opus 5 is documented at 1M tokens, and current GPT-5.6 models at 1.05M. Those are not safe universal harness defaults: both CLIs allow model selection, and the selected model is not part of the bridge request. Claude's official context-window guide still documents 200k models; the Codex baseline is the smaller context recorded by real supported rollouts in this project. The policy deliberately underfills current flagship models so an unknown-model bridge remains safe.
+
+### Counting tokens without a runtime tokenizer
+
+`ai-sessions` remains stdlib plus `psutil`; tokenizers do not ship with it. Development script `tools/measure_token_ratio.py` uses optional `tiktoken` `o200k_base` over a deterministic generated corpus of prose, Python, JSON, diffs, paths/UUIDs, tool output, and Unicode. On 2026-08-23 it measured **2.387 minimum, 2.572 p10, 3.788 median, 6.996 maximum chars/token**. The policy rounds p10 down to **2.5** and then applies the separate 0.75 usable fraction. This is an estimate biased toward underfill, not a claim that providers share a tokenizer.
+
+The default changes intentionally for a config with no budget key: Claude selects at 375,000 characters and Codex at 484,500. A legacy config explicitly containing `max_chars = 950000` remains exactly 950,000 characters. Old versions wrote that key when saving configuration, so existing saved behavior is preserved; only the truly unset default adopts target policy.
+
+### Applied budget contract
+
+```python
+@dataclass(frozen=True, slots=True)
+class BudgetPolicy:
+    context_tokens: int
+    usable_fraction: float
+    chars_per_token: float
+    source: str
+
+@dataclass(frozen=True, slots=True)
+class Budget:
+    target: str
+    tokens: int
+    chars: int
+    origin: str  # config.max_tokens | config.max_chars | target-default
+    clamped: bool = False
+```
+
+`resolve_budget(target, max_tokens=None, max_chars=None)` is the only production path to a ceiling:
+
+1. A positive, non-boolean `max_tokens` wins. Values below 4,096 tokens are clamped and reported as such.
+2. Otherwise, a positive, non-boolean legacy `max_chars` is kept exactly; `tokens = ceil(chars / chars_per_token)` is reporting metadata only.
+3. Otherwise, `tokens = floor(context_tokens × usable_fraction)` from the target adapter and `chars = floor(tokens × chars_per_token)`.
+4. Invalid, boolean, zero, or negative config values are treated as unset, matching current forgiving config behavior.
+5. The resolved `Budget` is passed unchanged through launch, selection, and note rendering. No raw ceiling or fallback travels in parallel.
+
+If both keys are present, `max_tokens` wins and the next config save removes the ignored deprecated key. A newly saved target-default config writes neither key. An explicit legacy character budget too small for the bounded required handoff note fails with `BridgeError`; it is never silently enlarged and the payload never exceeds it.
 
 ## Part B — selection across windows
 
@@ -85,15 +129,18 @@ Invariants over an arbitrary transcript, in the style established by P1.
 | # | Invariant |
 |---|---|
 | T1 | The budget names its unit. Config carries a token-denominated key |
-| T2 | An existing `max_chars` config keeps working, converted, with no silent change of meaning |
+| T2 | An existing positive `max_chars` config keeps its exact character ceiling; it is estimated into tokens for reporting but never round-tripped through the estimate. If it cannot hold required handoff metadata, bridging fails clearly rather than exceeding or silently changing it |
+| T2b | With neither key set, each target receives the documented target default; the intentional default reduction is stated in the handoff note and release documentation |
 | T3 | The effective ceiling is derived **per target harness**, not one global constant |
-| T4 | **Selection** drops whole messages; a message is truncated only when it alone exceeds the budget, and then carries the existing marker |
-| T5 | The opening request survives trimming whenever anything survives |
-| T6 | The note states the budget and unit actually applied |
-| T7 | The conversion is exercised **end to end** — `prepare_launch` → `bridge` → `fit` → `handoff_note` — not just at the config boundary |
+| T4 | If all prepared messages fit, they are byte-identical. On overflow, selection happens before same-role merging, drops only whole messages, and may truncate an anchor above half the available conversation budget so both the first selected-context message and newest message can survive |
+| T5 | The first message of the **selected source context** survives whenever anything survives; after compaction this is not necessarily the original conversation request |
+| T6 | The note is rendered from the resolved `Budget`, states the actually applied token estimate and character ceiling, and is included in the total payload ceiling |
+| T7 | The conversion is exercised **end to end** — `LaunchConfig.load` → production launch path → `prepare_launch` → `bridge` → selection → note → written payload |
 | T8 | Existing P1 invariants R1–R10 continue to hold, including R10 (`latest_window=False`) |
+| T9 | Selection preserves order, is deterministic and monotone with increasing budgets, and reports dropped source-message count before same-role merging |
+| T10 | Budget policy belongs to the target `Harness`; the core contains no target-name budget branches, and the selector accepts a cost hook for P4 projection sizing |
 
-**T4 was wrong in the first draft.** It said "never trim mid-message." `fit()` already caps any turn at `max(1000, max_chars // 2)` and truncates with a `[... message truncated ...]` marker (`src/ai_sessions/bridge.py:601-608`), and `test_oversized_single_turn_is_truncated_not_dropped` (`tests/test_bridge.py:261`) blesses that deliberately — a truncated oversized message beats an absent one. As written, T4 contradicted shipped behavior *and* T5, since an oversized opening request cannot both survive whole and be under budget. Restated above to say what actually matters: whole-message granularity for the *selection* decision, truncation only as the single-message escape hatch.
+**T4 was wrong twice in earlier drafts.** `fit()` currently caps every prepared run at `max(1000, max_chars // 2)` before it even knows whether the conversation fits, and it runs after `merge_runs`, where source messages no longer exist as units. P3 deliberately changes this: a fits-within-budget conversation is untouched; overflow selection operates on `flatten(turns)` before same-role merging; the half-budget anchor cap is retained only in the overflow path so first and newest context can both survive.
 
 **T7 exists because of a named mutation.** Adding a `max_tokens` key, printing it in the note, and leaving the character path active would pass every config-level and note-level test while behavior stayed in characters. That is the same shape as P1's proxy-tested R5, so the invariant is written to forbid it.
 
@@ -101,7 +148,7 @@ Invariants over an arbitrary transcript, in the style established by P1.
 
 ### Part A
 
-- **A1 — token key, character key deprecated (recommended).** Add `max_tokens`; keep reading `max_chars` and convert. Ratio per harness, documented as an estimate.
+- **A1 — token key, character key deprecated (chosen).** Add `max_tokens`; keep positive `max_chars` verbatim. Both config fields use `None` for unset, `max_tokens` wins if both occur, and a pure resolver returns one immutable applied `Budget`.
 - **A2 — keep characters, fix only the value.** Cheapest, but leaves the config lying about what it measures and leaves the next person to rediscover it.
 - **A3 — ship a tokenizer.** Rejected: dependency weight, provider disagreement, and it would still be an estimate for the target harness's overhead.
 
@@ -119,13 +166,16 @@ Two further objections made B1 unsalvageable even setting the semantics aside:
 ## Open Questions
 
 1. ~~**Is Part B worth its risk?**~~ **Answered: no.** B2 chosen. Recorded in the north star's *explicitly decided NOT to do* section.
-2. **What default budget per target?** Not "fix the unit and maybe raise later" — a derivation: `target model context − harness overhead − compaction margin`. Phase 0 produces it or Part A does not proceed.
-3. **Which characters-per-token ratio?** Per-harness is likely not enough. Engineering transcripts mix prose, code, JSON, paths, UUIDs, diffs, and tool output; a prose-derived ratio can overfill the target and trigger immediate compaction. Measure the spread, and prefer a conservative ratio over a mean.
-4. **Where does the estimate cause real harm** rather than mild imprecision, and does the failure mode need to be one-sided (underfill rather than overfill)?
+2. ~~**What default budget per target?**~~ **Answered:** 75% of the conservative unknown-model baseline in the table above.
+3. ~~**Which characters-per-token ratio?**~~ **Answered:** generated-corpus p10 rounded down to 2.5, with the full spread recorded above.
+4. ~~**Which side should estimation error favor?**~~ **Answered:** underfill. Immediate target compaction can discard intentionally selected context; unused capacity can be raised explicitly with `max_tokens`.
 
 ## References
 
 - `src/ai_sessions/bridge.py` — `fit`, `DEFAULT_MAX_CHARS`, `prepare`, `merge_runs`, `bridge`
 - `src/ai_sessions/config.py` — `bridge_max_chars`, `bridge_latest_window`
+- `tools/measure_token_ratio.py` — reproducible development-only ratio measurement
 - P1: [`../codex-compaction-window/`](../codex-compaction-window/) — corrected R5, R10, and the `PeakRecorder` harness
 - Measurements taken across 21 multi-window Codex sessions available locally, 2026-08-21
+- Claude context windows: https://platform.claude.com/docs/en/build-with-claude/context-windows
+- Current OpenAI model contexts: https://developers.openai.com/api/docs/models

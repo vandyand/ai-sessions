@@ -36,12 +36,14 @@ Those measurements made Part B worth reviewing, but did not make it correct. The
 | # | Decision | Rationale | Alternative rejected |
 |---|---|---|---|
 | K1 | Ship Part A first, independently | It is unambiguous, self-contained, and its correctness does not depend on Part B's riskier merge rule | Bundle both, and let a contested ordering question hold up a clear fix |
-| K2 | Token-denominated config key, `max_chars` still read and converted | The config should not lie about what it measures; existing configs must not silently change meaning | Keep characters and just raise the number |
-| K3 | Estimate tokens with a documented per-harness ratio | Shipping a tokenizer is a dependency this tool does not take, and every estimate is wrong at the margin anyway — say so rather than imply precision | Ship a tokenizer; or keep pretending characters are the unit |
-| K4 | The ceiling is derived per target harness, not one global constant | The copy lands inside a harness that has already spent context on its own prompt and tools, and that will compact on its own if crowded | One global number for every target |
-| K5 | Trim at message boundaries, never mid-message | A half-message is worse than an absent one, and P1 established boundaries as the unit of selection | Continue trimming by character position |
+| K2 | Token-denominated config key; positive legacy `max_chars` stays verbatim | Existing saved configs must not silently change meaning, while an unset config must remain distinguishable from an explicit 950,000-character limit | Default the field to 950,000 and lose the unset state |
+| K3 | Estimate with a generated-corpus p10 rounded down to 2.5 chars/token | Shipping a tokenizer is a runtime dependency this tool does not take; the separate 0.75 safety factor biases error toward underfill | Claim exact token counts or use a prose mean |
+| K4 | Budget policy lives on each target `Harness` | The target model is unknown, so each adapter declares a conservative baseline, safety factor, and provenance without target-name branches in core | Infer private overhead or key policy by `if target == ...` |
+| K5 | Select before same-role merging and drop at source-message boundaries | `prepare()` currently erases message boundaries before `fit()`; selection must retain a real unit and honest dropped count | Continue selecting merged runs |
 | K6 | **Part B does not ship.** The newest window is what the source itself resumes from, so a copy matching it is correct by construction | Merging older windows creates a transcript no harness ever held, and there is no stable message identity to deduplicate on | Recover the 10–41% because the number is non-zero |
-| K7 | Every invariant is exercised end to end, not at the config boundary | Adding a token key, printing it in the note, and leaving the character path live would pass config and note tests while behavior stayed in characters | Test the seam and assume the pipeline follows |
+| K7 | One immutable resolved `Budget` flows from loaded config to selection and the note | This prevents config, applied ceiling, and user-facing explanation from diverging | Pass raw integers through parallel paths |
+| K8 | The total projected payload, note included, stays under the applied ceiling | The note is part of what the target receives; budgeting only conversation text makes the limit false at the writer | Treat metadata as free |
+| K9 | A conversation that fits is byte-identical; anchor truncation exists only on overflow | The old half-budget cap changed content even when the whole conversation fit | Apply a per-message cap before checking total size |
 
 ## Success Criteria
 
@@ -52,21 +54,23 @@ P1's corrected **R5** still applies: anything claiming a memory property must be
 ## Non-Goals
 
 - The conversation log, per-message provenance, verbatim carry-forward — that is P4.
+- Choosing native-versus-projected message cost — P3 exposes a selector cost hook; P4 supplies native provenance and target projection.
 - Round-trip head tracking — that is completed P2 (`5e5503e` on `main`).
 - Decoding `encrypted_content` — impossible by construction.
 - Shipping a tokenizer.
+- Adding a CLI budget flag. P3 has one configuration path; a future flag must resolve through the same `Budget` function rather than create another path.
 
 ## Open Questions
 
 1. ~~Is Part B worth its risk?~~ **Answered on review: no.** Recorded in the north star as decided against.
-2. **What default budget per target?** A derivation — `target context − harness overhead − compaction margin` — produced in Phase 0, or Part A does not proceed.
-3. **Which chars-per-token ratio?** Per-harness is likely insufficient: engineering transcripts mix prose, code, JSON, diffs, and tool output. Measure the spread; prefer conservative over mean.
-4. **Should the estimate fail one-sided** — underfill rather than risk overfilling and triggering the target's own compaction on arrival?
+2. ~~**What default budget per target?**~~ **Answered:** Claude 150,000 estimated tokens / 375,000 characters; Codex 193,800 / 484,500, derived from adapter baselines at a declared 0.75 usable fraction.
+3. ~~**Which chars-per-token ratio?**~~ **Answered:** 2.5, below the generated-corpus p10 of 2.572; runtime remains tokenizer-free.
+4. ~~**Which side should estimation error favor?**~~ **Answered:** underfill, with explicit `max_tokens` available when the user knows the target model.
 
 ## Implementation Status
 
 - [x] Phase 3 — Adversarial review of the plan *(ran first; HIGH=4 MEDIUM=6, Part B closed)*
-- [ ] Phase 0 — Derive the ratio and the per-target ceiling
+- [x] Phase 0 — Derive the ratio and the per-target ceiling
 - [ ] Phase 1 — Per-target token budget (Part A)
 - [ ] Phase 2 — Whole-message selection (Part A)
 - [ ] ~~Phase 4 — Deduplicated union~~ *(decided against)*

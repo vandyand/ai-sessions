@@ -1,6 +1,6 @@
 # The Conversation Log
 
-A conversation carried across harnesses keeps its identity, its full user history, and its native fidelity. Concretely: bridging a Codex session into Claude and back returns every message you wrote — not an arbitrary character-window slice — the Codex-origin portion is never converted twice, resuming in either harness always continues from whichever side holds the newest work, and adding a third harness costs one reader and one writer with no changes to the neutral model.
+A conversation carried across harnesses keeps its identity, its authoritative current context, and its native fidelity. From the point the utility adopts a conversation, each message is projected at most once from its original native form; pre-existing provider compaction remains authoritative and is not reverse-engineered by merging superseded windows. Concretely: a Codex → Claude → Codex trip preserves the live carried context without converting the Codex-origin portion twice, resuming in either harness continues from whichever side holds the newest work, and adding a third harness costs one adapter with no pairwise conversion path.
 
 ## How to use this doc
 
@@ -93,7 +93,7 @@ never routing authority.
 
 ### P3 — Target-aware token budget and whole-message selection
 
-Replace the single global character ceiling with an explicit token-denominated policy derived for the target harness. Keep the source reader's newest carried window plus live tail unchanged, and fit that context at whole-message boundaries. Truncate inside a message only when an individual message cannot fit by itself.
+Replace the single global character ceiling with an explicit token-denominated policy owned by the target harness. Keep the source reader's newest carried window plus live tail unchanged, flatten tool summaries without merging same-role messages, then select at source-message boundaries. A conversation that fits remains byte-identical; on overflow, bounded anchor truncation may reserve room for both the first selected-context message and the newest message.
 
 Do **not** merge older `replacement_history` windows. The newest replacement history is the context Codex itself resumes from; merging earlier windows could resurrect superseded instructions and create a transcript no harness ever held.
 
@@ -127,7 +127,7 @@ Done when: a Codex → Claude → Codex trip keeps the Codex-origin portion in n
 ## Red flags
 
 - **The Codex writer is the risky surface.** Constructing valid records means honouring the `response_item` versus `user_message`/`agent_message` split and the `task_started`/`task_complete` framing. Getting it wrong produces a session that resumes with full context and a blank screen — indistinguishable from a failed bridge. Verify visually, not by asking the model what it remembers.
-- **Target budgets are estimates.** Engineering transcripts mix prose, code, JSON, diffs, and tool output, while provider tokenizers and harness overhead differ. P3 must fail toward underfilling, document its safety margin, and retain an oversized-single-message escape hatch.
+- **Target budgets are estimates.** Engineering transcripts mix prose, code, JSON, diffs, and tool output, while provider tokenizers and harness overhead differ. P3 must fail toward underfilling, document its safety margin, and retain its bounded overflow-only anchor truncation.
 - **Session proliferation.** Each hop writes a new native session. Superseded members are marked, not hidden — whether a long chain should ever be collapsed is unresolved.
 - **Specs written against one machine's data.** The P1 spec initially defined done in terms of a single local 530 MB rollout. Invariants over the format, verified on generated fixtures, are the correct shape — a criterion nobody else can check is not a criterion.
 - **A failed load leaks its SQLite connection.** The exception traceback keeps the frame alive, so on Windows the file stays handle-locked until garbage collection. Wants a `finally: connection.close()`.
