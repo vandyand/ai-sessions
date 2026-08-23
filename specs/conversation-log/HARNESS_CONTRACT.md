@@ -82,15 +82,24 @@ and marker-truncated anchors.
 The remaining provider branches in `app.py` should move behind the same adapter in this
 order:
 
-1. `discover() -> Iterable[NativeSession]` — enumerate sessions and provider metadata.
+1. `discover(context) -> Iterable[NativeSession]` — enumerate sessions and provider metadata.
 2. `resume_argv(native_id, mode, options) -> list[str]` — construct a shell-free command.
 3. `publish_name(session, title) -> PublishResult` — append the provider-supported name.
-4. `inspect_liveness(sessions) -> Mapping[id, NativeProcess]` — identify open sessions.
-5. `focus(process) -> FocusResult` — optional platform capability, never required to resume.
-6. The existing `read`, `write`, `locate`, and `change_status` conversion operations.
+4. `inspect_liveness(context, sessions) -> Mapping[id, NativeProcess]` — identify open
+   sessions from one shared process/lock snapshot.
+5. The existing `read`, `write`, `locate`, and `change_status` conversion operations.
 
-Capabilities should be explicit (`rename`, `focus`, `subagents`, `compaction`, budget policy,
-and so on)
+Terminal focus is a platform/core capability over a verified open PID, not a harness hook.
+On Windows exact tab focus is unsupported for every current harness; on Linux the same
+tmux/desktop-terminal logic applies regardless of which adapter identified the process.
+
+`NativeSession` contains provider discovery data only. Adapters do not construct the utility
+`Session` fields that carry local names, visibility, launch selection, conversation identity,
+frontiers, superseded state, or divergence. Its source kind is a closed neutral enum
+(`interactive`, `non-interactive`, `subagent`, `sdk`), not an unchecked provider string.
+
+Capabilities should be explicit (`rename`, `subagents`, `compaction`, read, write, discovery,
+liveness, budget policy, and so on)
 rather than detected with `if tool == ...` in core code. Provider-specific caches and
 database schemas belong inside the adapter. The core owns filtering, display, conversation
 state, head resolution, launch policy, and error presentation.
@@ -128,6 +137,11 @@ to rebuild it belongs to the full conversation-log phase.
 Version 5 bridge records have no safe cursor. Migration marks a surviving target copy as
 possibly advanced so the utility may duplicate history but will not silently choose its
 ancestor. Provider transcripts remain append-only and are never rewritten in place.
+
+State and configuration are forward-compatible data. A build whose registry does not know a
+harness may hide or refuse to operate on that harness, but load/save must preserve its bridge
+records, conversation members, launch preference, and keyed provider profile verbatim. An
+older or partial registry must never erase routing authority written by a newer adapter.
 
 ## Deliberate non-goals of the head-routing phase
 
