@@ -60,7 +60,7 @@ Measured on a real 366-compaction session, before and after:
 - **`replacement_history` carries only the user side.** The assistant's own work in a window is inside the sealed blob. A carried window plus the live tail is therefore complete user intent plus recent two-sided detail — not a full two-sided history.
 - Reading is ~20% slower on a 530 MB file: the window is parsed 366 times and discarded 365 of them. Acceptable now; if it ever matters, option B (locate the final boundary first) is the escape hatch.
 
-### P2 — Stop the round trip losing work **(COMPLETE as of af15fa9)**
+### P2 — Stop the round trip losing work **(COMPLETE as of 6593173)**
 
 Ignore bridge-ancestor back-references when resolving launch targets, and resume from whichever member of a bridge group carries the newest work. Mark non-head members superseded rather than hiding them.
 

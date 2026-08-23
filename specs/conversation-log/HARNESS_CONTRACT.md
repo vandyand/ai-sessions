@@ -55,6 +55,10 @@ partial record cannot strand later retries inside that record. This is intention
 lower bound: concurrent work may be copied twice on a later hop, but it cannot be marked
 as consumed without having been observed.
 
+Validated status is cached only for an unchanged native file snapshot. `unstable` results
+are never cached, because a sharing violation or other temporary read failure must remain
+retryable without requiring the provider to modify the transcript first.
+
 ## Complete adapter target
 
 The remaining provider branches in `app.py` should move behind the same adapter in this
