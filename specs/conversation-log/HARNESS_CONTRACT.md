@@ -45,14 +45,15 @@ change_status(path, byte_cursor) -> unchanged | changed | unstable
 resumable native transcript, including any separate records needed for both model context
 and visible scrollback. `change_status` recognizes conversation/tool activity and ignores
 metadata-only appends such as renames. Missing, replaced, truncated, or partially written
-append-only storage counts as changed so the core fails conservatively. If the newest
+append-only storage is `unstable` so the core fails conservatively. If the newest
 generation is unavailable and no equivalent native member survives, launch refuses to
 promote an older generation.
 
 The cursor returned with a bridge is captured before the read begins and aligned after the
-last complete JSONL record. This is intentionally a lower bound: concurrent work may be
-copied twice on a later hop, but it cannot be marked as consumed without having been
-observed.
+last complete JSONL record. Provisional state uses the same alignment, so completing a
+partial record cannot strand later retries inside that record. This is intentionally a
+lower bound: concurrent work may be copied twice on a later hop, but it cannot be marked
+as consumed without having been observed.
 
 ## Complete adapter target
 

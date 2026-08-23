@@ -79,7 +79,8 @@ never routing authority.
   frontiers, and semantic records appended after a byte cursor.
 - **The safe cursor is captured before reading.** A live transcript can grow during a
   large bridge. An earlier cursor may cause a conservative re-copy; a later EOF can mark
-  unread work consumed and lose it.
+  unread work consumed and lose it. Both persisted and provisional cursors stop after the
+  last complete JSONL record, so a partial provider write remains safely retryable.
 - **A copy and its source can both be current.** Immediately after a bridge they are
   equivalent native materializations of one frontier. `superseded` means a member is
   behind the active frontier, not merely that another file was created later.
