@@ -6,6 +6,7 @@ from the provider's own configuration.  Bypass flags require an explicit mode.
 
 from __future__ import annotations
 
+import json
 import os
 import tomllib
 from dataclasses import dataclass, field
@@ -166,7 +167,14 @@ class LaunchConfig:
     def save(self) -> None:
         self.path.parent.mkdir(parents=True, exist_ok=True)
         temporary = self.path.with_suffix(f".tmp-{os.getpid()}")
-        temporary.write_text(self.as_toml(), encoding="utf-8")
+        rendered = self.as_toml()
+        try:
+            tomllib.loads(rendered)
+        except tomllib.TOMLDecodeError as error:
+            raise ValueError(
+                f"refusing to save invalid generated configuration: {error}"
+            ) from error
+        temporary.write_text(rendered, encoding="utf-8")
         try:
             temporary.chmod(0o600)
         except OSError:
@@ -185,8 +193,11 @@ class LaunchConfig:
             provider_tables += f"\n[launch.providers.{_toml_key(name)}]\n"
             if profile.command is not None:
                 provider_tables += f"command = {_toml_array(profile.command)}\n"
-            provider_tables += f"custom_args = {_toml_array(profile.custom_args)}\n"
+            if "custom_args" not in profile.extra:
+                provider_tables += f"custom_args = {_toml_array(profile.custom_args)}\n"
             for key, value in profile.extra.items():
+                if key == "command" and profile.command is not None:
+                    continue
                 provider_tables += f"{_toml_key(key)} = {_toml_value(value)}\n"
         version = 3 if self.providers else 2
         provider_separator = "\n" if provider_tables else ""
@@ -226,8 +237,7 @@ def _optional_string_list(value: Any) -> list[str] | None:
 
 
 def _toml_string(value: str) -> str:
-    escaped = value.replace("\\", "\\\\").replace('"', '\\"')
-    return f'"{escaped}"'
+    return json.dumps(value, ensure_ascii=False)
 
 
 def _toml_array(values: list[str]) -> str:

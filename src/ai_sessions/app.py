@@ -28,7 +28,9 @@ from pathlib import Path
 from typing import Any, Iterable
 
 from . import __version__ as VERSION
-from .bridge import (
+from .capabilities import Unsupported
+from .config import LAUNCH_MODES, LaunchConfig
+from .conversion import (
     BridgeError,
     bridge,
     bridge_tools,
@@ -37,9 +39,7 @@ from .bridge import (
     native_session_exists,
     resolve_budget,
 )
-from .bridge import append_jsonl as append_jsonl
-from .capabilities import Unsupported
-from .config import LAUNCH_MODES, LaunchConfig
+from .conversion import append_jsonl as append_jsonl
 from .diagnostics import clear_warnings, record_warning
 from .diagnostics import warnings as load_warnings
 from .model import Session, SourceKind
@@ -773,6 +773,8 @@ def publish_name(
         note = publisher(item, name)
     except OSError as error:
         return f"could not update the provider title: {error}"
+    if note:
+        return note
     if restored_generated:
         label = tool_label(item.tool)
         return f"restored {name!r}; {label} now records it as an explicit title"
@@ -2972,7 +2974,11 @@ def command_for(session: Session, config: LaunchConfig) -> list[str]:
         source = SourceKind(session.source)
     except ValueError:
         raise BridgeError(f"invalid source kind for {session.tool}: {session.source!r}") from None
-    if source not in REGISTRY.get(session.tool).source_kinds:
+    try:
+        source_adapter = REGISTRY.get(session.tool)
+    except KeyError:
+        raise BridgeError(f"unknown recording harness: {session.tool}") from None
+    if source not in source_adapter.source_kinds:
         raise BridgeError(f"{session.tool} does not declare source kind {source.value!r}")
     argv = config.provider_prefix(tool)
     argv += resume(

@@ -3,7 +3,6 @@ import unittest
 from dataclasses import replace
 from pathlib import Path
 from tempfile import TemporaryDirectory
-from unittest.mock import patch
 
 from ai_sessions import app
 from ai_sessions.app import (
@@ -16,7 +15,6 @@ from ai_sessions.app import (
     rename_session,
 )
 from ai_sessions.capabilities import Unsupported
-from ai_sessions.harnesses import codex
 from ai_sessions.registry import REGISTRY
 
 
@@ -110,7 +108,7 @@ class PublishNameTests(unittest.TestCase):
     def test_codex_rename_appends_thread_name(self) -> None:
         with TemporaryDirectory() as directory:
             home = Path(directory)
-            with patch.object(codex, "CODEX_HOME", home):
+            with REGISTRY.temporary(replace(REGISTRY.get("codex"), home=home)):
                 item = session(tool="codex", session_id="019f-thread")
                 self.assertEqual(publish_name(item, "my-name"), "")
             written = json.loads((home / "session_index.jsonl").read_text().splitlines()[-1])
@@ -147,6 +145,17 @@ class PublishNameTests(unittest.TestCase):
             self.assertIn("explicit title", note)
             last = json.loads(transcript.read_text(encoding="utf-8").splitlines()[-1])
             self.assertEqual(last["customTitle"], "Auto Generated")
+
+    def test_reset_does_not_mask_provider_publication_failure(self) -> None:
+        item = session(
+            session_id="abc",
+            storage="/nonexistent/transcript.jsonl",
+            original_named=False,
+            original_title="Auto Generated",
+        )
+        note = publish_name(item, "")
+        self.assertIn("missing", note)
+        self.assertNotIn("now records it", note)
 
     def test_reset_without_any_earlier_title_still_refuses(self) -> None:
         with TemporaryDirectory() as directory:

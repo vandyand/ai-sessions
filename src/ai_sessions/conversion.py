@@ -62,8 +62,6 @@ DEFAULT_USABLE_FRACTION = 0.75
 DEFAULT_CHARS_PER_TOKEN = 2.0
 REQUEST_CHARS = 300
 RESULT_CHARS = 500
-CLAUDE_VERSION = "2.1.227"
-CODEX_CLI_VERSION = "0.147.0"
 CODEX_CONTEXT_WINDOW = 258_400
 
 # Machine-injected scaffolding that reads as noise once it is out of its
@@ -82,8 +80,6 @@ _SCRUB_PATTERNS = tuple(re.compile(rf"<{tag}>.*?</{tag}>", re.I | re.S) for tag 
 
 # Codex wraps every tool result in a fixed preamble that says nothing the
 # surrounding transcript does not already say.
-_CODEX_RESULT_NOISE = re.compile(r"^Script completed\s*(Wall time[^\n]*)?\s*Output:\s*", re.I)
-
 # Codex's ``exec`` tool takes a snippet of JavaScript that wraps the real
 # shell command, which is the only part worth carrying into a summary.
 _CODEX_EXEC_COMMAND = re.compile(r'"cmd"\s*:\s*("(?:[^"\\]|\\.)*")')

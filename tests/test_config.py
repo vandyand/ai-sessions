@@ -2,6 +2,7 @@ import unittest
 from dataclasses import replace
 from pathlib import Path
 from tempfile import TemporaryDirectory
+from unittest.mock import patch
 
 from ai_sessions.bridge import resolve_budget
 from ai_sessions.config import LaunchConfig, ProviderProfile
@@ -234,6 +235,51 @@ metadata = { owner = "future", levels = [1, 2] }
         self.assertEqual(reloaded.providers["extended"].extra["metadata"]["levels"], [1, 2])
         self.assertIn("[launch.providers.only_custom]", saved)
         self.assertIn("env_passthrough = true", saved)
+
+    def test_invalid_future_shape_and_control_text_cannot_corrupt_whole_config(self) -> None:
+        with TemporaryDirectory() as directory:
+            path = Path(directory) / "config.toml"
+            path.write_text(
+                '''version = 3
+[launch]
+mode = "dangerous"
+claude_command = ["my-claude", "--flag"]
+codex_command = ["my-codex"]
+[launch.custom]
+claude_args = ["--deep"]
+codex_args = []
+[launch.providers.future]
+command = ["future"]
+custom_args = 42
+note = """line1
+line2"""
+[bridge]
+max_tokens = 123456
+''',
+                encoding="utf-8",
+            )
+            loaded = LaunchConfig.load(path)
+            loaded.save()
+            reloaded = LaunchConfig.load(path)
+            saved = path.read_text(encoding="utf-8")
+        self.assertEqual(reloaded.mode, "dangerous")
+        self.assertEqual(reloaded.claude_command, ["my-claude", "--flag"])
+        self.assertEqual(reloaded.custom_claude_args, ["--deep"])
+        self.assertEqual(reloaded.bridge_max_tokens, 123_456)
+        self.assertEqual(reloaded.providers["future"].extra["custom_args"], 42)
+        self.assertEqual(reloaded.providers["future"].extra["note"], "line1\nline2")
+        self.assertEqual(saved.count("custom_args ="), 1)
+
+    def test_invalid_generated_toml_never_replaces_existing_file(self) -> None:
+        with TemporaryDirectory() as directory:
+            path = Path(directory) / "config.toml"
+            path.write_text('version = 2\n[launch]\nmode = "safe"\n', encoding="utf-8")
+            config = LaunchConfig(path=path)
+            with patch.object(LaunchConfig, "as_toml", return_value='broken = "\n'):
+                with self.assertRaisesRegex(ValueError, "refusing to save"):
+                    config.save()
+            saved = path.read_text(encoding="utf-8")
+        self.assertEqual(saved, 'version = 2\n[launch]\nmode = "safe"\n')
 
 
 if __name__ == "__main__":

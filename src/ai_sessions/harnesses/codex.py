@@ -31,12 +31,14 @@ from ..conversion import (
 )
 from ..model import BudgetPolicy, SourceKind, Transcript, Turn
 from ..paths import CODEX_HOME
+from ..registry import REGISTRY
 
 CODEX_CLI_VERSION = "0.147.0"
 _RESULT_NOISE = re.compile(r"^Script completed\s*(Wall time[^\n]*)?\s*Output:\s*", re.I)
 
 
 def uuid7() -> str:
+    """Create the time-ordered UUID shape Codex assigns to native sessions."""
     milliseconds = int(time.time() * 1000)
     raw = bytearray(secrets.token_bytes(16))
     raw[0:6] = milliseconds.to_bytes(6, "big")
@@ -46,6 +48,7 @@ def uuid7() -> str:
 
 
 def _codex_window_turns(payload: dict[str, Any]) -> tuple[list[Turn], bool] | None:
+    """Read the plaintext replacement context while disclosing its sealed summary."""
     history = payload.get("replacement_history")
     if not isinstance(history, list) or not history:
         return None
@@ -69,6 +72,11 @@ def _codex_window_turns(payload: dict[str, Any]) -> tuple[list[Turn], bool] | No
 
 
 def read_codex(path: Path, *, latest_window: bool = True) -> Transcript:
+    """Read Codex response items and honor replacement-history window semantics.
+
+    With ``latest_window`` the newest carried context replaces superseded history;
+    without it each window is appended as a marked boundary for whole-log replay.
+    """
     conversation = _Conversation()
     for record in _records(path):
         if record.get("type") == "compacted":
@@ -136,10 +144,16 @@ def _exchanges(turns: list[Turn]) -> list[list[Turn]]:
 def write_codex_session(
     *, cwd: str, turns: list[Turn], title: str = "", created: float | None = None
 ) -> tuple[str, Path]:
+    """Write context, TUI events, and task wrappers required for native resume.
+
+    ``response_item`` alone loads model context but leaves Codex scrollback blank,
+    so each exchange also receives user/agent events and a task wrapper.
+    """
     session_id = uuid7()
     moment = time.time() if created is None else created
     local = time.localtime(moment)
-    directory = CODEX_HOME / "sessions" / time.strftime("%Y/%m/%d", local)
+    home = REGISTRY.get("codex").home
+    directory = home / "sessions" / time.strftime("%Y/%m/%d", local)
     try:
         directory.mkdir(parents=True, exist_ok=True)
     except OSError as error:
@@ -229,17 +243,18 @@ def write_codex_session(
         raise BridgeError(f"could not write {path}: {error}") from error
     if title:
         append_jsonl(
-            CODEX_HOME / "session_index.jsonl",
+            home / "session_index.jsonl",
             {"id": session_id, "thread_name": title, "updated_at": _iso(moment)},
         )
     return session_id, path
 
 
 def _codex_exists(session_id: str) -> bool:
-    return any((CODEX_HOME / "sessions").rglob(f"rollout-*-{session_id}.jsonl"))
+    return any((REGISTRY.get("codex").home / "sessions").rglob(f"rollout-*-{session_id}.jsonl"))
 
 
 def _codex_change_status(path: Path, offset: int) -> str:
+    """Ignore UI metadata while treating messages and tool traffic as work."""
     changed = False
     for record in _records_after(path, offset):
         if record.get("type") in (
@@ -269,7 +284,7 @@ def _codex_change_status(path: Path, offset: int) -> str:
 def publish_name(session: Any, name: str) -> str:
     stamp = dt.datetime.now(dt.timezone.utc).isoformat().replace("+00:00", "Z")
     append_jsonl(
-        CODEX_HOME / "session_index.jsonl",
+        REGISTRY.get("codex").home / "session_index.jsonl",
         {"id": session.session_id, "thread_name": name, "updated_at": stamp},
     )
     return ""

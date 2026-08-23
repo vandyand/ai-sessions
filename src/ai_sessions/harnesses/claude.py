@@ -27,16 +27,19 @@ from ..conversion import (
 )
 from ..model import BudgetPolicy, SourceKind, Transcript, Turn
 from ..paths import CLAUDE_HOME
+from ..registry import REGISTRY
 
 CLAUDE_VERSION = "2.1.227"
 
 
 def claude_project_dir(cwd: str) -> Path:
+    """Resolve Claude's cwd-flattened project directory from the live adapter."""
     slug = re.sub(r"[^a-zA-Z0-9]", "-", cwd or str(Path.home()))
-    return CLAUDE_HOME / "projects" / slug
+    return REGISTRY.get("claude").home / "projects" / slug
 
 
 def read_claude(path: Path, *, latest_window: bool = True) -> Transcript:
+    """Read mainline Claude messages, using sidechain only for an agent-only file."""
     main = _Conversation()
     sidechain = _Conversation()
     for record in _records(path):
@@ -75,6 +78,7 @@ def read_claude(path: Path, *, latest_window: bool = True) -> Transcript:
 def write_claude_session(
     *, cwd: str, turns: list[Turn], title: str = "", created: float | None = None
 ) -> tuple[str, Path]:
+    """Write a native appendable Claude transcript with linked message UUIDs."""
     session_id = str(uuid.uuid4())
     moment = time.time() if created is None else created
     directory = claude_project_dir(cwd)
@@ -124,10 +128,11 @@ def write_claude_session(
 
 
 def _claude_exists(session_id: str) -> bool:
-    return any((CLAUDE_HOME / "projects").rglob(f"{session_id}.jsonl"))
+    return any((REGISTRY.get("claude").home / "projects").rglob(f"{session_id}.jsonl"))
 
 
 def _claude_change_status(path: Path, offset: int) -> str:
+    """Ignore title/metadata appends and classify only semantic messages."""
     changed = False
     for record in _records_after(path, offset):
         if record.get("type") in (
