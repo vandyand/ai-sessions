@@ -10,9 +10,7 @@ resumes -- and then keeps appending to -- natively.
 
 Conversions go through the neutral form rather than pairwise, so adding a
 harness costs one reader and one writer instead of a converter per existing
-harness.  ``HARNESSES`` is where a new one is registered; note that this
-covers bridging only, and that listing and open-session detection remain
-provider-specific in ``app.py``.
+harness. Harness capabilities are resolved dynamically through the registry.
 
 Tool calls have no portable representation -- a replayed ``tool_use`` block
 would name tools the target does not have, and would need a matching result
@@ -32,22 +30,34 @@ import re
 import secrets
 import time
 import uuid
-from dataclasses import dataclass, replace
+from dataclasses import replace
 from pathlib import Path
-from typing import Any, Callable, Iterable, Iterator
+from typing import Any, Iterable, Iterator
 
+from .capabilities import HarnessAdapter, Unsupported
+from .model import (
+    DEFAULT_MAX_CHARS,
+    HANDOFF_NOTE_RESERVE_CHARS,
+    LEGACY_DEFAULT_MAX_CHARS,
+    MIN_BRIDGE_CHARS,
+    MIN_BUDGET_TOKENS,
+    TRUNCATION_MARKER,
+    BridgeResult,
+    Budget,
+    BudgetPolicy,
+    SelectionMetric,
+    SelectionResult,
+    ToolCall,
+    Transcript,
+    Turn,
+)
 from .paths import CLAUDE_HOME, CODEX_HOME
+from .registry import REGISTRY
+
+__all__ = ["BudgetPolicy", "LEGACY_DEFAULT_MAX_CHARS"]
 
 # A bridged transcript is replayed into the target's context window in full,
 # so the ceiling is a context budget rather than a storage one.
-LEGACY_DEFAULT_MAX_CHARS = 950_000
-# Compatibility alias for callers of the pre-P3 shaping helper. Production
-# bridge launches resolve a target-owned Budget instead.
-DEFAULT_MAX_CHARS = LEGACY_DEFAULT_MAX_CHARS
-TRUNCATION_MARKER = "\n\n[... message truncated ...]"
-HANDOFF_NOTE_RESERVE_CHARS = 4_096
-MIN_BRIDGE_CHARS = HANDOFF_NOTE_RESERVE_CHARS + 2 * (len(TRUNCATION_MARKER) + 1) + 2
-MIN_BUDGET_TOKENS = 4_096
 CLAUDE_BUDGET_CONTEXT_TOKENS = 200_000
 CODEX_BUDGET_CONTEXT_TOKENS = 256_000
 DEFAULT_USABLE_FRACTION = 0.75
@@ -97,124 +107,6 @@ _SALIENT_KEYS = (
 
 class BridgeError(RuntimeError):
     """A session could not be carried into another harness."""
-
-
-@dataclass(frozen=True, slots=True)
-class ToolCall:
-    name: str
-    request: str
-    result: str = ""
-
-
-@dataclass(frozen=True, slots=True)
-class Turn:
-    role: str
-    text: str
-    calls: tuple[ToolCall, ...] = ()
-    # A turn that supersedes everything before it: the harness ran out of
-    # context, summarised the conversation so far, and carried on from the
-    # summary.  Resuming from here is what the source session itself does.
-    compaction: bool = False
-
-
-@dataclass(frozen=True, slots=True)
-class BudgetPolicy:
-    context_tokens: int
-    usable_fraction: float
-    chars_per_token: float
-    source: str
-
-    def __post_init__(self) -> None:
-        if self.context_tokens <= 0:
-            raise ValueError("budget context_tokens must be positive")
-        if not 0 < self.usable_fraction <= 1:
-            raise ValueError("budget usable_fraction must be in (0, 1]")
-        if self.chars_per_token <= 0:
-            raise ValueError("budget chars_per_token must be positive")
-        if not self.source.strip():
-            raise ValueError("budget policy source must not be empty")
-        default_tokens = math.floor(self.context_tokens * self.usable_fraction)
-        default_chars = math.floor(default_tokens * self.chars_per_token)
-        if default_chars < MIN_BRIDGE_CHARS:
-            raise ValueError("budget policy default is too small for bridge metadata")
-
-
-@dataclass(frozen=True, slots=True)
-class Budget:
-    target: str
-    tokens: int
-    chars: int
-    origin: str
-    clamped: bool = False
-    over_policy: bool = False
-
-    def __post_init__(self) -> None:
-        if not self.target or not self.origin:
-            raise ValueError("budget target and origin must not be empty")
-        if self.tokens <= 0 or self.chars < MIN_BRIDGE_CHARS:
-            raise ValueError("resolved budget is below the bridge minimum")
-
-
-@dataclass(frozen=True, slots=True)
-class SelectionResult:
-    turns: list[Turn]
-    dropped: int
-    truncated: int
-
-
-@dataclass(frozen=True)
-class SelectionMetric:
-    item_cost: Callable[[Turn], int]
-    join_cost: Callable[[Turn, Turn], int]
-    truncate: Callable[[Turn, int], Turn]
-
-
-@dataclass(frozen=True, slots=True)
-class BridgeResult:
-    tool: str
-    session_id: str
-    path: Path
-    turns: int
-    written_turns: int
-    calls: int
-    dropped: int
-    truncated: int
-    source_cursor: int
-    budget: Budget
-
-
-@dataclass(frozen=True, slots=True)
-class Transcript:
-    """A conversation read out of one harness, ready to be written to another."""
-
-    turns: list[Turn]
-    # Compactions whose summary the source harness stores unreadably *and*
-    # which carried no readable context either, so the copy has to fall back
-    # to the pre-compaction history.  Reported so the copy's size is explainable.
-    opaque_compactions: int = 0
-    # Compactions that did carry readable context.  Only the newest window
-    # survives in ``turns``; this is how many the source actually ran.
-    carried_windows: int = 0
-    # Whether the carried window's own summary is sealed by the source, so it
-    # could not cross even though the messages around it did.
-    sealed_summary: bool = False
-    # Whether the most recent compaction was one we could read.  When it was
-    # not, the copy does not begin where the source is picking up, and the
-    # handoff note must not claim otherwise.
-    resumes_at_last_summary: bool = False
-
-
-@dataclass(frozen=True)
-class Harness:
-    """Everything bridging needs to know about one CLI."""
-
-    name: str
-    label: str
-    read: Callable[..., Transcript]
-    write: Callable[..., tuple[str, Path]]
-    locate: Callable[[str], bool]
-    change_status: Callable[[Path, int], str]
-    budget: BudgetPolicy
 
 
 def append_jsonl(path: Path, payload: dict[str, Any]) -> None:
@@ -620,7 +512,10 @@ def read_transcript(
     path = Path(storage)
     if not storage or not path.is_file():
         raise BridgeError("the source transcript is missing, so there is nothing to carry over")
-    result = harness(tool).read(path, latest_window=latest_window)
+    reader = harness(tool).read
+    if isinstance(reader, Unsupported):
+        raise BridgeError(f"{harness(tool).label} cannot read native transcripts: {reader.reason}")
+    result = reader(path, latest_window=latest_window)
     turns = result.turns
     if not tool_calls:
         turns = [replace(turn, calls=()) for turn in turns]
@@ -1201,51 +1096,16 @@ def _claude_change_status(path: Path, offset: int) -> str:
     return "changed" if changed else "unchanged"
 
 
-HARNESSES: dict[str, Harness] = {
-    "codex": Harness(
-        name="codex",
-        label="Codex",
-        read=read_codex,
-        write=write_codex_session,
-        locate=_codex_exists,
-        change_status=_codex_change_status,
-        budget=BudgetPolicy(
-            context_tokens=CODEX_BUDGET_CONTEXT_TOKENS,
-            usable_fraction=DEFAULT_USABLE_FRACTION,
-            chars_per_token=DEFAULT_CHARS_PER_TOKEN,
-            source=(
-                "declared Codex unknown-model compatibility floor, 2026-08-23; "
-                "current flagship model context is larger"
-            ),
-        ),
-    ),
-    "claude": Harness(
-        name="claude",
-        label="Claude Code",
-        read=read_claude,
-        write=write_claude_session,
-        locate=_claude_exists,
-        change_status=_claude_change_status,
-        budget=BudgetPolicy(
-            context_tokens=CLAUDE_BUDGET_CONTEXT_TOKENS,
-            usable_fraction=DEFAULT_USABLE_FRACTION,
-            chars_per_token=DEFAULT_CHARS_PER_TOKEN,
-            source=(
-                "Claude 200k unknown-model floor from official context-window docs, "
-                "2026-08-23; Opus 5 context is larger"
-            ),
-        ),
-    ),
-}
-BRIDGE_TOOLS = tuple(HARNESSES)
-TOOL_NAMES = {name: entry.label for name, entry in HARNESSES.items()}
-
-
-def harness(name: str) -> Harness:
+def harness(name: str) -> HarnessAdapter:
     try:
-        return HARNESSES[name]
+        return REGISTRY.get(name)
     except KeyError:
         raise BridgeError(f"unknown harness: {name}") from None
+
+
+def bridge_tools() -> tuple[str, ...]:
+    """Return bridge-capable harness names from the current registry generation."""
+    return REGISTRY.bridge_targets()
 
 
 def resolve_budget(
@@ -1311,10 +1171,13 @@ def native_session_exists(tool: str, session_id: str) -> bool:
     Codex session id.  Sessions also get deleted.  Either way a reference has
     to be checked before a CLI is asked to resume it.
     """
-    if not session_id or tool not in HARNESSES:
+    if not session_id or tool not in REGISTRY:
         return False
     try:
-        return HARNESSES[tool].locate(session_id)
+        locator = REGISTRY.get(tool).locate
+        if isinstance(locator, Unsupported):
+            return False
+        return locator(session_id)
     except OSError:
         return False
 
@@ -1322,6 +1185,7 @@ def native_session_exists(tool: str, session_id: str) -> bool:
 @functools.lru_cache(maxsize=2048)
 def _snapshot_change_status(
     tool: str,
+    generation: int,
     storage: str,
     offset: int,
     device: int,
@@ -1330,8 +1194,11 @@ def _snapshot_change_status(
     mtime_ns: int,
 ) -> str:
     """Classify one immutable file snapshot once per process."""
-    del device, inode, size, mtime_ns
-    status = harness(tool).change_status(Path(storage), offset)
+    del generation, device, inode, size, mtime_ns
+    classifier = harness(tool).change_status
+    if isinstance(classifier, Unsupported):
+        return "unstable"
+    status = classifier(Path(storage), offset)
     if status == "unstable":
         # lru_cache does not retain exceptions. A sharing violation or other
         # transient read failure must be retried even if file metadata did not
@@ -1356,6 +1223,7 @@ def conversation_change_status(tool: str, storage: str | Path, offset: int) -> s
     try:
         return _snapshot_change_status(
             tool,
+            REGISTRY.generation,
             str(path),
             offset,
             stat.st_dev,
@@ -1477,7 +1345,10 @@ def bridge(
     payload = merge_runs([Turn("user", note), *kept])
     if sum(len(turn.text) for turn in payload) > applied_budget.chars:
         raise BridgeError("the assembled bridge payload exceeds its applied budget")
-    new_id, path = target.write(cwd=cwd, turns=payload, title=bridged_title(title, source_tool))
+    writer = target.write
+    if isinstance(writer, Unsupported):
+        raise BridgeError(f"{target.label} cannot write native transcripts: {writer.reason}")
+    new_id, path = writer(cwd=cwd, turns=payload, title=bridged_title(title, source_tool))
     return BridgeResult(
         tool=target_tool,
         session_id=new_id,

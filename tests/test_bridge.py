@@ -23,7 +23,6 @@ from ai_sessions.bridge import (
     CODEX_BUDGET_CONTEXT_TOKENS,
     CODEX_CONTEXT_WINDOW,
     HANDOFF_NOTE_RESERVE_CHARS,
-    HARNESSES,
     MIN_BRIDGE_CHARS,
     TRUNCATION_MARKER,
     BridgeError,
@@ -49,7 +48,9 @@ from ai_sessions.bridge import (
     write_claude_session,
     write_codex_session,
 )
+from ai_sessions.capabilities import HarnessAdapter
 from ai_sessions.config import LaunchConfig
+from ai_sessions.registry import REGISTRY
 
 
 def codex_line(role: str, text: str) -> str:
@@ -309,17 +310,24 @@ class ShapingTests(unittest.TestCase):
         )
 
     def test_non_integer_policy_ratio_applies_in_both_directions(self) -> None:
-        base = HARNESSES["claude"]
-        ratio_harness = bridge.Harness(
+        base = REGISTRY.get("claude")
+        ratio_harness = HarnessAdapter(
             name="ratio",
             label="Ratio",
+            short_label="Ratio",
+            order=999,
+            home=Path("ratio"),
+            default_command=("ratio",),
+            dangerous_args=(),
+            source_kinds=base.source_kinds,
+            id_patterns=base.id_patterns,
             read=base.read,
             write=base.write,
             locate=base.locate,
             change_status=base.change_status,
             budget=BudgetPolicy(10_000, 1.0, 2.5, "test ratio"),
         )
-        with patch.dict(HARNESSES, {"ratio": ratio_harness}):
+        with REGISTRY.temporary(ratio_harness):
             from_tokens = resolve_budget("ratio", max_tokens=10_000)
             from_chars = resolve_budget("ratio", max_chars=25_001)
         self.assertEqual((from_tokens.tokens, from_tokens.chars), (10_000, 25_000))
@@ -688,14 +696,13 @@ class CompactionTests(unittest.TestCase):
 
 class HarnessRegistryTests(unittest.TestCase):
     def test_every_harness_is_self_consistent(self) -> None:
-        for entry in HARNESSES.values():
+        for entry in REGISTRY.adapters():
             self.assertGreater(entry.budget.context_tokens, 0)
             self.assertGreater(entry.budget.usable_fraction, 0)
             self.assertLessEqual(entry.budget.usable_fraction, 1)
             self.assertGreater(entry.budget.chars_per_token, 0)
             self.assertTrue(entry.budget.source)
-        for name, entry in HARNESSES.items():
-            self.assertEqual(name, entry.name)
+        for entry in REGISTRY.adapters():
             self.assertTrue(entry.label)
             for hook in (entry.read, entry.write, entry.locate, entry.change_status):
                 self.assertTrue(callable(hook))
@@ -707,11 +714,13 @@ class HarnessRegistryTests(unittest.TestCase):
 
     def test_codex_budget_floor_is_not_writer_context_metadata(self) -> None:
         self.assertEqual(
-            HARNESSES["codex"].budget.context_tokens,
+            REGISTRY.get("codex").budget.context_tokens,
             CODEX_BUDGET_CONTEXT_TOKENS,
         )
         self.assertNotEqual(CODEX_BUDGET_CONTEXT_TOKENS, CODEX_CONTEXT_WINDOW)
-        registry_source = inspect.getsource(bridge)
+        from ai_sessions.harnesses import claude, codex
+
+        registry_source = inspect.getsource(claude) + inspect.getsource(codex)
         self.assertIn("context_tokens=CODEX_BUDGET_CONTEXT_TOKENS", registry_source)
         self.assertIn("context_tokens=CLAUDE_BUDGET_CONTEXT_TOKENS", registry_source)
 
@@ -1521,10 +1530,17 @@ class LaunchIntegrationTests(unittest.TestCase):
             path = Path(directory) / "codex.jsonl"
             path.write_text(codex_line("user", "Earlier") + "\n", encoding="utf-8")
             outcomes = iter(("unstable", "unchanged"))
-            entry = HARNESSES["codex"]
-            retrying = bridge.Harness(
+            entry = REGISTRY.get("codex")
+            retrying = HarnessAdapter(
                 name=entry.name,
                 label=entry.label,
+                short_label=entry.short_label,
+                order=entry.order,
+                home=entry.home,
+                default_command=entry.default_command,
+                dangerous_args=entry.dangerous_args,
+                source_kinds=entry.source_kinds,
+                id_patterns=entry.id_patterns,
                 read=entry.read,
                 write=entry.write,
                 locate=entry.locate,
@@ -1532,7 +1548,7 @@ class LaunchIntegrationTests(unittest.TestCase):
                 budget=entry.budget,
             )
 
-            with patch.dict(HARNESSES, {"codex": retrying}):
+            with REGISTRY.temporary(retrying):
                 self.assertEqual(bridge.conversation_change_status("codex", path, 0), "unstable")
                 self.assertEqual(bridge.conversation_change_status("codex", path, 0), "unchanged")
 

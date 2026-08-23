@@ -29,10 +29,10 @@ from typing import Any, Iterable
 
 from . import __version__ as VERSION
 from .bridge import (
-    BRIDGE_TOOLS,
     BridgeError,
     append_jsonl,
     bridge,
+    bridge_tools,
     complete_jsonl_cursor,
     conversation_change_status,
     native_session_exists,
@@ -129,7 +129,7 @@ class Session:
         """
         ordered = [self.tool, *(tool for tool in self.launch_targets if tool != self.tool)]
         if self.can_bridge:
-            ordered += [tool for tool in BRIDGE_TOOLS if tool not in ordered]
+            ordered += [tool for tool in bridge_tools() if tool not in ordered]
         return tuple(ordered)
 
     @property
