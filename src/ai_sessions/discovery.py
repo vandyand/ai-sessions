@@ -11,6 +11,7 @@ from typing import Any
 from .registry import REGISTRY
 
 MAX_EVIDENCE_IDS = 4_096
+MAX_EXISTENCE_PROBES_PER_PASS = 64
 
 
 def normalize_space(value: Any) -> str:
@@ -81,7 +82,8 @@ class EvidenceAccumulator:
         truncated: bool,
     ) -> "EvidenceAccumulator":
         valid = [value for value in tokens if isinstance(value, str) and value]
-        return cls(patterns, valid[:MAX_EVIDENCE_IDS], truncated, set(valid[:MAX_EVIDENCE_IDS]))
+        retained = valid[:MAX_EVIDENCE_IDS]
+        return cls(patterns, retained, truncated or len(valid) > len(retained), set(retained))
 
     def scan(self, line: bytes) -> None:
         matches: list[tuple[int, int, bytes]] = []

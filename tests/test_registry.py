@@ -1,5 +1,6 @@
 import io
 import json
+import re
 import tempfile
 import unittest
 from contextlib import redirect_stdout
@@ -68,6 +69,9 @@ class RegistryTests(unittest.TestCase):
             {"default_command": ()},
             {"source_kinds": frozenset()},
             {"id_patterns": ()},
+            {"id_patterns": ("not compiled",)},
+            {"scratch_patterns": [re.compile("scratch")]},
+            {"scratch_patterns": (re.compile(b"scratch"),)},
             {"read": "not callable"},
             {"change_status": Unsupported("")},
             {"budget": None},

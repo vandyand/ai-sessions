@@ -73,6 +73,7 @@ class HarnessAdapter:
     locate: LocateHook | Unsupported
     change_status: ChangeStatusHook | Unsupported
     budget: BudgetPolicy
+    scratch_patterns: tuple[Pattern[str], ...] = ()
     discover: DiscoverHook | Unsupported = Unsupported("discovery is not installed")
     resume_args: ResumeArgsHook | Unsupported = Unsupported("resume is not installed")
     publish_name: PublishNameHook | Unsupported = Unsupported("rename is not supported")
@@ -97,10 +98,20 @@ class HarnessAdapter:
             isinstance(value, SourceKind) for value in self.source_kinds
         ):
             raise ValueError("harness source_kinds must contain SourceKind values")
-        if not self.id_patterns or not all(
-            isinstance(pattern.pattern, bytes) for pattern in self.id_patterns
+        if (
+            not self.id_patterns
+            or not isinstance(self.id_patterns, tuple)
+            or not all(
+                isinstance(pattern, Pattern) and isinstance(pattern.pattern, bytes)
+                for pattern in self.id_patterns
+            )
         ):
             raise ValueError("harness id_patterns must contain compiled byte patterns")
+        if not isinstance(self.scratch_patterns, tuple) or not all(
+            isinstance(pattern, Pattern) and isinstance(pattern.pattern, str)
+            for pattern in self.scratch_patterns
+        ):
+            raise ValueError("harness scratch_patterns must contain compiled text patterns")
         if not isinstance(self.budget, BudgetPolicy):
             raise ValueError("harness budget must be a BudgetPolicy")
         required = (self.read, self.write, self.locate, self.change_status)

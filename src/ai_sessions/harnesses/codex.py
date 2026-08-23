@@ -567,10 +567,6 @@ def discover(context: HarnessContext, *, use_cache: bool = True) -> list[NativeS
                 count = int(history[session_id].get("count", 0))
                 latest = clean_prompt(history[session_id].get("latest"))
             cwd = str(field("cwd", "") or "")
-            if source is SourceKind.NON_INTERACTIVE and (
-                "/tmp/claude-" in cwd or "\\Temp\\claude-" in cwd
-            ):
-                context.mark_cross_origin("codex", session_id, "claude")
             result.append(
                 NativeSession(
                     tool="codex",
@@ -648,6 +644,7 @@ ADAPTER = HarnessAdapter(
             re.I,
         ),
     ),
+    scratch_patterns=(),
     read=read_codex,
     write=write_codex_session,
     locate=_codex_exists,

@@ -297,12 +297,24 @@ class DiscoveryCache:
             tokens=list(meta.get("candidate_ids", [])) if can_continue else [],
             truncated=bool(meta.get("evidence_truncated")) if can_continue else False,
         )
+        read_stat = stat
+        incomplete = False
         try:
             with path.open("rb") as handle:
+                opened_stat = os.fstat(handle.fileno())
+                if can_continue and (
+                    opened_stat.st_ino != stat.st_ino or opened_stat.st_size < start
+                ):
+                    meta = self.blank()
+                    start = 0
+                    evidence = self.context.accumulator()
                 handle.seek(start)
                 while True:
                     line = handle.readline()
                     if not line:
+                        break
+                    if not line.endswith(b"\n"):
+                        incomplete = True
                         break
                     meta["offset"] = handle.tell()
                     evidence.scan(line)
@@ -361,19 +373,24 @@ class DiscoveryCache:
                             if not meta.get("created"):
                                 meta["created"] = event_time
                             meta["updated"] = max(float(meta.get("updated", 0)), event_time)
+                read_stat = os.fstat(handle.fileno())
         except OSError:
-            return meta, evidence
+            incomplete_evidence = self.context.accumulator(tokens=evidence.tokens, truncated=True)
+            return meta, incomplete_evidence
+        offset = int(meta.get("offset", start))
         meta.update(
-            inode=stat.st_ino,
-            size=stat.st_size,
-            mtime_ns=stat.st_mtime_ns,
-            offset=stat.st_size,
+            inode=read_stat.st_ino,
+            size=offset,
+            mtime_ns=read_stat.st_mtime_ns,
+            offset=offset,
             candidate_ids=evidence.tokens,
             evidence_truncated=evidence.truncated,
             pattern_signature=self.context.pattern_signature,
         )
         self.entries[key] = meta
         self.dirty = True
+        if incomplete:
+            evidence = self.context.accumulator(tokens=evidence.tokens, truncated=True)
         return meta, evidence
 
     def save(self) -> None:
@@ -538,6 +555,7 @@ ADAPTER = HarnessAdapter(
             re.I,
         ),
     ),
+    scratch_patterns=(re.compile(r"(?:/tmp/claude-|\\Temp\\claude-)", re.I),),
     read=read_claude,
     write=write_claude_session,
     locate=_claude_exists,

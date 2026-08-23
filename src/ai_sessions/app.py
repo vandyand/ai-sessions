@@ -41,7 +41,7 @@ from .conversion import (
 from .conversion import append_jsonl as append_jsonl
 from .diagnostics import clear_warnings, record_warning
 from .diagnostics import warnings as load_warnings
-from .discovery import HarnessContext
+from .discovery import MAX_EXISTENCE_PROBES_PER_PASS, HarnessContext
 from .discovery import clean_prompt as clean_prompt
 from .discovery import normalize_space as normalize_space
 from .discovery import prompt_text as prompt_text
@@ -936,16 +936,39 @@ def reconcile_evidence(sessions: list[Session], context: HarnessContext) -> None
     by_id: dict[str, list[Session]] = {}
     for item in sessions:
         by_id.setdefault(item.session_id, []).append(item)
-    for key, source_tool in context.origin_hints.items():
+    for key in context.origin_hints:
         target = by_key.get(key)
-        if target is not None:
+        if target is not None and target.source is SourceKind.NON_INTERACTIVE:
             target.origin = "cross"
-            target.launch_targets.setdefault(source_tool, target.session_id)
-    for (publisher_tool, publisher_id), (tokens, truncated) in context.evidence.items():
+    locate_cache: dict[tuple[str, str], bool] = {}
+    probes = 0
+    probe_limit_reported = False
+
+    def evidence_rank(
+        entry: tuple[tuple[str, str], tuple[list[str], bool]],
+    ) -> tuple[bool, float, str, str]:
+        publisher = by_key.get(entry[0])
+        tool, session_id = entry[0]
+        return (
+            publisher is None,
+            -(publisher.updated if publisher is not None else 0),
+            tool,
+            session_id,
+        )
+
+    for (publisher_tool, publisher_id), (tokens, truncated) in sorted(
+        context.evidence.items(), key=evidence_rank
+    ):
         publisher = by_key.get((publisher_tool, publisher_id))
+        if publisher_tool not in REGISTRY:
+            record_warning(
+                f"ID evidence came from unavailable harness {publisher_tool}:{publisher_id}; "
+                "ignored"
+            )
+            continue
         if truncated:
             record_warning(
-                f"ID evidence was truncated for {publisher_tool}:{publisher_id}; "
+                f"ID evidence was truncated or incomplete for {publisher_tool}:{publisher_id}; "
                 "negative counterpart conclusions were suppressed"
             )
         for token in tokens:
@@ -963,10 +986,22 @@ def reconcile_evidence(sessions: list[Session], context: HarnessContext) -> None
                     locator = adapter.locate
                     if isinstance(locator, Unsupported):
                         continue
-                    try:
-                        exists = locator(token)
-                    except OSError:
-                        exists = False
+                    cache_key = (adapter.name, token)
+                    if cache_key not in locate_cache:
+                        if probes >= MAX_EXISTENCE_PROBES_PER_PASS:
+                            if not probe_limit_reported:
+                                record_warning(
+                                    "native existence probes were capped for this discovery "
+                                    "pass; some positive counterpart lookups were skipped"
+                                )
+                                probe_limit_reported = True
+                            continue
+                        probes += 1
+                        try:
+                            locate_cache[cache_key] = locator(token)
+                        except OSError:
+                            locate_cache[cache_key] = False
+                    exists = locate_cache[cache_key]
                     if exists:
                         resolved.append((adapter.name, token, by_key.get((adapter.name, token))))
             identities = {(tool, session_id) for tool, session_id, _ in resolved}
@@ -981,9 +1016,39 @@ def reconcile_evidence(sessions: list[Session], context: HarnessContext) -> None
             if publisher is not None:
                 publisher.launch_targets.setdefault(target_tool, target_id)
             if target is not None:
-                target.origin = "cross"
+                if target.source is SourceKind.NON_INTERACTIVE:
+                    target.origin = "cross"
                 if publisher is not None:
                     target.launch_targets.setdefault(publisher_tool, publisher.session_id)
+
+
+def collect_scratch_origin_hints(sessions: list[Session], context: HarnessContext) -> None:
+    """Match non-interactive cwd evidence against each publisher's declared scratch shape."""
+    for publisher in REGISTRY.adapters():
+        if not publisher.scratch_patterns:
+            continue
+        for item in sessions:
+            if item.tool == publisher.name or item.source is not SourceKind.NON_INTERACTIVE:
+                continue
+            if any(pattern.search(item.cwd) for pattern in publisher.scratch_patterns):
+                context.mark_cross_origin(item.tool, item.session_id, publisher.name)
+
+
+def dedupe_sessions(sessions: Iterable[Session]) -> list[Session]:
+    """Prefer the newest duplicate while retaining equal IDs from different harnesses."""
+    unique: dict[tuple[str, str], Session] = {}
+    for item in sessions:
+        key = (item.tool, item.session_id)
+        current = unique.get(key)
+        item_rank = (item.updated, item.created, item.storage, item.title, item.cwd)
+        current_rank = (
+            (current.updated, current.created, current.storage, current.title, current.cwd)
+            if current is not None
+            else None
+        )
+        if current_rank is None or item_rank > current_rank:
+            unique[key] = item
+    return list(unique.values())
 
 
 def load_sessions(use_cache: bool = True, state: UserState | None = None) -> list[Session]:
@@ -1012,15 +1077,9 @@ def load_sessions(use_cache: bool = True, state: UserState | None = None) -> lis
                 )
                 continue
             sessions.append(session_from_native(native))
-    reconcile_evidence(sessions, context)
-    # In the unlikely event of duplicate metadata, prefer the most recently
-    # updated record for a given tool/session pair.
-    unique: dict[tuple[str, str], Session] = {}
-    for item in sessions:
-        key = (item.tool, item.session_id)
-        if key not in unique or item.updated > unique[key].updated:
-            unique[key] = item
-    result = list(unique.values())
+    result = dedupe_sessions(sessions)
+    collect_scratch_origin_hints(result, context)
+    reconcile_evidence(result, context)
     if state is not None:
         state.apply(result)
     detect_open_sessions(result)
