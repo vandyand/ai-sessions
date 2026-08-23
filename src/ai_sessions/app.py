@@ -235,7 +235,9 @@ class UserState:
                             self.bridges[self.stable_key(str(key))] = entries
                 if isinstance(conversations, dict):
                     for conversation_id, value in conversations.items():
-                        if not isinstance(value, dict) or not isinstance(value.get("members"), dict):
+                        if not isinstance(value, dict) or not isinstance(
+                            value.get("members"), dict
+                        ):
                             continue
                         members = {
                             self.stable_key(str(key)): member
@@ -365,7 +367,9 @@ class UserState:
         if not members:
             return {"conflict": False, "heads": [], "advanced": []}
         maximum = max(int(member.get("generation", 0)) for _, member in members)
-        current = [(key, member) for key, member in members if int(member.get("generation", 0)) == maximum]
+        current = [
+            (key, member) for key, member in members if int(member.get("generation", 0)) == maximum
+        ]
         advanced = [(key, member) for key, member in members if self._member_changed(member)]
         if not advanced:
             return {"conflict": False, "heads": current, "advanced": []}
@@ -421,7 +425,7 @@ class UserState:
         # the requested harness, then the selected row, then a stable key order.
         requested = next((pair for pair in heads if pair[1].get("tool") == target_tool), None)
         selected = next((pair for pair in heads if pair[0] == item.key), None)
-        source_key, source_member = requested or selected or sorted(heads, key=lambda pair: pair[0])[0]
+        _, source_member = requested or selected or sorted(heads, key=lambda pair: pair[0])[0]
         source = self._session_for_member(source_member, item)
         frontier = source_member.get("frontier")
         generation = int(source_member.get("generation", 0))
@@ -438,7 +442,9 @@ class UserState:
                     break
         if source_member.get("tool") == target_tool:
             target_member = source_member
-        target = self._session_for_member(target_member, item) if target_member is not None else None
+        target = (
+            self._session_for_member(target_member, item) if target_member is not None else None
+        )
         return source, target, conversation_id
 
     def _apply_conversation_status(self, sessions: list[Session]) -> None:
@@ -609,7 +615,15 @@ class UserState:
             return ""
         return str(entry["session_id"])
 
-    def set_bridge(self, item: Session, tool: str, session_id: str, storage: str) -> None:
+    def set_bridge(
+        self,
+        item: Session,
+        tool: str,
+        session_id: str,
+        storage: str,
+        *,
+        source_cursor: int,
+    ) -> None:
         key = self.stable_key(item.key)
         self.bridges.setdefault(key, {})[tool] = {
             "session_id": session_id,
@@ -619,9 +633,10 @@ class UserState:
         conversation_id, source_member = self._ensure_conversation(item)
         conversation = self.conversations[conversation_id]
         if self._member_changed(source_member):
-            generation = max(
-                int(member.get("generation", 0)) for member in conversation["members"].values()
-            ) + 1
+            generation = (
+                max(int(member.get("generation", 0)) for member in conversation["members"].values())
+                + 1
+            )
             frontier = str(uuid.uuid4())
         else:
             generation = int(source_member.get("generation", 0))
@@ -631,7 +646,7 @@ class UserState:
                 item,
                 generation=generation,
                 frontier=frontier,
-                cursor=self._cursor(item.storage),
+                cursor=source_cursor,
             )
         )
         target_key = self._member_key(tool, session_id)
@@ -832,8 +847,18 @@ def agent_tag(session: Session) -> str:
 def display_list_title(session: Session) -> str:
     """Make generated/unnamed titles explicit without a separate flag column."""
     title = display_title(session)
-    status = " [diverged]" if session.diverged else " [superseded]" if session.superseded else ""
-    return agent_tag(session) + (title if session.named else f"*- {title}") + status
+    return agent_tag(session) + (title if session.named else f"*- {title}")
+
+
+def conversation_status(session: Session) -> str:
+    """A stable, non-title label for the session's conversation position."""
+    if session.diverged:
+        return "diverged"
+    if session.superseded:
+        return "superseded"
+    if session.conversation_id:
+        return "current"
+    return ""
 
 
 def load_codex_history() -> dict[str, dict[str, Any]]:
@@ -2245,8 +2270,14 @@ class Browser:
                 segment(f"{item.message_count:<{messages_width}}", "messages")
                 segment(f"{relative_time(item.created):<{time_width}}", "muted")
                 segment(f"{relative_time(item.updated):<{time_width}}", "timestamp")
+                status = conversation_status(item)
+                if status:
+                    badge = f"[{status}] "
+                    segment(badge, "warning" if status != "current" else "success", curses.A_BOLD)
                 tag = agent_tag(item)
                 remaining = title_width
+                if status:
+                    remaining = max(0, remaining - len(badge))
                 if tag:
                     segment(tag, item.origin, curses.A_BOLD)
                     remaining = max(0, remaining - len(tag))
@@ -2913,7 +2944,13 @@ def prepare_launch(
         conversation_id=conversation_id,
     )
     if state is not None:
-        state.set_bridge(session, tool, result.session_id, str(result.path))
+        state.set_bridge(
+            session,
+            tool,
+            result.session_id,
+            str(result.path),
+            source_cursor=result.source_cursor,
+        )
     carried = f"{result.turns} message(s)"
     if result.calls:
         carried += f" and {result.calls} summarised tool call(s)"
@@ -2989,10 +3026,12 @@ def list_output(items: list[Session], as_json: bool = False) -> None:
         terminal_width = os.get_terminal_size().columns if sys.stdout.isatty() else 120
     except OSError:
         terminal_width = 120
-    title_width = max(24, terminal_width - 100)
+    conversation_width = 11
+    title_width = max(24, terminal_width - 112)
     print(
         f"{'TOOL':<8} {'RUN':<6} {'ORIGIN':<7} {'OPEN':<5} {'MSGS':>5} {'STATE':<8} "
-        f"{'STARTED':<12} {'UPDATED':<12} {'TITLE':<{title_width}} DIRECTORY"
+        f"{'HEAD':<{conversation_width}} {'STARTED':<12} {'UPDATED':<12} "
+        f"{'TITLE':<{title_width}} DIRECTORY"
     )
     for item in items:
         paused = item.is_open and process_state(item.open_pid) in ("T", "t")
@@ -3001,6 +3040,7 @@ def list_output(items: list[Session], as_json: bool = False) -> None:
             f"{TOOL_LABELS[item.tool]:<8} {TOOL_LABELS[item.active_launch_tool]:<6} "
             f"{ORIGIN_LABELS[item.origin]:<7} {open_symbol:<5} {item.message_count:>5} "
             f"{('hidden' if item.hidden else 'visible'):<8} "
+            f"{conversation_status(item):<{conversation_width}} "
             f"{relative_time(item.created):<12} {relative_time(item.updated):<12} "
             f"{ellipsize(display_list_title(item), title_width):<{title_width}} {short_path(item.cwd)}"
         )

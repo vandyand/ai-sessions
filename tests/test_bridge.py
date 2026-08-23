@@ -1,6 +1,8 @@
+import io
 import json
 import tempfile
 import unittest
+from contextlib import redirect_stdout
 from pathlib import Path
 from unittest.mock import patch
 
@@ -9,6 +11,8 @@ from ai_sessions.app import (
     Session,
     UserState,
     command_for,
+    conversation_status,
+    list_output,
     load_claude_sessions,
     prepare_launch,
 )
@@ -16,6 +20,7 @@ from ai_sessions.bridge import (
     HARNESSES,
     BridgeError,
     ToolCall,
+    Transcript,
     Turn,
     bridged_title,
     fit,
@@ -705,6 +710,36 @@ class LaunchIntegrationTests(unittest.TestCase):
             self.assertNotEqual(second.launch_target("claude"), first.launch_target("claude"))
             self.assertIn("Copied", note)
 
+    def test_an_append_during_bridge_remains_unconsumed(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            source = session(directory, launch_tool="claude")
+            source_path = Path(source.storage)
+            cursor_before_bridge = source_path.stat().st_size
+            state = UserState(path=Path(directory) / "state.json")
+
+            def append_while_reading(*args: object, **kwargs: object) -> Transcript:
+                with source_path.open("a", encoding="utf-8") as handle:
+                    handle.write(codex_line("user", "Arrived during the bridge") + "\n")
+                return Transcript([Turn("user", "Ship it"), Turn("assistant", "Shipped.")])
+
+            with (
+                patch.object(bridge, "CLAUDE_HOME", Path(directory) / "claude"),
+                patch.object(bridge, "read_transcript", side_effect=append_while_reading),
+            ):
+                prepared, _ = prepare_launch(source, state=state)
+
+            conversation_id = state.conversation_id_for(source)
+            source_member = state.conversations[conversation_id]["members"][source.key]
+            self.assertEqual(source_member["cursor"], cursor_before_bridge)
+            self.assertGreater(source_path.stat().st_size, source_member["cursor"])
+
+            copy = self.claude_copy(
+                source, prepared, state.bridges[source.key]["claude"]["storage"]
+            )
+            state.apply([source, copy])
+            self.assertEqual(conversation_status(source), "current")
+            self.assertEqual(conversation_status(copy), "superseded")
+
     def test_codex_to_claude_work_to_codex_follows_the_newest_head(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             source = session(directory, launch_tool="claude")
@@ -723,13 +758,20 @@ class LaunchIntegrationTests(unittest.TestCase):
             state.apply([original_row, copy])
             self.assertTrue(original_row.superseded)
             self.assertFalse(copy.superseded)
+            output = io.StringIO()
+            with redirect_stdout(output):
+                list_output([original_row, copy])
+            self.assertIn("HEAD", output.getvalue().splitlines()[0])
+            self.assertIn("superseded", output.getvalue().splitlines()[1])
 
             with patch.object(bridge, "CODEX_HOME", codex_home):
                 codex_prepared, note = prepare_launch(original_row, state=state)
             self.assertIn("Copied", note)
             self.assertEqual(codex_prepared.tool, "codex")
             self.assertNotEqual(codex_prepared.session_id, source.session_id)
-            self.assertIn("Work completed in Claude", Path(codex_prepared.storage).read_text("utf-8"))
+            self.assertIn(
+                "Work completed in Claude", Path(codex_prepared.storage).read_text("utf-8")
+            )
 
             # Either historical row now resolves to the same current Codex copy.
             state.apply([original_row, copy, codex_prepared])

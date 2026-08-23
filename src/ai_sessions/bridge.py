@@ -112,6 +112,7 @@ class BridgeResult:
     turns: int
     calls: int
     dropped: int
+    source_cursor: int
 
 
 @dataclass(frozen=True, slots=True)
@@ -1046,6 +1047,14 @@ def bridge(
     if target_tool == source_tool:
         raise BridgeError("that session already belongs to this harness")
     harness(source_tool)
+    try:
+        # This is deliberately captured before reading. If the live source is
+        # appended while the bridge is materialising it, recording an earlier
+        # frontier may cause one conservative re-copy; recording the later EOF
+        # could mark work the reader never saw as already carried.
+        source_cursor = Path(storage).stat().st_size
+    except OSError as error:
+        raise BridgeError(f"could not inspect {storage}: {error}") from error
     source = read_transcript(
         source_tool, storage, tool_calls=tool_calls, latest_window=latest_window
     )
@@ -1081,4 +1090,5 @@ def bridge(
         turns=len(kept),
         calls=summarised,
         dropped=dropped,
+        source_cursor=source_cursor,
     )
