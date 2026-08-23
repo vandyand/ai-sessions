@@ -34,6 +34,7 @@ from .bridge import (
     BridgeError,
     append_jsonl,
     bridge,
+    complete_jsonl_cursor,
     conversation_change_status,
     native_session_exists,
 )
@@ -294,8 +295,8 @@ class UserState:
     @staticmethod
     def _cursor(storage: str) -> int:
         try:
-            return Path(storage).stat().st_size
-        except OSError:
+            return complete_jsonl_cursor(Path(storage))
+        except (BridgeError, OSError):
             return -1
 
     @staticmethod

@@ -937,6 +937,7 @@ def _records_after(path: Path, offset: int) -> Iterator[dict[str, Any]]:
 
 def _codex_change_status(path: Path, offset: int) -> str:
     """Classify Codex activity after ``offset`` without trusting unstable tails."""
+    changed = False
     for record in _records_after(path, offset):
         if record.get("type") in (
             "ai_sessions_replaced",
@@ -951,19 +952,20 @@ def _codex_change_status(path: Path, offset: int) -> str:
             continue
         kind = payload.get("type")
         if kind == "message" and payload.get("role") in ("user", "assistant"):
-            return "changed"
+            changed = True
         if kind in (
             "function_call",
             "custom_tool_call",
             "function_call_output",
             "custom_tool_call_output",
         ):
-            return "changed"
-    return "unchanged"
+            changed = True
+    return "changed" if changed else "unchanged"
 
 
 def _claude_change_status(path: Path, offset: int) -> str:
     """Classify Claude activity after ``offset`` while ignoring metadata."""
+    changed = False
     for record in _records_after(path, offset):
         if record.get("type") in (
             "ai_sessions_replaced",
@@ -975,8 +977,8 @@ def _claude_change_status(path: Path, offset: int) -> str:
             continue
         message = record.get("message")
         if isinstance(message, dict) and message.get("content") not in (None, "", []):
-            return "changed"
-    return "unchanged"
+            changed = True
+    return "changed" if changed else "unchanged"
 
 
 HARNESSES: dict[str, Harness] = {
@@ -1046,7 +1048,7 @@ def bridged_title(title: str, source_tool: str) -> str:
     return base[: 200 - len(suffix)] + suffix
 
 
-def _jsonl_frontier(path: Path) -> int:
+def complete_jsonl_cursor(path: Path) -> int:
     """Return the byte offset after the last complete record currently on disk."""
     try:
         with path.open("rb") as handle:
@@ -1093,7 +1095,7 @@ def bridge(
     # JSONL record. If the live source is appended while the bridge is
     # materialising it, an earlier frontier may cause one conservative
     # re-copy; a later or partial EOF could mark unread work as already carried.
-    source_cursor = _jsonl_frontier(Path(storage))
+    source_cursor = complete_jsonl_cursor(Path(storage))
     source = read_transcript(
         source_tool, storage, tool_calls=tool_calls, latest_window=latest_window
     )

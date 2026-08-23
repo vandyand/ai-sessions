@@ -391,7 +391,7 @@ class HarnessRegistryTests(unittest.TestCase):
         for name, entry in HARNESSES.items():
             self.assertEqual(name, entry.name)
             self.assertTrue(entry.label)
-            for hook in (entry.read, entry.write, entry.locate):
+            for hook in (entry.read, entry.write, entry.locate, entry.change_status):
                 self.assertTrue(callable(hook))
 
     def test_an_unknown_harness_is_reported_rather_than_guessed(self) -> None:
@@ -874,6 +874,49 @@ class LaunchIntegrationTests(unittest.TestCase):
             with patch.object(bridge, "CLAUDE_HOME", Path(directory) / "claude"):
                 with self.assertRaisesRegex(BridgeError, "changed or became incomplete"):
                     prepare_launch(source, state=state)
+
+    def test_semantic_append_does_not_hide_a_later_partial_record(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            cases = (
+                ("codex", codex_line("user", "Complete work")),
+                ("claude", claude_line("user", "Complete work")),
+            )
+            for tool, complete in cases:
+                with self.subTest(tool=tool):
+                    path = Path(directory) / f"{tool}.jsonl"
+                    path.write_text(codex_line("user", "Earlier") + "\n", encoding="utf-8")
+                    cursor = path.stat().st_size
+                    with path.open("a", encoding="utf-8") as handle:
+                        handle.write(complete + "\n" + '{"type":"unfinished"')
+                    self.assertEqual(
+                        bridge.conversation_change_status(tool, path, cursor), "unstable"
+                    )
+
+    def test_retry_after_partial_tail_uses_the_last_complete_cursor(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            source = session(directory, launch_tool="claude")
+            source_path = Path(source.storage)
+            complete_cursor = source_path.stat().st_size
+            arriving = codex_line("user", "Completed after retry")
+            split = len(arriving) // 2
+            with source_path.open("a", encoding="utf-8") as handle:
+                handle.write(arriving[:split])
+            state = UserState(path=Path(directory) / "state.json")
+
+            with patch.object(bridge, "CLAUDE_HOME", Path(directory) / "claude"):
+                with self.assertRaisesRegex(BridgeError, "changed or became incomplete"):
+                    prepare_launch(source, state=state)
+
+                conversation_id = state.conversation_id_for(source)
+                member = state.conversations[conversation_id]["members"][source.key]
+                self.assertEqual(member["cursor"], complete_cursor)
+
+                with source_path.open("a", encoding="utf-8") as handle:
+                    handle.write(arriving[split:] + "\n")
+                prepared, note = prepare_launch(source, state=state)
+
+            self.assertEqual(prepared.tool, "claude")
+            self.assertIn("Copied", note)
 
     def test_renaming_a_copy_does_not_advance_the_conversation(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
