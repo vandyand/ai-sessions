@@ -23,7 +23,7 @@ import subprocess
 import sys
 import textwrap
 import uuid
-from dataclasses import asdict, dataclass, field, replace
+from dataclasses import asdict, replace
 from pathlib import Path
 from typing import Any, Iterable
 
@@ -42,7 +42,7 @@ from .capabilities import Unsupported
 from .config import LAUNCH_MODES, LaunchConfig
 from .diagnostics import clear_warnings, record_warning
 from .diagnostics import warnings as load_warnings
-from .model import SourceKind
+from .model import Session, SourceKind
 from .paths import (
     CACHE_FILE,
     CLAUDE_HOME,
@@ -92,122 +92,62 @@ def tool_column_width(minimum: int) -> int:
     return max((minimum, *(len(adapter.short_label) for adapter in REGISTRY.adapters())))
 
 
-@dataclass(slots=True)
-class Session:
-    tool: str
-    session_id: str
-    title: str
-    cwd: str
-    updated: float
-    created: float
-    preview: str
-    named: bool
-    storage: str
-    source: str = "interactive"
-    auxiliary: bool = False
-    origin: str = "human"
-    resume_id: str = ""
-    parent_id: str = ""
-    original_title: str = ""
-    original_named: bool = False
-    renamed: bool = False
-    hidden: bool = False
-    message_count: int = 0
-    is_open: bool = False
-    open_pid: int = 0
-    agent_nickname: str = ""
-    launch_targets: dict[str, str] = field(default_factory=dict)
-    launch_tool: str = ""
-    conversation_id: str = ""
-    superseded: bool = False
-    diverged: bool = False
+def available_launch_tools(item: Session) -> tuple[str, ...]:
+    """Current native and bridgeable launch choices, with the native tool first."""
+    ordered = [item.tool, *(tool for tool in item.launch_targets if tool != item.tool)]
+    if can_bridge(item):
+        ordered += [tool for tool in bridge_tools() if tool not in ordered]
+    return tuple(ordered)
 
-    @property
-    def key(self) -> str:
-        # Origin is inferred metadata and can improve over time.  Keep utility
-        # names/visibility attached to the stable vendor session identity.
-        return f"{self.tool}:{self.session_id}"
 
-    @property
-    def can_bridge(self) -> bool:
-        """Whether the conversation can be copied into the other harness.
+def can_bridge(item: Session) -> bool:
+    return bool(item.storage)
 
-        Bridging replays the stored transcript, so it needs one: sessions
-        discovered without a readable file on disk stay single-harness.
-        """
-        return bool(self.storage)
 
-    @property
-    def available_launch_tools(self) -> tuple[str, ...]:
-        """Harnesses this session can be resumed in, native ones first.
+def active_launch_tool(item: Session) -> str:
+    options = available_launch_tools(item)
+    return item.launch_tool if item.launch_tool in options else item.tool
 
-        A provider id only ever resumes in its own CLI, so anything beyond
-        ``launch_targets`` is reached by bridging a copy across.
-        """
-        ordered = [self.tool, *(tool for tool in self.launch_targets if tool != self.tool)]
-        if self.can_bridge:
-            ordered += [tool for tool in bridge_tools() if tool not in ordered]
-        return tuple(ordered)
 
-    @property
-    def active_launch_tool(self) -> str:
-        return self.launch_tool if self.launch_tool in self.available_launch_tools else self.tool
+def session_needs_bridge(item: Session, tool: str | None = None) -> bool:
+    resolved = tool or active_launch_tool(item)
+    return resolved != item.tool and resolved not in item.launch_targets
 
-    def launch_target(self, tool: str | None = None) -> str:
-        """The id that resumes this conversation in ``tool``, or "" if none yet."""
-        resolved = tool or self.active_launch_tool
-        return self.launch_targets.get(resolved, "")
 
-    def needs_bridge(self, tool: str | None = None) -> bool:
-        resolved = tool or self.active_launch_tool
-        return resolved != self.tool and resolved not in self.launch_targets
+def cycle_session_launch_tool(item: Session, backwards: bool = False) -> None:
+    options = available_launch_tools(item)
+    if len(options) < 2:
+        return
+    selected = active_launch_tool(item)
+    index = options.index(selected) if selected in options else 0
+    item.launch_tool = options[(index + (-1 if backwards else 1)) % len(options)]
 
-    def cycle_launch_tool(self, backwards: bool = False) -> None:
-        options = self.available_launch_tools
-        if len(options) < 2:
-            return
-        selected = self.active_launch_tool
-        if selected not in options:
-            selected = options[0]
-        index = options.index(selected)
-        self.launch_tool = options[(index + (-1 if backwards else 1)) % len(options)]
 
-    def supports_launch_tool(self, value: str) -> bool:
-        return value in self.available_launch_tools
+def supports_launch_tool(item: Session, value: str) -> bool:
+    return value in available_launch_tools(item)
 
-    def __post_init__(self) -> None:
-        if not self.launch_targets:
-            self.launch_targets = {self.tool: self.session_id}
-        elif self.tool not in self.launch_targets:
-            self.launch_targets = {self.tool: self.session_id, **self.launch_targets}
-        if self.launch_tool and self.launch_tool not in self.available_launch_tools:
-            self.launch_tool = ""
 
-    @property
-    def resume_target(self) -> str:
-        return self.resume_id or self.session_id
-
-    def searchable(self) -> str:
-        return " ".join(
-            (
-                self.tool,
-                tool_label(self.tool),
-                self.session_id,
-                self.active_launch_tool,
-                *self.available_launch_tools,
-                self.title,
-                self.cwd,
-                self.preview,
-                self.source,
-                self.origin,
-                self.parent_id,
-                "hidden" if self.hidden else "visible",
-                "open running active" if self.is_open else "closed inactive",
-                self.original_title,
-                str(self.message_count),
-                str(self.open_pid) if self.open_pid else "",
-            )
-        ).casefold()
+def session_searchable(item: Session) -> str:
+    return " ".join(
+        (
+            item.tool,
+            tool_label(item.tool),
+            item.session_id,
+            active_launch_tool(item),
+            *available_launch_tools(item),
+            item.title,
+            item.cwd,
+            item.preview,
+            item.source,
+            item.origin,
+            item.parent_id,
+            "hidden" if item.hidden else "visible",
+            "open running active" if item.is_open else "closed inactive",
+            item.original_title,
+            str(item.message_count),
+            str(item.open_pid) if item.open_pid else "",
+        )
+    ).casefold()
 
 
 class UserState:
@@ -642,7 +582,7 @@ class UserState:
             item.named = item.original_named
             item.renamed = False
             item.launch_tool = self.launch_tools.get(item.key, "")
-            if item.launch_tool and item.launch_tool not in item.available_launch_tools:
+            if item.launch_tool and item.launch_tool not in available_launch_tools(item):
                 item.launch_tool = ""
             custom = self.names.get(item.key, "")
             if custom:
@@ -710,7 +650,7 @@ class UserState:
 
     def set_launch_tool(self, item: Session, launch_tool: str) -> None:
         key = self.stable_key(item.key)
-        if launch_tool and launch_tool in item.available_launch_tools and launch_tool != item.tool:
+        if launch_tool and launch_tool in available_launch_tools(item) and launch_tool != item.tool:
             self.launch_tools[key] = launch_tool
         else:
             self.launch_tools.pop(key, None)
@@ -1968,7 +1908,7 @@ def query_match(session: Session, query: str) -> tuple[bool, int]:
     words = [word for word in query.casefold().split() if word]
     if not words:
         return True, 0
-    haystack = session.searchable()
+    haystack = session_searchable(session)
     title = session.title.casefold()
     cwd = session.cwd.casefold()
     score = 0
@@ -2000,7 +1940,7 @@ def query_match(session: Session, query: str) -> tuple[bool, int]:
         if word.startswith("launch:"):
             wanted = word[7:]
             if wanted and not any(
-                item.startswith(wanted) for item in session.available_launch_tools
+                item.startswith(wanted) for item in available_launch_tools(session)
             ):
                 return False, 0
             score += 20
@@ -2008,7 +1948,7 @@ def query_match(session: Session, query: str) -> tuple[bool, int]:
         if word.startswith("harness:"):
             wanted = word[8:]
             if wanted and not any(
-                item.startswith(wanted) for item in session.available_launch_tools
+                item.startswith(wanted) for item in available_launch_tools(session)
             ):
                 return False, 0
             score += 20
@@ -2435,8 +2375,8 @@ class Browser:
             name_badge = " · utility name" if item.renamed else (" · named" if item.named else "")
             source_badge = f" · {item.source}" if item.source != "interactive" else ""
             hidden_badge = " · hidden" if item.hidden else ""
-            launch_tool = tool_label(item.active_launch_tool)
-            if item.needs_bridge():
+            launch_tool = tool_label(active_launch_tool(item))
+            if session_needs_bridge(item):
                 launch_tool += " (bridged copy)"
             if item.is_open and process_state(item.open_pid) in ("T", "t"):
                 open_badge = f" · PAUSED in terminal (PID {item.open_pid})"
@@ -2541,16 +2481,16 @@ class Browser:
         if not items:
             return
         item = items[self.selected]
-        before = item.active_launch_tool
-        item.cycle_launch_tool()
-        selected = item.active_launch_tool
+        before = active_launch_tool(item)
+        cycle_session_launch_tool(item)
+        selected = active_launch_tool(item)
         self.state.set_launch_tool(item, selected)
         if selected == before:
             self.message = (
                 "Only one launch harness is available: this session has no readable "
                 "transcript to copy across."
             )
-        elif item.needs_bridge(selected):
+        elif session_needs_bridge(item, selected):
             self.message = (
                 f"Launching {tool_label(selected)}: a copy of this conversation will be "
                 "created there, with tool calls summarised inline."
@@ -2974,8 +2914,8 @@ def command_for(session: Session, config: LaunchConfig) -> list[str]:
     describe how the *recording* provider filed the session, so they apply
     only when resuming there.  A bridged copy is an ordinary new session.
     """
-    tool = session.active_launch_tool
-    if session.needs_bridge(tool):
+    tool = active_launch_tool(session)
+    if session_needs_bridge(session, tool):
         raise BridgeError(
             f"{tool_label(tool)} cannot resume a "
             f"{tool_label(session.tool)} session id directly; "
@@ -3020,7 +2960,7 @@ def prepare_launch(
     repeatedly launching the same pairing continues one conversation rather
     than spawning a new snapshot each time.
     """
-    tool = session.active_launch_tool
+    tool = active_launch_tool(session)
     conversation_id = ""
     if state is not None:
         source, target, conversation_id = state.resolve_launch(session, tool)
@@ -3160,8 +3100,8 @@ def launch(
         print(f"sessions: {note}", file=sys.stderr)
     argv = command_for(session, config)
     cwd = strip_extended_prefix(session.cwd) or str(HOME)
-    if config.custom_args_missing(session.active_launch_tool):
-        print(custom_mode_notice(config, session.active_launch_tool), file=sys.stderr)
+    if config.custom_args_missing(active_launch_tool(session)):
+        print(custom_mode_notice(config, active_launch_tool(session)), file=sys.stderr)
     if dry_run:
         if IS_WINDOWS:
             rendered = subprocess.list2cmdline(argv)
@@ -3215,7 +3155,7 @@ def list_output(items: list[Session], as_json: bool = False) -> None:
         open_symbol = "Ⅱ" if paused else ("●" if item.is_open else "")
         print(
             f"{tool_label(item.tool):<{tool_width}} "
-            f"{tool_label(item.active_launch_tool):<{run_width}} "
+            f"{tool_label(active_launch_tool(item)):<{run_width}} "
             f"{ORIGIN_LABELS[item.origin]:<7} {open_symbol:<5} {item.message_count:>5} "
             f"{('hidden' if item.hidden else 'visible'):<8} "
             f"{conversation_status(item):<{conversation_width}} "
@@ -3401,8 +3341,8 @@ def main(argv: list[str] | None = None) -> int:
         item = resolve(args.resume)
         if item is None:
             return 2
-        if args.launch_tool and not item.supports_launch_tool(args.launch_tool):
-            tools = ", ".join(sorted({tool_label(tool) for tool in item.available_launch_tools}))
+        if args.launch_tool and not supports_launch_tool(item, args.launch_tool):
+            tools = ", ".join(sorted({tool_label(tool) for tool in available_launch_tools(item)}))
             print(
                 f"sessions: --launch-tool={args.launch_tool} is not available for "
                 f"that session (available: {tools})",

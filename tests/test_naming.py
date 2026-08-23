@@ -8,6 +8,7 @@ from ai_sessions import app
 from ai_sessions.app import (
     Session,
     UserState,
+    active_launch_tool,
     agent_tag,
     append_jsonl,
     publish_name,
@@ -267,9 +268,9 @@ class UserStateLaunchToolTests(unittest.TestCase):
                 ),
             ]
             state.apply(items)
-            self.assertEqual(items[0].active_launch_tool, "codex")
-            self.assertEqual(items[1].active_launch_tool, "claude")
-            self.assertEqual(items[2].active_launch_tool, "codex")
+            self.assertEqual(active_launch_tool(items[0]), "codex")
+            self.assertEqual(active_launch_tool(items[1]), "claude")
+            self.assertEqual(active_launch_tool(items[2]), "codex")
 
     def test_launch_tool_preference_round_trips(self) -> None:
         with TemporaryDirectory() as directory:
@@ -299,7 +300,7 @@ class UserStateLaunchToolTests(unittest.TestCase):
             )
             state.apply([fallback])
             self.assertEqual(fallback.launch_tool, "")
-            self.assertEqual(fallback.active_launch_tool, "claude")
+            self.assertEqual(active_launch_tool(fallback), "claude")
 
 
 class AgentTagTests(unittest.TestCase):

@@ -13,6 +13,8 @@ from ai_sessions import bridge
 from ai_sessions.app import (
     Session,
     UserState,
+    available_launch_tools,
+    can_bridge,
     command_for,
     launch,
     list_output,
@@ -1102,13 +1104,13 @@ class LaunchIntegrationTests(unittest.TestCase):
     def test_a_session_with_a_transcript_offers_both_harnesses(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             item = session(directory)
-            self.assertEqual(item.available_launch_tools, ("codex", "claude"))
-            self.assertTrue(item.can_bridge)
+            self.assertEqual(available_launch_tools(item), ("codex", "claude"))
+            self.assertTrue(can_bridge(item))
 
     def test_a_session_without_a_transcript_offers_only_its_own(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             item = session(directory, storage="")
-            self.assertEqual(item.available_launch_tools, ("codex",))
+            self.assertEqual(available_launch_tools(item), ("codex",))
 
     def test_loaded_token_budget_drives_the_real_dry_run_bridge(self) -> None:
         with tempfile.TemporaryDirectory() as directory:

@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import math
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from enum import StrEnum
 from pathlib import Path
 from typing import Callable
@@ -111,6 +111,57 @@ class Transcript:
     carried_windows: int = 0
     sealed_summary: bool = False
     resumes_at_last_summary: bool = False
+
+
+@dataclass(slots=True)
+class Session:
+    """Utility/UI state layered over a native session without registry dependencies."""
+
+    tool: str
+    session_id: str
+    title: str
+    cwd: str
+    updated: float
+    created: float
+    preview: str
+    named: bool
+    storage: str
+    source: SourceKind = SourceKind.INTERACTIVE
+    auxiliary: bool = False
+    origin: str = "human"
+    resume_id: str = ""
+    parent_id: str = ""
+    original_title: str = ""
+    original_named: bool = False
+    renamed: bool = False
+    hidden: bool = False
+    message_count: int = 0
+    is_open: bool = False
+    open_pid: int = 0
+    agent_nickname: str = ""
+    launch_targets: dict[str, str] = field(default_factory=dict)
+    launch_tool: str = ""
+    conversation_id: str = ""
+    superseded: bool = False
+    diverged: bool = False
+
+    def __post_init__(self) -> None:
+        self.source = SourceKind(self.source)
+        if not self.launch_targets:
+            self.launch_targets = {self.tool: self.session_id}
+        elif self.tool not in self.launch_targets:
+            self.launch_targets = {self.tool: self.session_id, **self.launch_targets}
+
+    @property
+    def key(self) -> str:
+        return f"{self.tool}:{self.session_id}"
+
+    def launch_target(self, tool: str) -> str:
+        return self.launch_targets.get(tool, "")
+
+    @property
+    def resume_target(self) -> str:
+        return self.resume_id or self.session_id
 
 
 @dataclass(frozen=True, slots=True)

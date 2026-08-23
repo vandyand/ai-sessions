@@ -7,7 +7,14 @@ from dataclasses import replace
 from pathlib import Path
 
 from ai_sessions import bridge
-from ai_sessions.app import Browser, Session, UserState, build_parser, list_output
+from ai_sessions.app import (
+    Browser,
+    Session,
+    UserState,
+    available_launch_tools,
+    build_parser,
+    list_output,
+)
 from ai_sessions.capabilities import Unsupported
 from ai_sessions.harnesses import install
 from ai_sessions.model import SourceKind
@@ -77,10 +84,10 @@ class RegistryTests(unittest.TestCase):
             named=False,
             storage="transcript.jsonl",
         )
-        self.assertNotIn("late", row.available_launch_tools)
+        self.assertNotIn("late", available_launch_tools(row))
         with REGISTRY.temporary(fake):
-            self.assertIn("late", row.available_launch_tools)
-        self.assertNotIn("late", row.available_launch_tools)
+            self.assertIn("late", available_launch_tools(row))
+        self.assertNotIn("late", available_launch_tools(row))
 
     def test_late_registration_is_visible_in_rendering_and_browser_styles(self) -> None:
         base = REGISTRY.get("codex")

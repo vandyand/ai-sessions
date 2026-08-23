@@ -117,8 +117,8 @@ class LaunchCommandTests(unittest.TestCase):
             )
 
     def test_invalid_source_kind_is_rejected(self) -> None:
-        with self.assertRaisesRegex(Exception, "invalid source kind"):
-            command_for(session("codex", "invented"), LaunchConfig())
+        with self.assertRaisesRegex(ValueError, "invented"):
+            session("codex", "invented")
 
 
 class LaunchDirectoryTests(unittest.TestCase):
