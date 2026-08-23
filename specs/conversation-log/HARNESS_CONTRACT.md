@@ -150,10 +150,13 @@ possibly newer frontier but does not invoke a missing adapter or crash known-har
 Cross-harness discovery evidence is format-agnostic and registry-sensitive. Transcript scanners
 match the union of registered native-ID prefilters and cache a digest of that pattern set; adding
 an adapter forces historical bytes to be rescanned. Candidate tokens are deduped and capped at
-4,096 per transcript with a persisted truncation flag. Truncated evidence can establish positive
+4,096 per transcript in first-scan order with a persisted truncation flag. This item-count cap is
+unrelated to the 4,096-character handoff-note reserve and uses a separate constant. Truncated evidence can establish positive
 discovered/existing-ID matches but cannot support a negative "no counterpart" conclusion.
 Claims are not exclusive—ID shapes overlap—so evidence resolves first against IDs returned by
 discovery and then against verified native existence. No adapter names or imports another.
+If multiple adapters verify the same otherwise-undiscovered token, resolution remains ambiguous
+and produces no cross-origin claim.
 
 ## Deliberate non-goals of the head-routing phase
 

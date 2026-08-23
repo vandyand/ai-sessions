@@ -100,6 +100,7 @@ are specified in [implementation-plan.md](implementation-plan.md).
 - [x] Initial Opus 5 plan review *(HIGH=5 MEDIUM=10; all incorporated before code)*
 - [x] Second Opus 5 plan review *(HIGH=3 MEDIUM=4; all incorporated before code)*
 - [x] Third Opus 5 plan review *(HIGH=0 MEDIUM=2; enforcement gaps incorporated)*
+- [x] Final Opus 5 plan review *(CLEAN — GO; HIGH=0 MEDIUM=0)*
 - [ ] Characterization and mutation tests
 - [ ] Generic adapter/registry and config profile
 - [ ] Claude and Codex runtime routing
@@ -130,4 +131,4 @@ The third review of `c202161` found no architectural HIGH issue. Its two MEDIUM 
 registry generation monotone across unregistration/context exit and added explicit overlapping
 ID plus 4,096-token evidence-bound mutations. Five LOW corrections moved provider paths out of
 the neutral root, made the terminal-width reserve dynamic, validated registry names, clarified
-the non-raising membership check, and updated the mutation-gate count.
+the non-raising membership check, and expanded the then-twenty mutation gates.

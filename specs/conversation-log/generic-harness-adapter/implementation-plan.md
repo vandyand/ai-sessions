@@ -67,7 +67,8 @@ generation simply become unreachable.
   claim, source kinds, and budget policy.
 - [ ] Implement ordered `Registry` with `register`, `unregister` test context, `get`, `names`,
   labels, bridge targets, generation, duplicate rejection, and idempotent built-in install.
-  Names are non-empty, colon-free, and cannot equal the synthetic filter value `all`.
+  Names match lowercase `[a-z0-9_-]+`, contain no whitespace/dot/colon, and cannot equal the
+  synthetic filter value `all`, so state keys, search filters, and TOML tables remain unambiguous.
 - [ ] Delete import-time snapshots (`BRIDGE_TOOLS`, `TOOL_NAMES`, `TOOL_LABELS`, `TOOL_ORDER`).
   All consumers query the registry at call time; CLI keeps synthetic `all` separate.
 - [ ] Every registry mutation—register, replace, unregister, and scoped-context exit—increments
@@ -106,14 +107,18 @@ generation simply become unreachable.
 - [ ] Use a per-pass `HarnessContext` shared by discovery/reconciliation: format-agnostic found
   tokens, one process snapshot, one lock map, warnings, and provider cache handles.
 - [ ] Publishers emit candidate tokens matched by the union of registered adapter ID prefilters,
-  deduped as a set capped at 4,096 per transcript with a persisted truncation flag. A truncation
-  flag makes evidence incomplete: reconciliation may accept positive discovered/existing-ID
+  deduped in scan order and capped at 4,096 per transcript by stopping new insertions, with a
+  persisted truncation flag. This evidence cap is unrelated to the 4,096-character handoff-note
+  reserve and uses a separate constant. A truncation flag makes evidence incomplete:
+  reconciliation may accept positive discovered/existing-ID
   matches but must suppress negative "no counterpart" conclusions and surface a warning. Cache
   entries record a stable digest of the registered ID-pattern set and fully rescan from offset
   zero when it changes.
 - [ ] Resolve evidence primarily by IDs actually produced by adapter discovery, then by verified
   native existence. `claims_native_id` is a non-exclusive prefilter only because Claude and
-  Codex ID shapes overlap. No adapter imports/names another or owns another adapter's regex.
+  Codex ID shapes overlap. If multiple adapters verify the same otherwise-undiscovered token,
+  treat it as ambiguous and make no cross-origin claim. No adapter imports/names another or
+  owns another adapter's regex.
 - [ ] Make `load_sessions` iterate registered discovery hooks, convert `NativeSession` to
   `Session`, reconcile typed evidence, dedupe by `(tool, session_id)`, apply state, and inspect
   liveness. A fresh writable copy is not required to appear in native discovery before resume.
