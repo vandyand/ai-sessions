@@ -5,7 +5,8 @@
 Imports point only downward; the registry never imports built-in adapters.
 
 ```text
-paths.py
+paths.py          neutral app/config/cache roots only; provider homes/cache filenames move
+                  into harnesses/<name>.py
   ↓
 model.py          neutral Turn/transcript/budget types, NativeSession, Session utility row,
                   SourceKind(StrEnum), capability results; never imports registry
@@ -49,9 +50,10 @@ generation simply become unreachable.
   budget, and capability lookup must fail explicitly rather than be preserved.
 - [ ] Preserve unknown-tool bridge records, conversation members, and launch preferences through
   `UserState.load → save`; older builds must not erase future harness routing authority.
-- [ ] Give preserved unregistered members an explicit `unknown` change status without registry
-  lookup. They block automatic head promotion like unavailable members but do not make listing
-  or unrelated known-harness launches raise.
+- [ ] Give preserved unregistered members an explicit `unknown` change status via a non-raising
+  registry membership check in the core status helper, never an adapter hook call. They block
+  automatic head promotion like unavailable members but do not make listing or unrelated
+  known-harness launches raise.
 
 ## Phase 1: Split neutral modules and install a dynamic registry
 
@@ -65,17 +67,19 @@ generation simply become unreachable.
   claim, source kinds, and budget policy.
 - [ ] Implement ordered `Registry` with `register`, `unregister` test context, `get`, `names`,
   labels, bridge targets, generation, duplicate rejection, and idempotent built-in install.
+  Names are non-empty, colon-free, and cannot equal the synthetic filter value `all`.
 - [ ] Delete import-time snapshots (`BRIDGE_TOOLS`, `TOOL_NAMES`, `TOOL_LABELS`, `TOOL_ORDER`).
   All consumers query the registry at call time; CLI keeps synthetic `all` separate.
-- [ ] Registration/replacement increments generation. Conversion includes that generation in
-  `_snapshot_change_status` cache keys so a re-registered adapter cannot reuse an old hook
-  result for the same file snapshot without any registry → conversion import.
+- [ ] Every registry mutation—register, replace, unregister, and scoped-context exit—increments
+  generation monotonically and never restores an earlier value. Conversion includes that
+  generation in `_snapshot_change_status` cache keys so no restored adapter reuses another
+  hook's result for the same snapshot, without any registry → conversion import.
 - [ ] Install built-ins from `ai_sessions.__init__` through `harnesses.install()`; importing any
   public submodule observes the same initialized registry without `app.py` late binding.
 - [ ] Delete dead label maps and give Browser dynamic, initialized color pairs with a stable
   fallback when terminal color capacity is limited; a third row must never raise. Derive TOOL
-  and RUN column widths from registered `short_label` lengths rather than enforcing current
-  fixed widths, while preserving existing two-adapter output exactly.
+  and RUN column widths and the title-width reserve from registered `short_label` lengths rather
+  than enforcing current fixed widths, while preserving existing two-adapter output exactly.
 - [ ] Add deterministic sort tie-breakers independent of registry/discovery iteration order.
 
 ## Phase 2: Generic configuration, launch, and naming
@@ -102,8 +106,11 @@ generation simply become unreachable.
 - [ ] Use a per-pass `HarnessContext` shared by discovery/reconciliation: format-agnostic found
   tokens, one process snapshot, one lock map, warnings, and provider cache handles.
 - [ ] Publishers emit candidate tokens matched by the union of registered adapter ID prefilters,
-  deduped as a bounded set with a persisted truncation flag. Cache entries record a stable digest
-  of the registered ID-pattern set and fully rescan from offset zero when it changes.
+  deduped as a set capped at 4,096 per transcript with a persisted truncation flag. A truncation
+  flag makes evidence incomplete: reconciliation may accept positive discovered/existing-ID
+  matches but must suppress negative "no counterpart" conclusions and surface a warning. Cache
+  entries record a stable digest of the registered ID-pattern set and fully rescan from offset
+  zero when it changes.
 - [ ] Resolve evidence primarily by IDs actually produced by adapter discovery, then by verified
   native existence. `claims_native_id` is a non-exclusive prefilter only because Claude and
   Codex ID shapes overlap. No adapter imports/names another or owns another adapter's regex.
@@ -117,7 +124,8 @@ generation simply become unreachable.
 
 ## Phase 4: Genuine third-format contract fixture
 
-- [ ] Build a test-only adapter with its own home, record shape, id shape, reader, writer, locate,
+- [ ] Build a test-only adapter with its own home, record shape, deliberately built-in-overlapping
+  id shape, reader, writer, locate,
   tail detector, discovery, resume argv, rename storage, and liveness marker. It must not reuse
   Claude/Codex hooks.
 - [ ] Register it after `app` import; prove it appears, disappears on context exit, and changes
@@ -137,7 +145,8 @@ Every mutation below must fail at least one test:
 3. One adapter receives another adapter's dangerous flag.
 4. Unsupported rename writes Codex index data.
 5. A registry snapshot misses a fake registered after app import.
-6. Registration does not clear semantic-tail cache.
+6. Register, replace, unregister, or scoped context exit does not increment the generation used
+   in semantic-tail cache identity.
 7. Long label replaces width-bounded short label in list output/bridged title.
 8. Browser uses a static/fallback pair without initializing the fake style.
 9. A nonstandard raw source string bypasses SourceKind validation/liveness/origin.
@@ -160,6 +169,10 @@ Every mutation below must fail at least one test:
 23. A short label wider than the original fixed columns shifts or corrupts `--list` output.
 24. `SourceKind` breaks searchable/detail/`--json`, or archived interactive evidence loses its
     auxiliary flag.
+25. A transcript with more than 4,096 distinct candidate IDs drops a real cross-origin match
+    without persisting/consuming the evidence-truncated flag.
+26. Evidence assigns a token exclusively to the first matching ID prefilter instead of resolving
+    against discovered/existing native IDs when two registered prefilters overlap.
 
 ## Phase 6: Adversarial review, verification, and doc sync
 

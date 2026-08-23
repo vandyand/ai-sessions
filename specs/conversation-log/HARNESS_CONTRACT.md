@@ -148,10 +148,12 @@ Such a member has an `unknown` availability status: it blocks automatic promotio
 possibly newer frontier but does not invoke a missing adapter or crash known-harness listing.
 
 Cross-harness discovery evidence is format-agnostic and registry-sensitive. Transcript scanners
-match the bounded union of registered native-ID prefilters and cache a digest of that pattern
-set; adding an adapter forces historical bytes to be rescanned. Claims are not exclusive—ID
-shapes overlap—so evidence resolves first against IDs returned by discovery and then against
-verified native existence. No adapter names or imports another adapter.
+match the union of registered native-ID prefilters and cache a digest of that pattern set; adding
+an adapter forces historical bytes to be rescanned. Candidate tokens are deduped and capped at
+4,096 per transcript with a persisted truncation flag. Truncated evidence can establish positive
+discovered/existing-ID matches but cannot support a negative "no counterpart" conclusion.
+Claims are not exclusive—ID shapes overlap—so evidence resolves first against IDs returned by
+discovery and then against verified native existence. No adapter names or imports another.
 
 ## Deliberate non-goals of the head-routing phase
 

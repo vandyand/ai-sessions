@@ -84,7 +84,7 @@ utility-owned conversation/head fields.
 neutral definitions and never imports adapters. Built-in provider modules import the neutral
 layers but never each other or `app.py`. `harnesses.install()` pushes complete adapters in
 declaration order and is invoked idempotently during package initialization. Config and app
-consume the already initialized registry. Exact modules and the twenty named mutation gates
+consume the already initialized registry. Exact modules and the twenty-six named mutation gates
 are specified in [implementation-plan.md](implementation-plan.md).
 
 ## Non-goals
@@ -99,6 +99,7 @@ are specified in [implementation-plan.md](implementation-plan.md).
 
 - [x] Initial Opus 5 plan review *(HIGH=5 MEDIUM=10; all incorporated before code)*
 - [x] Second Opus 5 plan review *(HIGH=3 MEDIUM=4; all incorporated before code)*
+- [x] Third Opus 5 plan review *(HIGH=0 MEDIUM=2; enforcement gaps incorporated)*
 - [ ] Characterization and mutation tests
 - [ ] Generic adapter/registry and config profile
 - [ ] Claude and Codex runtime routing
@@ -124,3 +125,9 @@ would still crash on a registry lookup, and evidence caches would never rescan h
 after a new ID pattern registered. Four MEDIUM findings replaced exclusive regex ownership with
 discovered/existing-ID resolution, bounded the registry-derived token set, made display widths
 dynamic, and required `SourceKind` to preserve searchable/detail/JSON and archived semantics.
+
+The third review of `c202161` found no architectural HIGH issue. Its two MEDIUM findings made
+registry generation monotone across unregistration/context exit and added explicit overlapping
+ID plus 4,096-token evidence-bound mutations. Five LOW corrections moved provider paths out of
+the neutral root, made the terminal-width reserve dynamic, validated registry names, clarified
+the non-raising membership check, and updated the mutation-gate count.
