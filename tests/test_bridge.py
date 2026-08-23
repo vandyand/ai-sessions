@@ -9,7 +9,7 @@ from contextlib import redirect_stderr, redirect_stdout
 from pathlib import Path
 from unittest.mock import patch
 
-from ai_sessions import bridge
+from ai_sessions import bridge, conversion
 from ai_sessions.app import (
     Session,
     UserState,
@@ -52,6 +52,8 @@ from ai_sessions.bridge import (
 )
 from ai_sessions.capabilities import HarnessAdapter
 from ai_sessions.config import LaunchConfig
+from ai_sessions.harnesses import claude as claude_harness
+from ai_sessions.harnesses import codex as codex_harness
 from ai_sessions.registry import REGISTRY
 
 
@@ -629,7 +631,7 @@ class CompactionTests(unittest.TestCase):
 
     def test_bridging_starts_at_the_summary_and_says_so(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
-            with patch.object(bridge, "CODEX_HOME", Path(directory) / "codex"):
+            with patch.object(codex_harness, "CODEX_HOME", Path(directory) / "codex"):
                 result = bridge.bridge(
                     source_tool="claude",
                     target_tool="codex",
@@ -644,7 +646,7 @@ class CompactionTests(unittest.TestCase):
 
     def test_the_whole_history_can_still_be_carried(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
-            with patch.object(bridge, "CODEX_HOME", Path(directory) / "codex"):
+            with patch.object(codex_harness, "CODEX_HOME", Path(directory) / "codex"):
                 result = bridge.bridge(
                     source_tool="claude",
                     target_tool="codex",
@@ -683,7 +685,7 @@ class CompactionTests(unittest.TestCase):
             source = bridge.read_transcript("codex", path)
             self.assertEqual(source.opaque_compactions, 1)
             self.assertEqual(from_last_compaction(source.turns)[1], 0)
-            with patch.object(bridge, "CLAUDE_HOME", Path(directory) / "claude"):
+            with patch.object(claude_harness, "CLAUDE_HOME", Path(directory) / "claude"):
                 result = bridge.bridge(
                     source_tool="codex",
                     target_tool="claude",
@@ -730,7 +732,7 @@ class HarnessRegistryTests(unittest.TestCase):
 class WriteSessionTests(unittest.TestCase):
     def test_claude_session_lands_in_the_project_directory_for_its_cwd(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
-            with patch.object(bridge, "CLAUDE_HOME", Path(directory)):
+            with patch.object(claude_harness, "CLAUDE_HOME", Path(directory)):
                 session_id, path = write_claude_session(
                     cwd="/home/andrew/ai-sessions",
                     turns=[Turn("user", "hi"), Turn("assistant", "hello")],
@@ -749,7 +751,7 @@ class WriteSessionTests(unittest.TestCase):
 
     def test_codex_rollout_opens_with_session_meta_and_names_the_thread(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
-            with patch.object(bridge, "CODEX_HOME", Path(directory)):
+            with patch.object(codex_harness, "CODEX_HOME", Path(directory)):
                 session_id, path = write_codex_session(
                     cwd="/home/andrew",
                     turns=[Turn("user", "hi"), Turn("assistant", "hello")],
@@ -794,7 +796,7 @@ class WriteSessionTests(unittest.TestCase):
 
     def test_each_exchange_gets_its_own_codex_turn(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
-            with patch.object(bridge, "CODEX_HOME", Path(directory)):
+            with patch.object(codex_harness, "CODEX_HOME", Path(directory)):
                 _, path = write_codex_session(
                     cwd="/home/andrew",
                     turns=[
@@ -831,7 +833,7 @@ class BridgeTests(unittest.TestCase):
     def test_codex_conversation_becomes_a_resumable_claude_session(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             source = self.source(directory)
-            with patch.object(bridge, "CLAUDE_HOME", Path(directory) / "claude"):
+            with patch.object(claude_harness, "CLAUDE_HOME", Path(directory) / "claude"):
                 result = bridge.bridge(
                     source_tool="codex",
                     target_tool="claude",
@@ -858,7 +860,7 @@ class BridgeTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             source = self.source(directory)
             before = source.read_bytes()
-            with patch.object(bridge, "CLAUDE_HOME", Path(directory) / "claude"):
+            with patch.object(claude_harness, "CLAUDE_HOME", Path(directory) / "claude"):
                 result = bridge.bridge(
                     source_tool="codex",
                     target_tool="claude",
@@ -882,7 +884,7 @@ class BridgeTests(unittest.TestCase):
                 encoding="utf-8",
             )
             budget = resolve_budget("claude", max_tokens=5_000)
-            with patch.object(bridge, "CLAUDE_HOME", Path(directory) / "claude"):
+            with patch.object(claude_harness, "CLAUDE_HOME", Path(directory) / "claude"):
                 result = bridge.bridge(
                     source_tool="codex",
                     target_tool="claude",
@@ -904,7 +906,7 @@ class BridgeTests(unittest.TestCase):
                 "\n".join(codex_line("user", text) for text in ("one", "two", "three")) + "\n",
                 encoding="utf-8",
             )
-            with patch.object(bridge, "CLAUDE_HOME", Path(directory) / "claude"):
+            with patch.object(claude_harness, "CLAUDE_HOME", Path(directory) / "claude"):
                 result = bridge.bridge(
                     source_tool="codex",
                     target_tool="claude",
@@ -920,9 +922,9 @@ class BridgeTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             source = self.source(directory)
             with (
-                patch.object(bridge, "CLAUDE_HOME", Path(directory) / "claude"),
+                patch.object(claude_harness, "CLAUDE_HOME", Path(directory) / "claude"),
                 patch.object(
-                    bridge,
+                    conversion,
                     "handoff_note",
                     return_value="x" * (HANDOFF_NOTE_RESERVE_CHARS - 1),
                 ),
@@ -945,8 +947,8 @@ class BridgeTests(unittest.TestCase):
                 truncated=0,
             )
             with (
-                patch.object(bridge, "CLAUDE_HOME", Path(directory) / "claude"),
-                patch.object(bridge, "select_messages", return_value=selected),
+                patch.object(claude_harness, "CLAUDE_HOME", Path(directory) / "claude"),
+                patch.object(conversion, "select_messages", return_value=selected),
                 self.assertRaisesRegex(BridgeError, "payload exceeds"),
             ):
                 bridge.bridge(
@@ -980,8 +982,8 @@ class BridgeTests(unittest.TestCase):
                 encoding="utf-8",
             )
             with (
-                patch.object(bridge, "CLAUDE_HOME", Path(directory) / "claude-home"),
-                patch.object(bridge, "CODEX_HOME", Path(directory) / "codex-home"),
+                patch.object(claude_harness, "CLAUDE_HOME", Path(directory) / "claude-home"),
+                patch.object(codex_harness, "CODEX_HOME", Path(directory) / "codex-home"),
             ):
                 into_claude = bridge.bridge(
                     source_tool="codex",
@@ -1092,7 +1094,7 @@ class LaunchIntegrationTests(unittest.TestCase):
         stdout = io.StringIO()
         stderr = io.StringIO()
         with (
-            patch.object(bridge, "CLAUDE_HOME", Path(directory) / "claude"),
+            patch.object(claude_harness, "CLAUDE_HOME", Path(directory) / "claude"),
             redirect_stdout(stdout),
             redirect_stderr(stderr),
         ):
@@ -1189,7 +1191,7 @@ class LaunchIntegrationTests(unittest.TestCase):
             state = UserState(path=Path(directory) / "state.json")
             stderr = io.StringIO()
             with (
-                patch.object(bridge, "CLAUDE_HOME", Path(directory) / "claude"),
+                patch.object(claude_harness, "CLAUDE_HOME", Path(directory) / "claude"),
                 redirect_stdout(io.StringIO()),
                 redirect_stderr(stderr),
             ):
@@ -1214,7 +1216,7 @@ class LaunchIntegrationTests(unittest.TestCase):
                 + "\n",
                 encoding="utf-8",
             )
-            with patch.object(bridge, "CLAUDE_HOME", Path(directory) / "claude"):
+            with patch.object(claude_harness, "CLAUDE_HOME", Path(directory) / "claude"):
                 prepared, notice = prepare_launch(
                     item,
                     config=LaunchConfig(bridge_max_tokens=4_096),
@@ -1233,7 +1235,7 @@ class LaunchIntegrationTests(unittest.TestCase):
     def test_prepare_launch_bridges_then_the_command_resumes_the_copy(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             item = session(directory, launch_tool="claude")
-            with patch.object(bridge, "CLAUDE_HOME", Path(directory) / "claude"):
+            with patch.object(claude_harness, "CLAUDE_HOME", Path(directory) / "claude"):
                 prepared, note = prepare_launch(item)
                 self.assertIn("Copied 2 source message(s), assembled as 2 target message(s)", note)
             argv = command_for(prepared, LaunchConfig())
@@ -1265,7 +1267,7 @@ class LaunchIntegrationTests(unittest.TestCase):
                 launch_targets={"codex": "019f-source", "claude": "real-claude-id"},
                 launch_tool="claude",
             )
-            with patch.object(bridge, "CLAUDE_HOME", claude_home):
+            with patch.object(claude_harness, "CLAUDE_HOME", claude_home):
                 prepared, note = prepare_launch(item)
             self.assertEqual(note, "")
             self.assertEqual(command_for(prepared, LaunchConfig())[2], "real-claude-id")
@@ -1279,7 +1281,7 @@ class LaunchIntegrationTests(unittest.TestCase):
                 launch_targets={"codex": "019f-source", "claude": "never-existed"},
                 launch_tool="claude",
             )
-            with patch.object(bridge, "CLAUDE_HOME", Path(directory) / "claude"):
+            with patch.object(claude_harness, "CLAUDE_HOME", Path(directory) / "claude"):
                 prepared, note = prepare_launch(item)
             self.assertIn("does not exist", note)
             self.assertNotEqual(command_for(prepared, LaunchConfig())[2], "never-existed")
@@ -1288,7 +1290,7 @@ class LaunchIntegrationTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             item = session(directory, launch_tool="claude")
             state = UserState(path=Path(directory) / "state.json")
-            with patch.object(bridge, "CLAUDE_HOME", Path(directory) / "claude"):
+            with patch.object(claude_harness, "CLAUDE_HOME", Path(directory) / "claude"):
                 first, _ = prepare_launch(item, state=state)
                 second, note = prepare_launch(item, state=state)
                 self.assertEqual(first.launch_target("claude"), second.launch_target("claude"))
@@ -1305,7 +1307,7 @@ class LaunchIntegrationTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             item = session(directory, launch_tool="claude")
             state = UserState(path=Path(directory) / "state.json")
-            with patch.object(bridge, "CLAUDE_HOME", Path(directory) / "claude"):
+            with patch.object(claude_harness, "CLAUDE_HOME", Path(directory) / "claude"):
                 first, _ = prepare_launch(item, state=state)
                 Path(state.bridges[item.key]["claude"]["storage"]).unlink()
                 second, note = prepare_launch(item, state=state)
@@ -1329,7 +1331,7 @@ class LaunchIntegrationTests(unittest.TestCase):
                 return Transcript([Turn("user", "Ship it"), Turn("assistant", "Shipped.")])
 
             with (
-                patch.object(bridge, "CLAUDE_HOME", Path(directory) / "claude"),
+                patch.object(claude_harness, "CLAUDE_HOME", Path(directory) / "claude"),
                 patch.object(bridge, "read_transcript", side_effect=append_while_reading),
             ):
                 with self.assertRaisesRegex(BridgeError, "changed or became incomplete"):
@@ -1344,7 +1346,7 @@ class LaunchIntegrationTests(unittest.TestCase):
             state = UserState(path=Path(directory) / "state.json")
             claude_home = Path(directory) / "claude"
             codex_home = Path(directory) / "codex"
-            with patch.object(bridge, "CLAUDE_HOME", claude_home):
+            with patch.object(claude_harness, "CLAUDE_HOME", claude_home):
                 claude_prepared, _ = prepare_launch(source, state=state)
             copy = self.claude_copy(
                 source, claude_prepared, state.bridges[source.key]["claude"]["storage"]
@@ -1362,7 +1364,7 @@ class LaunchIntegrationTests(unittest.TestCase):
             self.assertIn("HEAD", output.getvalue().splitlines()[0])
             self.assertIn("superseded", output.getvalue().splitlines()[1])
 
-            with patch.object(bridge, "CODEX_HOME", codex_home):
+            with patch.object(codex_harness, "CODEX_HOME", codex_home):
                 codex_prepared, note = prepare_launch(original_row, state=state)
             self.assertIn("Copied", note)
             self.assertEqual(codex_prepared.tool, "codex")
@@ -1381,7 +1383,7 @@ class LaunchIntegrationTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             source = session(directory, launch_tool="claude")
             state = UserState(path=Path(directory) / "state.json")
-            with patch.object(bridge, "CLAUDE_HOME", Path(directory) / "claude"):
+            with patch.object(claude_harness, "CLAUDE_HOME", Path(directory) / "claude"):
                 claude_prepared, _ = prepare_launch(source, state=state)
             copy = self.claude_copy(
                 source, claude_prepared, state.bridges[source.key]["claude"]["storage"]
@@ -1397,7 +1399,7 @@ class LaunchIntegrationTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             source = session(directory, launch_tool="claude")
             state = UserState(path=Path(directory) / "state.json")
-            with patch.object(bridge, "CLAUDE_HOME", Path(directory) / "claude"):
+            with patch.object(claude_harness, "CLAUDE_HOME", Path(directory) / "claude"):
                 claude_prepared, _ = prepare_launch(source, state=state)
             copy = self.claude_copy(
                 source, claude_prepared, state.bridges[source.key]["claude"]["storage"]
@@ -1418,7 +1420,7 @@ class LaunchIntegrationTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             original = session(directory, launch_tool="claude")
             state = UserState(path=Path(directory) / "state.json")
-            with patch.object(bridge, "CLAUDE_HOME", Path(directory) / "claude"):
+            with patch.object(claude_harness, "CLAUDE_HOME", Path(directory) / "claude"):
                 claude_prepared, _ = prepare_launch(original, state=state)
             copy = self.claude_copy(
                 original, claude_prepared, state.bridges[original.key]["claude"]["storage"]
@@ -1426,7 +1428,7 @@ class LaunchIntegrationTests(unittest.TestCase):
             with Path(copy.storage).open("a", encoding="utf-8") as handle:
                 handle.write(claude_line("user", "Advance one generation") + "\n")
             state.apply([original, copy])
-            with patch.object(bridge, "CODEX_HOME", Path(directory) / "codex"):
+            with patch.object(codex_harness, "CODEX_HOME", Path(directory) / "codex"):
                 newest, _ = prepare_launch(original, state=state)
 
             with Path(copy.storage).open("a", encoding="utf-8") as handle:
@@ -1444,7 +1446,7 @@ class LaunchIntegrationTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             original = session(directory, launch_tool="claude")
             state = UserState(path=Path(directory) / "state.json")
-            with patch.object(bridge, "CLAUDE_HOME", Path(directory) / "claude"):
+            with patch.object(claude_harness, "CLAUDE_HOME", Path(directory) / "claude"):
                 claude_prepared, _ = prepare_launch(original, state=state)
             copy = self.claude_copy(
                 original, claude_prepared, state.bridges[original.key]["claude"]["storage"]
@@ -1452,7 +1454,7 @@ class LaunchIntegrationTests(unittest.TestCase):
             with Path(copy.storage).open("a", encoding="utf-8") as handle:
                 handle.write(claude_line("user", "Newest work") + "\n")
             state.apply([original, copy])
-            with patch.object(bridge, "CODEX_HOME", Path(directory) / "codex"):
+            with patch.object(codex_harness, "CODEX_HOME", Path(directory) / "codex"):
                 newest, _ = prepare_launch(original, state=state)
 
             Path(copy.storage).unlink()
@@ -1474,7 +1476,7 @@ class LaunchIntegrationTests(unittest.TestCase):
 
             source.launch_tool = "claude"
             state = UserState(path=Path(directory) / "state.json")
-            with patch.object(bridge, "CLAUDE_HOME", Path(directory) / "claude"):
+            with patch.object(claude_harness, "CLAUDE_HOME", Path(directory) / "claude"):
                 with self.assertRaisesRegex(BridgeError, "changed or became incomplete"):
                     prepare_launch(source, state=state)
 
@@ -1565,7 +1567,7 @@ class LaunchIntegrationTests(unittest.TestCase):
                 handle.write(arriving[:split])
             state = UserState(path=Path(directory) / "state.json")
 
-            with patch.object(bridge, "CLAUDE_HOME", Path(directory) / "claude"):
+            with patch.object(claude_harness, "CLAUDE_HOME", Path(directory) / "claude"):
                 with self.assertRaisesRegex(BridgeError, "changed or became incomplete"):
                     prepare_launch(source, state=state)
 
@@ -1584,7 +1586,7 @@ class LaunchIntegrationTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             source = session(directory, launch_tool="claude")
             state = UserState(path=Path(directory) / "state.json")
-            with patch.object(bridge, "CLAUDE_HOME", Path(directory) / "claude"):
+            with patch.object(claude_harness, "CLAUDE_HOME", Path(directory) / "claude"):
                 claude_prepared, _ = prepare_launch(source, state=state)
             copy = self.claude_copy(
                 source, claude_prepared, state.bridges[source.key]["claude"]["storage"]
@@ -1620,7 +1622,7 @@ class LaunchIntegrationTests(unittest.TestCase):
             source = session(directory, launch_tool="claude")
             state_path = Path(directory) / "state.json"
             state = UserState(state_path)
-            with patch.object(bridge, "CLAUDE_HOME", Path(directory) / "claude"):
+            with patch.object(claude_harness, "CLAUDE_HOME", Path(directory) / "claude"):
                 prepared, _ = prepare_launch(source, state=state)
             conversation_id = state.conversation_id_for(source)
             reloaded = UserState(state_path)
@@ -1679,7 +1681,7 @@ class LaunchIntegrationTests(unittest.TestCase):
             self.assertTrue(source.superseded)
             self.assertFalse(target.superseded)
 
-            with patch.object(bridge, "CODEX_HOME", Path(directory) / "codex"):
+            with patch.object(codex_harness, "CODEX_HOME", Path(directory) / "codex"):
                 prepared, _ = prepare_launch(source, state=state)
             self.assertNotEqual(prepared.session_id, source.session_id)
             self.assertIn("Later Claude work", Path(prepared.storage).read_text("utf-8"))
@@ -1688,7 +1690,7 @@ class LaunchIntegrationTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             source = session(directory, launch_tool="claude")
             state = UserState(Path(directory) / "state.json")
-            with patch.object(bridge, "CLAUDE_HOME", Path(directory) / "claude"):
+            with patch.object(claude_harness, "CLAUDE_HOME", Path(directory) / "claude"):
                 prepared, _ = prepare_launch(source, state=state)
             text = Path(prepared.storage).read_text(encoding="utf-8")
             self.assertIn("[ai-sessions-provenance v1]", text)
@@ -1710,7 +1712,7 @@ class LaunchIntegrationTests(unittest.TestCase):
                 storage=str(path),
                 launch_tool="codex",
             )
-            with patch.object(bridge, "CODEX_HOME", Path(directory) / "codex"):
+            with patch.object(codex_harness, "CODEX_HOME", Path(directory) / "codex"):
                 prepared, _ = prepare_launch(item)
             argv = command_for(prepared, LaunchConfig())
             # The parent-id and --include-non-interactive rules describe Claude's
