@@ -29,7 +29,7 @@ an opaque, JSON-serializable semantic checkpoint before the OpenCode adapter is 
 | K2 | `read_snapshot(ref)` returns transcript and checkpoint from one native snapshot; adapters compare checkpoints | JSONL adapters read only through a captured complete-record offset; OpenCode reads and hashes raw semantic conversation/tool state in one transaction, then both are rechecked after materialization |
 | K3 | Use OpenCode's official `import` command for writes | The importer owns schema validation, migrations, project/worktree association, and transaction behavior; handcrafted database inserts would couple the utility to private write semantics |
 | K4 | Read/discover through SQLite read-only transactions | `session list` intentionally omits children and archived sessions, while the database contains both; session-specific reads avoid exporting every session through subprocesses |
-| K5 | Match OpenCode's `filterCompacted` ordering | A bridge must carry what OpenCode itself feeds the model: the completed summary, retained tail, then live continuation |
+| K5 | Let only a completed compaction govern neutral reorder/truncation, deliberately diverging from OpenCode 1.18.21 failed-attempt behavior | Upstream reorders around any summary attempt. After an abort and retry, that can put the completed boundary after the retained tail; if every attempt fails, it can truncate earlier history without a replacement summary. The adapter anchors on the newest completed summary and otherwise retains full history |
 | K6 | Project tools as inert `ToolCall` summaries | Completed/error/interrupted tool states remain useful context without replaying unavailable target-native tool blocks |
 | K7 | Prepare the OpenCode target before selection: choose an installed model, derive policy from its input limit, then resolve the bridge budget | Imported user messages require a real model reference and context/input limits differ. An explicit `bridge_model` wins; otherwise CLI order and cost are deterministic tie-breaks. The static 128k policy is a warned fallback only when verbose metadata cannot be parsed |
 | K8 | Provider title publication is an explicit best-effort, bounded `mode=rw` exception; local rename remains authoritative | Current OpenCode has no rename CLI command. The update never creates storage, uses `BEGIN IMMEDIATE`, verifies exactly one row and re-reads it, and is excluded from semantic checkpoints; a live TUI may refresh it later |
@@ -84,9 +84,29 @@ an opaque, JSON-serializable semantic checkpoint before the OpenCode adapter is 
 - [x] Final Opus 5 plan verdict *(GO: HIGH=0, MEDIUM=0)*
 - [x] Storage-neutral cursor/reference refinement *(273-test Windows/WSL gate; final Opus 5 GO)*
 - [x] OpenCode authoritative storage and discovery *(11 reviews; final GO: HIGH=0, MEDIUM=0)*
+- [x] OpenCode semantic reader, staged revert, compaction windows, and checkpoints *(397-test Windows/WSL gate; completed-only compaction policy pinned)*
 - [ ] OpenCode read/write/resume/rename/liveness adapter
 - [ ] Six-direction and real-CLI validation
 - [ ] Final Opus 5 reviews, documentation, PR/CI, and completion audit
+
+## Phase 2 validation
+
+- The semantic reader hydrates one session in a pinned read-only SQLite transaction, applies staged
+  revert boundaries, selects the latest compaction window, and returns that transcript with a
+  complete `sqlite-semantic-v1` checkpoint from the same snapshot.
+- OpenCode 1.18.21 source files for the session schema, `MessageV2`, and revert cleanup are pinned by
+  commit and SHA-256 in the semantic fixture; all three hashes were independently fetched and
+  verified byte-for-byte. The fixture also pins roles, part kinds, tool states, file-source types,
+  ordering, the compaction prompt, bookkeeping exclusions, optional-null behavior, and K5's
+  completed-only compaction policy.
+- Differential review fuzzing found zero SQL-versus-pure staged-revert mismatches and zero cases in
+  which projection changed without the semantic digest changing. Under K5, reorder and truncation
+  happen only when a completed summary governs: a successful retry keeps its retained tail after
+  the boundary, while failed-only attempts conservatively retain full history where upstream may
+  truncate it without a replacement summary.
+- Current pre-commit gate: 397 tests pass on native Windows (one skip) and Ubuntu WSL (two skips),
+  with Ruff 0.16.3 lint/format and `git diff --check` clean. Six exhaustive Phase 2 Opus 5 reviews
+  incorporated every finding and ended with **GO (HIGH=0, MEDIUM=0, LOW=0, nits=0)**.
 
 ## Initial Opus 5 review disposition
 

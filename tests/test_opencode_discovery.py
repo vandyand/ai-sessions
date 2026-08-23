@@ -1590,7 +1590,7 @@ class OpenCodeDiscoveryTests(unittest.TestCase):
         self.assertEqual(len(rows[0].title), opencode.DISCOVERY_PREVIEW_CHARS)
         self.assertEqual(len(rows[0].preview), opencode.DISCOVERY_PREVIEW_CHARS)
 
-    def test_unreadable_opencode_rows_do_not_offer_cross_harness_bridge_actions(self) -> None:
+    def test_installed_reader_offers_opencode_source_bridge_actions(self) -> None:
         item = Session(
             "opencode",
             "ses_000000000001AAAAAAAAAAAAAA",
@@ -1602,8 +1602,8 @@ class OpenCodeDiscoveryTests(unittest.TestCase):
             True,
             str(self.root / "opencode.db"),
         )
-        self.assertFalse(can_bridge(item))
-        self.assertEqual(available_launch_tools(item), ("opencode",))
+        self.assertTrue(can_bridge(item))
+        self.assertEqual(available_launch_tools(item), ("opencode", "codex", "claude"))
 
     def test_home_resolution_treats_empty_environment_as_unset(self) -> None:
         fake_home = self.root / "user"

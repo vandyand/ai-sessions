@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import contextlib
+import functools
 import json
 import os
 import re
@@ -15,7 +17,7 @@ import time
 import urllib.parse
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any
+from typing import Any, Iterator
 
 from ..capabilities import HarnessAdapter, Unsupported
 from ..conversion import DEFAULT_CHARS_PER_TOKEN, DEFAULT_USABLE_FRACTION, BridgeError
@@ -26,10 +28,19 @@ from ..model import (
     BudgetPolicy,
     NativeRef,
     NativeSession,
+    ReadSnapshot,
     SourceKind,
 )
 from ..paths import HOME, IS_WINDOWS, env_path
 from ..registry import REGISTRY
+from .opencode_semantics import (
+    CHECKPOINT_SCHEME,
+    StoredMessage,
+    normalize_revert,
+    project_view,
+    select_compacted_newest,
+    semantic_checkpoint,
+)
 
 OPENCODE_CONTEXT_FLOOR_TOKENS = 128_000
 DB_PATH_TIMEOUT_SECONDS = 3.0
@@ -38,6 +49,7 @@ DISCOVERY_JSON_BYTES = 262_144
 OPENCODE_EVIDENCE_BYTES = 16_777_216
 DISCOVERY_PREVIEW_CHARS = 4_096
 DISCOVERY_WARNING_CHARS = 512
+SEMANTIC_BUSY_TIMEOUT_SECONDS = 2.0
 _DEFAULT_TITLE = re.compile(
     r"^(?:New session - |Child session - )\d{4}-\d{2}-\d{2}T"
     r"\d{2}:\d{2}:\d{2}\.\d{3}Z$"
@@ -55,6 +67,8 @@ _REQUIRED_COLUMNS = {
     "message": {"id", "session_id", "time_created", "data"},
     "part": {"id", "message_id", "session_id", "time_created", "data"},
 }
+_SEMANTIC_REQUIRED_COLUMNS = {"session": {"revert"}}
+_SEMANTIC_CHECKPOINT = re.compile(rf"{re.escape(CHECKPOINT_SCHEME)}[0-9a-f]{{64}}\Z")
 
 
 def _default_home() -> Path:
@@ -660,7 +674,7 @@ def _sqlite_readonly_uri(path: Path) -> str:
     return f"{prefix}{urllib.parse.quote(posix, safe='/:')}?mode=ro"
 
 
-def _connect_existing(path: Path) -> sqlite3.Connection:
+def _connect_existing(path: Path, *, timeout_seconds: float = 0.25) -> sqlite3.Connection:
     state = _storage_state(path)
     if state is Availability.UNAVAILABLE:
         raise FileNotFoundError(path)
@@ -669,11 +683,11 @@ def _connect_existing(path: Path) -> sqlite3.Connection:
     connection = sqlite3.connect(
         _sqlite_readonly_uri(path),
         uri=True,
-        timeout=0.25,
+        timeout=timeout_seconds,
     )
     connection.text_factory = lambda raw: raw.decode("utf-8", "replace")
     try:
-        connection.execute("PRAGMA busy_timeout=250")
+        connection.execute(f"PRAGMA busy_timeout={max(1, round(timeout_seconds * 1_000))}")
         connection.execute("PRAGMA query_only=ON")
     except Exception:
         connection.close()
@@ -681,12 +695,15 @@ def _connect_existing(path: Path) -> sqlite3.Connection:
     return connection
 
 
-def _schema_columns(connection: sqlite3.Connection) -> dict[str, set[str]]:
+def _schema_columns(
+    connection: sqlite3.Connection, *, semantic: bool = False
+) -> dict[str, set[str]]:
     result: dict[str, set[str]] = {}
     for table, required in _REQUIRED_COLUMNS.items():
         columns = {str(row[1]) for row in connection.execute(f"PRAGMA table_info({table})")}
         result[table] = columns
-        missing = required - columns
+        semantic_required = _SEMANTIC_REQUIRED_COLUMNS.get(table, set()) if semantic else set()
+        missing = (required | semantic_required) - columns
         if missing:
             raise BridgeError(
                 f"OpenCode database schema is incompatible: {table} lacks "
@@ -712,6 +729,27 @@ def _json_object(value: Any) -> dict[str, Any] | None:
     except (json.JSONDecodeError, MemoryError, RecursionError, UnicodeDecodeError):
         return None
     return parsed if isinstance(parsed, dict) else None
+
+
+def _reject_json_constant(value: str) -> None:
+    raise ValueError(f"invalid JSON constant {value}")
+
+
+def _strict_json_object(value: Any, label: str) -> dict[str, Any]:
+    if isinstance(value, bytes):
+        try:
+            value = value.decode("utf-8", "strict")
+        except UnicodeDecodeError as error:
+            raise BridgeError(f"OpenCode {label} is not valid UTF-8") from error
+    if not isinstance(value, str):
+        raise BridgeError(f"OpenCode {label} is not stored as JSON text")
+    try:
+        parsed = json.loads(value, parse_constant=_reject_json_constant)
+    except (RecursionError, TypeError, ValueError) as error:
+        raise BridgeError(f"OpenCode {label} is malformed JSON: {error}") from error
+    if not isinstance(parsed, dict):
+        raise BridgeError(f"OpenCode {label} must be a JSON object")
+    return parsed
 
 
 def _prefix_bytes(value: Any) -> bytes | None:
@@ -880,7 +918,8 @@ def discover(context: HarnessContext, *, use_cache: bool = True) -> list[NativeS
             connection.execute(
                 "SELECT rowid, CAST(session_id AS BLOB), CAST(message_id AS BLOB), "
                 "time_created, CAST(id AS BLOB), typeof(data) "
-                "FROM part ORDER BY session_id, message_id, time_created, id"
+                # MessageV2.parts() orders native parts by their sortable ID.
+                "FROM part ORDER BY session_id, message_id, id"
             )
         )
         part_row = next(part_rows, None)
@@ -1009,6 +1048,275 @@ def discover(context: HarnessContext, *, use_cache: bool = True) -> list[NativeS
     return result
 
 
+def _optional_strict_json_object(value: Any, label: str) -> dict[str, Any] | None:
+    if value is None or (isinstance(value, (bytes, str)) and not value.strip()):
+        return None
+    return _strict_json_object(value, label)
+
+
+@contextlib.contextmanager
+def _semantic_snapshot(
+    ref: NativeRef,
+) -> Iterator[tuple[sqlite3.Connection, bytes, dict[str, Any] | None]]:
+    """Pin one WAL snapshot and expose its exact session-local semantic state."""
+    path = Path(ref.storage)
+    connection: sqlite3.Connection | None = None
+    try:
+        expected_session = ref.session_id.encode("utf-8", "strict")
+        connection = _connect_existing(path, timeout_seconds=SEMANTIC_BUSY_TIMEOUT_SECONDS)
+        connection.execute("BEGIN")
+        _schema_columns(connection, semantic=True)
+        session_row = connection.execute(
+            "SELECT CAST(id AS BLOB), CAST(revert AS BLOB) FROM session WHERE id=?",
+            (ref.session_id,),
+        ).fetchone()
+        # The session SELECT above pins the deferred read transaction before any
+        # digest or projection scan can observe a concurrent WAL commit.
+        if session_row is None:
+            raise BridgeError(
+                f"OpenCode session {ref.session_id} is not present in the referenced database"
+            )
+        stored_session = _native_identifier(session_row[0])
+        if stored_session is None or stored_session[0] != expected_session:
+            raise BridgeError("OpenCode session identity is malformed in the referenced database")
+        inconsistent = connection.execute(
+            "SELECT part_id, missing FROM ("
+            "SELECT CAST(p.id AS BLOB) AS part_id, m.id IS NULL AS missing "
+            "FROM part AS p LEFT JOIN message AS m ON m.id=p.message_id "
+            "WHERE p.session_id=? AND (m.id IS NULL OR m.session_id IS NOT p.session_id) "
+            "UNION ALL "
+            "SELECT CAST(p.id AS BLOB) AS part_id, 0 AS missing "
+            "FROM message AS m JOIN part AS p ON p.message_id=m.id "
+            "WHERE m.session_id=? AND p.session_id IS NOT m.session_id"
+            ") LIMIT 1",
+            (ref.session_id, ref.session_id),
+        ).fetchone()
+        if inconsistent is not None:
+            identity = _native_identifier(inconsistent[0])
+            label = identity[1] if identity is not None else "<malformed>"
+            if inconsistent[1]:
+                raise BridgeError(f"OpenCode part {label} refers to a missing message")
+            raise BridgeError(
+                f"OpenCode part {label} belongs to a different session than its message"
+            )
+        revert = _optional_strict_json_object(session_row[1], f"session {ref.session_id} revert")
+        yield connection, expected_session, revert
+    except BridgeError:
+        raise
+    except (
+        OSError,
+        RecursionError,
+        RuntimeError,
+        UnicodeError,
+        ValueError,
+        sqlite3.Error,
+    ) as error:
+        raise BridgeError(f"could not read OpenCode semantic state from {path}: {error}") from error
+    finally:
+        if connection is not None:
+            try:
+                connection.rollback()
+            except sqlite3.Error:
+                pass
+            connection.close()
+
+
+def _message_parts(
+    connection: sqlite3.Connection,
+    ref: NativeRef,
+    expected_session: bytes,
+    message_id: str,
+) -> tuple[dict[str, Any], ...]:
+    result: list[dict[str, Any]] = []
+    part_ids: set[bytes] = set()
+    for row in connection.execute(
+        "SELECT CAST(id AS BLOB), CAST(message_id AS BLOB), CAST(session_id AS BLOB), "
+        "CAST(data AS BLOB) FROM part WHERE session_id=? AND message_id=? ORDER BY id ASC",
+        (ref.session_id, message_id),
+    ):
+        part_identity = _native_identifier(row[0])
+        stored_message = _native_identifier(row[1])
+        stored_session = _native_identifier(row[2])
+        if part_identity is None or stored_message is None or stored_session is None:
+            raise BridgeError("OpenCode part identity is malformed")
+        raw_part_id, part_id = part_identity
+        if stored_session[0] != expected_session or stored_message[1] != message_id:
+            raise BridgeError(f"OpenCode part {part_id} belongs to a different message or session")
+        if raw_part_id in part_ids:
+            raise BridgeError(f"OpenCode part identity {part_id} is duplicated")
+        part_ids.add(raw_part_id)
+        part = _strict_json_object(row[3], f"part {part_id}")
+        result.append(
+            {
+                **part,
+                "id": part_id,
+                "messageID": message_id,
+                "sessionID": ref.session_id,
+            }
+        )
+    return tuple(result)
+
+
+def _iter_semantic_messages(
+    connection: sqlite3.Connection,
+    ref: NativeRef,
+    expected_session: bytes,
+    *,
+    newest_first: bool = False,
+    boundary: tuple[int, str, bool, str] | None = None,
+) -> Iterator[StoredMessage]:
+    clauses = ["session_id=?"]
+    parameters: list[Any] = [ref.session_id]
+    if boundary is not None:
+        created, message_id, inclusive, _ = boundary
+        operator = "<=" if inclusive else "<"
+        clauses.append(f"(time_created < ? OR (time_created = ? AND id {operator} ?))")
+        parameters.extend((created, created, message_id))
+    direction = "DESC" if newest_first else "ASC"
+    # OpenCode 1.18.21 MessageV2.stream() orders by time_created, then sortable id;
+    # tests/fixtures/opencode-1.18.21-semantics.json pins the audited source.
+    query = (
+        "SELECT CAST(id AS BLOB), CAST(session_id AS BLOB), time_created, "
+        "CAST(data AS BLOB) FROM message WHERE "
+        + " AND ".join(clauses)
+        + f" ORDER BY time_created {direction}, id {direction}"
+    )
+    seen: set[bytes] = set()
+    for row in connection.execute(query, parameters):
+        message_identity = _native_identifier(row[0])
+        stored_session = _native_identifier(row[1])
+        if message_identity is None or stored_session is None:
+            raise BridgeError("OpenCode message identity is malformed")
+        raw_message_id, message_id = message_identity
+        if stored_session[0] != expected_session:
+            raise BridgeError(f"OpenCode message {message_id} belongs to a different session")
+        if raw_message_id in seen:
+            raise BridgeError(f"OpenCode message identity {message_id} is duplicated")
+        seen.add(raw_message_id)
+        created = row[2]
+        if isinstance(created, bool) or not isinstance(created, int) or created < 0:
+            raise BridgeError(f"OpenCode message {message_id} has an invalid creation time")
+        info = _strict_json_object(row[3], f"message {message_id}")
+        info = {**info, "id": message_id, "sessionID": ref.session_id}
+        parts = _message_parts(connection, ref, expected_session, message_id)
+        if boundary is not None and boundary[2] and message_id == boundary[1] and boundary[3]:
+            part_index = next(
+                (index for index, part in enumerate(parts) if part["id"] == boundary[3]), -1
+            )
+            # SessionRevert.cleanup retains the whole target when its part vanished.
+            if part_index >= 0:
+                parts = parts[:part_index]
+        yield StoredMessage(message_id, created, info, parts)
+
+
+def _staged_boundary(
+    connection: sqlite3.Connection,
+    ref: NativeRef,
+    revert: dict[str, Any] | None,
+) -> tuple[int, str, bool, str] | None:
+    if revert is None:
+        return None
+    # The caller passes normalize_revert() output so this SQL projector has one
+    # validation authority rather than a second, drifting schema implementation.
+    message_id = revert["messageID"]
+    part_id = revert.get("partID")
+    row = connection.execute(
+        "SELECT time_created, CAST(id AS BLOB) FROM message WHERE session_id=? AND id=?",
+        (ref.session_id, message_id),
+    ).fetchone()
+    if row is None:
+        return None
+    identity = _native_identifier(row[1])
+    if identity is None or isinstance(row[0], bool) or not isinstance(row[0], int):
+        raise BridgeError("OpenCode session revert message boundary is malformed")
+    return row[0], identity[1], part_id is not None, part_id or ""
+
+
+def _read_opencode_snapshot(ref: NativeRef, *, latest_window: bool = True) -> ReadSnapshot:
+    with _semantic_snapshot(ref) as (connection, expected_session, revert):
+        normalized_revert = normalize_revert(revert)
+        checkpoint = semantic_checkpoint(
+            _iter_semantic_messages(connection, ref, expected_session), normalized_revert
+        )
+        boundary = _staged_boundary(connection, ref, normalized_revert)
+        if latest_window:
+            selection = select_compacted_newest(
+                _iter_semantic_messages(
+                    connection,
+                    ref,
+                    expected_session,
+                    newest_first=True,
+                    boundary=boundary,
+                )
+            )
+            if selection.unresolved_tail:
+                record_warning(
+                    "OpenCode compaction retained-tail boundary is missing; native full-history "
+                    "fallback was preserved"
+                )
+            viewed = selection.messages
+            summary_ids = frozenset({selection.summary_id}) if selection.summary_id else frozenset()
+        else:
+            viewed = list(
+                _iter_semantic_messages(connection, ref, expected_session, boundary=boundary)
+            )
+            summary_ids = None
+        transcript = project_view(
+            viewed,
+            resumes_at_last_summary=True,
+            summary_ids=summary_ids,
+        )
+        return ReadSnapshot(transcript, checkpoint)
+
+
+def _opencode_checkpoint(ref: NativeRef) -> str:
+    with _semantic_snapshot(ref) as (connection, expected_session, revert):
+        return semantic_checkpoint(
+            _iter_semantic_messages(connection, ref, expected_session), revert
+        )
+
+
+class _UnstableSemanticSnapshot(RuntimeError):
+    """Prevent a racing or failed SQLite classification from entering the cache."""
+
+
+@functools.lru_cache(maxsize=128)
+def _cached_opencode_change_status(
+    registry_generation: int,
+    ref: NativeRef,
+    checkpoint: str,
+    stamp: tuple[Any, ...],
+) -> str:
+    del registry_generation
+    try:
+        current = _opencode_checkpoint(ref)
+    except (BridgeError, OSError, RuntimeError, ValueError, sqlite3.Error) as error:
+        raise _UnstableSemanticSnapshot from error
+    if _store_stamp(Path(ref.storage)) != stamp:
+        raise _UnstableSemanticSnapshot
+    return "unchanged" if current == checkpoint else "changed"
+
+
+def _opencode_change_status(ref: NativeRef, checkpoint: int | str) -> str:
+    if not isinstance(checkpoint, str) or _SEMANTIC_CHECKPOINT.fullmatch(checkpoint) is None:
+        record_warning(
+            "OpenCode session checkpoint has an unknown or legacy format; expected "
+            f"{CHECKPOINT_SCHEME.removesuffix(':')}"
+        )
+        return "unknown"
+    stamp = _store_stamp(Path(ref.storage))
+    if stamp is None:
+        try:
+            current = _opencode_checkpoint(ref)
+        except (BridgeError, OSError, RuntimeError, ValueError, sqlite3.Error):
+            return "unstable"
+        return "unchanged" if current == checkpoint else "changed"
+    try:
+        return _cached_opencode_change_status(REGISTRY.generation, ref, checkpoint, stamp)
+    except _UnstableSemanticSnapshot:
+        return "unstable"
+
+
 def _availability(ref: NativeRef) -> Availability:
     path = Path(ref.storage)
     state = _storage_state(path)
@@ -1061,12 +1369,12 @@ ADAPTER = HarnessAdapter(
     dangerous_args=("--auto",),
     source_kinds=frozenset((SourceKind.INTERACTIVE, SourceKind.SUBAGENT)),
     id_patterns=(re.compile(rb"(?<![0-9A-Za-z])ses_[0-9A-Za-z]{26}(?![0-9A-Za-z])"),),
-    read=Unsupported("OpenCode reader is not installed yet"),
+    read=_read_opencode_snapshot,
     write=Unsupported("OpenCode writer is not installed yet"),
     resolve=_resolve,
     availability=_availability,
-    checkpoint=Unsupported("OpenCode semantic checkpoints are not installed yet"),
-    change_status=Unsupported("OpenCode semantic status is not installed yet"),
+    checkpoint=_opencode_checkpoint,
+    change_status=_opencode_change_status,
     discover=discover,
     resume_args=resume_args,
     budget=BudgetPolicy(

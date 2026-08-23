@@ -1,0 +1,59 @@
+{
+  "captured_at": "2026-08-23",
+  "opencode_version": "1.18.21",
+  "commit": "3a31c4ea801915c0b050df4b3842997ea62b6e93",
+  "sources": {
+    "session_schema": {
+      "url": "https://github.com/anomalyco/opencode/blob/3a31c4ea801915c0b050df4b3842997ea62b6e93/packages/schema/src/v1/session.ts",
+      "sha256": "8516f7405c91636e7a78ce9da099bf5bf307682a4320c9ad6d89888d80fac4fb"
+    },
+    "message_v2": {
+      "url": "https://github.com/anomalyco/opencode/blob/3a31c4ea801915c0b050df4b3842997ea62b6e93/packages/opencode/src/session/message-v2.ts",
+      "sha256": "828789508afda97a1570b96413dd40ee9d9119dd25d057b5f0a985154378e619"
+    },
+    "session_revert": {
+      "url": "https://github.com/anomalyco/opencode/blob/3a31c4ea801915c0b050df4b3842997ea62b6e93/packages/opencode/src/session/revert.ts",
+      "sha256": "c7e578bc0e8d01e551a06ce91a611c974e2e0e6ce59c5f6578922ba162536879"
+    }
+  },
+  "message_order": ["time_created", "id"],
+  "message_stream_direction": "newest-first",
+  "part_order": ["id"],
+  "message_roles": ["user", "assistant"],
+  "tool_state_statuses": ["pending", "running", "completed", "error"],
+  "file_source_types": ["file", "symbol", "resource"],
+  "compaction_prompt": "What did we do so far?",
+  "part_kinds": [
+    "text",
+    "subtask",
+    "reasoning",
+    "file",
+    "tool",
+    "step-start",
+    "step-finish",
+    "snapshot",
+    "patch",
+    "agent",
+    "retry",
+    "compaction"
+  ],
+  "adapter_bookkeeping_part_kinds": [
+    "reasoning",
+    "step-start",
+    "step-finish",
+    "snapshot",
+    "patch",
+    "retry"
+  ],
+  "adapter_policy": {
+    "reasoning": "intentionally excluded as private model reasoning",
+    "step-start": "provider replay marker without neutral conversation content",
+    "step-finish": "provider replay marker without neutral conversation content",
+    "snapshot": "provider filesystem bookkeeping",
+    "patch": "provider filesystem bookkeeping",
+    "retry": "not consumed by MessageV2.toModelMessages",
+    "optional_nulls": "treat optional file/agent source, subtask model/command, and running/error tool metadata null as absent",
+    "empty_tail_start_id": "treat as absent, matching upstream's falsy boundary check",
+    "reorder_anchor": "apply retained-tail reorder and truncation only when the newest completed summary governs; this keeps the tail after a successful retry and preserves full history when every attempt failed"
+  }
+}

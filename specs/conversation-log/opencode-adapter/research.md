@@ -91,17 +91,26 @@ verification important.
 
 `MessageV2.stream()` reads newest-first. `filterCompacted()` walks that order until it finds the
 newest completed compaction (a user `compaction` part whose assistant child has `summary=true`,
-`finish`, and no error). It then reverses the result and, when `tail_start_id` is present, reorders
-the live model context to:
+`finish`, and no error). It then reverses the result and, when `tail_start_id` is present, normally
+reorders the live model context to:
 
 ```text
 compaction request → assistant summary → retained tail → later continuation
 ```
 
-The reader must reproduce this algorithm, including its time/ID ordering and incomplete-
-compaction behavior. `latest_window=false` instead exposes the complete chronological transcript.
-The summary is readable, unlike Codex's sealed summary, so it becomes a compaction-marked
-assistant turn.
+OpenCode 1.18.21's reorder pass anchors on any summary attempt, even one with an error and no finish.
+This creates two writer-reachable safety exceptions. After an aborted attempt and successful retry,
+upstream can place the completed summary after the retained tail, so a neutral
+`from_last_compaction` cut would discard that tail. When every attempt fails, upstream can truncate
+earlier history to the retained tail even though no completed summary replaces it: provider failure
+is caught as `"stop"` in `processor.ts:675-681`, after which `compaction.ts:450-466` can still write
+`tail_start_id`. The adapter deliberately reorders and truncates only around the newest completed
+summary. Thus a retry becomes request and failed attempts, completed summary, retained tail, then
+continuation; a failed-only attempt keeps full history and governs no neutral window. The fixture
+and bridge regressions pin both conservative deviations. Otherwise the reader reproduces ordinary
+filtering behavior, including time/ID ordering and incomplete compactions without a tail.
+`latest_window=false` exposes the complete chronological transcript. A completed summary is
+readable, unlike Codex's sealed summary, so it becomes a compaction-marked assistant turn.
 
 OpenCode undo/redo is also part of live conversation semantics. A staged undo persists
 `session.revert = {messageID, partID?, snapshot?, diff?}` without immediately deleting rows.

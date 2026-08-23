@@ -150,21 +150,24 @@
 
 ## Phase 2: Reader, compaction, and semantic cursor
 
-- [ ] Hydrate ordered current `message`/`part` rows in one read transaction and reconstruct exact
+- [x] Hydrate ordered current `message`/`part` rows in one read transaction and reconstruct exact
   native `info`/part objects plus the session's `revert` boundary.
-- [ ] Apply staged revert before compaction exactly like `SessionRevert.cleanup`: no-part boundary
+- [x] Apply staged revert before compaction exactly like `SessionRevert.cleanup`: no-part boundary
   removes that message and later messages; part boundary retains earlier parts of that message and
   removes the selected/later parts plus later messages. Revert/unrevert before and after compaction
   must change both exported context and checkpoint without waiting for physical row cleanup.
-- [ ] Port the current `MessageV2.filterCompacted` algorithm with named tests copied as behavioral
-  invariants—not TypeScript implementation dependencies—including no compaction, completed summary,
-  retained tail reorder, incomplete compaction, error/no-finish summary, equal-time ID ordering, and
-  `latest_window=false`.
-- [ ] Project user/assistant text and completed/error/pending/running tool parts into neutral turns.
+- [x] Reproduce ordinary `MessageV2.filterCompacted` behavior with named tests for no compaction,
+  completed summary, retained tail, incomplete compaction, error/no-finish summary, equal-time ID
+  ordering, and `latest_window=false`. Deliberately reorder and truncate only when the newest
+  completed summary governs. This differs from OpenCode 1.18.21 when an earlier attempt failed: a
+  successful retry keeps its retained tail after the completed boundary, and a failed-only attempt
+  retains full history rather than truncating it without a replacement summary. Pin both safety
+  cases in the fixture and bridge regressions.
+- [x] Project user/assistant text and completed/error/pending/running tool parts into neutral turns.
   Mark readable assistant summaries as compaction boundaries. Project file attachments, subtasks,
   and agent selectors as bounded inert placeholders/summaries; ignore only audited reasoning,
   snapshot, patch, step, and retry bookkeeping. Unknown part kinds fail conservatively.
-- [ ] Implement `sqlite-semantic-v1:<sha256>` checkpoints over complete raw semantic state: ordered
+- [x] Implement `sqlite-semantic-v1:<sha256>` checkpoints over complete raw semantic state: ordered
   user/assistant text, compaction/revert fields, file/subtask/agent semantics, and tool
   ID/name/input/status/output/error. Exclude title, unrelated sessions, audited reasoning,
   snapshots, patches, step/retry bookkeeping, and display metadata. The digest input
@@ -172,24 +175,37 @@
   Verify unchanged, append, edit/delete before and after compaction, compaction, pending→running and
   terminal tool transitions, unrelated-session update, title-only update, row deletion, WAL
   activity, busy/error, and schema-replacement outcomes.
-- [ ] Define digest closure mechanically: every native field consumed by compaction filtering or
+- [x] Define digest closure mechanically: every native field consumed by compaction filtering or
   neutral projection is included—message role/ID/order key, summary flag, finish/error completion,
   compaction auto/overflow/tail start, revert message/part boundary, text, semantic attachment/task/
   agent fields, and listed tool state. A field may be excluded only with evidence that it cannot
   alter user-visible conversation content. Record the audited 1.18.21 part-kind list; any unknown
   kind changes the fixture and fails until classified.
-- [ ] If status caching is justified by measurement, keep it inside the adapter and key it by exact
-  ref, prior checkpoint, `latest_window`, main/WAL/SHM snapshot, registry generation, and hook identity. Prove an
-  uncheckpointed second-connection WAL commit invalidates it. No cache is preferred until needed.
-- [ ] Parse checkpoint scheme tags. Current scheme compares normally; unknown/old schemes return
+- [x] Status caching is justified by measurement and remains inside the adapter, keyed by exact ref,
+  prior checkpoint, main/WAL/SHM snapshot, and registry generation. `latest_window` is deliberately
+  absent because both modes share the same complete semantic checkpoint. An uncheckpointed
+  second-connection WAL commit invalidates the cache; unstable results are never cached.
+- [x] Parse checkpoint scheme tags. Current scheme compares normally; unknown/old schemes return
   UNKNOWN, retain authority, block promotion without claiming divergence, and emit one bounded
   diagnostic.
-- [ ] Pin OpenCode's status mapping: equal digest → unchanged; unequal current semantic digest →
+- [x] Pin OpenCode's status mapping: equal digest → unchanged; unequal current semantic digest →
   changed; missing/inaccessible/incompatible/unknown-scheme routes through the separate
   availability/unstable/unknown contracts. Core never asks the digest to order changes. A
   legitimate revert is changed and becomes the head even though projected turn count shrinks.
-- [ ] Measure reader and digest memory on generated large SQLite sessions; query/streaming growth
+- [x] Measure reader and digest memory on generated large SQLite sessions; query/streaming growth
   must follow live session records, not total database size or compaction count.
+
+### Phase 2 validation
+
+- The three immutable OpenCode 1.18.21 source files pinned by the semantic fixture were downloaded
+  from commit `3a31c4ea801915c0b050df4b3842997ea62b6e93`; every SHA-256 matched.
+- Opus 5 differential fuzzing reported zero transcript/checkpoint mismatches across dense equal-time
+  staged-revert trials, zero projection-without-digest-change cases, flat streaming digest memory,
+  and stable WAL cache invalidation. It also identified and justified K5's completed-only
+  reorder/truncation policy, now guarded for both successful retries and failed-only attempts.
+- Pre-commit gate: 397 tests pass on native Windows (one skip) and Ubuntu WSL (two skips); Ruff
+  0.16.3 lint/format and `git diff --check` pass. Six Phase 2 Opus 5 reviews ended with
+  **GO (HIGH=0, MEDIUM=0, LOW=0, nits=0)**.
 
 ## Phase 3: Writer and native mutations
 
@@ -276,9 +292,10 @@
 - [ ] Run an isolated real OpenCode integration on Linux: create a native session, discover/read it,
   bridge Claude and Codex copies into OpenCode, export/reread them, resume/append one via
   `opencode run --session`, observe semantic advancement, bridge back, and verify head routing.
-- [ ] Create/observe a real compaction and differentially compare the adapter's latest-window order
-  with current OpenCode behavior. Record tested CLI/session versions and warn on unknown semantic
-  part kinds; do not reject every future patch version solely by its version string.
+- [ ] Create/observe a real compaction and differentially compare the adapter's latest-window
+  content and ordinary order with current OpenCode behavior, plus the documented K5 abort/retry
+  reorder exception. Record tested CLI/session versions and warn on unknown semantic part kinds;
+  do not reject every future patch version solely by its version string.
 - [ ] Attribute the compaction port and behavioral fixtures in adapter/test comments to OpenCode
   1.18.21 `packages/opencode/src/session/message-v2.ts`; retain the source URL in documentation.
 - [ ] Run the corresponding temporary native-Windows OpenCode import/discovery/read/resume-command
