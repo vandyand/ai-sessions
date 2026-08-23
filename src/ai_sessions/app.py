@@ -3034,11 +3034,16 @@ def prepare_launch(
     truncated = (
         f", {result.truncated} anchor message(s) truncated to fit" if result.truncated else ""
     )
-    budget_notice = ""
+    budget_notice = (
+        f" Applied bridge budget: approximately {result.budget.tokens:,} tokens / "
+        f"{result.budget.chars:,} projected characters ({result.budget.origin})."
+    )
+    if result.budget.clamped:
+        budget_notice += " The configured token budget was raised to the safe bridge minimum."
     if result.budget.origin == "target-default-migrated":
-        budget_notice = " Migrated the legacy 950,000-character default to target policy."
+        budget_notice += " Migrated the legacy 950,000-character default to target policy."
     elif result.budget.over_policy:
-        budget_notice = (
+        budget_notice += (
             " The legacy max_chars override exceeds target policy; delete it or set "
             "max_tokens to change this."
         )

@@ -2,6 +2,7 @@ import unittest
 from pathlib import Path
 from tempfile import TemporaryDirectory
 
+from ai_sessions.bridge import resolve_budget
 from ai_sessions.config import LaunchConfig
 
 
@@ -102,6 +103,43 @@ class LaunchConfigTests(unittest.TestCase):
         self.assertIsNone(loaded.bridge_max_chars)
         self.assertIn("max_tokens = 12345", text)
         self.assertNotIn("max_chars", text)
+
+    def test_loaded_token_budget_wins_when_both_legacy_keys_exist(self) -> None:
+        with TemporaryDirectory() as directory:
+            path = Path(directory) / "config.toml"
+            path.write_text(
+                "version = 2\n[bridge]\nmax_tokens = 5000\nmax_chars = 950000\n",
+                encoding="utf-8",
+            )
+            loaded = LaunchConfig.load(path)
+            budget = resolve_budget(
+                "claude",
+                max_tokens=loaded.bridge_max_tokens,
+                max_chars=loaded.bridge_max_chars,
+            )
+            loaded.save()
+            saved = path.read_text(encoding="utf-8")
+        self.assertEqual((budget.tokens, budget.chars), (5_000, 10_000))
+        self.assertIn("max_tokens = 5000", saved)
+        self.assertNotIn("max_chars", saved)
+
+    def test_migrated_default_save_preserves_effective_target_budget(self) -> None:
+        with TemporaryDirectory() as directory:
+            path = Path(directory) / "config.toml"
+            path.write_text("[bridge]\nmax_chars = 950000\n", encoding="utf-8")
+            loaded = LaunchConfig.load(path)
+            before = resolve_budget("claude", migrated=loaded.bridge_max_chars_migrated)
+            loaded.save()
+            reloaded = LaunchConfig.load(path)
+            after = resolve_budget(
+                "claude",
+                max_tokens=reloaded.bridge_max_tokens,
+                max_chars=reloaded.bridge_max_chars,
+                migrated=reloaded.bridge_max_chars_migrated,
+            )
+            saved = path.read_text(encoding="utf-8")
+        self.assertEqual((before.tokens, before.chars), (after.tokens, after.chars))
+        self.assertNotIn("max_chars", saved)
 
 
 if __name__ == "__main__":
