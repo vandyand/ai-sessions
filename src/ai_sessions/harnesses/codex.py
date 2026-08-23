@@ -2,7 +2,9 @@
 
 from __future__ import annotations
 
+import datetime as dt
 import re
+from typing import Any
 
 from ..bridge import (
     CODEX_BUDGET_CONTEXT_TOKENS,
@@ -10,12 +12,22 @@ from ..bridge import (
     DEFAULT_USABLE_FRACTION,
     _codex_change_status,
     _codex_exists,
+    append_jsonl,
     read_codex,
     write_codex_session,
 )
 from ..capabilities import HarnessAdapter
 from ..model import BudgetPolicy, SourceKind
 from ..paths import CODEX_HOME
+
+
+def publish_name(session: Any, name: str) -> str:
+    stamp = dt.datetime.now(dt.timezone.utc).isoformat().replace("+00:00", "Z")
+    append_jsonl(
+        CODEX_HOME / "session_index.jsonl",
+        {"id": session.session_id, "thread_name": name, "updated_at": stamp},
+    )
+    return ""
 
 
 def resume_args(
@@ -60,6 +72,7 @@ ADAPTER = HarnessAdapter(
     locate=_codex_exists,
     change_status=_codex_change_status,
     resume_args=resume_args,
+    publish_name=publish_name,
     budget=BudgetPolicy(
         context_tokens=CODEX_BUDGET_CONTEXT_TOKENS,
         usable_fraction=DEFAULT_USABLE_FRACTION,

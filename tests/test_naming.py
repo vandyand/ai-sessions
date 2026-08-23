@@ -1,5 +1,6 @@
 import json
 import unittest
+from dataclasses import replace
 from pathlib import Path
 from tempfile import TemporaryDirectory
 from unittest.mock import patch
@@ -14,6 +15,9 @@ from ai_sessions.app import (
     publish_name,
     rename_session,
 )
+from ai_sessions.capabilities import Unsupported
+from ai_sessions.harnesses import codex
+from ai_sessions.registry import REGISTRY
 
 
 def session(**overrides) -> Session:
@@ -58,6 +62,36 @@ class AppendJsonlTests(unittest.TestCase):
 
 
 class PublishNameTests(unittest.TestCase):
+    def test_registered_adapter_owns_title_publication(self) -> None:
+        calls: list[tuple[str, str]] = []
+        base = REGISTRY.get("codex")
+        fake = replace(
+            base,
+            name="other",
+            label="Other",
+            short_label="Other",
+            publish_name=lambda item, name: (
+                calls.append((item.session_id, name)) or "provider-note"
+            ),
+        )
+        with REGISTRY.temporary(fake):
+            self.assertEqual(publish_name(session(tool="other"), "new"), "provider-note")
+        self.assertEqual(calls, [("session-id", "new")])
+
+    def test_unsupported_title_publication_stays_local(self) -> None:
+        base = REGISTRY.get("codex")
+        fake = replace(
+            base,
+            name="limited",
+            label="Limited",
+            short_label="Limited",
+            publish_name=Unsupported("native titles are unavailable"),
+        )
+        with REGISTRY.temporary(fake):
+            note = publish_name(session(tool="limited"), "new")
+        self.assertIn("cannot publish titles", note)
+        self.assertIn("kept local", note)
+
     def test_claude_rename_appends_custom_title(self) -> None:
         with TemporaryDirectory() as directory:
             transcript = Path(directory) / "abc.jsonl"
@@ -76,7 +110,7 @@ class PublishNameTests(unittest.TestCase):
     def test_codex_rename_appends_thread_name(self) -> None:
         with TemporaryDirectory() as directory:
             home = Path(directory)
-            with patch.object(app, "CODEX_HOME", home):
+            with patch.object(codex, "CODEX_HOME", home):
                 item = session(tool="codex", session_id="019f-thread")
                 self.assertEqual(publish_name(item, "my-name"), "")
             written = json.loads((home / "session_index.jsonl").read_text().splitlines()[-1])

@@ -30,7 +30,6 @@ from typing import Any, Iterable
 from . import __version__ as VERSION
 from .bridge import (
     BridgeError,
-    append_jsonl,
     bridge,
     bridge_tools,
     complete_jsonl_cursor,
@@ -38,6 +37,7 @@ from .bridge import (
     native_session_exists,
     resolve_budget,
 )
+from .bridge import append_jsonl as append_jsonl
 from .capabilities import Unsupported
 from .config import LAUNCH_MODES, LaunchConfig
 from .diagnostics import clear_warnings, record_warning
@@ -761,26 +761,22 @@ def publish_name(
         name = original_title
         restored_generated = not original_named
     try:
-        if item.tool == "claude":
-            transcript = Path(item.storage)
-            if not transcript.is_file():
-                return f"transcript for {item.session_id} is missing; name kept local only"
-            append_jsonl(
-                transcript,
-                {"type": "custom-title", "customTitle": name, "sessionId": item.session_id},
+        try:
+            adapter = REGISTRY.get(item.tool)
+        except KeyError:
+            return f"unknown harness {item.tool!r}; name kept local only"
+        publisher = adapter.publish_name
+        if isinstance(publisher, Unsupported):
+            return (
+                f"{adapter.label} cannot publish titles: {publisher.reason}; name kept local only"
             )
-        else:
-            stamp = dt.datetime.now(dt.timezone.utc).isoformat().replace("+00:00", "Z")
-            append_jsonl(
-                CODEX_HOME / "session_index.jsonl",
-                {"id": item.session_id, "thread_name": name, "updated_at": stamp},
-            )
+        note = publisher(item, name)
     except OSError as error:
         return f"could not update the provider title: {error}"
     if restored_generated:
         label = tool_label(item.tool)
         return f"restored {name!r}; {label} now records it as an explicit title"
-    return ""
+    return note
 
 
 def rename_session(state: UserState, item: Session, name: str) -> str:

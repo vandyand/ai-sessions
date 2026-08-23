@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import re
+from pathlib import Path
+from typing import Any
 
 from ..bridge import (
     CLAUDE_BUDGET_CONTEXT_TOKENS,
@@ -10,12 +12,24 @@ from ..bridge import (
     DEFAULT_USABLE_FRACTION,
     _claude_change_status,
     _claude_exists,
+    append_jsonl,
     read_claude,
     write_claude_session,
 )
 from ..capabilities import HarnessAdapter
 from ..model import BudgetPolicy, SourceKind
 from ..paths import CLAUDE_HOME
+
+
+def publish_name(session: Any, name: str) -> str:
+    transcript = Path(session.storage)
+    if not transcript.is_file():
+        return f"transcript for {session.session_id} is missing; name kept local only"
+    append_jsonl(
+        transcript,
+        {"type": "custom-title", "customTitle": name, "sessionId": session.session_id},
+    )
+    return ""
 
 
 def resume_args(
@@ -50,6 +64,7 @@ ADAPTER = HarnessAdapter(
     locate=_claude_exists,
     change_status=_claude_change_status,
     resume_args=resume_args,
+    publish_name=publish_name,
     budget=BudgetPolicy(
         context_tokens=CLAUDE_BUDGET_CONTEXT_TOKENS,
         usable_fraction=DEFAULT_USABLE_FRACTION,
