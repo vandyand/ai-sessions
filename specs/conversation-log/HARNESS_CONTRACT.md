@@ -1,0 +1,100 @@
+# Harness contract
+
+The end state is one core that understands conversations and one adapter per harness that
+understands native storage and process behavior. No adapter may know about another adapter,
+and no bridge path may be implemented pairwise.
+
+## Domain boundaries
+
+A **native session** is an append-only transcript that one harness can resume by its own
+id. A **conversation** is the utility-owned identity that survives movement between
+harnesses. A **member** is one native materialization of that conversation.
+
+Each member records:
+
+| Field | Meaning |
+| --- | --- |
+| `tool`, `session_id`, `storage` | Native identity and transcript location |
+| `generation` | Causal materialization step; never inferred from wall-clock time |
+| `frontier` | Equivalence token shared by members containing the same carried history |
+| `cursor` | Safe byte boundary consumed from this append-only transcript |
+| `cwd`, `title`, `updated` | Discovery/display metadata, not routing authority |
+
+If no member has meaningful records after its cursor, every member at the maximum
+generation is an equivalent head. If exactly one maximum-generation member advances, it is
+the head. Two advanced members, or an older member advancing after a newer generation
+exists, is divergence. Automatic launch must stop on divergence.
+
+The selected row is only a user entry point. Launch resolves the conversation first,
+follows its head, then either reuses an equivalent member in the requested harness or
+materializes a new one. A native UUID mentioned in transcript prose is never identity.
+
+## Current bridge adapter
+
+`bridge.Harness` currently owns the operations needed by conversion and head detection:
+
+```text
+name, label
+read(path, options) -> Transcript
+write(cwd, turns, title) -> (native_id, path)
+locate(native_id) -> bool
+changed_since(path, byte_cursor) -> bool
+```
+
+`read` projects native records into the shared `Turn` model. `write` must produce a truly
+resumable native transcript, including any separate records needed for both model context
+and visible scrollback. `changed_since` recognizes conversation/tool activity and ignores
+metadata-only appends such as renames. Missing, replaced, or truncated append-only storage
+counts as changed so the core fails conservatively.
+
+The cursor returned with a bridge is captured before the read begins and aligned after the
+last complete JSONL record. This is intentionally a lower bound: concurrent work may be
+copied twice on a later hop, but it cannot be marked as consumed without having been
+observed.
+
+## Complete adapter target
+
+The remaining provider branches in `app.py` should move behind the same adapter in this
+order:
+
+1. `discover() -> Iterable[NativeSession]` — enumerate sessions and provider metadata.
+2. `resume_argv(native_id, mode, options) -> list[str]` — construct a shell-free command.
+3. `publish_name(session, title) -> PublishResult` — append the provider-supported name.
+4. `inspect_liveness(sessions) -> Mapping[id, NativeProcess]` — identify open sessions.
+5. `focus(process) -> FocusResult` — optional platform capability, never required to resume.
+6. The existing `read`, `write`, `locate`, and `changed_since` conversion operations.
+
+Capabilities should be explicit (`rename`, `focus`, `subagents`, `compaction`, and so on)
+rather than detected with `if tool == ...` in core code. Provider-specific caches and
+database schemas belong inside the adapter. The core owns filtering, display, conversation
+state, head resolution, launch policy, and error presentation.
+
+Adding a third harness is complete when its adapter passes shared contract fixtures for:
+
+- discovery and stable native identity;
+- native resume command construction in every launch mode;
+- transcript projection and resumable materialization;
+- semantic tail detection that ignores metadata;
+- round trips through each existing harness without pairwise code;
+- rename/liveness capabilities when declared; and
+- concurrent append safety and explicit divergence.
+
+## Persistence and recovery
+
+State schema 6 stores conversations and member cursors in `state.json`; this is the routing
+authority. New materializations also carry an `[ai-sessions-provenance v1]` JSON marker with
+the conversation id and immediate source. The marker is currently for auditability and a
+future recovery tool. Losing `state.json` still loses group identity; scanning transcripts
+to rebuild it belongs to the full conversation-log phase.
+
+Version 5 bridge records have no safe cursor. Migration marks a surviving target copy as
+possibly advanced so the utility may duplicate history but will not silently choose its
+ancestor. Provider transcripts remain append-only and are never rewritten in place.
+
+## Deliberate non-goals of the head-routing phase
+
+- Per-message provenance and verbatim same-origin replay.
+- Automatic merge or winner selection for divergent heads.
+- Reconstructing conversation state solely from provenance markers.
+- Editing an existing native materialization to avoid creating the next one.
+- Treating timestamps, titles, UUID-shaped prose, or process state as causal evidence.

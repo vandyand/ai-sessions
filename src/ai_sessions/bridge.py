@@ -1029,6 +1029,31 @@ def bridged_title(title: str, source_tool: str) -> str:
     return base[: 200 - len(suffix)] + suffix
 
 
+def _jsonl_frontier(path: Path) -> int:
+    """Return the byte offset after the last complete record currently on disk."""
+    try:
+        with path.open("rb") as handle:
+            handle.seek(0, os.SEEK_END)
+            size = handle.tell()
+            if not size:
+                return 0
+            handle.seek(size - 1)
+            if handle.read(1) == b"\n":
+                return size
+            position = size
+            while position:
+                start = max(0, position - 64 * 1024)
+                handle.seek(start)
+                block = handle.read(position - start)
+                newline = block.rfind(b"\n")
+                if newline >= 0:
+                    return start + newline + 1
+                position = start
+            return 0
+    except OSError as error:
+        raise BridgeError(f"could not inspect {path}: {error}") from error
+
+
 def bridge(
     *,
     source_tool: str,
@@ -1047,14 +1072,11 @@ def bridge(
     if target_tool == source_tool:
         raise BridgeError("that session already belongs to this harness")
     harness(source_tool)
-    try:
-        # This is deliberately captured before reading. If the live source is
-        # appended while the bridge is materialising it, recording an earlier
-        # frontier may cause one conservative re-copy; recording the later EOF
-        # could mark work the reader never saw as already carried.
-        source_cursor = Path(storage).stat().st_size
-    except OSError as error:
-        raise BridgeError(f"could not inspect {storage}: {error}") from error
+    # This is deliberately captured before reading and aligned to a complete
+    # JSONL record. If the live source is appended while the bridge is
+    # materialising it, an earlier frontier may cause one conservative
+    # re-copy; a later or partial EOF could mark unread work as already carried.
+    source_cursor = _jsonl_frontier(Path(storage))
     source = read_transcript(
         source_tool, storage, tool_calls=tool_calls, latest_window=latest_window
     )

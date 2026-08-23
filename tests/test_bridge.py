@@ -715,11 +715,15 @@ class LaunchIntegrationTests(unittest.TestCase):
             source = session(directory, launch_tool="claude")
             source_path = Path(source.storage)
             cursor_before_bridge = source_path.stat().st_size
+            arriving = codex_line("user", "Arrived during the bridge") + "\n"
+            split = len(arriving) // 2
+            with source_path.open("a", encoding="utf-8") as handle:
+                handle.write(arriving[:split])
             state = UserState(path=Path(directory) / "state.json")
 
             def append_while_reading(*args: object, **kwargs: object) -> Transcript:
                 with source_path.open("a", encoding="utf-8") as handle:
-                    handle.write(codex_line("user", "Arrived during the bridge") + "\n")
+                    handle.write(arriving[split:])
                 return Transcript([Turn("user", "Ship it"), Turn("assistant", "Shipped.")])
 
             with (
