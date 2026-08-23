@@ -97,6 +97,8 @@ tmux/desktop-terminal logic applies regardless of which adapter identified the p
 `Session` fields that carry local names, visibility, launch selection, conversation identity,
 frontiers, superseded state, or divergence. Its source kind is a closed neutral enum
 (`interactive`, `non-interactive`, `subagent`, `sdk`), not an unchecked provider string.
+It is string-serializable for search/detail/JSON output, while provider facts such as archived
+status remain explicit `NativeSession` fields instead of being guessed from source kind.
 
 Capabilities should be explicit (`rename`, `subagents`, `compaction`, read, write, discovery,
 liveness, budget policy, and so on)
@@ -142,6 +144,14 @@ State and configuration are forward-compatible data. A build whose registry does
 harness may hide or refuse to operate on that harness, but load/save must preserve its bridge
 records, conversation members, launch preference, and keyed provider profile verbatim. An
 older or partial registry must never erase routing authority written by a newer adapter.
+Such a member has an `unknown` availability status: it blocks automatic promotion past its
+possibly newer frontier but does not invoke a missing adapter or crash known-harness listing.
+
+Cross-harness discovery evidence is format-agnostic and registry-sensitive. Transcript scanners
+match the bounded union of registered native-ID prefilters and cache a digest of that pattern
+set; adding an adapter forces historical bytes to be rescanned. Claims are not exclusive—ID
+shapes overlap—so evidence resolves first against IDs returned by discovery and then against
+verified native existence. No adapter names or imports another adapter.
 
 ## Deliberate non-goals of the head-routing phase
 

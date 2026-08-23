@@ -57,8 +57,9 @@ utility-owned conversation/head fields.
 7. Import order follows the one-way DAG in the implementation plan. Registration pushes;
    the registry never imports adapters, and `app.py` never mutates a partially initialized
    conversion registry.
-8. `SourceKind` is a closed neutral enum. Raw adapter strings cannot silently change origin,
-   auxiliary display, resume behavior, or liveness eligibility.
+8. `SourceKind` is a closed, string-serializable neutral enum. Raw adapter strings cannot
+   silently change origin, resume behavior, or liveness eligibility; searchable/detail/JSON
+   output stays serializable, and adapter-supplied archived evidence remains explicit.
 9. `UserState` and generic provider config preserve unknown-harness records on load/save.
    Running a build without an adapter may hide its rows but cannot erase future routing state.
 10. Discovery and liveness each build one shared pass context. Process enumeration, lock maps,
@@ -67,6 +68,15 @@ utility-owned conversation/head fields.
     crash rendering, overflow fixed label columns, or disappear because it registered late.
 12. Adapters return neutral `NativeSession` records. The core alone applies conversation ids,
     superseded/diverged state, launch selection, visibility, and local names.
+13. Unknown preserved members have an explicit `unknown` status. They block unsafe head
+    promotion but never call a missing adapter or crash listing/known-harness operations.
+14. Transcript evidence is bounded and registry-sensitive. It is derived from the union of
+    registered ID prefilters, resolved by discovered/existing native IDs rather than exclusive
+    regex claims, and fully rescanned when the registered pattern signature changes.
+15. Registry generation is part of semantic-tail cache identity. The registry never imports
+    conversion merely to clear a cache above it in the DAG.
+16. List/browser column widths are derived from registered short labels; OpenCode cannot shift
+    the fixed Claude/Codex layout or overflow a hardcoded RUN width.
 
 ## Registration architecture
 
@@ -88,6 +98,7 @@ are specified in [implementation-plan.md](implementation-plan.md).
 ## Status
 
 - [x] Initial Opus 5 plan review *(HIGH=5 MEDIUM=10; all incorporated before code)*
+- [x] Second Opus 5 plan review *(HIGH=3 MEDIUM=4; all incorporated before code)*
 - [ ] Characterization and mutation tests
 - [ ] Generic adapter/registry and config profile
 - [ ] Claude and Codex runtime routing
@@ -106,3 +117,10 @@ cache migration, shared liveness snapshots, registry-generation cache invalidati
 unknown-provider failure, a genuine third on-disk fixture, and precise ownership of
 `NativeSession` and focus. The revised plan makes each finding and twenty named mutations an
 executable gate.
+
+The second review of `e25115f` confirmed the package bootstrap was acyclic but found three
+remaining HIGH gaps: upward cache invalidation contradicted the DAG, preserved unknown members
+would still crash on a registry lookup, and evidence caches would never rescan historical bytes
+after a new ID pattern registered. Four MEDIUM findings replaced exclusive regex ownership with
+discovered/existing-ID resolution, bounded the registry-derived token set, made display widths
+dynamic, and required `SourceKind` to preserve searchable/detail/JSON and archived semantics.

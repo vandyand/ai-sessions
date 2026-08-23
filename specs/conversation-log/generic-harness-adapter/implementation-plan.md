@@ -8,7 +8,7 @@ Imports point only downward; the registry never imports built-in adapters.
 paths.py
   ↓
 model.py          neutral Turn/transcript/budget types, NativeSession, Session utility row,
-                  SourceKind, capability results; never imports registry
+                  SourceKind(StrEnum), capability results; never imports registry
   ↓
 capabilities.py   typed adapter hook protocols and immutable HarnessAdapter
   ↓
@@ -29,10 +29,16 @@ Adapters return `NativeSession`; core constructs `Session`. `Session` contains n
 lookup. Registry-dependent launch choices are computed by a core function so model, registry,
 and adapters cannot form a cycle.
 
+Registry generation is read downward by conversion and included in semantic-tail cache keys.
+The registry never imports conversion and does not clear its cache upward; entries from an old
+generation simply become unreachable.
+
 ## Phase 0: Close contracts and add characterization tests
 
-- [ ] Define `SourceKind` as a closed enum for interactive, non-interactive, subagent, and SDK
-  rows; adapters declare emitted kinds. Origin/auxiliary/display behavior is derived centrally.
+- [ ] Define `SourceKind` as a `str`-serializable `StrEnum` for interactive, non-interactive,
+  subagent, and SDK rows; adapters declare emitted kinds. Characterize searchable text,
+  detail display, and `--json`. Preserve adapter-supplied `archived`/auxiliary evidence rather
+  than deriving every utility flag from source kind.
 - [ ] Decide that terminal focus is a platform/core capability over an open PID, not a harness
   hook; update the harness contract now. Adapters own liveness evidence only.
 - [ ] Define `NativeSession` without utility state and conversion read/write protocols with exact
@@ -43,11 +49,17 @@ and adapters cannot form a cycle.
   budget, and capability lookup must fail explicitly rather than be preserved.
 - [ ] Preserve unknown-tool bridge records, conversation members, and launch preferences through
   `UserState.load → save`; older builds must not erase future harness routing authority.
+- [ ] Give preserved unregistered members an explicit `unknown` change status without registry
+  lookup. They block automatic head promotion like unavailable members but do not make listing
+  or unrelated known-harness launches raise.
 
 ## Phase 1: Split neutral modules and install a dynamic registry
 
 - [ ] Move neutral dataclasses into `model.py`, using `NativeSession` for adapter output and
-  `Session` for utility/UI state. Neither type imports or reads the registry.
+  `Session` for utility/UI state. Neither type imports or reads the registry. Move
+  `available_launch_tools`, `active_launch_tool`, `needs_bridge`, launch cycling/support,
+  launch-tool normalization, and label-aware `searchable` into registry-aware core helpers;
+  keep only registry-free identity/target properties on the model.
 - [ ] Define immutable `HarnessAdapter` with `name`, `label`, `short_label`, order, home,
   commands/dangerous arguments, capabilities, exact conversion hooks, runtime hooks, native-id
   claim, source kinds, and budget policy.
@@ -55,12 +67,15 @@ and adapters cannot form a cycle.
   labels, bridge targets, generation, duplicate rejection, and idempotent built-in install.
 - [ ] Delete import-time snapshots (`BRIDGE_TOOLS`, `TOOL_NAMES`, `TOOL_LABELS`, `TOOL_ORDER`).
   All consumers query the registry at call time; CLI keeps synthetic `all` separate.
-- [ ] Registration/replacement increments generation and clears semantic-tail caches so a
-  re-registered adapter cannot reuse an old hook result for the same file snapshot.
+- [ ] Registration/replacement increments generation. Conversion includes that generation in
+  `_snapshot_change_status` cache keys so a re-registered adapter cannot reuse an old hook
+  result for the same file snapshot without any registry → conversion import.
 - [ ] Install built-ins from `ai_sessions.__init__` through `harnesses.install()`; importing any
   public submodule observes the same initialized registry without `app.py` late binding.
 - [ ] Delete dead label maps and give Browser dynamic, initialized color pairs with a stable
-  fallback when terminal color capacity is limited; a third row must never raise.
+  fallback when terminal color capacity is limited; a third row must never raise. Derive TOOL
+  and RUN column widths from registered `short_label` lengths rather than enforcing current
+  fixed widths, while preserving existing two-adapter output exactly.
 - [ ] Add deterministic sort tie-breakers independent of registry/discovery iteration order.
 
 ## Phase 2: Generic configuration, launch, and naming
@@ -80,12 +95,18 @@ and adapters cannot form a cycle.
 
 ## Phase 3: Generic discovery, evidence, cache, and liveness
 
-- [ ] Move provider cache ownership into adapters. Rename Claude metadata evidence generically,
-  bump its cache schema, and prove v4 either migrates or intentionally rescans.
+- [ ] Move provider cache ownership into adapters. Use one authoritative cache schema version in
+  both filename and payload, retain superseded cache files without reading them, and prove old
+  Claude v4 evidence intentionally triggers a full rescan. Repoint existing source-inspection
+  tests to provider registration modules.
 - [ ] Use a per-pass `HarnessContext` shared by discovery/reconciliation: format-agnostic found
   tokens, one process snapshot, one lock map, warnings, and provider cache handles.
-- [ ] Publishers emit unclaimed id-shaped tokens; consumers implement `claims_native_id(token)`.
-  No adapter imports another adapter or names another provider in evidence keys/heuristics.
+- [ ] Publishers emit candidate tokens matched by the union of registered adapter ID prefilters,
+  deduped as a bounded set with a persisted truncation flag. Cache entries record a stable digest
+  of the registered ID-pattern set and fully rescan from offset zero when it changes.
+- [ ] Resolve evidence primarily by IDs actually produced by adapter discovery, then by verified
+  native existence. `claims_native_id` is a non-exclusive prefilter only because Claude and
+  Codex ID shapes overlap. No adapter imports/names another or owns another adapter's regex.
 - [ ] Make `load_sessions` iterate registered discovery hooks, convert `NativeSession` to
   `Session`, reconcile typed evidence, dedupe by `(tool, session_id)`, apply state, and inspect
   liveness. A fresh writable copy is not required to appear in native discovery before resume.
@@ -132,6 +153,13 @@ Every mutation below must fail at least one test:
 18. Session dedupe keys only on native id.
 19. Built-in install duplicates registry entries.
 20. Reversed discovery order changes equal-time list output.
+21. A preserved unknown-harness member with a surviving transcript makes discovery/listing raise
+    or allows promotion past an unknown current head.
+22. Installing an adapter with a new ID pattern does not invalidate/rescan already-cached
+    transcript bytes.
+23. A short label wider than the original fixed columns shifts or corrupts `--list` output.
+24. `SourceKind` breaks searchable/detail/`--json`, or archived interactive evidence loses its
+    auxiliary flag.
 
 ## Phase 6: Adversarial review, verification, and doc sync
 
