@@ -1,11 +1,19 @@
 import gc
 import sqlite3
 import unittest
+from contextlib import contextmanager
+from dataclasses import replace
 from pathlib import Path
 from tempfile import TemporaryDirectory
-from unittest.mock import patch
 
 from ai_sessions import app, diagnostics
+from ai_sessions.registry import REGISTRY
+
+
+@contextmanager
+def harness_home(name: str, home: Path):
+    with REGISTRY.temporary(replace(REGISTRY.get(name), home=home)):
+        yield
 
 
 def make_state_database(directory: Path) -> Path:
@@ -48,7 +56,7 @@ class UnreadableCodexStateTests(unittest.TestCase):
         with TemporaryDirectory() as directory:
             root = Path(directory)
             make_state_database(root)
-            with patch.object(app, "CODEX_HOME", root):
+            with harness_home("codex", root):
                 app.load_codex_sessions()
             self.assertEqual(diagnostics.warnings(), [])
 
@@ -60,7 +68,7 @@ class UnreadableCodexStateTests(unittest.TestCase):
             holder.execute("PRAGMA journal_mode=DELETE")
             holder.execute("BEGIN EXCLUSIVE")
             try:
-                with patch.object(app, "CODEX_HOME", root):
+                with harness_home("codex", root):
                     result = app.load_codex_sessions()
             finally:
                 holder.execute("ROLLBACK")
@@ -77,7 +85,7 @@ class UnreadableCodexStateTests(unittest.TestCase):
     def test_missing_state_database_is_reported_when_codex_home_exists(self) -> None:
         with TemporaryDirectory() as directory:
             root = Path(directory)
-            with patch.object(app, "CODEX_HOME", root):
+            with harness_home("codex", root):
                 self.assertEqual(app.load_codex_sessions(), [])
             self.assertEqual(len(diagnostics.warnings()), 1)
             self.assertIn("no Codex state database", diagnostics.warnings()[0])
@@ -86,16 +94,20 @@ class UnreadableCodexStateTests(unittest.TestCase):
         """Codex simply not being installed is not a fault to report."""
         with TemporaryDirectory() as directory:
             missing = Path(directory) / "no-codex-here"
-            with patch.object(app, "CODEX_HOME", missing):
+            with harness_home("codex", missing):
                 self.assertEqual(app.load_codex_sessions(), [])
             self.assertEqual(diagnostics.warnings(), [])
 
     def test_a_load_clears_warnings_from_the_previous_one(self) -> None:
         diagnostics.record_warning("stale note from an earlier load")
         with TemporaryDirectory() as directory:
-            with patch.object(app, "CLAUDE_HOME", Path(directory)):
-                with patch.object(app, "CODEX_HOME", Path(directory) / "absent"):
-                    app.load_sessions(use_cache=False)
+            with (
+                REGISTRY.temporary(
+                    replace(REGISTRY.get("claude"), home=Path(directory) / "claude")
+                ),
+                REGISTRY.temporary(replace(REGISTRY.get("codex"), home=Path(directory) / "absent")),
+            ):
+                app.load_sessions(use_cache=False)
         self.assertNotIn("stale note from an earlier load", diagnostics.warnings())
 
 

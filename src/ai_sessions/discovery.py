@@ -109,6 +109,7 @@ class HarnessContext:
     patterns: tuple[re.Pattern[bytes], ...]
     pattern_signature: str
     evidence: dict[tuple[str, str], tuple[list[str], bool]] = field(default_factory=dict)
+    origin_hints: dict[tuple[str, str], str] = field(default_factory=dict)
     process_snapshot: tuple[Any, ...] = ()
     lock_map: dict[Any, int] = field(default_factory=dict)
 
@@ -133,3 +134,6 @@ class HarnessContext:
 
     def publish(self, tool: str, session_id: str, evidence: EvidenceAccumulator) -> None:
         self.evidence[(tool, session_id)] = (list(evidence.tokens), evidence.truncated)
+
+    def mark_cross_origin(self, tool: str, session_id: str, source_tool: str) -> None:
+        self.origin_hints[(tool, session_id)] = source_tool

@@ -4,8 +4,10 @@ from __future__ import annotations
 
 import datetime as dt
 import json
+import os
 import re
 import secrets
+import sqlite3
 import time
 import uuid
 from dataclasses import replace
@@ -29,12 +31,16 @@ from ..conversion import (
     append_jsonl,
     scrub,
 )
-from ..model import BudgetPolicy, SourceKind, Transcript, Turn
-from ..paths import CODEX_HOME
+from ..diagnostics import record_warning
+from ..discovery import HarnessContext, clean_prompt, normalize_space, prompt_text, timestamp
+from ..model import BudgetPolicy, NativeSession, SourceKind, Transcript, Turn
+from ..paths import APP_CACHE_DIR, CODEX_HOME
 from ..registry import REGISTRY
 
 CODEX_CLI_VERSION = "0.147.0"
 _RESULT_NOISE = re.compile(r"^Script completed\s*(Wall time[^\n]*)?\s*Output:\s*", re.I)
+DISCOVERY_CACHE_VERSION = 5
+DISCOVERY_CACHE_FILE = APP_CACHE_DIR / f"codex-discovery-v{DISCOVERY_CACHE_VERSION}.json"
 
 
 def uuid7() -> str:
@@ -281,6 +287,321 @@ def _codex_change_status(path: Path, offset: int) -> str:
     return "changed" if changed else "unchanged"
 
 
+def load_history() -> dict[str, dict[str, Any]]:
+    """Load user-turn counts and latest prompts from Codex's global history."""
+    sessions: dict[str, dict[str, Any]] = {}
+    path = REGISTRY.get("codex").home / "history.jsonl"
+    if not path.exists():
+        return sessions
+    try:
+        with path.open("r", encoding="utf-8", errors="replace") as handle:
+            for line in handle:
+                try:
+                    item = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+                session_id = item.get("session_id") or item.get("sessionId")
+                if isinstance(session_id, str) and session_id:
+                    entry = sessions.setdefault(session_id, {"count": 0, "latest": ""})
+                    entry["count"] = int(entry["count"]) + 1
+                    latest = clean_prompt(item.get("text"))
+                    if latest:
+                        entry["latest"] = latest
+    except OSError:
+        pass
+    return sessions
+
+
+class DiscoveryCache:
+    """Incrementally index Codex rollouts and registry-sensitive ID evidence."""
+
+    def __init__(self, context: HarnessContext) -> None:
+        self.context = context
+        self.entries: dict[str, dict[str, Any]] = {}
+        self.dirty = False
+        if context.use_cache:
+            try:
+                payload = json.loads(DISCOVERY_CACHE_FILE.read_text(encoding="utf-8"))
+                if payload.get("version") == DISCOVERY_CACHE_VERSION and isinstance(
+                    payload.get("entries"), dict
+                ):
+                    self.entries = payload["entries"]
+            except (OSError, json.JSONDecodeError, AttributeError):
+                pass
+
+    def scan(self, path: Path, source: SourceKind) -> tuple[int, str, Any]:
+        key = str(path)
+        try:
+            stat = path.stat()
+        except OSError:
+            return 0, "", self.context.accumulator()
+        cached = self.entries.get(key)
+        signature_matches = bool(
+            cached and cached.get("pattern_signature") == self.context.pattern_signature
+        )
+        exact = bool(
+            cached
+            and signature_matches
+            and cached.get("mode") == source.value
+            and cached.get("inode") == stat.st_ino
+            and cached.get("size") == stat.st_size
+            and cached.get("mtime_ns") == stat.st_mtime_ns
+            and "user_messages" in cached
+            and "latest_user_message" in cached
+            and "candidate_ids" in cached
+            and "evidence_truncated" in cached
+        )
+        if exact:
+            evidence = self.context.accumulator(
+                tokens=list(cached.get("candidate_ids", [])),
+                truncated=bool(cached.get("evidence_truncated")),
+            )
+            return (
+                int(cached.get("user_messages", 0)),
+                clean_prompt(cached.get("latest_user_message")),
+                evidence,
+            )
+        can_continue = bool(
+            cached
+            and signature_matches
+            and cached.get("mode") == source.value
+            and cached.get("inode") == stat.st_ino
+            and 0 <= int(cached.get("offset", 0)) <= stat.st_size
+            and int(cached.get("size", 0)) < stat.st_size
+            and "user_messages" in cached
+            and "latest_user_message" in cached
+            and "candidate_ids" in cached
+            and "evidence_truncated" in cached
+        )
+        count = int(cached.get("user_messages", 0)) if can_continue and cached else 0
+        latest = clean_prompt(cached.get("latest_user_message")) if can_continue and cached else ""
+        latest_from_event = (
+            bool(cached.get("latest_from_event")) if can_continue and cached else False
+        )
+        start = int(cached.get("offset", 0)) if can_continue and cached else 0
+        evidence = self.context.accumulator(
+            tokens=list(cached.get("candidate_ids", [])) if can_continue and cached else [],
+            truncated=bool(cached.get("evidence_truncated")) if can_continue and cached else False,
+        )
+        offset = start
+        try:
+            with path.open("rb") as handle:
+                handle.seek(start)
+                while True:
+                    line = handle.readline()
+                    if not line:
+                        break
+                    offset = handle.tell()
+                    evidence.scan(line)
+                    response_user = bool(
+                        b"response_item" in line
+                        and (b'"role":"user"' in line or b'"role": "user"' in line)
+                    )
+                    user_event = b"event_msg" in line and b"user_message" in line
+                    if source is SourceKind.SUBAGENT:
+                        if not response_user and not user_event:
+                            continue
+                    elif not user_event:
+                        continue
+                    try:
+                        item = json.loads(line)
+                    except (json.JSONDecodeError, UnicodeDecodeError):
+                        continue
+                    payload = item.get("payload")
+                    if not isinstance(payload, dict):
+                        continue
+                    if item.get("type") == "event_msg" and payload.get("type") == "user_message":
+                        value = clean_prompt(payload.get("message"))
+                        if value:
+                            latest = value
+                            latest_from_event = True
+                        if source is not SourceKind.SUBAGENT:
+                            count += 1
+                    elif (
+                        source is SourceKind.SUBAGENT
+                        and item.get("type") == "response_item"
+                        and payload.get("type") == "message"
+                        and payload.get("role") == "user"
+                    ):
+                        count += 1
+                        if not latest_from_event:
+                            value = clean_prompt(prompt_text(payload))
+                            if value and not value.startswith("<codex_internal_context"):
+                                latest = value
+        except OSError:
+            return count, latest, evidence
+        try:
+            final_stat = path.stat()
+        except OSError:
+            final_stat = stat
+        self.entries[key] = {
+            "mode": source.value,
+            "inode": final_stat.st_ino,
+            "size": final_stat.st_size,
+            "mtime_ns": final_stat.st_mtime_ns,
+            "offset": offset,
+            "user_messages": count,
+            "latest_user_message": latest,
+            "latest_from_event": latest_from_event,
+            "candidate_ids": evidence.tokens,
+            "evidence_truncated": evidence.truncated,
+            "pattern_signature": self.context.pattern_signature,
+        }
+        self.dirty = True
+        return count, latest, evidence
+
+    def save(self) -> None:
+        if not self.context.use_cache or not self.dirty:
+            return
+        try:
+            DISCOVERY_CACHE_FILE.parent.mkdir(parents=True, exist_ok=True)
+            temporary = DISCOVERY_CACHE_FILE.with_suffix(f".tmp-{os.getpid()}")
+            temporary.write_text(
+                json.dumps(
+                    {"version": DISCOVERY_CACHE_VERSION, "entries": self.entries},
+                    ensure_ascii=False,
+                ),
+                encoding="utf-8",
+            )
+            temporary.chmod(0o600)
+            temporary.replace(DISCOVERY_CACHE_FILE)
+        except OSError:
+            pass
+
+
+def discover(context: HarnessContext, *, use_cache: bool = True) -> list[NativeSession]:
+    del use_cache
+    home = REGISTRY.get("codex").home
+    databases = list(home.glob("state_*.sqlite"))
+    if not databases:
+        if home.is_dir():
+            record_warning(f"no Codex state database found in {home}")
+        return []
+
+    def database_version(path: Path) -> tuple[int, float]:
+        match = re.search(r"state_(\d+)\.sqlite$", path.name)
+        try:
+            modified = path.stat().st_mtime
+        except OSError:
+            modified = 0.0
+        return (int(match.group(1)) if match else 0, modified)
+
+    database = max(databases, key=database_version)
+    indexed_names: dict[str, str] = {}
+    index_file = home / "session_index.jsonl"
+    if index_file.exists():
+        try:
+            with index_file.open("r", encoding="utf-8", errors="replace") as handle:
+                for line in handle:
+                    try:
+                        item = json.loads(line)
+                    except json.JSONDecodeError:
+                        continue
+                    session_id = item.get("id")
+                    name = normalize_space(item.get("thread_name"))
+                    if isinstance(session_id, str) and name:
+                        indexed_names[session_id] = name
+        except OSError:
+            pass
+
+    result: list[NativeSession] = []
+    history = load_history()
+    cache = DiscoveryCache(context)
+    connection: sqlite3.Connection | None = None
+    try:
+        connection = sqlite3.connect(f"file:{database}?mode=ro", uri=True, timeout=2)
+        connection.row_factory = sqlite3.Row
+        for row in connection.execute("SELECT * FROM threads"):
+            keys = set(row.keys())
+
+            def field(name: str, default: Any = None) -> Any:
+                return row[name] if name in keys else default
+
+            session_id = str(field("id", ""))
+            if not session_id:
+                continue
+            launch_source = str(field("source", "") or "")
+            thread_source = str(field("thread_source", "") or "")
+            is_subagent = (
+                bool(field("agent_path"))
+                or thread_source == "subagent"
+                or "subagent" in launch_source
+            )
+            if is_subagent:
+                source = SourceKind.SUBAGENT
+            elif launch_source == "exec":
+                source = SourceKind.NON_INTERACTIVE
+            else:
+                source = SourceKind.INTERACTIVE
+            parent_id = ""
+            nickname = normalize_space(field("agent_nickname"))
+            if launch_source.startswith("{"):
+                try:
+                    spawn = json.loads(launch_source)["subagent"]["thread_spawn"]
+                    parent_id = str(spawn.get("parent_thread_id") or "")
+                    nickname = nickname or normalize_space(spawn.get("agent_nickname"))
+                except (json.JSONDecodeError, KeyError, TypeError):
+                    pass
+            name = indexed_names.get(session_id) or normalize_space(field("name"))
+            fallback = field("title") or field("preview") or field("first_user_message")
+            title = name or clean_prompt(fallback)
+            indexed_preview = clean_prompt(field("preview") or field("first_user_message"))
+            created = timestamp(field("created_at_ms") or field("created_at"))
+            updated = timestamp(
+                max(
+                    int(field("updated_at_ms", 0) or 0),
+                    int(field("recency_at_ms", 0) or 0),
+                )
+                or field("updated_at")
+            )
+            rollout_path = str(field("rollout_path", "") or "")
+            if rollout_path and not Path(rollout_path).is_file():
+                continue
+            count = 0
+            latest = ""
+            evidence = context.accumulator()
+            if rollout_path:
+                count, latest, evidence = cache.scan(Path(rollout_path), source)
+                context.publish("codex", session_id, evidence)
+            if source is SourceKind.INTERACTIVE and session_id in history:
+                count = int(history[session_id].get("count", 0))
+                latest = clean_prompt(history[session_id].get("latest"))
+            cwd = str(field("cwd", "") or "")
+            if source is SourceKind.NON_INTERACTIVE and (
+                "/tmp/claude-" in cwd or "\\Temp\\claude-" in cwd
+            ):
+                context.mark_cross_origin("codex", session_id, "claude")
+            result.append(
+                NativeSession(
+                    tool="codex",
+                    session_id=session_id,
+                    title=title,
+                    cwd=cwd,
+                    updated=updated,
+                    created=created,
+                    preview=latest or indexed_preview,
+                    named=bool(name),
+                    storage=rollout_path,
+                    source=source,
+                    archived=bool(field("archived", False)),
+                    resume_id=parent_id
+                    if source is SourceKind.SUBAGENT and parent_id
+                    else session_id,
+                    parent_id=parent_id,
+                    message_count=count,
+                    agent_nickname=nickname,
+                )
+            )
+    except (sqlite3.Error, OSError) as error:
+        record_warning(f"could not read Codex sessions from {database}: {error}")
+        return []
+    finally:
+        if connection is not None:
+            connection.close()
+    cache.save()
+    return result
+
+
 def publish_name(session: Any, name: str) -> str:
     stamp = dt.datetime.now(dt.timezone.utc).isoformat().replace("+00:00", "Z")
     append_jsonl(
@@ -331,6 +652,7 @@ ADAPTER = HarnessAdapter(
     write=write_codex_session,
     locate=_codex_exists,
     change_status=_codex_change_status,
+    discover=discover,
     resume_args=resume_args,
     publish_name=publish_name,
     budget=BudgetPolicy(

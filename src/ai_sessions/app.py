@@ -18,7 +18,6 @@ import os
 import re
 import shlex
 import shutil
-import sqlite3
 import subprocess
 import sys
 import textwrap
@@ -42,15 +41,14 @@ from .conversion import (
 from .conversion import append_jsonl as append_jsonl
 from .diagnostics import clear_warnings, record_warning
 from .diagnostics import warnings as load_warnings
+from .discovery import HarnessContext
 from .discovery import clean_prompt as clean_prompt
 from .discovery import normalize_space as normalize_space
 from .discovery import prompt_text as prompt_text
 from .discovery import timestamp as timestamp
-from .model import Session, SourceKind
+from .model import NativeSession, Session, SourceKind
 from .paths import (
-    CACHE_FILE,
     CLAUDE_HOME,
-    CODEX_COUNT_CACHE_FILE,
     CODEX_HOME,
     HOME,
     IS_WINDOWS,
@@ -868,683 +866,153 @@ def conversation_status(session: Session) -> str:
     return ""
 
 
-def load_codex_history() -> dict[str, dict[str, Any]]:
-    """Load counts and genuine latest prompts from Codex's user history."""
-    sessions: dict[str, dict[str, Any]] = {}
-    path = CODEX_HOME / "history.jsonl"
-    if not path.exists():
-        return sessions
-    try:
-        with path.open("r", encoding="utf-8", errors="replace") as handle:
-            for line in handle:
-                try:
-                    item = json.loads(line)
-                except json.JSONDecodeError:
-                    continue
-                sid = item.get("session_id") or item.get("sessionId")
-                if isinstance(sid, str) and sid:
-                    entry = sessions.setdefault(sid, {"count": 0, "latest": ""})
-                    entry["count"] = int(entry["count"]) + 1
-                    latest = clean_prompt(item.get("text"))
-                    if latest:
-                        entry["latest"] = latest
-    except OSError:
-        pass
-    return sessions
-
-
-class CodexMessageCountCache:
-    """Incrementally index user turns in append-only Codex rollouts."""
-
-    def __init__(self) -> None:
-        self.entries: dict[str, dict[str, Any]] = {}
-        self.dirty = False
-        try:
-            payload = json.loads(CODEX_COUNT_CACHE_FILE.read_text(encoding="utf-8"))
-            if payload.get("version") == 2 and isinstance(payload.get("entries"), dict):
-                self.entries = payload["entries"]
-        except (OSError, json.JSONDecodeError, AttributeError):
-            pass
-
-    def scan(self, path: Path, source: str) -> tuple[int, str]:
-        key = str(path)
-        try:
-            stat = path.stat()
-        except OSError:
-            return 0, ""
-        cached = self.entries.get(key)
-        exact = bool(
-            cached
-            and cached.get("mode") == source
-            and cached.get("inode") == stat.st_ino
-            and cached.get("size") == stat.st_size
-            and cached.get("mtime_ns") == stat.st_mtime_ns
-            and "user_messages" in cached
-            and "latest_user_message" in cached
-        )
-        if exact:
-            return (
-                int(cached.get("user_messages", 0)),
-                clean_prompt(cached.get("latest_user_message")),
-            )
-        can_continue = bool(
-            cached
-            and cached.get("mode") == source
-            and cached.get("inode") == stat.st_ino
-            and 0 <= int(cached.get("offset", 0)) <= stat.st_size
-            and int(cached.get("size", 0)) < stat.st_size
-            and "user_messages" in cached
-            and "latest_user_message" in cached
-        )
-        count = int(cached.get("user_messages", 0)) if can_continue and cached else 0
-        latest = clean_prompt(cached.get("latest_user_message")) if can_continue and cached else ""
-        latest_from_event = (
-            bool(cached.get("latest_from_event")) if can_continue and cached else False
-        )
-        start = int(cached.get("offset", 0)) if can_continue and cached else 0
-        offset = start
-        try:
-            with path.open("rb") as handle:
-                handle.seek(start)
-                while True:
-                    line = handle.readline()
-                    if not line:
-                        break
-                    offset = handle.tell()
-                    if source == "subagent":
-                        response_user = bool(
-                            b"response_item" in line
-                            and (b'"role":"user"' in line or b'"role": "user"' in line)
-                        )
-                        user_event = b"event_msg" in line and b"user_message" in line
-                        if not response_user and not user_event:
-                            continue
-                    else:
-                        if b"event_msg" not in line or b"user_message" not in line:
-                            continue
-                    try:
-                        item = json.loads(line)
-                    except (json.JSONDecodeError, UnicodeDecodeError):
-                        continue
-                    payload = item.get("payload")
-                    if not isinstance(payload, dict):
-                        continue
-                    if item.get("type") == "event_msg" and payload.get("type") == "user_message":
-                        value = clean_prompt(payload.get("message"))
-                        if value:
-                            latest = value
-                            latest_from_event = True
-                        if source != "subagent":
-                            count += 1
-                    elif source == "subagent":
-                        if (
-                            item.get("type") == "response_item"
-                            and payload.get("type") == "message"
-                            and payload.get("role") == "user"
-                        ):
-                            count += 1
-                            if not latest_from_event:
-                                value = clean_prompt(prompt_text(payload))
-                                if value and not value.startswith("<codex_internal_context"):
-                                    latest = value
-        except OSError:
-            return count, latest
-        try:
-            final_stat = path.stat()
-        except OSError:
-            final_stat = stat
-        self.entries[key] = {
-            "mode": source,
-            "inode": final_stat.st_ino,
-            "size": final_stat.st_size,
-            "mtime_ns": final_stat.st_mtime_ns,
-            "offset": offset,
-            "user_messages": count,
-            "latest_user_message": latest,
-            "latest_from_event": latest_from_event,
-        }
-        self.dirty = True
-        return count, latest
-
-    def save(self) -> None:
-        if not self.dirty:
-            return
-        try:
-            CODEX_COUNT_CACHE_FILE.parent.mkdir(parents=True, exist_ok=True)
-            temp = CODEX_COUNT_CACHE_FILE.with_suffix(f".tmp-{os.getpid()}")
-            temp.write_text(
-                json.dumps({"version": 2, "entries": self.entries}, ensure_ascii=False),
-                encoding="utf-8",
-            )
-            temp.chmod(0o600)
-            temp.replace(CODEX_COUNT_CACHE_FILE)
-        except OSError:
-            pass
-
-
 def codex_resume_target(session_id: str, source: str, parent_id: str) -> str:
-    """Resume a subagent's usable parent thread, or the thread itself as fallback."""
-    return parent_id if source == "subagent" and parent_id else session_id
+    """Compatibility helper for callers that reason about Codex parent threads."""
+    return parent_id if source == SourceKind.SUBAGENT and parent_id else session_id
 
 
 def load_codex_sessions() -> list[Session]:
-    databases = list(CODEX_HOME.glob("state_*.sqlite"))
-    if not databases:
-        # No Codex home at all just means Codex is not installed here.  A
-        # Codex home with no state database is an anomaly worth reporting.
-        if CODEX_HOME.is_dir():
-            record_warning(f"no Codex state database found in {CODEX_HOME}")
+    """Compatibility wrapper around the registered Codex discovery capability."""
+    context = HarnessContext.create()
+    adapter = REGISTRY.get("codex")
+    discover = adapter.discover
+    if isinstance(discover, Unsupported):
         return []
-
-    def database_version(path: Path) -> tuple[int, float]:
-        match = re.search(r"state_(\d+)\.sqlite$", path.name)
-        try:
-            modified = path.stat().st_mtime
-        except OSError:
-            modified = 0.0
-        return (int(match.group(1)) if match else 0, modified)
-
-    # Codex may advance the state schema in a future release. Prefer the newest
-    # numbered database rather than pinning this utility to today's filename.
-    db = max(databases, key=database_version)
-
-    indexed_names: dict[str, str] = {}
-    index_file = CODEX_HOME / "session_index.jsonl"
-    if index_file.exists():
-        try:
-            with index_file.open("r", encoding="utf-8", errors="replace") as handle:
-                for line in handle:
-                    try:
-                        item = json.loads(line)
-                    except json.JSONDecodeError:
-                        continue
-                    sid, name = item.get("id"), normalize_space(item.get("thread_name"))
-                    if isinstance(sid, str) and name:
-                        indexed_names[sid] = name
-        except OSError:
-            pass
-
-    result: list[Session] = []
-    history = load_codex_history()
-    count_cache = CodexMessageCountCache()
-    try:
-        connection = sqlite3.connect(f"file:{db}?mode=ro", uri=True, timeout=2)
-        connection.row_factory = sqlite3.Row
-        rows = connection.execute("SELECT * FROM threads")
-        for row in rows:
-            keys = set(row.keys())
-
-            def field(name: str, default: Any = None) -> Any:
-                return row[name] if name in keys else default
-
-            sid = str(field("id", ""))
-            if not sid:
-                continue
-            launch_source = str(field("source", "") or "")
-            thread_source = str(field("thread_source", "") or "")
-            is_subagent = (
-                bool(field("agent_path"))
-                or thread_source == "subagent"
-                or "subagent" in launch_source
-            )
-            if is_subagent:
-                source = "subagent"
-            elif launch_source == "exec":
-                source = "non-interactive"
-            else:
-                source = "interactive"
-            # Codex describes a spawned thread with a JSON blob in `source`.
-            # It carries the parent and the nickname that tell otherwise
-            # identical sibling agents apart.
-            parent_id = ""
-            nickname = normalize_space(field("agent_nickname"))
-            if launch_source.startswith("{"):
-                try:
-                    spawn = json.loads(launch_source)["subagent"]["thread_spawn"]
-                    parent_id = str(spawn.get("parent_thread_id") or "")
-                    nickname = nickname or normalize_space(spawn.get("agent_nickname"))
-                except (json.JSONDecodeError, KeyError, TypeError):
-                    pass
-            auxiliary = source != "interactive" or bool(field("archived", False))
-            # Interactive CLI threads are human-launched. Codex exec threads
-            # and internal subagents are normally created by agent workflows or
-            # automation, so the UI groups both under Agent.
-            origin = "human" if source == "interactive" else "agent"
-            name = indexed_names.get(sid) or normalize_space(field("name"))
-            fallback = field("title") or field("preview") or field("first_user_message")
-            title = name or clean_prompt(fallback)
-            indexed_preview = clean_prompt(field("preview") or field("first_user_message"))
-            created = timestamp(field("created_at_ms") or field("created_at"))
-            updated = timestamp(
-                max(
-                    int(field("updated_at_ms", 0) or 0),
-                    int(field("recency_at_ms", 0) or 0),
-                )
-                or field("updated_at")
-            )
-            rollout_path = str(field("rollout_path", "") or "")
-            # Codex keeps its thread row after the rollout behind it is gone.
-            # Such a thread cannot be resumed or read, so listing it offers a
-            # session that does not exist.
-            if rollout_path and not Path(rollout_path).is_file():
-                continue
-            if source == "interactive" and sid in history:
-                message_count = int(history[sid].get("count", 0))
-                latest_user_message = clean_prompt(history[sid].get("latest"))
-            else:
-                message_count, latest_user_message = (
-                    count_cache.scan(Path(rollout_path), source) if rollout_path else (0, "")
-                )
-            result.append(
-                Session(
-                    tool="codex",
-                    session_id=sid,
-                    title=title,
-                    cwd=str(field("cwd", "") or ""),
-                    updated=updated,
-                    created=created,
-                    preview=latest_user_message or indexed_preview,
-                    named=bool(name),
-                    storage=rollout_path,
-                    source=source,
-                    auxiliary=auxiliary,
-                    origin=origin,
-                    resume_id=codex_resume_target(sid, source, parent_id),
-                    parent_id=parent_id,
-                    original_title=title,
-                    original_named=bool(name),
-                    message_count=message_count,
-                    agent_nickname=nickname,
-                )
-            )
-        connection.close()
-        count_cache.save()
-    except (sqlite3.Error, OSError) as error:
-        record_warning(f"could not read Codex sessions from {db}: {error}")
-        return []
-    return result
-
-
-class ClaudeMetadataCache:
-    """Incrementally extracts titles and paths from Claude transcript JSONL."""
-
-    INTERESTING = (
-        b'"type":"user"',
-        b'"type": "user"',
-        b'"type":"custom-title"',
-        b'"type": "custom-title"',
-        b'"type":"ai-title"',
-        b'"type": "ai-title"',
-        b'"type":"last-prompt"',
-        b'"type": "last-prompt"',
-    )
-
-    def __init__(self, enabled: bool = True) -> None:
-        self.enabled = enabled
-        self.entries: dict[str, dict[str, Any]] = {}
-        self.dirty = False
-        if enabled:
-            try:
-                payload = json.loads(CACHE_FILE.read_text(encoding="utf-8"))
-                if payload.get("version") == 4 and isinstance(payload.get("entries"), dict):
-                    self.entries = payload["entries"]
-            except (OSError, json.JSONDecodeError, AttributeError):
-                pass
-
-    @staticmethod
-    def blank() -> dict[str, Any]:
-        return {
-            "offset": 0,
-            "inode": 0,
-            "size": 0,
-            "mtime_ns": 0,
-            "custom_title": "",
-            "ai_title": "",
-            "cwd": "",
-            "first_prompt": "",
-            "last_prompt": "",
-            "agent_id": "",
-            "parent_session_id": "",
-            "slug": "",
-            "entrypoint": "",
-            "prompt_source": "",
-            "codex_session_refs": [],
-            "user_messages": 0,
-            "created": 0.0,
-            "updated": 0.0,
-        }
-
-    def scan(
-        self,
-        path: Path,
-        allow_sidechain: bool = False,
-        count_user_messages: bool = False,
-    ) -> dict[str, Any]:
-        key = str(path)
-        stat = path.stat()
-        cached = self.entries.get(key)
-        needs_count = bool(count_user_messages and cached and "user_messages" not in cached)
-        exact = bool(
-            cached
-            and not needs_count
-            and cached.get("inode") == stat.st_ino
-            and cached.get("size") == stat.st_size
-            and cached.get("mtime_ns") == stat.st_mtime_ns
-        )
-        if exact:
-            return cached  # type: ignore[return-value]
-
-        can_continue = bool(
-            cached
-            and not needs_count
-            and cached.get("inode") == stat.st_ino
-            and 0 <= int(cached.get("offset", 0)) <= stat.st_size
-            and int(cached.get("size", 0)) < stat.st_size
-        )
-        meta = dict(cached) if can_continue else self.blank()
-        start = int(meta.get("offset", 0)) if can_continue else 0
-        codex_refs = [
-            str(value) for value in meta.get("codex_session_refs", []) if isinstance(value, str)
-        ]
-        try:
-            with path.open("rb") as handle:
-                handle.seek(start)
-                while True:
-                    line = handle.readline()
-                    if not line:
-                        break
-                    meta["offset"] = handle.tell()
-                    for match in CODEX_ID_PATTERN.findall(line):
-                        found = match.decode("ascii")
-                        if found not in codex_refs:
-                            codex_refs.append(found)
-                    if not any(marker in line for marker in self.INTERESTING):
-                        continue
-                    try:
-                        item = json.loads(line)
-                    except (json.JSONDecodeError, UnicodeDecodeError):
-                        continue
-                    kind = item.get("type")
-                    if allow_sidechain:
-                        agent_id = item.get("agentId")
-                        parent_id = item.get("sessionId")
-                        slug = item.get("slug")
-                        if isinstance(agent_id, str) and agent_id:
-                            meta["agent_id"] = agent_id
-                        if isinstance(parent_id, str) and parent_id:
-                            meta["parent_session_id"] = parent_id
-                        if isinstance(slug, str) and slug:
-                            meta["slug"] = normalize_space(slug)
-                    if kind == "custom-title":
-                        value = normalize_space(item.get("customTitle"))
-                        if value:
-                            meta["custom_title"] = value
-                    elif kind == "ai-title":
-                        value = normalize_space(item.get("aiTitle"))
-                        if value:
-                            meta["ai_title"] = value
-                    elif kind == "last-prompt":
-                        value = clean_prompt(item.get("lastPrompt"))
-                        if value:
-                            meta["last_prompt"] = value
-                    elif (
-                        kind == "user"
-                        and not item.get("isMeta")
-                        and (allow_sidechain or not item.get("isSidechain"))
-                    ):
-                        entrypoint = normalize_space(item.get("entrypoint"))
-                        prompt_source = normalize_space(item.get("promptSource"))
-                        if entrypoint and not meta.get("entrypoint"):
-                            meta["entrypoint"] = entrypoint
-                        if prompt_source and not meta.get("prompt_source"):
-                            meta["prompt_source"] = prompt_source
-                        value = clean_prompt(prompt_text(item.get("message")))
-                        if value:
-                            if count_user_messages:
-                                meta["user_messages"] = int(meta.get("user_messages", 0)) + 1
-                            if not meta.get("first_prompt"):
-                                meta["first_prompt"] = value
-                            meta["last_prompt"] = value
-                        cwd = item.get("cwd")
-                        if isinstance(cwd, str) and cwd:
-                            meta["cwd"] = cwd
-                        event_time = timestamp(item.get("timestamp"))
-                        if event_time:
-                            if not meta.get("created"):
-                                meta["created"] = event_time
-                            meta["updated"] = max(float(meta.get("updated", 0)), event_time)
-        except OSError:
-            return meta
-
-        meta.update(
-            inode=stat.st_ino,
-            size=stat.st_size,
-            mtime_ns=stat.st_mtime_ns,
-            offset=stat.st_size,
-            codex_session_refs=codex_refs,
-        )
-        self.entries[key] = meta
-        self.dirty = True
-        return meta
-
-    def save(self) -> None:
-        if not self.enabled or not self.dirty:
-            return
-        try:
-            CACHE_FILE.parent.mkdir(parents=True, exist_ok=True)
-            temp = CACHE_FILE.with_suffix(f".tmp-{os.getpid()}")
-            temp.write_text(
-                json.dumps({"version": 4, "entries": self.entries}, ensure_ascii=False),
-                encoding="utf-8",
-            )
-            temp.chmod(0o600)
-            temp.replace(CACHE_FILE)
-        except OSError:
-            pass
-
-
-def load_claude_history() -> dict[str, dict[str, Any]]:
-    history_file = CLAUDE_HOME / "history.jsonl"
-    grouped: dict[str, dict[str, Any]] = {}
-    if not history_file.exists():
-        return grouped
-    try:
-        with history_file.open("r", encoding="utf-8", errors="replace") as handle:
-            for line in handle:
-                try:
-                    item = json.loads(line)
-                except json.JSONDecodeError:
-                    continue
-                sid = item.get("sessionId")
-                if not isinstance(sid, str) or not sid:
-                    continue
-                value = clean_prompt(item.get("display"))
-                event_time = timestamp(item.get("timestamp"))
-                entry = grouped.setdefault(
-                    sid,
-                    {
-                        "first_prompt": "",
-                        "last_prompt": "",
-                        "cwd": "",
-                        "created": 0.0,
-                        "updated": 0.0,
-                        "message_count": 0,
-                    },
-                )
-                if value:
-                    entry["message_count"] += 1
-                    if not entry["first_prompt"]:
-                        entry["first_prompt"] = value
-                    entry["last_prompt"] = value
-                project = item.get("project")
-                if isinstance(project, str) and project:
-                    entry["cwd"] = project
-                if event_time:
-                    if not entry["created"]:
-                        entry["created"] = event_time
-                    entry["updated"] = max(entry["updated"], event_time)
-    except OSError:
-        pass
-    return grouped
+    return [session_from_native(item) for item in discover(context, use_cache=True)]
 
 
 def load_claude_sessions(
     use_cache: bool = True,
     codex_refs: dict[str, list[str]] | None = None,
 ) -> list[Session]:
-    projects = CLAUDE_HOME / "projects"
-    if not projects.exists():
+    """Compatibility wrapper around the registered Claude discovery capability."""
+    context = HarnessContext.create(use_cache=use_cache)
+    adapter = REGISTRY.get("claude")
+    discover = adapter.discover
+    if isinstance(discover, Unsupported):
         return []
-    history = load_claude_history()
-    cache = ClaudeMetadataCache(enabled=use_cache)
-    result: list[Session] = []
-    try:
-        files = sorted(projects.glob("*/*.jsonl"))
-    except OSError:
-        files = []
-    for path in files:
-        # Primary transcripts are UUID.jsonl directly inside an encoded project
-        # directory.  Agent logs live deeper under subagents/ and are excluded.
-        sid = path.stem
-        if not re.fullmatch(r"[0-9a-fA-F-]{32,36}", sid):
-            continue
-        hist = history.get(sid, {})
-        try:
-            meta = cache.scan(
-                path,
-                count_user_messages=not bool(hist.get("message_count")),
-            )
-            stat = path.stat()
-        except OSError:
-            continue
-        if codex_refs is not None:
-            codex_refs[sid] = [
-                str(value) for value in meta.get("codex_session_refs", []) if isinstance(value, str)
-            ]
-        custom = normalize_space(meta.get("custom_title"))
-        automatic = normalize_space(meta.get("ai_title"))
-        first = clean_prompt(meta.get("first_prompt") or hist.get("first_prompt"))
-        # Claude's global history is the most direct record of prompts typed in
-        # interactive sessions. Programmatic sessions fall back to transcript
-        # user events because they are normally absent from that history.
-        last = clean_prompt(hist.get("last_prompt") or meta.get("last_prompt"))
-        title = custom or automatic or first
-        cwd = str(meta.get("cwd") or hist.get("cwd") or "")
-        created = float(meta.get("created") or hist.get("created") or stat.st_ctime)
-        updated = max(
-            float(meta.get("updated") or 0),
-            float(hist.get("updated") or 0),
-            stat.st_mtime,
-        )
-        message_count = int(hist.get("message_count") or meta.get("user_messages") or 0)
-        programmatic = meta.get("entrypoint") == "sdk-cli" or meta.get("prompt_source") == "sdk"
-        launch_targets = {"claude": sid}
-        result.append(
-            Session(
-                tool="claude",
-                session_id=sid,
-                title=title,
-                cwd=cwd,
-                updated=updated,
-                created=created,
-                preview=last or first,
-                named=bool(custom),
-                storage=str(path),
-                source="sdk" if programmatic else "interactive",
-                auxiliary=programmatic,
-                origin="cross" if programmatic else "human",
-                resume_id=sid,
-                original_title=title,
-                original_named=bool(custom),
-                message_count=message_count,
-                launch_targets=launch_targets,
-            )
-        )
+    native = list(discover(context, use_cache=use_cache))
+    if codex_refs is not None:
+        for (tool, session_id), (tokens, _) in context.evidence.items():
+            if tool == "claude":
+                codex_refs[session_id] = list(tokens)
+    return [session_from_native(item) for item in native]
 
-    # Claude subagents are stored as nested transcripts. They are useful for
-    # finding delegated work, but Claude resumes them through their owning
-    # top-level session rather than as independent conversations.
-    try:
-        agent_files = sorted(
-            path for path in projects.rglob("agent-*.jsonl") if "subagents" in path.parts
-        )
-    except OSError:
-        agent_files = []
-    for path in agent_files:
-        fallback_agent_id = path.stem.removeprefix("agent-")
-        try:
-            fallback_parent_id = path.relative_to(projects).parts[1]
-        except (ValueError, IndexError):
-            fallback_parent_id = ""
-        try:
-            meta = cache.scan(path, allow_sidechain=True, count_user_messages=True)
-            stat = path.stat()
-        except OSError:
-            continue
-        if codex_refs is not None:
-            agent_key = str(path.stem.removeprefix("agent-") or "")
-            if agent_key:
-                codex_refs[agent_key] = [
-                    str(value)
-                    for value in meta.get("codex_session_refs", [])
-                    if isinstance(value, str)
-                ]
-        agent_id = str(meta.get("agent_id") or fallback_agent_id)
-        parent_id = str(meta.get("parent_session_id") or fallback_parent_id)
-        if not agent_id or not parent_id:
-            continue
-        first = clean_prompt(meta.get("first_prompt"))
-        last = clean_prompt(meta.get("last_prompt"))
-        slug = normalize_space(meta.get("slug"))
-        title = slug or first or f"Claude subagent {agent_id[:8]}"
-        parent_history = history.get(parent_id, {})
-        cwd = str(meta.get("cwd") or parent_history.get("cwd") or "")
-        created = float(meta.get("created") or stat.st_ctime)
-        updated = max(float(meta.get("updated") or 0), stat.st_mtime)
-        launch_targets = {"claude": agent_id}
-        result.append(
-            Session(
-                tool="claude",
-                session_id=agent_id,
-                title=title,
-                cwd=cwd,
-                updated=updated,
-                created=created,
-                preview=last or first,
-                named=False,
-                storage=str(path),
-                source="subagent",
-                auxiliary=True,
-                origin="agent",
-                resume_id=parent_id,
-                parent_id=parent_id,
-                original_title=title,
-                message_count=int(meta.get("user_messages") or 0),
-                launch_targets=launch_targets,
+
+def session_from_native(item: NativeSession) -> Session:
+    """Apply neutral utility defaults to one adapter-owned discovery record."""
+    auxiliary = item.archived or item.source is not SourceKind.INTERACTIVE
+    if item.source is SourceKind.INTERACTIVE:
+        origin = "human"
+    elif item.source is SourceKind.SDK:
+        origin = "cross"
+    else:
+        origin = "agent"
+    return Session(
+        tool=item.tool,
+        session_id=item.session_id,
+        title=item.title,
+        cwd=item.cwd,
+        updated=item.updated,
+        created=item.created,
+        preview=item.preview,
+        named=item.named,
+        storage=item.storage,
+        source=item.source,
+        auxiliary=auxiliary,
+        origin=origin,
+        resume_id=item.resume_id or item.session_id,
+        parent_id=item.parent_id,
+        original_title=item.title,
+        original_named=item.named,
+        message_count=item.message_count,
+        agent_nickname=item.agent_nickname,
+    )
+
+
+def reconcile_evidence(sessions: list[Session], context: HarnessContext) -> None:
+    """Resolve candidate IDs against discovered rows or verified native existence."""
+    by_key = {(item.tool, item.session_id): item for item in sessions}
+    by_id: dict[str, list[Session]] = {}
+    for item in sessions:
+        by_id.setdefault(item.session_id, []).append(item)
+    for key, source_tool in context.origin_hints.items():
+        target = by_key.get(key)
+        if target is not None:
+            target.origin = "cross"
+            target.launch_targets.setdefault(source_tool, target.session_id)
+    for (publisher_tool, publisher_id), (tokens, truncated) in context.evidence.items():
+        publisher = by_key.get((publisher_tool, publisher_id))
+        if truncated:
+            record_warning(
+                f"ID evidence was truncated for {publisher_tool}:{publisher_id}; "
+                "negative counterpart conclusions were suppressed"
             )
-        )
-    cache.save()
-    return result
+        for token in tokens:
+            discovered = [item for item in by_id.get(token, []) if item.tool != publisher_tool]
+            resolved: list[tuple[str, str, Session | None]] = [
+                (item.tool, item.session_id, item) for item in discovered
+            ]
+            if not resolved:
+                raw = token.encode("ascii", errors="ignore")
+                for adapter in REGISTRY.adapters():
+                    if adapter.name == publisher_tool or not any(
+                        pattern.fullmatch(raw) for pattern in adapter.id_patterns
+                    ):
+                        continue
+                    locator = adapter.locate
+                    if isinstance(locator, Unsupported):
+                        continue
+                    try:
+                        exists = locator(token)
+                    except OSError:
+                        exists = False
+                    if exists:
+                        resolved.append((adapter.name, token, by_key.get((adapter.name, token))))
+            identities = {(tool, session_id) for tool, session_id, _ in resolved}
+            if len(identities) != 1:
+                continue
+            identity = next(iter(identities))
+            target_tool, target_id = identity
+            target = next(
+                (item for tool, session_id, item in resolved if (tool, session_id) == identity),
+                None,
+            )
+            if publisher is not None:
+                publisher.launch_targets.setdefault(target_tool, target_id)
+            if target is not None:
+                target.origin = "cross"
+                if publisher is not None:
+                    target.launch_targets.setdefault(publisher_tool, publisher.session_id)
 
 
 def load_sessions(use_cache: bool = True, state: UserState | None = None) -> list[Session]:
     clear_warnings()
-    codex_refs: dict[str, list[str]] = {}
-    claude_sessions = load_claude_sessions(use_cache=use_cache, codex_refs=codex_refs)
-    codex_sessions = load_codex_sessions()
-    codex_session_ids = {session_id for refs in codex_refs.values() for session_id in refs}
-    for item in codex_sessions:
-        # Claude captures the Codex thread ID in its transcript when it invokes
-        # `codex exec`.  The Claude scratchpad path is a second strong native
-        # signal for older calls whose output omitted that ID.
-        if item.source == "non-interactive" and (
-            item.session_id in codex_session_ids
-            or "/tmp/claude-" in item.cwd
-            or "\\Temp\\claude-" in item.cwd
-        ):
-            item.origin = "cross"
-            item.launch_targets.setdefault("claude", item.session_id)
-    sessions = codex_sessions + claude_sessions
+    context = HarnessContext.create(use_cache=use_cache)
+    sessions: list[Session] = []
+    for adapter in REGISTRY.adapters():
+        discover = adapter.discover
+        if isinstance(discover, Unsupported):
+            continue
+        try:
+            native_rows = list(discover(context, use_cache=use_cache))
+        except OSError as error:
+            record_warning(f"could not discover {adapter.label} sessions: {error}")
+            continue
+        for native in native_rows:
+            if native.tool != adapter.name:
+                record_warning(
+                    f"{adapter.label} discovery returned a foreign {native.tool!r} row; ignored"
+                )
+                continue
+            if native.source not in adapter.source_kinds:
+                record_warning(
+                    f"{adapter.label} discovery returned undeclared source {native.source.value!r}; "
+                    "ignored"
+                )
+                continue
+            sessions.append(session_from_native(native))
+    reconcile_evidence(sessions, context)
     # In the unlikely event of duplicate metadata, prefer the most recently
     # updated record for a given tool/session pair.
     unique: dict[tuple[str, str], Session] = {}

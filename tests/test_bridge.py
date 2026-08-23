@@ -1616,7 +1616,7 @@ class LaunchIntegrationTests(unittest.TestCase):
                 encoding="utf-8",
             )
             refs: dict[str, list[str]] = {}
-            with patch("ai_sessions.app.CLAUDE_HOME", claude_home):
+            with harness_home("claude", claude_home):
                 items = load_claude_sessions(use_cache=False, codex_refs=refs)
             self.assertEqual(len(items), 1)
             self.assertEqual(items[0].launch_targets, {"claude": session_id})

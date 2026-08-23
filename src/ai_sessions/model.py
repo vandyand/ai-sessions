@@ -183,3 +183,9 @@ class NativeSession:
     parent_id: str = ""
     message_count: int = 0
     agent_nickname: str = ""
+
+    def __post_init__(self) -> None:
+        if not self.tool or not self.session_id:
+            raise ValueError("native session tool and session_id must not be empty")
+        if not isinstance(self.source, SourceKind):
+            raise ValueError("native session source must be a SourceKind")
