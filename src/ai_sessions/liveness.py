@@ -1,0 +1,112 @@
+"""Provider-neutral process and file-lock snapshots for one discovery pass."""
+
+from __future__ import annotations
+
+import sys
+from dataclasses import dataclass
+from pathlib import Path
+from types import MappingProxyType
+from typing import Any, Mapping
+
+import psutil
+
+WINDOWS_EPOCH_FILETIME = 116_444_736_000_000_000
+
+
+@dataclass(frozen=True, slots=True)
+class ProcessInfo:
+    pid: int
+    name: str
+    command: tuple[str, ...]
+    start_token: str
+    started_at: float = 0.0
+
+
+@dataclass(frozen=True, slots=True)
+class LivenessContext:
+    """Read-only adapter view of one pass's point-in-time host evidence."""
+
+    platform: str
+    process_snapshot: tuple[ProcessInfo, ...]
+    lock_map: Mapping[tuple[int, int, int], int]
+
+
+def process_start_token(pid: int) -> str:
+    try:
+        value = Path(f"/proc/{pid}/stat").read_text(encoding="utf-8")
+        fields = value[value.rfind(")") + 2 :].split()
+        return fields[19]
+    except (OSError, IndexError):
+        return ""
+
+
+def _windows_start_token(value: Any) -> str:
+    try:
+        return str(int(float(value) * 10_000_000) + WINDOWS_EPOCH_FILETIME)
+    except (TypeError, ValueError, OverflowError):
+        return ""
+
+
+def process_snapshot(platform: str | None = None) -> tuple[ProcessInfo, ...]:
+    """Enumerate live processes once without retaining provider-specific state."""
+    current_platform = platform or sys.platform
+    result: list[ProcessInfo] = []
+    attributes = (
+        ("pid", "name", "cmdline", "create_time") if current_platform == "win32" else ("pid",)
+    )
+    for process in psutil.process_iter(attributes):
+        try:
+            pid = int(process.info["pid"])
+            if current_platform == "win32":
+                name = str(process.info.get("name") or "")
+                command = tuple(str(value) for value in (process.info.get("cmdline") or ()))
+                started_at = float(process.info.get("create_time") or 0)
+                start = _windows_start_token(started_at) if started_at > 0 else ""
+            else:
+                name = ""
+                command = ()
+                started_at = 0.0
+                start = process_start_token(pid)
+            result.append(ProcessInfo(pid, name, command, start, started_at))
+        except (psutil.Error, KeyError, TypeError, ValueError, OverflowError):
+            continue
+    return tuple(result)
+
+
+def held_file_locks(platform: str | None = None) -> dict[tuple[int, int, int], int]:
+    """Map Linux locked-file device/inode triples to their owning PID."""
+    if (platform or sys.platform) == "win32":
+        return {}
+    result: dict[tuple[int, int, int], int] = {}
+    try:
+        lines = Path("/proc/locks").read_text(encoding="utf-8").splitlines()
+    except OSError:
+        return result
+    for line in lines:
+        fields = line.split()
+        if len(fields) < 6 or fields[1] != "FLOCK":
+            continue
+        try:
+            major_text, minor_text, inode_text = fields[5].split(":", 2)
+            result[(int(major_text, 16), int(minor_text, 16), int(inode_text))] = int(fields[4])
+        except (ValueError, IndexError):
+            continue
+    return result
+
+
+def populate_context(context: Any) -> None:
+    """Populate a HarnessContext exactly once, including when both snapshots are empty."""
+    if context.liveness_ready:
+        return
+    context.process_snapshot = process_snapshot(context.platform)
+    context.lock_map = held_file_locks(context.platform)
+    context.liveness_ready = True
+
+
+def immutable_context(context: Any) -> LivenessContext:
+    """Freeze a populated per-pass context before it crosses adapter boundaries."""
+    return LivenessContext(
+        context.platform,
+        tuple(context.process_snapshot),
+        MappingProxyType(dict(context.lock_map)),
+    )

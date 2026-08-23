@@ -29,18 +29,28 @@ The selected row is only a user entry point. Launch resolves the conversation fi
 follows its head, then either reuses an equivalent member in the requested harness or
 materializes a new one. A native UUID mentioned in transcript prose is never identity.
 
-## Current bridge adapter
+## Runtime adapter
 
-`bridge.Harness` currently owns the operations needed by conversion and head detection:
+One immutable `HarnessAdapter` owns the complete native boundary:
 
 ```text
-name, label
+name, label, short_label, order, home
+default_command, dangerous_args, resume_args(...)
+source_kinds, id_patterns, scratch_patterns
+discover(context) -> Iterable[NativeSession]
+publish_name(session, title) -> note
+inspect_liveness(context, home, sessions) -> Mapping[id, pid]
 read(path, options) -> Transcript
 write(cwd, turns, title) -> (native_id, path)
 locate(native_id) -> bool
 change_status(path, byte_cursor) -> unchanged | changed | unstable
 budget -> BudgetPolicy(context_tokens, usable_fraction, chars_per_token, source)
 ```
+
+The ordered registry is dynamic and process-local. Built-ins push complete adapters during
+package initialization; the registry never imports providers. Core consumers query it at call
+time, so scoped late registration participates in CLI choices, configuration, discovery,
+rendering, liveness, naming, and conversion without refreshing an import-time snapshot.
 
 `read` projects native records into the shared `Turn` model. `write` must produce a truly
 resumable native transcript, including any separate records needed for both model context
@@ -77,21 +87,27 @@ decrease survivor count or increase dropped-message count. `BridgeResult` and bo
 distinguish selected source-message count, assembled target-message count, dropped messages,
 and marker-truncated anchors.
 
-## Complete adapter target
+## Runtime ownership
 
-The remaining provider branches in `app.py` should move behind the same adapter in this
-order:
+Provider-specific discovery, resume syntax, title publication, liveness evidence, transcript
+formats, caches, native-id patterns, and budget policy are all behind the adapter. Generic core
+code contains no provider-name routing maps or comparisons outside explicit schema-2
+configuration compatibility. Unsupported optional capabilities return an explicit reason;
+unknown harnesses never borrow another provider's behavior.
 
-1. `discover() -> Iterable[NativeSession]` — enumerate sessions and provider metadata.
-2. `resume_argv(native_id, mode, options) -> list[str]` — construct a shell-free command.
-3. `publish_name(session, title) -> PublishResult` — append the provider-supported name.
-4. `inspect_liveness(sessions) -> Mapping[id, NativeProcess]` — identify open sessions.
-5. `focus(process) -> FocusResult` — optional platform capability, never required to resume.
-6. The existing `read`, `write`, `locate`, and `change_status` conversion operations.
+Terminal focus is a platform/core capability over a verified open PID, not a harness hook.
+On Windows exact tab focus is unsupported for every current harness; on Linux the same
+tmux/desktop-terminal logic applies regardless of which adapter identified the process.
 
-Capabilities should be explicit (`rename`, `focus`, `subagents`, `compaction`, budget policy,
-and so on)
-rather than detected with `if tool == ...` in core code. Provider-specific caches and
+`NativeSession` contains provider discovery data only. Adapters do not construct the utility
+`Session` fields that carry local names, visibility, launch selection, conversation identity,
+frontiers, superseded state, or divergence. Its source kind is a closed neutral enum
+(`interactive`, `non-interactive`, `subagent`, `sdk`), not an unchecked provider string.
+It is string-serializable for search/detail/JSON output, while provider facts such as archived
+status remain explicit `NativeSession` fields instead of being guessed from source kind.
+
+Capabilities are explicit rather than detected with `if tool == ...` in core code.
+Provider-specific caches and
 database schemas belong inside the adapter. The core owns filtering, display, conversation
 state, head resolution, launch policy, and error presentation.
 
@@ -128,6 +144,24 @@ to rebuild it belongs to the full conversation-log phase.
 Version 5 bridge records have no safe cursor. Migration marks a surviving target copy as
 possibly advanced so the utility may duplicate history but will not silently choose its
 ancestor. Provider transcripts remain append-only and are never rewritten in place.
+
+State and configuration are forward-compatible data. A build whose registry does not know a
+harness may hide or refuse to operate on that harness, but load/save must preserve its bridge
+records, conversation members, launch preference, and keyed provider profile verbatim. An
+older or partial registry must never erase routing authority written by a newer adapter.
+Such a member has an `unknown` availability status: it blocks automatic promotion past its
+possibly newer frontier but does not invoke a missing adapter or crash known-harness listing.
+
+Cross-harness discovery evidence is format-agnostic and registry-sensitive. Transcript scanners
+match the union of registered native-ID prefilters and cache a digest of that pattern set; adding
+an adapter forces historical bytes to be rescanned. Candidate tokens are deduped and capped at
+4,096 per transcript in first-scan order with a persisted truncation flag. This item-count cap is
+unrelated to the 4,096-character handoff-note reserve and uses a separate constant. Truncated evidence can establish positive
+discovered/existing-ID matches but cannot support a negative "no counterpart" conclusion.
+Claims are not exclusive—ID shapes overlap—so evidence resolves first against IDs returned by
+discovery and then against verified native existence. No adapter names or imports another.
+If multiple adapters verify the same otherwise-undiscovered token, resolution remains ambiguous
+and produces no cross-origin claim.
 
 ## Deliberate non-goals of the head-routing phase
 

@@ -1,11 +1,13 @@
 import io
 import unittest
 from contextlib import redirect_stderr, redirect_stdout
+from dataclasses import replace
 from unittest.mock import patch
 
 from ai_sessions import app
 from ai_sessions.app import Session, codex_resume_target, command_for, launch
 from ai_sessions.config import LaunchConfig
+from ai_sessions.registry import REGISTRY
 
 
 def session(
@@ -98,6 +100,26 @@ class LaunchCommandTests(unittest.TestCase):
             ],
         )
 
+    def test_registered_adapter_owns_resume_syntax(self) -> None:
+        base = REGISTRY.get("codex")
+        fake = replace(
+            base,
+            name="other",
+            label="Other",
+            short_label="Other",
+            default_command=("other-cli",),
+            resume_args=lambda **values: ["continue-thread", values["session_id"]],
+        )
+        with REGISTRY.temporary(fake):
+            self.assertEqual(
+                command_for(session("other"), LaunchConfig()),
+                ["other-cli", "continue-thread", "session-id"],
+            )
+
+    def test_invalid_source_kind_is_rejected(self) -> None:
+        with self.assertRaisesRegex(ValueError, "invented"):
+            session("codex", "invented")
+
 
 class LaunchDirectoryTests(unittest.TestCase):
     def test_dry_run_strips_extended_length_prefix(self) -> None:
@@ -178,6 +200,25 @@ class CustomModeNoticeTests(unittest.TestCase):
         with redirect_stdout(io.StringIO()), redirect_stderr(errors):
             launch(session("codex"), LaunchConfig(), dry_run=True)
         self.assertEqual(errors.getvalue(), "")
+
+    def test_third_harness_notice_names_the_keyed_profile(self) -> None:
+        base = REGISTRY.get("codex")
+        fake = replace(
+            base,
+            name="other",
+            label="Other",
+            short_label="Other",
+            default_command=("other-cli",),
+            resume_args=lambda **values: ["continue-thread", values["session_id"]],
+        )
+        errors = io.StringIO()
+        with (
+            REGISTRY.temporary(fake),
+            redirect_stdout(io.StringIO()),
+            redirect_stderr(errors),
+        ):
+            launch(session("other"), LaunchConfig(mode="custom"), dry_run=True)
+        self.assertIn("[launch.providers.other] custom_args", errors.getvalue())
 
 
 if __name__ == "__main__":

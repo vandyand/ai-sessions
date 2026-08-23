@@ -1,9 +1,12 @@
 import unittest
+from dataclasses import replace
 from pathlib import Path
 from tempfile import TemporaryDirectory
+from unittest.mock import patch
 
 from ai_sessions.bridge import resolve_budget
-from ai_sessions.config import LaunchConfig
+from ai_sessions.config import LaunchConfig, ProviderProfile
+from ai_sessions.registry import REGISTRY
 
 
 class LaunchConfigTests(unittest.TestCase):
@@ -151,6 +154,132 @@ class LaunchConfigTests(unittest.TestCase):
                     loaded = LaunchConfig.load(path)
                 self.assertIsNone(loaded.bridge_max_tokens)
                 self.assertIsNone(loaded.bridge_max_chars)
+
+    def test_registered_profile_never_falls_back_to_a_builtin(self) -> None:
+        base = REGISTRY.get("codex")
+        fake = replace(
+            base,
+            name="other",
+            label="Other",
+            short_label="Other",
+            default_command=("other-cli",),
+            dangerous_args=("--other-danger",),
+        )
+        with REGISTRY.temporary(fake):
+            self.assertEqual(LaunchConfig().provider_prefix("other"), ["other-cli"])
+            self.assertEqual(
+                LaunchConfig(mode="dangerous").provider_prefix("other"),
+                ["other-cli", "--other-danger"],
+            )
+            configured = LaunchConfig(
+                mode="custom",
+                providers={"other": ProviderProfile(["custom-other"], ["--custom"])},
+            )
+            self.assertEqual(configured.provider_prefix("other"), ["custom-other", "--custom"])
+        with self.assertRaisesRegex(ValueError, "unknown harness"):
+            LaunchConfig().provider_prefix("other")
+
+    def test_schema_three_unknown_profile_survives_rewrite(self) -> None:
+        with TemporaryDirectory() as directory:
+            path = Path(directory) / "config.toml"
+            path.write_text(
+                """version = 3
+[launch]
+mode = "custom"
+claude_command = ["claude-custom"]
+codex_command = ["codex-custom"]
+[launch.custom]
+claude_args = ["--claude"]
+codex_args = ["--codex"]
+[launch.providers.future]
+command = ["future-cli"]
+custom_args = ["--future"]
+""",
+                encoding="utf-8",
+            )
+            loaded = LaunchConfig.load(path)
+            loaded.cycle_mode()
+            reloaded = LaunchConfig.load(path)
+            saved = path.read_text(encoding="utf-8")
+        self.assertEqual(reloaded.claude_command, ["claude-custom"])
+        self.assertEqual(reloaded.codex_command, ["codex-custom"])
+        self.assertEqual(reloaded.providers["future"].command, ["future-cli"])
+        self.assertEqual(reloaded.providers["future"].custom_args, ["--future"])
+        self.assertIn('claude_command = ["claude-custom"]', saved)
+        self.assertIn('codex_command = ["codex-custom"]', saved)
+        self.assertIn("[launch.providers.future]", saved)
+
+    def test_incomplete_and_extended_unknown_profiles_survive_rewrite(self) -> None:
+        with TemporaryDirectory() as directory:
+            path = Path(directory) / "config.toml"
+            path.write_text(
+                """version = 3
+[launch]
+[launch.providers.only_custom]
+custom_args = ["--only"]
+[launch.providers.extended]
+command = ["extended"]
+custom_args = []
+env_passthrough = true
+metadata = { owner = "future", levels = [1, 2] }
+""",
+                encoding="utf-8",
+            )
+            loaded = LaunchConfig.load(path)
+            loaded.save()
+            reloaded = LaunchConfig.load(path)
+            saved = path.read_text(encoding="utf-8")
+        self.assertIsNone(reloaded.providers["only_custom"].command)
+        self.assertEqual(reloaded.providers["only_custom"].custom_args, ["--only"])
+        self.assertTrue(reloaded.providers["extended"].extra["env_passthrough"])
+        self.assertEqual(reloaded.providers["extended"].extra["metadata"]["levels"], [1, 2])
+        self.assertIn("[launch.providers.only_custom]", saved)
+        self.assertIn("env_passthrough = true", saved)
+
+    def test_invalid_future_shape_and_control_text_cannot_corrupt_whole_config(self) -> None:
+        with TemporaryDirectory() as directory:
+            path = Path(directory) / "config.toml"
+            path.write_text(
+                '''version = 3
+[launch]
+mode = "dangerous"
+claude_command = ["my-claude", "--flag"]
+codex_command = ["my-codex"]
+[launch.custom]
+claude_args = ["--deep"]
+codex_args = []
+[launch.providers.future]
+command = ["future"]
+custom_args = 42
+note = """line1
+line2"""
+[bridge]
+max_tokens = 123456
+''',
+                encoding="utf-8",
+            )
+            loaded = LaunchConfig.load(path)
+            loaded.save()
+            reloaded = LaunchConfig.load(path)
+            saved = path.read_text(encoding="utf-8")
+        self.assertEqual(reloaded.mode, "dangerous")
+        self.assertEqual(reloaded.claude_command, ["my-claude", "--flag"])
+        self.assertEqual(reloaded.custom_claude_args, ["--deep"])
+        self.assertEqual(reloaded.bridge_max_tokens, 123_456)
+        self.assertEqual(reloaded.providers["future"].extra["custom_args"], 42)
+        self.assertEqual(reloaded.providers["future"].extra["note"], "line1\nline2")
+        self.assertEqual(saved.count("custom_args ="), 1)
+
+    def test_invalid_generated_toml_never_replaces_existing_file(self) -> None:
+        with TemporaryDirectory() as directory:
+            path = Path(directory) / "config.toml"
+            path.write_text('version = 2\n[launch]\nmode = "safe"\n', encoding="utf-8")
+            config = LaunchConfig(path=path)
+            with patch.object(LaunchConfig, "as_toml", return_value='broken = "\n'):
+                with self.assertRaisesRegex(ValueError, "refusing to save"):
+                    config.save()
+            saved = path.read_text(encoding="utf-8")
+        self.assertEqual(saved, 'version = 2\n[launch]\nmode = "safe"\n')
 
 
 if __name__ == "__main__":

@@ -18,41 +18,46 @@ import os
 import re
 import shlex
 import shutil
-import sqlite3
 import subprocess
 import sys
 import textwrap
 import uuid
-from dataclasses import asdict, dataclass, field, replace
+from collections.abc import Mapping
+from dataclasses import asdict, replace
 from pathlib import Path
 from typing import Any, Iterable
 
 from . import __version__ as VERSION
-from .bridge import (
-    BRIDGE_TOOLS,
+from .capabilities import HarnessAdapter, Unsupported
+from .config import LAUNCH_MODES, LaunchConfig
+from .conversion import (
     BridgeError,
-    append_jsonl,
     bridge,
+    bridge_tools,
     complete_jsonl_cursor,
     conversation_change_status,
     native_session_exists,
     resolve_budget,
 )
-from .config import LAUNCH_MODES, LaunchConfig
+from .conversion import append_jsonl as append_jsonl
 from .diagnostics import clear_warnings, record_warning
 from .diagnostics import warnings as load_warnings
+from .discovery import MAX_EXISTENCE_PROBES_PER_PASS, HarnessContext
+from .discovery import clean_prompt as clean_prompt
+from .discovery import normalize_space as normalize_space
+from .discovery import prompt_text as prompt_text
+from .discovery import timestamp as timestamp
+from .liveness import immutable_context as immutable_liveness_context
+from .liveness import populate_context as populate_liveness_context
+from .liveness import process_start_token
+from .model import LivenessSession, NativeSession, Session, SourceKind
 from .paths import (
-    CACHE_FILE,
-    CLAUDE_HOME,
-    CODEX_COUNT_CACHE_FILE,
-    CODEX_HOME,
     HOME,
     IS_WINDOWS,
     STATE_FILE,
 )
+from .registry import REGISTRY
 
-TOOL_LABELS = {"codex": "Codex", "claude": "Claude"}
-TOOL_ORDER = ("all", "codex", "claude")
 ORIGIN_ORDER = ("human", "cross", "agent", "all")
 ORIGIN_LABELS = {
     "human": "Human",
@@ -75,122 +80,78 @@ CODEX_ID_PATTERN = re.compile(
 )
 
 
-@dataclass(slots=True)
-class Session:
-    tool: str
-    session_id: str
-    title: str
-    cwd: str
-    updated: float
-    created: float
-    preview: str
-    named: bool
-    storage: str
-    source: str = "interactive"
-    auxiliary: bool = False
-    origin: str = "human"
-    resume_id: str = ""
-    parent_id: str = ""
-    original_title: str = ""
-    original_named: bool = False
-    renamed: bool = False
-    hidden: bool = False
-    message_count: int = 0
-    is_open: bool = False
-    open_pid: int = 0
-    agent_nickname: str = ""
-    launch_targets: dict[str, str] = field(default_factory=dict)
-    launch_tool: str = ""
-    conversation_id: str = ""
-    superseded: bool = False
-    diverged: bool = False
+def tool_label(name: str, *, short: bool = True) -> str:
+    """Return a current registry label, preserving unknown forward-compatible names."""
+    try:
+        return REGISTRY.label(name, short=short)
+    except KeyError:
+        return name
 
-    @property
-    def key(self) -> str:
-        # Origin is inferred metadata and can improve over time.  Keep utility
-        # names/visibility attached to the stable vendor session identity.
-        return f"{self.tool}:{self.session_id}"
 
-    @property
-    def can_bridge(self) -> bool:
-        """Whether the conversation can be copied into the other harness.
+def tool_order() -> tuple[str, ...]:
+    return ("all", *REGISTRY.names())
 
-        Bridging replays the stored transcript, so it needs one: sessions
-        discovered without a readable file on disk stay single-harness.
-        """
-        return bool(self.storage)
 
-    @property
-    def available_launch_tools(self) -> tuple[str, ...]:
-        """Harnesses this session can be resumed in, native ones first.
+def tool_column_width(minimum: int) -> int:
+    return max((minimum, *(len(adapter.short_label) for adapter in REGISTRY.adapters())))
 
-        A provider id only ever resumes in its own CLI, so anything beyond
-        ``launch_targets`` is reached by bridging a copy across.
-        """
-        ordered = [self.tool, *(tool for tool in self.launch_targets if tool != self.tool)]
-        if self.can_bridge:
-            ordered += [tool for tool in BRIDGE_TOOLS if tool not in ordered]
-        return tuple(ordered)
 
-    @property
-    def active_launch_tool(self) -> str:
-        return self.launch_tool if self.launch_tool in self.available_launch_tools else self.tool
+def available_launch_tools(item: Session) -> tuple[str, ...]:
+    """Current native and bridgeable launch choices, with the native tool first."""
+    ordered = [item.tool, *(tool for tool in item.launch_targets if tool != item.tool)]
+    if can_bridge(item):
+        ordered += [tool for tool in bridge_tools() if tool not in ordered]
+    return tuple(ordered)
 
-    def launch_target(self, tool: str | None = None) -> str:
-        """The id that resumes this conversation in ``tool``, or "" if none yet."""
-        resolved = tool or self.active_launch_tool
-        return self.launch_targets.get(resolved, "")
 
-    def needs_bridge(self, tool: str | None = None) -> bool:
-        resolved = tool or self.active_launch_tool
-        return resolved != self.tool and resolved not in self.launch_targets
+def can_bridge(item: Session) -> bool:
+    return bool(item.storage)
 
-    def cycle_launch_tool(self, backwards: bool = False) -> None:
-        options = self.available_launch_tools
-        if len(options) < 2:
-            return
-        selected = self.active_launch_tool
-        if selected not in options:
-            selected = options[0]
-        index = options.index(selected)
-        self.launch_tool = options[(index + (-1 if backwards else 1)) % len(options)]
 
-    def supports_launch_tool(self, value: str) -> bool:
-        return value in self.available_launch_tools
+def active_launch_tool(item: Session) -> str:
+    options = available_launch_tools(item)
+    return item.launch_tool if item.launch_tool in options else item.tool
 
-    def __post_init__(self) -> None:
-        if not self.launch_targets:
-            self.launch_targets = {self.tool: self.session_id}
-        elif self.tool not in self.launch_targets:
-            self.launch_targets = {self.tool: self.session_id, **self.launch_targets}
-        if self.launch_tool and self.launch_tool not in self.available_launch_tools:
-            self.launch_tool = ""
 
-    @property
-    def resume_target(self) -> str:
-        return self.resume_id or self.session_id
+def session_needs_bridge(item: Session, tool: str | None = None) -> bool:
+    resolved = tool or active_launch_tool(item)
+    return resolved != item.tool and resolved not in item.launch_targets
 
-    def searchable(self) -> str:
-        return " ".join(
-            (
-                self.tool,
-                TOOL_LABELS.get(self.tool, self.tool),
-                self.session_id,
-                self.active_launch_tool,
-                *self.available_launch_tools,
-                self.title,
-                self.cwd,
-                self.preview,
-                self.source,
-                self.origin,
-                self.parent_id,
-                "hidden" if self.hidden else "visible",
-                "open running active" if self.is_open else "closed inactive",
-                self.original_title,
-                str(self.message_count),
-                str(self.open_pid) if self.open_pid else "",
-            )
-        ).casefold()
+
+def cycle_session_launch_tool(item: Session, backwards: bool = False) -> None:
+    options = available_launch_tools(item)
+    if len(options) < 2:
+        return
+    selected = active_launch_tool(item)
+    index = options.index(selected) if selected in options else 0
+    item.launch_tool = options[(index + (-1 if backwards else 1)) % len(options)]
+
+
+def supports_launch_tool(item: Session, value: str) -> bool:
+    return value in available_launch_tools(item)
+
+
+def session_searchable(item: Session) -> str:
+    return " ".join(
+        (
+            item.tool,
+            tool_label(item.tool),
+            item.session_id,
+            active_launch_tool(item),
+            *available_launch_tools(item),
+            item.title,
+            item.cwd,
+            item.preview,
+            item.source,
+            item.origin,
+            item.parent_id,
+            "hidden" if item.hidden else "visible",
+            "open running active" if item.is_open else "closed inactive",
+            item.original_title,
+            str(item.message_count),
+            str(item.open_pid) if item.open_pid else "",
+        )
+    ).casefold()
 
 
 class UserState:
@@ -228,7 +189,8 @@ class UserState:
                         entries = {
                             tool: entry
                             for tool, entry in value.items()
-                            if tool in TOOL_LABELS
+                            if isinstance(tool, str)
+                            and tool
                             and isinstance(entry, dict)
                             and isinstance(entry.get("session_id"), str)
                         }
@@ -244,7 +206,8 @@ class UserState:
                             self.stable_key(str(key)): member
                             for key, member in value["members"].items()
                             if isinstance(member, dict)
-                            and member.get("tool") in TOOL_LABELS
+                            and isinstance(member.get("tool"), str)
+                            and member.get("tool")
                             and isinstance(member.get("session_id"), str)
                         }
                         if members:
@@ -279,7 +242,7 @@ class UserState:
                         if not isinstance(value, str):
                             continue
                         value = value.strip().lower()
-                        if value in TOOL_LABELS:
+                        if value:
                             self.launch_tools[self.stable_key(str(key))] = value
         except (OSError, json.JSONDecodeError, AttributeError):
             pass
@@ -370,8 +333,14 @@ class UserState:
             if Path(str(member.get("storage", ""))).is_file()
         ]
         maximum = max((int(member.get("generation", 0)) for _, member in all_members), default=0)
+        changes = {key: self._member_change_status(member) for key, member in members}
+        known_members = [
+            pair for pair in members if changes[pair[0]] not in ("unknown", "unsupported")
+        ]
         current = [
-            (key, member) for key, member in members if int(member.get("generation", 0)) == maximum
+            (key, member)
+            for key, member in known_members
+            if int(member.get("generation", 0)) == maximum
         ]
         current_frontiers = {str(member.get("frontier", "")) for _, member in current}
         unavailable = [
@@ -388,6 +357,7 @@ class UserState:
                 "advanced": [],
                 "unavailable": unavailable,
                 "unstable": [],
+                "unknown": [],
             }
         if not members:
             return {
@@ -396,9 +366,25 @@ class UserState:
                 "advanced": [],
                 "unavailable": [],
                 "unstable": [],
+                "unknown": [],
             }
-        changes = {key: self._member_change_status(member) for key, member in members}
-        unstable = [pair for pair in members if changes[pair[0]] == "unstable"]
+        unknown = [
+            pair
+            for pair in members
+            if changes[pair[0]] in ("unknown", "unsupported")
+            and int(pair[1].get("generation", 0)) == maximum
+            and str(pair[1].get("frontier", "")) not in current_frontiers
+        ]
+        if unknown:
+            return {
+                "conflict": False,
+                "heads": current,
+                "advanced": [],
+                "unavailable": [],
+                "unstable": [],
+                "unknown": unknown,
+            }
+        unstable = [pair for pair in known_members if changes[pair[0]] == "unstable"]
         if unstable:
             return {
                 "conflict": False,
@@ -406,8 +392,9 @@ class UserState:
                 "advanced": [],
                 "unavailable": [],
                 "unstable": unstable,
+                "unknown": [],
             }
-        advanced = [(key, member) for key, member in members if changes[key] == "changed"]
+        advanced = [(key, member) for key, member in known_members if changes[key] == "changed"]
         if not advanced:
             return {
                 "conflict": False,
@@ -415,6 +402,7 @@ class UserState:
                 "advanced": [],
                 "unavailable": [],
                 "unstable": [],
+                "unknown": [],
             }
         if len(advanced) == 1 and int(advanced[0][1].get("generation", 0)) == maximum:
             return {
@@ -423,6 +411,7 @@ class UserState:
                 "advanced": advanced,
                 "unavailable": [],
                 "unstable": [],
+                "unknown": [],
             }
         # Two members changed independently, or an older materialization moved
         # after a newer frontier existed. Either is a fork, never a timestamp race.
@@ -435,6 +424,7 @@ class UserState:
             "advanced": advanced,
             "unavailable": [],
             "unstable": [],
+            "unknown": [],
         }
 
     def _session_for_member(self, member: dict[str, Any], template: Session) -> Session:
@@ -467,6 +457,12 @@ class UserState:
         if not conversation_id:
             return item, item if item.tool == target_tool else None, ""
         status = self._conversation_status(conversation_id)
+        if status["unknown"]:
+            labels = ", ".join(key for key, _ in status["unknown"])
+            raise BridgeError(
+                f"conversation {conversation_id[:8]} has newest materialization(s) owned by "
+                f"an unavailable harness ({labels}); refusing to resume an older generation"
+            )
         if status["unstable"]:
             labels = ", ".join(key for key, _ in status["unstable"])
             raise BridgeError(
@@ -590,7 +586,7 @@ class UserState:
             item.named = item.original_named
             item.renamed = False
             item.launch_tool = self.launch_tools.get(item.key, "")
-            if item.launch_tool and item.launch_tool not in item.available_launch_tools:
+            if item.launch_tool and item.launch_tool not in available_launch_tools(item):
                 item.launch_tool = ""
             custom = self.names.get(item.key, "")
             if custom:
@@ -658,7 +654,7 @@ class UserState:
 
     def set_launch_tool(self, item: Session, launch_tool: str) -> None:
         key = self.stable_key(item.key)
-        if launch_tool and launch_tool in item.available_launch_tools and launch_tool != item.tool:
+        if launch_tool and launch_tool in available_launch_tools(item) and launch_tool != item.tool:
             self.launch_tools[key] = launch_tool
         else:
             self.launch_tools.pop(key, None)
@@ -769,26 +765,24 @@ def publish_name(
         name = original_title
         restored_generated = not original_named
     try:
-        if item.tool == "claude":
-            transcript = Path(item.storage)
-            if not transcript.is_file():
-                return f"transcript for {item.session_id} is missing; name kept local only"
-            append_jsonl(
-                transcript,
-                {"type": "custom-title", "customTitle": name, "sessionId": item.session_id},
+        try:
+            adapter = REGISTRY.get(item.tool)
+        except KeyError:
+            return f"unknown harness {item.tool!r}; name kept local only"
+        publisher = adapter.publish_name
+        if isinstance(publisher, Unsupported):
+            return (
+                f"{adapter.label} cannot publish titles: {publisher.reason}; name kept local only"
             )
-        else:
-            stamp = dt.datetime.now(dt.timezone.utc).isoformat().replace("+00:00", "Z")
-            append_jsonl(
-                CODEX_HOME / "session_index.jsonl",
-                {"id": item.session_id, "thread_name": name, "updated_at": stamp},
-            )
+        note = publisher(item, name)
     except OSError as error:
         return f"could not update the provider title: {error}"
+    if note:
+        return note
     if restored_generated:
-        label = TOOL_LABELS.get(item.tool, item.tool)
+        label = tool_label(item.tool)
         return f"restored {name!r}; {label} now records it as an explicit title"
-    return ""
+    return note
 
 
 def rename_session(state: UserState, item: Session, name: str) -> str:
@@ -804,60 +798,6 @@ def rename_session(state: UserState, item: Session, name: str) -> str:
     )
     state.set_name(item, value)
     return note
-
-
-def normalize_space(value: Any) -> str:
-    if not isinstance(value, str):
-        return ""
-    return re.sub(r"\s+", " ", value).strip()
-
-
-def clean_prompt(value: Any) -> str:
-    """Turn a first prompt or generated title into a useful one-line label."""
-    text = normalize_space(value)
-    if not text:
-        return ""
-    # Codex sessions often prefix the actual request with machine context.
-    text = re.sub(r"<environment_context>.*?</environment_context>", " ", text, flags=re.I | re.S)
-    text = re.sub(
-        r"<permissions instructions>.*?</permissions instructions>", " ", text, flags=re.I | re.S
-    )
-    text = normalize_space(text)
-    for prefix in ("<user>", "Human:", "User:"):
-        if text.startswith(prefix):
-            text = text[len(prefix) :].lstrip()
-    return text
-
-
-def prompt_text(message: Any) -> str:
-    if isinstance(message, str):
-        return message
-    if not isinstance(message, dict):
-        return ""
-    content = message.get("content", "")
-    if isinstance(content, str):
-        return content
-    if isinstance(content, list):
-        parts: list[str] = []
-        for block in content:
-            if isinstance(block, dict) and block.get("type") in ("text", "input_text"):
-                value = block.get("text", "")
-                if isinstance(value, str):
-                    parts.append(value)
-        return " ".join(parts)
-    return ""
-
-
-def timestamp(value: Any) -> float:
-    if isinstance(value, (int, float)):
-        result = float(value)
-        return result / 1000 if result > 100_000_000_000 else result
-    if isinstance(value, str) and value:
-        try:
-            return dt.datetime.fromisoformat(value.replace("Z", "+00:00")).timestamp()
-        except ValueError:
-            return 0.0
-    return 0.0
 
 
 def strip_extended_prefix(value: str) -> str:
@@ -891,7 +831,7 @@ def short_path(value: str) -> str:
 def display_title(session: Session) -> str:
     title = clean_prompt(session.title)
     if not title:
-        title = f"Untitled {TOOL_LABELS.get(session.tool, session.tool)} session"
+        title = f"Untitled {tool_label(session.tool)} session"
     return title
 
 
@@ -928,790 +868,294 @@ def conversation_status(session: Session) -> str:
     return ""
 
 
-def load_codex_history() -> dict[str, dict[str, Any]]:
-    """Load counts and genuine latest prompts from Codex's user history."""
-    sessions: dict[str, dict[str, Any]] = {}
-    path = CODEX_HOME / "history.jsonl"
-    if not path.exists():
-        return sessions
-    try:
-        with path.open("r", encoding="utf-8", errors="replace") as handle:
-            for line in handle:
-                try:
-                    item = json.loads(line)
-                except json.JSONDecodeError:
-                    continue
-                sid = item.get("session_id") or item.get("sessionId")
-                if isinstance(sid, str) and sid:
-                    entry = sessions.setdefault(sid, {"count": 0, "latest": ""})
-                    entry["count"] = int(entry["count"]) + 1
-                    latest = clean_prompt(item.get("text"))
-                    if latest:
-                        entry["latest"] = latest
-    except OSError:
-        pass
-    return sessions
-
-
-class CodexMessageCountCache:
-    """Incrementally index user turns in append-only Codex rollouts."""
-
-    def __init__(self) -> None:
-        self.entries: dict[str, dict[str, Any]] = {}
-        self.dirty = False
-        try:
-            payload = json.loads(CODEX_COUNT_CACHE_FILE.read_text(encoding="utf-8"))
-            if payload.get("version") == 2 and isinstance(payload.get("entries"), dict):
-                self.entries = payload["entries"]
-        except (OSError, json.JSONDecodeError, AttributeError):
-            pass
-
-    def scan(self, path: Path, source: str) -> tuple[int, str]:
-        key = str(path)
-        try:
-            stat = path.stat()
-        except OSError:
-            return 0, ""
-        cached = self.entries.get(key)
-        exact = bool(
-            cached
-            and cached.get("mode") == source
-            and cached.get("inode") == stat.st_ino
-            and cached.get("size") == stat.st_size
-            and cached.get("mtime_ns") == stat.st_mtime_ns
-            and "user_messages" in cached
-            and "latest_user_message" in cached
-        )
-        if exact:
-            return (
-                int(cached.get("user_messages", 0)),
-                clean_prompt(cached.get("latest_user_message")),
-            )
-        can_continue = bool(
-            cached
-            and cached.get("mode") == source
-            and cached.get("inode") == stat.st_ino
-            and 0 <= int(cached.get("offset", 0)) <= stat.st_size
-            and int(cached.get("size", 0)) < stat.st_size
-            and "user_messages" in cached
-            and "latest_user_message" in cached
-        )
-        count = int(cached.get("user_messages", 0)) if can_continue and cached else 0
-        latest = clean_prompt(cached.get("latest_user_message")) if can_continue and cached else ""
-        latest_from_event = (
-            bool(cached.get("latest_from_event")) if can_continue and cached else False
-        )
-        start = int(cached.get("offset", 0)) if can_continue and cached else 0
-        offset = start
-        try:
-            with path.open("rb") as handle:
-                handle.seek(start)
-                while True:
-                    line = handle.readline()
-                    if not line:
-                        break
-                    offset = handle.tell()
-                    if source == "subagent":
-                        response_user = bool(
-                            b"response_item" in line
-                            and (b'"role":"user"' in line or b'"role": "user"' in line)
-                        )
-                        user_event = b"event_msg" in line and b"user_message" in line
-                        if not response_user and not user_event:
-                            continue
-                    else:
-                        if b"event_msg" not in line or b"user_message" not in line:
-                            continue
-                    try:
-                        item = json.loads(line)
-                    except (json.JSONDecodeError, UnicodeDecodeError):
-                        continue
-                    payload = item.get("payload")
-                    if not isinstance(payload, dict):
-                        continue
-                    if item.get("type") == "event_msg" and payload.get("type") == "user_message":
-                        value = clean_prompt(payload.get("message"))
-                        if value:
-                            latest = value
-                            latest_from_event = True
-                        if source != "subagent":
-                            count += 1
-                    elif source == "subagent":
-                        if (
-                            item.get("type") == "response_item"
-                            and payload.get("type") == "message"
-                            and payload.get("role") == "user"
-                        ):
-                            count += 1
-                            if not latest_from_event:
-                                value = clean_prompt(prompt_text(payload))
-                                if value and not value.startswith("<codex_internal_context"):
-                                    latest = value
-        except OSError:
-            return count, latest
-        try:
-            final_stat = path.stat()
-        except OSError:
-            final_stat = stat
-        self.entries[key] = {
-            "mode": source,
-            "inode": final_stat.st_ino,
-            "size": final_stat.st_size,
-            "mtime_ns": final_stat.st_mtime_ns,
-            "offset": offset,
-            "user_messages": count,
-            "latest_user_message": latest,
-            "latest_from_event": latest_from_event,
-        }
-        self.dirty = True
-        return count, latest
-
-    def save(self) -> None:
-        if not self.dirty:
-            return
-        try:
-            CODEX_COUNT_CACHE_FILE.parent.mkdir(parents=True, exist_ok=True)
-            temp = CODEX_COUNT_CACHE_FILE.with_suffix(f".tmp-{os.getpid()}")
-            temp.write_text(
-                json.dumps({"version": 2, "entries": self.entries}, ensure_ascii=False),
-                encoding="utf-8",
-            )
-            temp.chmod(0o600)
-            temp.replace(CODEX_COUNT_CACHE_FILE)
-        except OSError:
-            pass
-
-
 def codex_resume_target(session_id: str, source: str, parent_id: str) -> str:
-    """Resume a subagent's usable parent thread, or the thread itself as fallback."""
-    return parent_id if source == "subagent" and parent_id else session_id
+    """Compatibility helper for callers that reason about Codex parent threads."""
+    return parent_id if source == SourceKind.SUBAGENT and parent_id else session_id
 
 
 def load_codex_sessions() -> list[Session]:
-    databases = list(CODEX_HOME.glob("state_*.sqlite"))
-    if not databases:
-        # No Codex home at all just means Codex is not installed here.  A
-        # Codex home with no state database is an anomaly worth reporting.
-        if CODEX_HOME.is_dir():
-            record_warning(f"no Codex state database found in {CODEX_HOME}")
+    """Compatibility wrapper around the registered Codex discovery capability."""
+    context = HarnessContext.create()
+    adapter = REGISTRY.get("codex")
+    discover = adapter.discover
+    if isinstance(discover, Unsupported):
         return []
-
-    def database_version(path: Path) -> tuple[int, float]:
-        match = re.search(r"state_(\d+)\.sqlite$", path.name)
-        try:
-            modified = path.stat().st_mtime
-        except OSError:
-            modified = 0.0
-        return (int(match.group(1)) if match else 0, modified)
-
-    # Codex may advance the state schema in a future release. Prefer the newest
-    # numbered database rather than pinning this utility to today's filename.
-    db = max(databases, key=database_version)
-
-    indexed_names: dict[str, str] = {}
-    index_file = CODEX_HOME / "session_index.jsonl"
-    if index_file.exists():
-        try:
-            with index_file.open("r", encoding="utf-8", errors="replace") as handle:
-                for line in handle:
-                    try:
-                        item = json.loads(line)
-                    except json.JSONDecodeError:
-                        continue
-                    sid, name = item.get("id"), normalize_space(item.get("thread_name"))
-                    if isinstance(sid, str) and name:
-                        indexed_names[sid] = name
-        except OSError:
-            pass
-
-    result: list[Session] = []
-    history = load_codex_history()
-    count_cache = CodexMessageCountCache()
-    try:
-        connection = sqlite3.connect(f"file:{db}?mode=ro", uri=True, timeout=2)
-        connection.row_factory = sqlite3.Row
-        rows = connection.execute("SELECT * FROM threads")
-        for row in rows:
-            keys = set(row.keys())
-
-            def field(name: str, default: Any = None) -> Any:
-                return row[name] if name in keys else default
-
-            sid = str(field("id", ""))
-            if not sid:
-                continue
-            launch_source = str(field("source", "") or "")
-            thread_source = str(field("thread_source", "") or "")
-            is_subagent = (
-                bool(field("agent_path"))
-                or thread_source == "subagent"
-                or "subagent" in launch_source
-            )
-            if is_subagent:
-                source = "subagent"
-            elif launch_source == "exec":
-                source = "non-interactive"
-            else:
-                source = "interactive"
-            # Codex describes a spawned thread with a JSON blob in `source`.
-            # It carries the parent and the nickname that tell otherwise
-            # identical sibling agents apart.
-            parent_id = ""
-            nickname = normalize_space(field("agent_nickname"))
-            if launch_source.startswith("{"):
-                try:
-                    spawn = json.loads(launch_source)["subagent"]["thread_spawn"]
-                    parent_id = str(spawn.get("parent_thread_id") or "")
-                    nickname = nickname or normalize_space(spawn.get("agent_nickname"))
-                except (json.JSONDecodeError, KeyError, TypeError):
-                    pass
-            auxiliary = source != "interactive" or bool(field("archived", False))
-            # Interactive CLI threads are human-launched. Codex exec threads
-            # and internal subagents are normally created by agent workflows or
-            # automation, so the UI groups both under Agent.
-            origin = "human" if source == "interactive" else "agent"
-            name = indexed_names.get(sid) or normalize_space(field("name"))
-            fallback = field("title") or field("preview") or field("first_user_message")
-            title = name or clean_prompt(fallback)
-            indexed_preview = clean_prompt(field("preview") or field("first_user_message"))
-            created = timestamp(field("created_at_ms") or field("created_at"))
-            updated = timestamp(
-                max(
-                    int(field("updated_at_ms", 0) or 0),
-                    int(field("recency_at_ms", 0) or 0),
-                )
-                or field("updated_at")
-            )
-            rollout_path = str(field("rollout_path", "") or "")
-            # Codex keeps its thread row after the rollout behind it is gone.
-            # Such a thread cannot be resumed or read, so listing it offers a
-            # session that does not exist.
-            if rollout_path and not Path(rollout_path).is_file():
-                continue
-            if source == "interactive" and sid in history:
-                message_count = int(history[sid].get("count", 0))
-                latest_user_message = clean_prompt(history[sid].get("latest"))
-            else:
-                message_count, latest_user_message = (
-                    count_cache.scan(Path(rollout_path), source) if rollout_path else (0, "")
-                )
-            result.append(
-                Session(
-                    tool="codex",
-                    session_id=sid,
-                    title=title,
-                    cwd=str(field("cwd", "") or ""),
-                    updated=updated,
-                    created=created,
-                    preview=latest_user_message or indexed_preview,
-                    named=bool(name),
-                    storage=rollout_path,
-                    source=source,
-                    auxiliary=auxiliary,
-                    origin=origin,
-                    resume_id=codex_resume_target(sid, source, parent_id),
-                    parent_id=parent_id,
-                    original_title=title,
-                    original_named=bool(name),
-                    message_count=message_count,
-                    agent_nickname=nickname,
-                )
-            )
-        connection.close()
-        count_cache.save()
-    except (sqlite3.Error, OSError) as error:
-        record_warning(f"could not read Codex sessions from {db}: {error}")
-        return []
-    return result
-
-
-class ClaudeMetadataCache:
-    """Incrementally extracts titles and paths from Claude transcript JSONL."""
-
-    INTERESTING = (
-        b'"type":"user"',
-        b'"type": "user"',
-        b'"type":"custom-title"',
-        b'"type": "custom-title"',
-        b'"type":"ai-title"',
-        b'"type": "ai-title"',
-        b'"type":"last-prompt"',
-        b'"type": "last-prompt"',
-    )
-
-    def __init__(self, enabled: bool = True) -> None:
-        self.enabled = enabled
-        self.entries: dict[str, dict[str, Any]] = {}
-        self.dirty = False
-        if enabled:
-            try:
-                payload = json.loads(CACHE_FILE.read_text(encoding="utf-8"))
-                if payload.get("version") == 4 and isinstance(payload.get("entries"), dict):
-                    self.entries = payload["entries"]
-            except (OSError, json.JSONDecodeError, AttributeError):
-                pass
-
-    @staticmethod
-    def blank() -> dict[str, Any]:
-        return {
-            "offset": 0,
-            "inode": 0,
-            "size": 0,
-            "mtime_ns": 0,
-            "custom_title": "",
-            "ai_title": "",
-            "cwd": "",
-            "first_prompt": "",
-            "last_prompt": "",
-            "agent_id": "",
-            "parent_session_id": "",
-            "slug": "",
-            "entrypoint": "",
-            "prompt_source": "",
-            "codex_session_refs": [],
-            "user_messages": 0,
-            "created": 0.0,
-            "updated": 0.0,
-        }
-
-    def scan(
-        self,
-        path: Path,
-        allow_sidechain: bool = False,
-        count_user_messages: bool = False,
-    ) -> dict[str, Any]:
-        key = str(path)
-        stat = path.stat()
-        cached = self.entries.get(key)
-        needs_count = bool(count_user_messages and cached and "user_messages" not in cached)
-        exact = bool(
-            cached
-            and not needs_count
-            and cached.get("inode") == stat.st_ino
-            and cached.get("size") == stat.st_size
-            and cached.get("mtime_ns") == stat.st_mtime_ns
-        )
-        if exact:
-            return cached  # type: ignore[return-value]
-
-        can_continue = bool(
-            cached
-            and not needs_count
-            and cached.get("inode") == stat.st_ino
-            and 0 <= int(cached.get("offset", 0)) <= stat.st_size
-            and int(cached.get("size", 0)) < stat.st_size
-        )
-        meta = dict(cached) if can_continue else self.blank()
-        start = int(meta.get("offset", 0)) if can_continue else 0
-        codex_refs = [
-            str(value) for value in meta.get("codex_session_refs", []) if isinstance(value, str)
-        ]
-        try:
-            with path.open("rb") as handle:
-                handle.seek(start)
-                while True:
-                    line = handle.readline()
-                    if not line:
-                        break
-                    meta["offset"] = handle.tell()
-                    for match in CODEX_ID_PATTERN.findall(line):
-                        found = match.decode("ascii")
-                        if found not in codex_refs:
-                            codex_refs.append(found)
-                    if not any(marker in line for marker in self.INTERESTING):
-                        continue
-                    try:
-                        item = json.loads(line)
-                    except (json.JSONDecodeError, UnicodeDecodeError):
-                        continue
-                    kind = item.get("type")
-                    if allow_sidechain:
-                        agent_id = item.get("agentId")
-                        parent_id = item.get("sessionId")
-                        slug = item.get("slug")
-                        if isinstance(agent_id, str) and agent_id:
-                            meta["agent_id"] = agent_id
-                        if isinstance(parent_id, str) and parent_id:
-                            meta["parent_session_id"] = parent_id
-                        if isinstance(slug, str) and slug:
-                            meta["slug"] = normalize_space(slug)
-                    if kind == "custom-title":
-                        value = normalize_space(item.get("customTitle"))
-                        if value:
-                            meta["custom_title"] = value
-                    elif kind == "ai-title":
-                        value = normalize_space(item.get("aiTitle"))
-                        if value:
-                            meta["ai_title"] = value
-                    elif kind == "last-prompt":
-                        value = clean_prompt(item.get("lastPrompt"))
-                        if value:
-                            meta["last_prompt"] = value
-                    elif (
-                        kind == "user"
-                        and not item.get("isMeta")
-                        and (allow_sidechain or not item.get("isSidechain"))
-                    ):
-                        entrypoint = normalize_space(item.get("entrypoint"))
-                        prompt_source = normalize_space(item.get("promptSource"))
-                        if entrypoint and not meta.get("entrypoint"):
-                            meta["entrypoint"] = entrypoint
-                        if prompt_source and not meta.get("prompt_source"):
-                            meta["prompt_source"] = prompt_source
-                        value = clean_prompt(prompt_text(item.get("message")))
-                        if value:
-                            if count_user_messages:
-                                meta["user_messages"] = int(meta.get("user_messages", 0)) + 1
-                            if not meta.get("first_prompt"):
-                                meta["first_prompt"] = value
-                            meta["last_prompt"] = value
-                        cwd = item.get("cwd")
-                        if isinstance(cwd, str) and cwd:
-                            meta["cwd"] = cwd
-                        event_time = timestamp(item.get("timestamp"))
-                        if event_time:
-                            if not meta.get("created"):
-                                meta["created"] = event_time
-                            meta["updated"] = max(float(meta.get("updated", 0)), event_time)
-        except OSError:
-            return meta
-
-        meta.update(
-            inode=stat.st_ino,
-            size=stat.st_size,
-            mtime_ns=stat.st_mtime_ns,
-            offset=stat.st_size,
-            codex_session_refs=codex_refs,
-        )
-        self.entries[key] = meta
-        self.dirty = True
-        return meta
-
-    def save(self) -> None:
-        if not self.enabled or not self.dirty:
-            return
-        try:
-            CACHE_FILE.parent.mkdir(parents=True, exist_ok=True)
-            temp = CACHE_FILE.with_suffix(f".tmp-{os.getpid()}")
-            temp.write_text(
-                json.dumps({"version": 4, "entries": self.entries}, ensure_ascii=False),
-                encoding="utf-8",
-            )
-            temp.chmod(0o600)
-            temp.replace(CACHE_FILE)
-        except OSError:
-            pass
-
-
-def load_claude_history() -> dict[str, dict[str, Any]]:
-    history_file = CLAUDE_HOME / "history.jsonl"
-    grouped: dict[str, dict[str, Any]] = {}
-    if not history_file.exists():
-        return grouped
-    try:
-        with history_file.open("r", encoding="utf-8", errors="replace") as handle:
-            for line in handle:
-                try:
-                    item = json.loads(line)
-                except json.JSONDecodeError:
-                    continue
-                sid = item.get("sessionId")
-                if not isinstance(sid, str) or not sid:
-                    continue
-                value = clean_prompt(item.get("display"))
-                event_time = timestamp(item.get("timestamp"))
-                entry = grouped.setdefault(
-                    sid,
-                    {
-                        "first_prompt": "",
-                        "last_prompt": "",
-                        "cwd": "",
-                        "created": 0.0,
-                        "updated": 0.0,
-                        "message_count": 0,
-                    },
-                )
-                if value:
-                    entry["message_count"] += 1
-                    if not entry["first_prompt"]:
-                        entry["first_prompt"] = value
-                    entry["last_prompt"] = value
-                project = item.get("project")
-                if isinstance(project, str) and project:
-                    entry["cwd"] = project
-                if event_time:
-                    if not entry["created"]:
-                        entry["created"] = event_time
-                    entry["updated"] = max(entry["updated"], event_time)
-    except OSError:
-        pass
-    return grouped
+    return [session_from_native(item) for item in discover(context, use_cache=True)]
 
 
 def load_claude_sessions(
     use_cache: bool = True,
     codex_refs: dict[str, list[str]] | None = None,
 ) -> list[Session]:
-    projects = CLAUDE_HOME / "projects"
-    if not projects.exists():
+    """Compatibility wrapper around the registered Claude discovery capability."""
+    context = HarnessContext.create(use_cache=use_cache)
+    adapter = REGISTRY.get("claude")
+    discover = adapter.discover
+    if isinstance(discover, Unsupported):
         return []
-    history = load_claude_history()
-    cache = ClaudeMetadataCache(enabled=use_cache)
-    result: list[Session] = []
-    try:
-        files = sorted(projects.glob("*/*.jsonl"))
-    except OSError:
-        files = []
-    for path in files:
-        # Primary transcripts are UUID.jsonl directly inside an encoded project
-        # directory.  Agent logs live deeper under subagents/ and are excluded.
-        sid = path.stem
-        if not re.fullmatch(r"[0-9a-fA-F-]{32,36}", sid):
-            continue
-        hist = history.get(sid, {})
-        try:
-            meta = cache.scan(
-                path,
-                count_user_messages=not bool(hist.get("message_count")),
-            )
-            stat = path.stat()
-        except OSError:
-            continue
-        if codex_refs is not None:
-            codex_refs[sid] = [
-                str(value) for value in meta.get("codex_session_refs", []) if isinstance(value, str)
-            ]
-        custom = normalize_space(meta.get("custom_title"))
-        automatic = normalize_space(meta.get("ai_title"))
-        first = clean_prompt(meta.get("first_prompt") or hist.get("first_prompt"))
-        # Claude's global history is the most direct record of prompts typed in
-        # interactive sessions. Programmatic sessions fall back to transcript
-        # user events because they are normally absent from that history.
-        last = clean_prompt(hist.get("last_prompt") or meta.get("last_prompt"))
-        title = custom or automatic or first
-        cwd = str(meta.get("cwd") or hist.get("cwd") or "")
-        created = float(meta.get("created") or hist.get("created") or stat.st_ctime)
-        updated = max(
-            float(meta.get("updated") or 0),
-            float(hist.get("updated") or 0),
-            stat.st_mtime,
-        )
-        message_count = int(hist.get("message_count") or meta.get("user_messages") or 0)
-        programmatic = meta.get("entrypoint") == "sdk-cli" or meta.get("prompt_source") == "sdk"
-        launch_targets = {"claude": sid}
-        result.append(
-            Session(
-                tool="claude",
-                session_id=sid,
-                title=title,
-                cwd=cwd,
-                updated=updated,
-                created=created,
-                preview=last or first,
-                named=bool(custom),
-                storage=str(path),
-                source="sdk" if programmatic else "interactive",
-                auxiliary=programmatic,
-                origin="cross" if programmatic else "human",
-                resume_id=sid,
-                original_title=title,
-                original_named=bool(custom),
-                message_count=message_count,
-                launch_targets=launch_targets,
-            )
+    native = list(discover(context, use_cache=use_cache))
+    if codex_refs is not None:
+        for (tool, session_id), (tokens, _) in context.evidence.items():
+            if tool == "claude":
+                codex_refs[session_id] = list(tokens)
+    return [session_from_native(item) for item in native]
+
+
+def session_from_native(item: NativeSession) -> Session:
+    """Apply neutral utility defaults to one adapter-owned discovery record."""
+    auxiliary = item.archived or item.source is not SourceKind.INTERACTIVE
+    if item.source is SourceKind.INTERACTIVE:
+        origin = "human"
+    elif item.source is SourceKind.SDK:
+        origin = "cross"
+    else:
+        origin = "agent"
+    return Session(
+        tool=item.tool,
+        session_id=item.session_id,
+        title=item.title,
+        cwd=item.cwd,
+        updated=item.updated,
+        created=item.created,
+        preview=item.preview,
+        named=item.named,
+        storage=item.storage,
+        source=item.source,
+        auxiliary=auxiliary,
+        origin=origin,
+        resume_id=item.resume_id or item.session_id,
+        parent_id=item.parent_id,
+        original_title=item.title,
+        original_named=item.named,
+        message_count=item.message_count,
+        agent_nickname=item.agent_nickname,
+    )
+
+
+def reconcile_evidence(sessions: list[Session], context: HarnessContext) -> None:
+    """Resolve candidate IDs against discovered rows or verified native existence."""
+    by_key = {(item.tool, item.session_id): item for item in sessions}
+    by_id: dict[str, list[Session]] = {}
+    for item in sessions:
+        by_id.setdefault(item.session_id, []).append(item)
+    by_folded_id: dict[str, list[Session]] = {}
+    for item in sessions:
+        by_folded_id.setdefault(item.session_id.casefold(), []).append(item)
+    for key in context.origin_hints:
+        target = by_key.get(key)
+        if target is not None and target.source is SourceKind.NON_INTERACTIVE:
+            target.origin = "cross"
+    locate_cache: dict[tuple[str, str], bool] = {}
+    probes = 0
+    probe_limit_reported = False
+
+    def evidence_rank(
+        entry: tuple[tuple[str, str], tuple[list[str], bool]],
+    ) -> tuple[bool, float, str, str]:
+        publisher = by_key.get(entry[0])
+        tool, session_id = entry[0]
+        return (
+            publisher is None,
+            -(publisher.updated if publisher is not None else 0),
+            tool,
+            session_id,
         )
 
-    # Claude subagents are stored as nested transcripts. They are useful for
-    # finding delegated work, but Claude resumes them through their owning
-    # top-level session rather than as independent conversations.
-    try:
-        agent_files = sorted(
-            path for path in projects.rglob("agent-*.jsonl") if "subagents" in path.parts
-        )
-    except OSError:
-        agent_files = []
-    for path in agent_files:
-        fallback_agent_id = path.stem.removeprefix("agent-")
-        try:
-            fallback_parent_id = path.relative_to(projects).parts[1]
-        except (ValueError, IndexError):
-            fallback_parent_id = ""
-        try:
-            meta = cache.scan(path, allow_sidechain=True, count_user_messages=True)
-            stat = path.stat()
-        except OSError:
-            continue
-        if codex_refs is not None:
-            agent_key = str(path.stem.removeprefix("agent-") or "")
-            if agent_key:
-                codex_refs[agent_key] = [
-                    str(value)
-                    for value in meta.get("codex_session_refs", [])
-                    if isinstance(value, str)
-                ]
-        agent_id = str(meta.get("agent_id") or fallback_agent_id)
-        parent_id = str(meta.get("parent_session_id") or fallback_parent_id)
-        if not agent_id or not parent_id:
-            continue
-        first = clean_prompt(meta.get("first_prompt"))
-        last = clean_prompt(meta.get("last_prompt"))
-        slug = normalize_space(meta.get("slug"))
-        title = slug or first or f"Claude subagent {agent_id[:8]}"
-        parent_history = history.get(parent_id, {})
-        cwd = str(meta.get("cwd") or parent_history.get("cwd") or "")
-        created = float(meta.get("created") or stat.st_ctime)
-        updated = max(float(meta.get("updated") or 0), stat.st_mtime)
-        launch_targets = {"claude": agent_id}
-        result.append(
-            Session(
-                tool="claude",
-                session_id=agent_id,
-                title=title,
-                cwd=cwd,
-                updated=updated,
-                created=created,
-                preview=last or first,
-                named=False,
-                storage=str(path),
-                source="subagent",
-                auxiliary=True,
-                origin="agent",
-                resume_id=parent_id,
-                parent_id=parent_id,
-                original_title=title,
-                message_count=int(meta.get("user_messages") or 0),
-                launch_targets=launch_targets,
+    for (publisher_tool, publisher_id), (tokens, truncated) in sorted(
+        context.evidence.items(), key=evidence_rank
+    ):
+        publisher = by_key.get((publisher_tool, publisher_id))
+        if publisher_tool not in REGISTRY:
+            record_warning(
+                f"ID evidence came from unavailable harness {publisher_tool}:{publisher_id}; "
+                "ignored"
             )
+            continue
+        if truncated:
+            record_warning(
+                f"ID evidence was truncated or incomplete for {publisher_tool}:{publisher_id}; "
+                "negative counterpart conclusions were suppressed"
+            )
+        for token in tokens:
+            # Native writers always mint a fresh target id. An own-id token is
+            # therefore transcript metadata, not evidence that an unrelated
+            # harness with the same namespaced id is a causal counterpart.
+            if token.casefold() == publisher_id.casefold():
+                continue
+            discovered = [item for item in by_id.get(token, []) if item.tool != publisher_tool]
+            if not discovered:
+                raw = token.encode("ascii", errors="ignore")
+                discovered = [
+                    item
+                    for item in by_folded_id.get(token.casefold(), [])
+                    if item.tool != publisher_tool
+                    and any(
+                        pattern.flags & re.I and pattern.fullmatch(raw)
+                        for pattern in REGISTRY.get(item.tool).id_patterns
+                    )
+                ]
+            resolved: list[tuple[str, str, Session | None]] = [
+                (item.tool, item.session_id, item) for item in discovered
+            ]
+            if not resolved:
+                raw = token.encode("ascii", errors="ignore")
+                for adapter in REGISTRY.adapters():
+                    if adapter.name == publisher_tool or not any(
+                        pattern.fullmatch(raw) for pattern in adapter.id_patterns
+                    ):
+                        continue
+                    locator = adapter.locate
+                    if isinstance(locator, Unsupported):
+                        continue
+                    cache_key = (adapter.name, token)
+                    if cache_key not in locate_cache:
+                        if probes >= MAX_EXISTENCE_PROBES_PER_PASS:
+                            if not probe_limit_reported:
+                                record_warning(
+                                    "native existence probes were capped for this discovery "
+                                    "pass; some positive counterpart lookups were skipped"
+                                )
+                                probe_limit_reported = True
+                            continue
+                        probes += 1
+                        try:
+                            locate_cache[cache_key] = locator(token)
+                        except OSError:
+                            locate_cache[cache_key] = False
+                    exists = locate_cache[cache_key]
+                    if exists:
+                        resolved.append((adapter.name, token, by_key.get((adapter.name, token))))
+            identities = {(tool, session_id) for tool, session_id, _ in resolved}
+            if len(identities) != 1:
+                continue
+            identity = next(iter(identities))
+            target_tool, target_id = identity
+            target = next(
+                (item for tool, session_id, item in resolved if (tool, session_id) == identity),
+                None,
+            )
+            if publisher is not None:
+                publisher.launch_targets.setdefault(target_tool, target_id)
+            if target is not None:
+                if target.source is SourceKind.NON_INTERACTIVE:
+                    target.origin = "cross"
+                if publisher is not None:
+                    target.launch_targets.setdefault(publisher_tool, publisher.session_id)
+
+
+def collect_scratch_origin_hints(sessions: list[Session], context: HarnessContext) -> None:
+    """Match non-interactive cwd evidence against each publisher's declared scratch shape."""
+    for publisher in REGISTRY.adapters():
+        if not publisher.scratch_patterns:
+            continue
+        for item in sessions:
+            if item.tool == publisher.name or item.source is not SourceKind.NON_INTERACTIVE:
+                continue
+            if any(pattern.search(item.cwd) for pattern in publisher.scratch_patterns):
+                context.mark_cross_origin(item.tool, item.session_id, publisher.name)
+
+
+def dedupe_sessions(sessions: Iterable[Session]) -> list[Session]:
+    """Prefer the newest duplicate while retaining equal IDs from different harnesses."""
+    unique: dict[tuple[str, str], Session] = {}
+    for item in sessions:
+        key = (item.tool, item.session_id)
+        current = unique.get(key)
+        item_rank = (item.updated, item.created, item.storage, item.title, item.cwd)
+        current_rank = (
+            (current.updated, current.created, current.storage, current.title, current.cwd)
+            if current is not None
+            else None
         )
-    cache.save()
-    return result
+        if current_rank is None or item_rank > current_rank:
+            unique[key] = item
+    return list(unique.values())
 
 
 def load_sessions(use_cache: bool = True, state: UserState | None = None) -> list[Session]:
     clear_warnings()
-    codex_refs: dict[str, list[str]] = {}
-    claude_sessions = load_claude_sessions(use_cache=use_cache, codex_refs=codex_refs)
-    codex_sessions = load_codex_sessions()
-    codex_session_ids = {session_id for refs in codex_refs.values() for session_id in refs}
-    for item in codex_sessions:
-        # Claude captures the Codex thread ID in its transcript when it invokes
-        # `codex exec`.  The Claude scratchpad path is a second strong native
-        # signal for older calls whose output omitted that ID.
-        if item.source == "non-interactive" and (
-            item.session_id in codex_session_ids
-            or "/tmp/claude-" in item.cwd
-            or "\\Temp\\claude-" in item.cwd
-        ):
-            item.origin = "cross"
-            item.launch_targets.setdefault("claude", item.session_id)
-    sessions = codex_sessions + claude_sessions
-    # In the unlikely event of duplicate metadata, prefer the most recently
-    # updated record for a given tool/session pair.
-    unique: dict[tuple[str, str], Session] = {}
-    for item in sessions:
-        key = (item.tool, item.session_id)
-        if key not in unique or item.updated > unique[key].updated:
-            unique[key] = item
-    result = list(unique.values())
-    if state is not None:
-        state.apply(result)
-    detect_open_sessions(result)
-    return result
-
-
-def process_start_token(pid: int) -> str:
-    """Return Linux /proc start ticks, which protects against PID reuse."""
-    try:
-        value = Path(f"/proc/{pid}/stat").read_text(encoding="utf-8")
-        # The executable name is parenthesized and may contain spaces.  Field
-        # 22 (starttime) is index 19 after the closing parenthesis.
-        fields = value[value.rfind(")") + 2 :].split()
-        return fields[19]
-    except (OSError, IndexError):
-        return ""
-
-
-def held_file_locks() -> dict[tuple[int, int, int], int]:
-    """Map Linux locked-file device/inode triples to their owning PID."""
-    result: dict[tuple[int, int, int], int] = {}
-    try:
-        lines = Path("/proc/locks").read_text(encoding="utf-8").splitlines()
-    except OSError:
-        return result
-    for line in lines:
-        fields = line.split()
-        if len(fields) < 6 or fields[1] != "FLOCK":
+    context = HarnessContext.create(use_cache=use_cache)
+    sessions: list[Session] = []
+    for adapter in REGISTRY.adapters():
+        discover = adapter.discover
+        if isinstance(discover, Unsupported):
             continue
         try:
-            major_text, minor_text, inode_text = fields[5].split(":", 2)
-            result[(int(major_text, 16), int(minor_text, 16), int(inode_text))] = int(fields[4])
-        except (ValueError, IndexError):
+            native_rows = list(discover(context, use_cache=use_cache))
+        except OSError as error:
+            record_warning(f"could not discover {adapter.label} sessions: {error}")
             continue
+        for native in native_rows:
+            if native.tool != adapter.name:
+                record_warning(
+                    f"{adapter.label} discovery returned a foreign {native.tool!r} row; ignored"
+                )
+                continue
+            if native.source not in adapter.source_kinds:
+                record_warning(
+                    f"{adapter.label} discovery returned undeclared source {native.source.value!r}; "
+                    "ignored"
+                )
+                continue
+            sessions.append(session_from_native(native))
+    result = dedupe_sessions(sessions)
+    collect_scratch_origin_hints(result, context)
+    reconcile_evidence(result, context)
+    if state is not None:
+        state.apply(result)
+    detect_open_sessions(result, context=context)
     return result
 
 
-def detect_open_sessions(sessions: Iterable[Session]) -> None:
-    """Mark sessions owned by live Claude/Codex processes anywhere on the host.
-
-    Claude publishes a PID/session registry. Codex holds an advisory lock whose
-    filename is the thread ID. Both mechanisms work independently of terminal,
-    pseudoterminal, and tmux layout.
-    """
+def detect_open_sessions(
+    sessions: Iterable[Session], *, context: HarnessContext | None = None
+) -> None:
+    """Fan one shared host snapshot through registered adapter liveness hooks."""
     session_list = list(sessions)
-    by_identity = {(item.tool, item.session_id): item for item in session_list}
     for item in session_list:
         item.is_open = False
         item.open_pid = 0
-
-    if IS_WINDOWS:
-        from .platforms.windows import detect_open_sessions as detect_windows_sessions
-
-        detect_windows_sessions(session_list, CLAUDE_HOME, CODEX_HOME)
+    pending: list[tuple[HarnessAdapter, list[Session]]] = []
+    for adapter in REGISTRY.adapters():
+        if isinstance(adapter.inspect_liveness, Unsupported):
+            continue
+        own = [
+            item
+            for item in session_list
+            if item.tool == adapter.name and item.source is SourceKind.INTERACTIVE
+        ]
+        if own:
+            pending.append((adapter, own))
+    if not pending:
         return
-
-    registry = CLAUDE_HOME / "sessions"
-    try:
-        registry_files = registry.glob("*.json")
-    except OSError:
-        registry_files = ()
-    for path in registry_files:
+    shared = context or HarnessContext.create()
+    populate_liveness_context(shared)
+    snapshot = immutable_liveness_context(shared)
+    live_pids = {process.pid for process in snapshot.process_snapshot}
+    for adapter, own in pending:
+        hook = adapter.inspect_liveness
+        assert not isinstance(hook, Unsupported)
+        views = tuple(LivenessSession(item.session_id, item.source, item.storage) for item in own)
         try:
-            record = json.loads(path.read_text(encoding="utf-8"))
-            pid = int(record.get("pid", 0))
-            sid = str(record.get("sessionId", ""))
-            expected_start = str(record.get("procStart", ""))
-            kind = str(record.get("kind", ""))
-        except (OSError, ValueError, json.JSONDecodeError, AttributeError):
+            detected = hook(snapshot, adapter.home, views)
+            if not isinstance(detected, Mapping):
+                raise TypeError("liveness hook did not return a mapping")
+            pairs = tuple(detected.items())
+        except Exception as error:
+            record_warning(f"could not inspect {adapter.label} liveness: {error}")
             continue
-        if (
-            not pid
-            or not sid
-            or not expected_start
-            or (kind and kind != "interactive")
-            or process_start_token(pid) != expected_start
-        ):
-            continue
-        item = by_identity.get(("claude", sid))
-        if item and item.source == "interactive":
-            item.is_open = True
-            item.open_pid = pid
-
-    locks = held_file_locks()
-    try:
-        writer_locks = (CODEX_HOME / "thread-writer-locks").glob("*.lock")
-    except OSError:
-        writer_locks = ()
-    for path in writer_locks:
-        try:
-            stat = path.stat()
-        except OSError:
-            continue
-        identity = (os.major(stat.st_dev), os.minor(stat.st_dev), stat.st_ino)
-        pid = locks.get(identity, 0)
-        if not pid or not process_start_token(pid):
-            continue
-        item = by_identity.get(("codex", path.stem))
-        if item and item.source == "interactive":
+        by_id = {item.session_id: item for item in own}
+        for session_id, pid in pairs:
+            item = by_id.get(session_id) if isinstance(session_id, str) else None
+            if (
+                item is None
+                or item.source is not SourceKind.INTERACTIVE
+                or not isinstance(pid, int)
+                or isinstance(pid, bool)
+                or pid <= 0
+                or pid not in live_pids
+            ):
+                continue
             item.is_open = True
             item.open_pid = pid
 
@@ -1916,7 +1360,7 @@ def query_match(session: Session, query: str) -> tuple[bool, int]:
     words = [word for word in query.casefold().split() if word]
     if not words:
         return True, 0
-    haystack = session.searchable()
+    haystack = session_searchable(session)
     title = session.title.casefold()
     cwd = session.cwd.casefold()
     score = 0
@@ -1948,7 +1392,7 @@ def query_match(session: Session, query: str) -> tuple[bool, int]:
         if word.startswith("launch:"):
             wanted = word[7:]
             if wanted and not any(
-                item.startswith(wanted) for item in session.available_launch_tools
+                item.startswith(wanted) for item in available_launch_tools(session)
             ):
                 return False, 0
             score += 20
@@ -1956,7 +1400,7 @@ def query_match(session: Session, query: str) -> tuple[bool, int]:
         if word.startswith("harness:"):
             wanted = word[8:]
             if wanted and not any(
-                item.startswith(wanted) for item in session.available_launch_tools
+                item.startswith(wanted) for item in available_launch_tools(session)
             ):
                 return False, 0
             score += 20
@@ -2023,34 +1467,77 @@ def filtered_sessions(
         if matched:
             matches.append((score, item))
     if query:
-        return [item for _, item in sorted(matches, key=lambda pair: (-pair[0], -pair[1].updated))]
+        return [
+            item
+            for _, item in sorted(
+                matches,
+                key=lambda pair: (
+                    -pair[0],
+                    -pair[1].updated,
+                    pair[1].tool,
+                    pair[1].session_id,
+                ),
+            )
+        ]
     if sort_mode == "title":
         return [
             item
             for _, item in sorted(
-                matches, key=lambda pair: (display_title(pair[1]).casefold(), -pair[1].updated)
+                matches,
+                key=lambda pair: (
+                    display_title(pair[1]).casefold(),
+                    -pair[1].updated,
+                    pair[1].tool,
+                    pair[1].session_id,
+                ),
             )
         ]
     if sort_mode == "directory":
         return [
             item
             for _, item in sorted(
-                matches, key=lambda pair: (pair[1].cwd.casefold(), -pair[1].updated)
+                matches,
+                key=lambda pair: (
+                    pair[1].cwd.casefold(),
+                    -pair[1].updated,
+                    pair[1].tool,
+                    pair[1].session_id,
+                ),
             )
         ]
     if sort_mode == "messages":
         return [
             item
             for _, item in sorted(
-                matches, key=lambda pair: (-pair[1].message_count, -pair[1].updated)
+                matches,
+                key=lambda pair: (
+                    -pair[1].message_count,
+                    -pair[1].updated,
+                    pair[1].tool,
+                    pair[1].session_id,
+                ),
             )
         ]
     if sort_mode == "open":
         return [
             item
-            for _, item in sorted(matches, key=lambda pair: (not pair[1].is_open, -pair[1].updated))
+            for _, item in sorted(
+                matches,
+                key=lambda pair: (
+                    not pair[1].is_open,
+                    -pair[1].updated,
+                    pair[1].tool,
+                    pair[1].session_id,
+                ),
+            )
         ]
-    return [item for _, item in sorted(matches, key=lambda pair: -pair[1].updated)]
+    return [
+        item
+        for _, item in sorted(
+            matches,
+            key=lambda pair: (-pair[1].updated, pair[1].tool, pair[1].session_id),
+        )
+    ]
 
 
 def relative_time(value: float) -> str:
@@ -2089,23 +1576,6 @@ def ellipsize(value: str, width: int) -> str:
 
 
 class Browser:
-    PAIRS = {
-        "accent": 1,
-        "codex": 2,
-        "claude": 3,
-        "selected": 4,
-        "primary": 5,
-        "warning": 6,
-        "success": 7,
-        "muted": 8,
-        "human": 9,
-        "cross": 10,
-        "agent": 11,
-        "hidden": 12,
-        "timestamp": 13,
-        "messages": 14,
-    }
-
     def __init__(
         self,
         screen: Any,
@@ -2130,7 +1600,27 @@ class Browser:
         self.searching = False
         self.message = ""
         self.result: Session | None = None
+        self.pairs = self._pair_layout()
         self.setup_colors()
+
+    @staticmethod
+    def _pair_layout() -> dict[str, int]:
+        names = [
+            "accent",
+            *(adapter.name for adapter in REGISTRY.adapters()),
+            "selected",
+            "primary",
+            "warning",
+            "success",
+            "muted",
+            "human",
+            "cross",
+            "agent",
+            "hidden",
+            "timestamp",
+            "messages",
+        ]
+        return {name: number for number, name in enumerate(names, 1)}
 
     def setup_colors(self) -> None:
         try:
@@ -2151,29 +1641,40 @@ class Browser:
             curses.use_default_colors()
         except curses.error:
             pass
+        provider_count = len(REGISTRY.adapters())
         if getattr(curses, "COLORS", 0) >= 256:
-            # Theme-friendly xterm-256 colors: cool provider hues, green live
-            # state, amber cross-provider state, and quiet neutral metadata.
-            colors = (45, 75, 176, 16, -1, 214, 82, 245, 114, 215, 141, 245, 110, 223)
-            backgrounds = (-1, -1, -1, 45, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1)
-        else:
-            colors = (
-                curses.COLOR_CYAN,
-                curses.COLOR_BLUE,
-                curses.COLOR_MAGENTA,
-                curses.COLOR_BLACK,
-                -1,
-                curses.COLOR_YELLOW,
-                curses.COLOR_GREEN,
-                curses.COLOR_WHITE,
-                curses.COLOR_GREEN,
-                curses.COLOR_YELLOW,
-                curses.COLOR_CYAN,
-                curses.COLOR_WHITE,
-                curses.COLOR_CYAN,
-                curses.COLOR_YELLOW,
+            provider_palette = (75, 176, 39, 208, 111, 141, 45)
+            colors = [45]
+            colors.extend(
+                provider_palette[index % len(provider_palette)] for index in range(provider_count)
             )
-            backgrounds = (-1, -1, -1, curses.COLOR_CYAN) + (-1,) * 10
+            colors.extend((-1, -1, 214, 82, 245, 114, 215, 141, 245, 110, 223))
+            backgrounds = [-1] * len(colors)
+            backgrounds[self.pairs["selected"] - 1] = 45
+            colors[self.pairs["selected"] - 1] = 16
+        else:
+            provider_palette = (curses.COLOR_BLUE, curses.COLOR_MAGENTA, curses.COLOR_CYAN)
+            colors = [curses.COLOR_CYAN]
+            colors.extend(
+                provider_palette[index % len(provider_palette)] for index in range(provider_count)
+            )
+            colors.extend(
+                (
+                    curses.COLOR_BLACK,
+                    -1,
+                    curses.COLOR_YELLOW,
+                    curses.COLOR_GREEN,
+                    curses.COLOR_WHITE,
+                    curses.COLOR_GREEN,
+                    curses.COLOR_YELLOW,
+                    curses.COLOR_CYAN,
+                    curses.COLOR_WHITE,
+                    curses.COLOR_CYAN,
+                    curses.COLOR_YELLOW,
+                )
+            )
+            backgrounds = [-1] * len(colors)
+            backgrounds[self.pairs["selected"] - 1] = curses.COLOR_CYAN
         for number, (foreground, background) in enumerate(zip(colors, backgrounds), 1):
             if number >= getattr(curses, "COLOR_PAIRS", 0):
                 break
@@ -2184,7 +1685,7 @@ class Browser:
                 pass
 
     def style(self, name: str = "primary", attrs: int = 0, selected: bool = False) -> int:
-        pair = self.PAIRS["selected" if selected else name]
+        pair = self.pairs.get("selected" if selected else name, self.pairs["primary"])
         if self.colors_enabled and pair in self.initialized_pairs:
             return attrs | curses.color_pair(pair)
         if selected:
@@ -2251,7 +1752,7 @@ class Browser:
         count_text = f"{open_count} open · {len(items)} shown · {len(self.sessions)} indexed"
         self.add(0, max(1, width - len(count_text) - 2), count_text, self.style("muted"))
 
-        tool_text = "All tools" if self.tool == "all" else TOOL_LABELS[self.tool]
+        tool_text = "All tools" if self.tool == "all" else tool_label(self.tool)
         dir_text = "All directories" if not self.directory else short_path(self.directory)
         filters = (
             f"{tool_text}  ·  {ORIGIN_LABELS[self.origin]}  ·  "
@@ -2279,7 +1780,8 @@ class Browser:
         self.offset = min(self.offset, max(0, len(items) - visible_rows))
 
         show_directory = width >= 100
-        tool_width, origin_width, open_width, messages_width, time_width = 8, 7, 6, 6, 10
+        tool_width = tool_column_width(8)
+        origin_width, open_width, messages_width, time_width = 7, 6, 6, 10
         directory_width = min(34, max(16, width // 4)) if show_directory else 0
         title_width = (
             width
@@ -2312,7 +1814,7 @@ class Browser:
                 y = list_top + row
                 selected = index == self.selected
                 marker = "›" if selected else ("⊘" if item.hidden else " ")
-                tool_label = TOOL_LABELS[item.tool]
+                item_tool_label = tool_label(item.tool)
                 origin_label = ORIGIN_LABELS[item.origin]
                 directory = short_path(item.cwd)
                 paused = item.is_open and process_state(item.open_pid) in ("T", "t")
@@ -2326,7 +1828,7 @@ class Browser:
 
                 marker_color = "hidden" if item.hidden else "primary"
                 segment(f"{marker} ", marker_color, curses.A_BOLD if marker.strip() else 0)
-                segment(f"{tool_label:<{tool_width}}", item.tool, curses.A_BOLD)
+                segment(f"{item_tool_label:<{tool_width}}", item.tool, curses.A_BOLD)
                 segment(f"{origin_label:<{origin_width}}", item.origin, curses.A_BOLD)
                 open_symbol = "Ⅱ" if paused else ("●" if item.is_open else "")
                 segment(
@@ -2368,8 +1870,8 @@ class Browser:
             name_badge = " · utility name" if item.renamed else (" · named" if item.named else "")
             source_badge = f" · {item.source}" if item.source != "interactive" else ""
             hidden_badge = " · hidden" if item.hidden else ""
-            launch_tool = TOOL_LABELS[item.active_launch_tool]
-            if item.needs_bridge():
+            launch_tool = tool_label(active_launch_tool(item))
+            if session_needs_bridge(item):
                 launch_tool += " (bridged copy)"
             if item.is_open and process_state(item.open_pid) in ("T", "t"):
                 open_badge = f" · PAUSED in terminal (PID {item.open_pid})"
@@ -2378,7 +1880,7 @@ class Browser:
             self.add(
                 detail_top + 1,
                 2,
-                f"{TOOL_LABELS[item.tool]} · {ORIGIN_LABELS[item.origin]} · launch via {launch_tool} · "
+                f"{tool_label(item.tool)} · {ORIGIN_LABELS[item.origin]} · launch via {launch_tool} · "
                 f"{item.message_count} user msgs{name_badge}{source_badge}{hidden_badge}{open_badge}",
                 self.style(item.origin, curses.A_BOLD),
                 width - 4,
@@ -2445,8 +1947,9 @@ class Browser:
 
     def cycle_tool(self, backwards: bool = False) -> None:
         previous = self.selected_id()
-        index = TOOL_ORDER.index(self.tool)
-        self.tool = TOOL_ORDER[(index + (-1 if backwards else 1)) % len(TOOL_ORDER)]
+        order = tool_order()
+        index = order.index(self.tool) if self.tool in order else 0
+        self.tool = order[(index + (-1 if backwards else 1)) % len(order)]
         if self.directory and not any(
             item.cwd == self.directory and (self.tool == "all" or item.tool == self.tool)
             for item in self.sessions
@@ -2473,22 +1976,22 @@ class Browser:
         if not items:
             return
         item = items[self.selected]
-        before = item.active_launch_tool
-        item.cycle_launch_tool()
-        selected = item.active_launch_tool
+        before = active_launch_tool(item)
+        cycle_session_launch_tool(item)
+        selected = active_launch_tool(item)
         self.state.set_launch_tool(item, selected)
         if selected == before:
             self.message = (
                 "Only one launch harness is available: this session has no readable "
                 "transcript to copy across."
             )
-        elif item.needs_bridge(selected):
+        elif session_needs_bridge(item, selected):
             self.message = (
-                f"Launching {TOOL_LABELS[selected]}: a copy of this conversation will be "
+                f"Launching {tool_label(selected)}: a copy of this conversation will be "
                 "created there, with tool calls summarised inline."
             )
         else:
-            self.message = f"Launching {TOOL_LABELS[selected]} for this session."
+            self.message = f"Launching {tool_label(selected)} for this session."
 
     def cycle_sort(self) -> None:
         previous = self.selected_id()
@@ -2881,9 +2384,13 @@ class Browser:
 
 def custom_mode_notice(config: LaunchConfig, provider: str | None = None) -> str:
     """Explain why custom launch mode is adding nothing to the provider command."""
-    if provider in TOOL_LABELS:
-        provider_label = TOOL_LABELS[provider]
-        setting = f"launch.custom.{provider}_args"
+    if provider is not None:
+        provider_label = tool_label(provider)
+        setting = (
+            f"launch.custom.{provider}_args"
+            if provider in ("claude", "codex")
+            else f"[launch.providers.{provider}] custom_args"
+        )
         return (
             f"sessions: custom launch mode has no arguments configured for {provider_label}, "
             f"so it starts with provider defaults; set {setting} in {config.path}"
@@ -2902,29 +2409,39 @@ def command_for(session: Session, config: LaunchConfig) -> list[str]:
     describe how the *recording* provider filed the session, so they apply
     only when resuming there.  A bridged copy is an ordinary new session.
     """
-    tool = session.active_launch_tool
-    if session.needs_bridge(tool):
+    tool = active_launch_tool(session)
+    if session_needs_bridge(session, tool):
         raise BridgeError(
-            f"{TOOL_LABELS.get(tool, tool)} cannot resume a "
-            f"{TOOL_LABELS.get(session.tool, session.tool)} session id directly; "
+            f"{tool_label(tool)} cannot resume a "
+            f"{tool_label(session.tool)} session id directly; "
             "bridge a copy across first"
         )
     native = tool == session.tool
+    try:
+        adapter = REGISTRY.get(tool)
+    except KeyError:
+        raise BridgeError(f"unknown harness: {tool}") from None
+    resume = adapter.resume_args
+    if isinstance(resume, Unsupported):
+        raise BridgeError(f"{adapter.label} cannot resume sessions: {resume.reason}")
+    try:
+        source = SourceKind(session.source)
+    except ValueError:
+        raise BridgeError(f"invalid source kind for {session.tool}: {session.source!r}") from None
+    try:
+        source_adapter = REGISTRY.get(session.tool)
+    except KeyError:
+        raise BridgeError(f"unknown recording harness: {session.tool}") from None
+    if source not in source_adapter.source_kinds:
+        raise BridgeError(f"{session.tool} does not declare source kind {source.value!r}")
     argv = config.provider_prefix(tool)
-    if tool == "codex" and native and session.source == "subagent":
-        resume_target = session.resume_target
-    else:
-        resume_target = session.launch_target(tool)
-    if tool == "claude":
-        argv += ["--resume", resume_target]
-    else:
-        argv += ["resume"]
-        if native and (
-            session.source == "non-interactive"
-            or (session.source == "subagent" and session.resume_target == session.session_id)
-        ):
-            argv.append("--include-non-interactive")
-        argv.append(resume_target)
+    argv += resume(
+        session_id=session.launch_target(tool),
+        source=source,
+        resume_id=session.resume_target,
+        parent_id=session.parent_id,
+        native=native,
+    )
     return argv
 
 
@@ -2942,7 +2459,7 @@ def prepare_launch(
     repeatedly launching the same pairing continues one conversation rather
     than spawning a new snapshot each time.
     """
-    tool = session.active_launch_tool
+    tool = active_launch_tool(session)
     conversation_id = ""
     if state is not None:
         source, target, conversation_id = state.resolve_launch(session, tool)
@@ -2951,7 +2468,7 @@ def prepare_launch(
             if target.key == session.key:
                 return target, ""
             return target, (
-                f"Continuing the {TOOL_LABELS[tool]} copy—the current materialization of "
+                f"Continuing the {tool_label(tool)} copy—the current materialization of "
                 f"conversation {conversation_id[:8]} ({target.session_id})."
             )
         session = source
@@ -2966,7 +2483,7 @@ def prepare_launch(
         # The reference was matched out of transcript text, so it may never
         # have been a session at all.  Fall through and make a real one.
         stale = (
-            f"The recorded {TOOL_LABELS[tool]} counterpart {recorded} does not exist; "
+            f"The recorded {tool_label(tool)} counterpart {recorded} does not exist; "
             "copying the conversation across instead. "
         )
 
@@ -2995,7 +2512,7 @@ def prepare_launch(
         existing = state.bridge_for(session, tool)
         if existing:
             return attach(existing), (
-                f"{stale}Continuing the {TOOL_LABELS[tool]} copy of this session ({existing})."
+                f"{stale}Continuing the {tool_label(tool)} copy of this session ({existing})."
             )
         conversation_id = state.conversation_id_for(session, create=True)
     budget = resolve_budget(
@@ -3052,7 +2569,7 @@ def prepare_launch(
             "max_tokens to change this."
         )
     note = (
-        f"{stale}Copied {carried} into a new {TOOL_LABELS[tool]} session "
+        f"{stale}Copied {carried} into a new {tool_label(tool)} session "
         f"{result.session_id}{dropped}{truncated}.{budget_notice}"
     )
     return attach(result.session_id, str(result.path)), note
@@ -3082,8 +2599,8 @@ def launch(
         print(f"sessions: {note}", file=sys.stderr)
     argv = command_for(session, config)
     cwd = strip_extended_prefix(session.cwd) or str(HOME)
-    if config.custom_args_missing(session.active_launch_tool):
-        print(custom_mode_notice(config, session.active_launch_tool), file=sys.stderr)
+    if config.custom_args_missing(active_launch_tool(session)):
+        print(custom_mode_notice(config, active_launch_tool(session)), file=sys.stderr)
     if dry_run:
         if IS_WINDOWS:
             rendered = subprocess.list2cmdline(argv)
@@ -3123,9 +2640,12 @@ def list_output(items: list[Session], as_json: bool = False) -> None:
     except OSError:
         terminal_width = 120
     conversation_width = 11
-    title_width = max(24, terminal_width - 112)
+    tool_width = tool_column_width(8)
+    run_width = tool_column_width(6)
+    title_width = max(24, terminal_width - 112 - (tool_width - 8) - (run_width - 6))
     print(
-        f"{'TOOL':<8} {'RUN':<6} {'ORIGIN':<7} {'OPEN':<5} {'MSGS':>5} {'STATE':<8} "
+        f"{'TOOL':<{tool_width}} {'RUN':<{run_width}} {'ORIGIN':<7} "
+        f"{'OPEN':<5} {'MSGS':>5} {'STATE':<8} "
         f"{'HEAD':<{conversation_width}} {'STARTED':<12} {'UPDATED':<12} "
         f"{'TITLE':<{title_width}} DIRECTORY"
     )
@@ -3133,7 +2653,8 @@ def list_output(items: list[Session], as_json: bool = False) -> None:
         paused = item.is_open and process_state(item.open_pid) in ("T", "t")
         open_symbol = "Ⅱ" if paused else ("●" if item.is_open else "")
         print(
-            f"{TOOL_LABELS[item.tool]:<8} {TOOL_LABELS[item.active_launch_tool]:<6} "
+            f"{tool_label(item.tool):<{tool_width}} "
+            f"{tool_label(active_launch_tool(item)):<{run_width}} "
             f"{ORIGIN_LABELS[item.origin]:<7} {open_symbol:<5} {item.message_count:>5} "
             f"{('hidden' if item.hidden else 'visible'):<8} "
             f"{conversation_status(item):<{conversation_width}} "
@@ -3169,7 +2690,7 @@ def build_parser() -> argparse.ArgumentParser:
         "--list", action="store_true", help="print matching sessions instead of opening the browser"
     )
     parser.add_argument("--json", action="store_true", help="emit JSON (implies --list)")
-    parser.add_argument("--tool", choices=TOOL_ORDER, default="all", help="initial tool filter")
+    parser.add_argument("--tool", choices=tool_order(), default="all", help="initial tool filter")
     parser.add_argument(
         "--origin", choices=ORIGIN_ORDER, default="human", help="filter by who launched the session"
     )
@@ -3193,7 +2714,7 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument(
         "--launch-tool",
-        choices=TOOL_ORDER[1:],
+        choices=REGISTRY.names(),
         help=(
             "resume in this harness instead of the recording one; a session from the "
             "other CLI is copied across first"
@@ -3319,15 +2840,8 @@ def main(argv: list[str] | None = None) -> int:
         item = resolve(args.resume)
         if item is None:
             return 2
-        if args.launch_tool and not item.supports_launch_tool(args.launch_tool):
-            tools = ", ".join(
-                sorted(
-                    {
-                        TOOL_LABELS[tool] if tool in TOOL_LABELS else tool
-                        for tool in item.available_launch_tools
-                    }
-                )
-            )
+        if args.launch_tool and not supports_launch_tool(item, args.launch_tool):
+            tools = ", ".join(sorted({tool_label(tool) for tool in available_launch_tools(item)}))
             print(
                 f"sessions: --launch-tool={args.launch_tool} is not available for "
                 f"that session (available: {tools})",

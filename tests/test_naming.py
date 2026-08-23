@@ -1,18 +1,21 @@
 import json
 import unittest
+from dataclasses import replace
 from pathlib import Path
 from tempfile import TemporaryDirectory
-from unittest.mock import patch
 
 from ai_sessions import app
 from ai_sessions.app import (
     Session,
     UserState,
+    active_launch_tool,
     agent_tag,
     append_jsonl,
     publish_name,
     rename_session,
 )
+from ai_sessions.capabilities import Unsupported
+from ai_sessions.registry import REGISTRY
 
 
 def session(**overrides) -> Session:
@@ -57,6 +60,40 @@ class AppendJsonlTests(unittest.TestCase):
 
 
 class PublishNameTests(unittest.TestCase):
+    def test_registered_adapter_owns_title_publication(self) -> None:
+        calls: list[tuple[str, str]] = []
+        base = REGISTRY.get("codex")
+        fake = replace(
+            base,
+            name="other",
+            label="Other",
+            short_label="Other",
+            publish_name=lambda item, name: (
+                calls.append((item.session_id, name)) or "provider-note"
+            ),
+        )
+        with REGISTRY.temporary(fake):
+            self.assertEqual(publish_name(session(tool="other"), "new"), "provider-note")
+        self.assertEqual(calls, [("session-id", "new")])
+
+    def test_unsupported_title_publication_stays_local(self) -> None:
+        with TemporaryDirectory() as directory:
+            home = Path(directory)
+            base = REGISTRY.get("codex")
+            fake = replace(
+                base,
+                name="limited",
+                label="Limited",
+                short_label="Limited",
+                home=home,
+                publish_name=Unsupported("native titles are unavailable"),
+            )
+            with REGISTRY.temporary(fake):
+                note = publish_name(session(tool="limited"), "new")
+            self.assertIn("cannot publish titles", note)
+            self.assertIn("kept local", note)
+            self.assertEqual(list(home.iterdir()), [])
+
     def test_claude_rename_appends_custom_title(self) -> None:
         with TemporaryDirectory() as directory:
             transcript = Path(directory) / "abc.jsonl"
@@ -75,7 +112,7 @@ class PublishNameTests(unittest.TestCase):
     def test_codex_rename_appends_thread_name(self) -> None:
         with TemporaryDirectory() as directory:
             home = Path(directory)
-            with patch.object(app, "CODEX_HOME", home):
+            with REGISTRY.temporary(replace(REGISTRY.get("codex"), home=home)):
                 item = session(tool="codex", session_id="019f-thread")
                 self.assertEqual(publish_name(item, "my-name"), "")
             written = json.loads((home / "session_index.jsonl").read_text().splitlines()[-1])
@@ -112,6 +149,17 @@ class PublishNameTests(unittest.TestCase):
             self.assertIn("explicit title", note)
             last = json.loads(transcript.read_text(encoding="utf-8").splitlines()[-1])
             self.assertEqual(last["customTitle"], "Auto Generated")
+
+    def test_reset_does_not_mask_provider_publication_failure(self) -> None:
+        item = session(
+            session_id="abc",
+            storage="/nonexistent/transcript.jsonl",
+            original_named=False,
+            original_title="Auto Generated",
+        )
+        note = publish_name(item, "")
+        self.assertIn("missing", note)
+        self.assertNotIn("now records it", note)
 
     def test_reset_without_any_earlier_title_still_refuses(self) -> None:
         with TemporaryDirectory() as directory:
@@ -267,9 +315,9 @@ class UserStateLaunchToolTests(unittest.TestCase):
                 ),
             ]
             state.apply(items)
-            self.assertEqual(items[0].active_launch_tool, "codex")
-            self.assertEqual(items[1].active_launch_tool, "claude")
-            self.assertEqual(items[2].active_launch_tool, "codex")
+            self.assertEqual(active_launch_tool(items[0]), "codex")
+            self.assertEqual(active_launch_tool(items[1]), "claude")
+            self.assertEqual(active_launch_tool(items[2]), "codex")
 
     def test_launch_tool_preference_round_trips(self) -> None:
         with TemporaryDirectory() as directory:
@@ -299,7 +347,7 @@ class UserStateLaunchToolTests(unittest.TestCase):
             )
             state.apply([fallback])
             self.assertEqual(fallback.launch_tool, "")
-            self.assertEqual(fallback.active_launch_tool, "claude")
+            self.assertEqual(active_launch_tool(fallback), "claude")
 
 
 class AgentTagTests(unittest.TestCase):

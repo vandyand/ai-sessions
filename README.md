@@ -195,14 +195,16 @@ Conversions run through a harness-neutral conversation rather than pairwise, so 
 for another CLI costs one adapter rather than a converter per existing harness. The current
 bridge registry requires a name and label, a conservative budget policy, plus four operations: read a transcript into
 `Turn` objects, write `Turn` objects as a resumable native session, locate a native id, and
-detect meaningful transcript changes after a byte cursor. Bridging and head tracking in
+detect meaningful transcript changes after a byte cursor. The same adapter also owns native
+discovery, resume arguments, title publication, liveness evidence, native-id patterns, labels,
+ordering, home-directory semantics, and its launch/budget policy. Bridging and head tracking in
 both directions then work without pairwise logic.
 
-This seam covers bridging and conversation advancement. Discovery, resume commands,
-naming, message counts, and open-session detection are still provider-specific in
-`app.py`, because each CLI records them differently — Codex in a SQLite state database and
-lock files, Claude Code in a PID registry and per-project transcript directories. The
-target adapter contract and the migration sequence are specified in
+The registry is dynamic: CLI choices, keyed schema-3 provider profiles, list/browser rendering,
+discovery, liveness, naming, and conversion all query it at runtime. Unsupported capabilities
+and unknown harnesses fail explicitly instead of borrowing Claude or Codex behavior. A test-only
+third on-disk format exercises the whole contract without reusing either built-in adapter. The
+complete target contract is specified in
 [`specs/conversation-log/HARNESS_CONTRACT.md`](specs/conversation-log/HARNESS_CONTRACT.md).
 
 A Codex writer has one non-obvious obligation. Codex records the model's context
