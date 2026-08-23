@@ -13,6 +13,7 @@ from ai_sessions.app import (
     UserState,
     available_launch_tools,
     build_parser,
+    filtered_sessions,
     list_output,
 )
 from ai_sessions.capabilities import Unsupported
@@ -28,6 +29,25 @@ class RegistryTests(unittest.TestCase):
         install()
         self.assertEqual(REGISTRY.names(), ("codex", "claude"))
         self.assertEqual(REGISTRY.generation, before)
+
+    def test_equal_time_sort_is_independent_of_discovery_order(self) -> None:
+        def row(tool: str, session_id: str) -> Session:
+            return Session(
+                tool=tool,
+                session_id=session_id,
+                title="same",
+                cwd="/same",
+                updated=10,
+                created=10,
+                preview="",
+                named=True,
+                storage="",
+            )
+
+        rows = [row("claude", "b"), row("codex", "a"), row("claude", "a")]
+        forward = [item.key for item in filtered_sessions(rows, sort_mode="recent")]
+        backward = [item.key for item in filtered_sessions(reversed(rows), sort_mode="recent")]
+        self.assertEqual(forward, backward)
 
     def test_duplicate_and_ambiguous_names_are_rejected(self) -> None:
         registry = Registry()

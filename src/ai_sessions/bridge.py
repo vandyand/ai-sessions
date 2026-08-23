@@ -1212,7 +1212,7 @@ class _UnstableSnapshot(RuntimeError):
 
 
 def conversation_change_status(tool: str, storage: str | Path, offset: int) -> str:
-    """Return ``unchanged``, ``changed``, or ``unstable`` after a frontier."""
+    """Classify semantic activity, instability, or unavailable harness support."""
     if tool not in REGISTRY:
         return "unknown"
     path = Path(storage)

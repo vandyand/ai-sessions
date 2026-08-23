@@ -17,3 +17,5 @@ def install() -> None:
     for adapter in (CODEX, CLAUDE):
         if adapter.name not in REGISTRY:
             REGISTRY.register(adapter)
+        elif REGISTRY.get(adapter.name) is not adapter:
+            raise ValueError(f"built-in harness name is already registered: {adapter.name}")

@@ -15,6 +15,8 @@ class Registry:
     def __init__(self) -> None:
         self._adapters: dict[str, HarnessAdapter] = {}
         self._generation = 0
+        self._ordered_generation = -1
+        self._ordered: tuple[HarnessAdapter, ...] = ()
 
     @property
     def generation(self) -> int:
@@ -58,7 +60,12 @@ class Registry:
             raise KeyError(f"unknown harness: {name}") from None
 
     def adapters(self) -> tuple[HarnessAdapter, ...]:
-        return tuple(sorted(self._adapters.values(), key=lambda item: (item.order, item.name)))
+        if self._ordered_generation != self._generation:
+            self._ordered = tuple(
+                sorted(self._adapters.values(), key=lambda item: (item.order, item.name))
+            )
+            self._ordered_generation = self._generation
+        return self._ordered
 
     def names(self) -> tuple[str, ...]:
         return tuple(adapter.name for adapter in self.adapters())

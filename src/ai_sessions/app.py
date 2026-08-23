@@ -2015,34 +2015,77 @@ def filtered_sessions(
         if matched:
             matches.append((score, item))
     if query:
-        return [item for _, item in sorted(matches, key=lambda pair: (-pair[0], -pair[1].updated))]
+        return [
+            item
+            for _, item in sorted(
+                matches,
+                key=lambda pair: (
+                    -pair[0],
+                    -pair[1].updated,
+                    pair[1].tool,
+                    pair[1].session_id,
+                ),
+            )
+        ]
     if sort_mode == "title":
         return [
             item
             for _, item in sorted(
-                matches, key=lambda pair: (display_title(pair[1]).casefold(), -pair[1].updated)
+                matches,
+                key=lambda pair: (
+                    display_title(pair[1]).casefold(),
+                    -pair[1].updated,
+                    pair[1].tool,
+                    pair[1].session_id,
+                ),
             )
         ]
     if sort_mode == "directory":
         return [
             item
             for _, item in sorted(
-                matches, key=lambda pair: (pair[1].cwd.casefold(), -pair[1].updated)
+                matches,
+                key=lambda pair: (
+                    pair[1].cwd.casefold(),
+                    -pair[1].updated,
+                    pair[1].tool,
+                    pair[1].session_id,
+                ),
             )
         ]
     if sort_mode == "messages":
         return [
             item
             for _, item in sorted(
-                matches, key=lambda pair: (-pair[1].message_count, -pair[1].updated)
+                matches,
+                key=lambda pair: (
+                    -pair[1].message_count,
+                    -pair[1].updated,
+                    pair[1].tool,
+                    pair[1].session_id,
+                ),
             )
         ]
     if sort_mode == "open":
         return [
             item
-            for _, item in sorted(matches, key=lambda pair: (not pair[1].is_open, -pair[1].updated))
+            for _, item in sorted(
+                matches,
+                key=lambda pair: (
+                    not pair[1].is_open,
+                    -pair[1].updated,
+                    pair[1].tool,
+                    pair[1].session_id,
+                ),
+            )
         ]
-    return [item for _, item in sorted(matches, key=lambda pair: -pair[1].updated)]
+    return [
+        item
+        for _, item in sorted(
+            matches,
+            key=lambda pair: (-pair[1].updated, pair[1].tool, pair[1].session_id),
+        )
+    ]
 
 
 def relative_time(value: float) -> str:
