@@ -10,7 +10,7 @@ Priorities are ordered by evidence strength and independence, not by architectur
 
 ## Current state
 
-`ai-sessions` 3.1.5 plus merged P2 (`5e5503e`) and completed P3 (`e15f73f`). Bridging has a neutral `Turn` model, per-harness readers and writers, and a `HARNESSES` registry in `bridge.py`. P1 fixed selection at Codex compaction boundaries. P2 adds utility-owned conversation ids, native members, equivalence frontiers, append cursors, head routing, and explicit divergence. P3 adds adapter-owned token budgets and whole-source-message selection. The remaining identity work is finer-grained provenance: ordered live segments and original-form projection.
+`ai-sessions` 3.1.5 plus merged P2 (`5e5503e`), completed P3 (`e15f73f`), and the generic harness boundary implemented through `ac16e41` with CI validation pending. P1 fixed selection at Codex compaction boundaries. P2 adds utility-owned conversation ids, native members, equivalence frontiers, append cursors, head routing, and explicit divergence. P3 adds target-owned token budgets and whole-source-message selection. One dynamic registry now routes the complete Claude/Codex runtime surface through immutable `HarnessAdapter` objects, and an independent third-format fixture proves late registration without core edits. The remaining identity work is finer-grained provenance: ordered live segments and original-form projection.
 
 The two failures that started this effort were:
 
@@ -135,6 +135,20 @@ for same-origin runs, fork resolution, and resume-from-a-point then fall out.
 
 Done when: a Codex → Claude → Codex trip keeps the Codex-origin portion in native form, and `specs/` records how a third harness would be added.
 
+### P4 prerequisite — generic harness boundary **(IMPLEMENTED as of ac16e41; CI pending)**
+
+Discovery, launch construction, configuration, naming, liveness, transcript conversion,
+semantic-tail detection, budgeting, filtering, and display now consume one ordered dynamic
+registry. Claude and Codex own their native formats and process/storage behavior in isolated
+adapters; neither imports or names the other. Unknown provider state and schema-3 profiles
+survive round trips even when their adapter is absent.
+
+A genuine test-only third format supplies its own records and every runtime hook. Registering it
+after `app` import changes discovery, CLI choices, browser rendering, resume commands, naming,
+liveness, budgets, and bidirectional bridges, then reverses cleanly on context exit. Twenty-six
+named mutation gates, a provider-name AST gate, 247-test Windows/Linux runs, and repeated Opus 5
+reviews establish the seam before OpenCode is allowed to exercise it in production.
+
 ## Key decisions
 
 - **D1 — A concept enters the neutral model only when two or more harnesses need it.** Compaction qualifies: Codex marks `compacted`, Claude marks `isCompactSummary`. `replacement_history` does not — it is one harness's expression of a shared idea and stays inside `read_codex`. *Alternative rejected:* a canonical format that is lossless for every harness. That path ends in tracking every harness's quirks forever.
@@ -179,8 +193,10 @@ Every `/feature plan` generated from this doc ends with a final Doc Sync phase t
 ## References
 
 - Design pass, rendered: https://claude.ai/code/artifact/d3dc3a4d-fbc8-48f5-bc7f-6fe2e26f8d17
-- `src/ai_sessions/bridge.py` — `Turn`, `read_codex`, `read_claude`, `from_last_compaction`, `fit`, `HARNESSES`
+- `src/ai_sessions/model.py`, `capabilities.py`, and `registry.py` — neutral types, the complete adapter contract, and dynamic registration
+- `src/ai_sessions/conversion.py` — harness-neutral reading, selection, materialization, and semantic-tail routing
+- `src/ai_sessions/harnesses/` — isolated Claude and Codex native adapters
 - `src/ai_sessions/app.py` — `prepare_launch`, `command_for`, `UserState.resolve_launch`, `UserState.set_bridge`
 - [`HARNESS_CONTRACT.md`](HARNESS_CONTRACT.md) — current adapter seam and the complete target contract
 - Measured against `~/.codex/sessions/2026/07/13/rollout-…-019f59af-….jsonl` and `~/.claude/projects/…/776daa15-….jsonl`
-- Released through 3.1.5; P2 merged to `main` as `5e5503e`; P3 implementation completed as `e15f73f`
+- Released through 3.1.5; P2 merged to `main` as `5e5503e`; P3 completed as `e15f73f`; the generic harness prerequisite is implemented through `ac16e41` pending CI

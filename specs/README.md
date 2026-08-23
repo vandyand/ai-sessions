@@ -1,8 +1,8 @@
 # Specifications
 
-*Auto-generated on 2026-08-23 03:58*
+*Auto-generated on 2026-08-23 08:40*
 
-## Planned
+## In Progress
 
 - [Generic Harness Adapter Boundary](conversation-log/generic-harness-adapter/README.md)
 

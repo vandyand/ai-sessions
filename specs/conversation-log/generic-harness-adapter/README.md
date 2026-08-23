@@ -1,6 +1,6 @@
 ---
 title: "Generic Harness Adapter Boundary"
-status: planned
+status: in-progress
 date: 2026-08-23
 priority: 30
 ---
@@ -101,11 +101,11 @@ are specified in [implementation-plan.md](implementation-plan.md).
 - [x] Second Opus 5 plan review *(HIGH=3 MEDIUM=4; all incorporated before code)*
 - [x] Third Opus 5 plan review *(HIGH=0 MEDIUM=2; enforcement gaps incorporated)*
 - [x] Final Opus 5 plan review *(CLEAN — GO; HIGH=0 MEDIUM=0)*
-- [ ] Characterization and mutation tests
-- [ ] Generic adapter/registry and config profile
-- [ ] Claude and Codex runtime routing
-- [ ] Discovery/liveness routing
-- [ ] Adversarial implementation review and doc sync
+- [x] Characterization and mutation tests
+- [x] Generic adapter/registry and config profile
+- [x] Claude and Codex runtime routing
+- [x] Discovery/liveness routing
+- [x] Adversarial implementation review and doc sync
 
 ## Initial plan-review findings
 
@@ -132,3 +132,24 @@ registry generation monotone across unregistration/context exit and added explic
 ID plus 4,096-token evidence-bound mutations. Five LOW corrections moved provider paths out of
 the neutral root, made the terminal-width reserve dynamic, validated registry names, clarified
 the non-raising membership check, and expanded the then-twenty mutation gates.
+
+## Implementation-review findings
+
+Focused Opus 5 passes reviewed conversion, discovery, liveness, and the independent third-format
+fixture as each phase landed. They found and closed overlapping-ID self-attribution, incomplete
+evidence-cache invalidation, mutable/shared liveness context, Windows PID-reuse ambiguity,
+case-sensitive foreign-ID lookup, fixture-hook reuse, compaction-window mismatch, and structural
+gate exemptions that were broader than their named compatibility scopes.
+
+The final path-boundary cleanup review initially returned HIGH=0, MEDIUM=5, LOW=2. Three
+evidence-backed improvements followed: empty environment overrides now mean unset, unsupported
+publication proves the whole provider home remains untouched, and provider-home constants are
+structurally confined to `HarnessAdapter(home=...)`. Required `BudgetPolicy` validation and a
+repository-wide reference audit disproved the two remaining proposed scenarios. A follow-up found
+one provider-variable/default coverage gap; fresh-interpreter Windows and Linux tests closed it.
+The final focused Opus 5 verdict was **CLEAN**.
+
+The completed implementation spans `b66975b` through `ac16e41`. Its final tree passes 247 tests
+on native Windows and 247 on Ubuntu WSL (one intentional Windows-only focus skip) plus Ruff lint
+and format checks. OpenCode remains deliberately outside this phase and is now the production
+acceptance test for the completed seam.

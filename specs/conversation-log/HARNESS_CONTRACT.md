@@ -29,18 +29,28 @@ The selected row is only a user entry point. Launch resolves the conversation fi
 follows its head, then either reuses an equivalent member in the requested harness or
 materializes a new one. A native UUID mentioned in transcript prose is never identity.
 
-## Current bridge adapter
+## Runtime adapter
 
-`bridge.Harness` currently owns the operations needed by conversion and head detection:
+One immutable `HarnessAdapter` owns the complete native boundary:
 
 ```text
-name, label
+name, label, short_label, order, home
+default_command, dangerous_args, resume_args(...)
+source_kinds, id_patterns, scratch_patterns
+discover(context) -> Iterable[NativeSession]
+publish_name(session, title) -> note
+inspect_liveness(context, home, sessions) -> Mapping[id, pid]
 read(path, options) -> Transcript
 write(cwd, turns, title) -> (native_id, path)
 locate(native_id) -> bool
 change_status(path, byte_cursor) -> unchanged | changed | unstable
 budget -> BudgetPolicy(context_tokens, usable_fraction, chars_per_token, source)
 ```
+
+The ordered registry is dynamic and process-local. Built-ins push complete adapters during
+package initialization; the registry never imports providers. Core consumers query it at call
+time, so scoped late registration participates in CLI choices, configuration, discovery,
+rendering, liveness, naming, and conversion without refreshing an import-time snapshot.
 
 `read` projects native records into the shared `Turn` model. `write` must produce a truly
 resumable native transcript, including any separate records needed for both model context
@@ -77,17 +87,13 @@ decrease survivor count or increase dropped-message count. `BridgeResult` and bo
 distinguish selected source-message count, assembled target-message count, dropped messages,
 and marker-truncated anchors.
 
-## Complete adapter target
+## Runtime ownership
 
-The remaining provider branches in `app.py` should move behind the same adapter in this
-order:
-
-1. `discover(context) -> Iterable[NativeSession]` — enumerate sessions and provider metadata.
-2. `resume_argv(native_id, mode, options) -> list[str]` — construct a shell-free command.
-3. `publish_name(session, title) -> PublishResult` — append the provider-supported name.
-4. `inspect_liveness(context, sessions) -> Mapping[id, NativeProcess]` — identify open
-   sessions from one shared process/lock snapshot.
-5. The existing `read`, `write`, `locate`, and `change_status` conversion operations.
+Provider-specific discovery, resume syntax, title publication, liveness evidence, transcript
+formats, caches, native-id patterns, and budget policy are all behind the adapter. Generic core
+code contains no provider-name routing maps or comparisons outside explicit schema-2
+configuration compatibility. Unsupported optional capabilities return an explicit reason;
+unknown harnesses never borrow another provider's behavior.
 
 Terminal focus is a platform/core capability over a verified open PID, not a harness hook.
 On Windows exact tab focus is unsupported for every current harness; on Linux the same
@@ -100,9 +106,8 @@ frontiers, superseded state, or divergence. Its source kind is a closed neutral 
 It is string-serializable for search/detail/JSON output, while provider facts such as archived
 status remain explicit `NativeSession` fields instead of being guessed from source kind.
 
-Capabilities should be explicit (`rename`, `subagents`, `compaction`, read, write, discovery,
-liveness, budget policy, and so on)
-rather than detected with `if tool == ...` in core code. Provider-specific caches and
+Capabilities are explicit rather than detected with `if tool == ...` in core code.
+Provider-specific caches and
 database schemas belong inside the adapter. The core owns filtering, display, conversation
 state, head resolution, launch policy, and error presentation.
 
