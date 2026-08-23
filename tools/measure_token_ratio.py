@@ -95,7 +95,8 @@ def corpus() -> dict[str, str]:
 def main() -> None:
     encoding = tiktoken.get_encoding("o200k_base")
     ratios: list[float] = []
-    for name, sample in corpus().items():
+    samples = corpus()
+    for name, sample in samples.items():
         tokens = len(encoding.encode(sample))
         ratio = len(sample) / tokens
         ratios.append(ratio)
@@ -103,8 +104,11 @@ def main() -> None:
             f"{name:12} chars={len(sample):7} tokens={tokens:7} "
             f"chars/token={ratio:.3f}"
         )
+    mixture = "\n".join(samples.values())
+    mixture_ratio = len(mixture) / len(encoding.encode(mixture))
     print(
-        f"min={min(ratios):.3f} median={statistics.median(ratios):.3f} "
+        f"min={min(ratios):.3f} mixture={mixture_ratio:.3f} "
+        f"median={statistics.median(ratios):.3f} "
         f"max={max(ratios):.3f} tiktoken={tiktoken.__version__} encoding=o200k_base"
     )
 

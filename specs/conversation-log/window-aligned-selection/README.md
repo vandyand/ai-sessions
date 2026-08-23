@@ -37,12 +37,12 @@ Those measurements made Part B worth reviewing, but did not make it correct. The
 |---|---|---|---|
 | K1 | Ship Part A first, independently | It is unambiguous, self-contained, and its correctness does not depend on Part B's riskier merge rule | Bundle both, and let a contested ordering question hold up a clear fix |
 | K2 | Token-denominated config key; explicit legacy `max_chars` stays verbatim, except the exact version-1 machine default | Old versions auto-wrote 950,000, so schema-aware migration must distinguish that ambiguous default from version-2 explicit intent | Preserve every auto-written value and leave the target defect in place |
-| K3 | Estimate with the generated-corpus minimum rounded down to 1.0 chars/token | Dense CJK, base64, hashes, and minified data invalidate a prose ratio; the OpenAI tokenizer measurement is disclosed as a proxy for Claude | Claim exact token counts or use an interpolated seven-class p10 |
+| K3 | Estimate with the 2.318 full-corpus mixture rounded down to 2.0 chars/token | Dense classes invalidate a prose ratio, while a pure-class minimum double-counts conservatism with the separate 0.75 harness margin; the OpenAI measurement is disclosed as a Claude proxy | Claim exact token counts or equate tokens with characters |
 | K4 | Budget policy lives on each target `Harness` | The target model is unknown, so each adapter declares a conservative baseline, safety factor, and provenance without target-name branches in core | Infer private overhead or key policy by `if target == ...` |
 | K5 | Select before same-role merging and drop at source-message boundaries | `prepare()` currently erases message boundaries before `fit()`; selection must retain a real unit and honest dropped count | Continue selecting merged runs |
 | K6 | **Part B does not ship.** The newest window is what the source itself resumes from, so a copy matching it is correct by construction | Merging older windows creates a transcript no harness ever held, and there is no stable message identity to deduplicate on | Recover the 10–41% because the number is non-zero |
 | K7 | One immutable resolved `Budget` flows from loaded config to selection and the note | This prevents config, applied ceiling, and user-facing explanation from diverging | Pass raw integers through parallel paths |
-| K8 | Reserve a bounded 4,096 characters for the note; the total projected payload stays under the applied ceiling | A fixed checked reserve is monotone and makes metadata part of the budget without a count-dependent selection loop | Treat metadata as free or iterate toward an unstable note size |
+| K8 | Reserve a bounded 4,096 characters for the note and price conversation after same-role assembly; total projected payload stays under the ceiling | A fixed checked reserve is monotone, while a sequence cost includes every `\n\n` separator introduced after pre-merge selection | Treat metadata or assembly separators as free |
 | K9 | A conversation that fits is byte-identical; anchor truncation exists only on overflow | The old half-budget cap changed content even when the whole conversation fit | Apply a per-message cap before checking total size |
 
 ## Success Criteria
@@ -63,8 +63,8 @@ P1's corrected **R5** still applies: anything claiming a memory property must be
 ## Open Questions
 
 1. ~~Is Part B worth its risk?~~ **Answered on review: no.** Recorded in the north star as decided against.
-2. ~~**What default budget per target?**~~ **Answered:** Claude 150,000 estimated tokens / 150,000 characters; Codex 193,800 / 193,800, derived from adapter baselines at a declared 0.75 usable fraction.
-3. ~~**Which chars-per-token ratio?**~~ **Answered:** 1.0, below the generated-corpus minimum of 1.143; runtime remains tokenizer-free and the Claude use is explicitly a proxy.
+2. ~~**What default budget per target?**~~ **Answered:** Claude 150,000 estimated tokens / 300,000 characters; Codex 192,000 / 384,000, derived from adapter baselines at a declared 0.75 usable fraction.
+3. ~~**Which chars-per-token ratio?**~~ **Answered:** 2.0, below the generated full-corpus mixture of 2.318; runtime remains tokenizer-free and the Claude use is explicitly a proxy.
 4. ~~**Which side should estimation error favor?**~~ **Answered:** underfill, with explicit `max_tokens` available when the user knows the target model.
 
 ## Implementation Status

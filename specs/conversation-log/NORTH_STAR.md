@@ -97,7 +97,7 @@ Replace the single global character ceiling with an explicit token-denominated p
 
 Do **not** merge older `replacement_history` windows. The newest replacement history is the context Codex itself resumes from; merging earlier windows could resurrect superseded instructions and create a transcript no harness ever held.
 
-Done when: the budget names its unit, is derived per target harness, legacy `max_chars` configuration retains its meaning, and end-to-end tests prove selection drops complete messages rather than slicing arbitrary transcript text.
+Done when: the budget names its unit, is derived per target harness, explicit legacy `max_chars` retains its meaning except for the documented version-1 auto-written default migration, and end-to-end tests prove selection drops complete messages rather than slicing arbitrary transcript text.
 
 ### P4 — The full conversation log
 

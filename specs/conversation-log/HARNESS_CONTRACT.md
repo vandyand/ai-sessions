@@ -102,7 +102,10 @@ an unset configuration to resolve through that policy, and the same explicit leg
 the full conversation-log phase can account for native-versus-projected forms and assembly
 overhead without rewriting the selection algorithm. That callback prices a complete candidate
 sequence in the applied budget's character unit; a per-message callback is insufficient because
-same-role merge separators depend on adjacency.
+same-role merge separators depend on adjacency. The selection metric also supplies a matching
+`truncate(turn, limit)` operation; core verifies that sequence cost is monotone and that a
+truncated anchor fits its assigned share. P3's default metric prices the text produced by
+`merge_runs`, including separators and stripping, in `Budget.chars`.
 
 ## Persistence and recovery
 
