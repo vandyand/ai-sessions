@@ -18,6 +18,8 @@ from ai_sessions.app import (
 from ai_sessions.bridge import (
     HARNESSES,
     BridgeError,
+    Budget,
+    BudgetPolicy,
     ToolCall,
     Transcript,
     Turn,
@@ -27,6 +29,9 @@ from ai_sessions.bridge import (
     merge_runs,
     prepare,
     read_turns,
+    resolve_budget,
+    select_messages,
+    selection_cost,
     write_claude_session,
     write_codex_session,
 )
@@ -273,6 +278,55 @@ class ShapingTests(unittest.TestCase):
         self.assertEqual(dropped, 0)
         self.assertIn("message truncated", kept[0].text)
 
+    def test_target_defaults_and_legacy_override_resolve_distinctly(self) -> None:
+        claude = resolve_budget("claude")
+        codex = resolve_budget("codex")
+        self.assertEqual((claude.tokens, claude.chars), (150_000, 300_000))
+        self.assertEqual((codex.tokens, codex.chars), (192_000, 384_000))
+        self.assertEqual(resolve_budget("claude", max_chars=950_000).chars, 950_000)
+        self.assertTrue(resolve_budget("claude", max_chars=950_000).over_policy)
+        self.assertEqual(
+            resolve_budget("claude", migrated=True).origin, "target-default-migrated"
+        )
+
+    def test_token_budget_applies_ratio_and_precedence(self) -> None:
+        budget = resolve_budget("claude", max_tokens=5_000, max_chars=950_000)
+        self.assertEqual(
+            (budget.tokens, budget.chars, budget.origin),
+            (5_000, 10_000, "config.max_tokens"),
+        )
+
+    def test_too_small_legacy_character_budget_fails(self) -> None:
+        with self.assertRaisesRegex(BridgeError, "must be at least"):
+            resolve_budget("claude", max_chars=100)
+
+    def test_fit_through_prices_same_role_joins(self) -> None:
+        turns = [Turn("user", "x" * 10) for _ in range(10)]
+        self.assertEqual(selection_cost(turns), 118)
+        selected = select_messages(turns, 117)
+        self.assertGreater(selected.dropped, 0)
+        self.assertLessEqual(selection_cost(selected.turns), 117)
+
+    def test_overflow_keeps_first_and_contiguous_newest_suffix(self) -> None:
+        turns = [Turn("user", str(index) * 40) for index in range(8)]
+        selected = select_messages(turns, 180)
+        self.assertEqual(selected.turns[0].text, turns[0].text)
+        kept_text = [turn.text for turn in selected.turns[1:]]
+        self.assertEqual(kept_text, [turn.text for turn in turns[-len(kept_text) :]])
+
+    def test_oversized_newest_anchor_is_truncated_and_disclosed(self) -> None:
+        selected = select_messages(
+            [Turn("user", "short"), Turn("assistant", "x" * 50_000)], 2_000
+        )
+        self.assertEqual((selected.dropped, selected.truncated), (0, 1))
+        self.assertIn("message truncated", selected.turns[-1].text)
+
+    def test_budget_policy_rejects_invalid_registration(self) -> None:
+        with self.assertRaises(ValueError):
+            BudgetPolicy(1, 0.0, 2.0, "bad")
+        with self.assertRaises(ValueError):
+            Budget("claude", 1, 1, "target-default")
+
     def test_bridged_title_names_the_origin(self) -> None:
         self.assertEqual(
             bridged_title("ai-sessions-cli-util", "codex"), "ai-sessions-cli-util (from Codex)"
@@ -388,6 +442,12 @@ class CompactionTests(unittest.TestCase):
 
 class HarnessRegistryTests(unittest.TestCase):
     def test_every_harness_is_self_consistent(self) -> None:
+        for entry in HARNESSES.values():
+            self.assertGreater(entry.budget.context_tokens, 0)
+            self.assertGreater(entry.budget.usable_fraction, 0)
+            self.assertLessEqual(entry.budget.usable_fraction, 1)
+            self.assertGreater(entry.budget.chars_per_token, 0)
+            self.assertTrue(entry.budget.source)
         for name, entry in HARNESSES.items():
             self.assertEqual(name, entry.name)
             self.assertTrue(entry.label)
@@ -543,6 +603,33 @@ class BridgeTests(unittest.TestCase):
             self.assertEqual(source.read_bytes(), before)
             self.assertNotEqual(result.path, source)
 
+    def test_explicit_token_budget_changes_written_payload_end_to_end(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            source = Path(directory) / "source.jsonl"
+            source.write_text(
+                "\n".join(
+                    codex_line("user" if index % 2 == 0 else "assistant", str(index) * 2_000)
+                    for index in range(20)
+                )
+                + "\n",
+                encoding="utf-8",
+            )
+            budget = resolve_budget("claude", max_tokens=5_000)
+            with patch.object(bridge, "CLAUDE_HOME", Path(directory) / "claude"):
+                result = bridge.bridge(
+                    source_tool="codex",
+                    target_tool="claude",
+                    session_id="source-session",
+                    storage=str(source),
+                    cwd=directory,
+                    budget=budget,
+                )
+            written = read_turns("claude", result.path)
+        self.assertEqual((result.budget.tokens, result.budget.chars), (5_000, 10_000))
+        self.assertGreater(result.dropped, 0)
+        self.assertLessEqual(sum(len(turn.text) for turn in written), 10_000)
+        self.assertIn("approximately 5,000 tokens / 10,000 projected characters", written[0].text)
+
     def test_bridging_into_the_recording_harness_is_refused(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             with self.assertRaises(BridgeError):
@@ -632,7 +719,7 @@ class LaunchIntegrationTests(unittest.TestCase):
             item = session(directory, launch_tool="claude")
             with patch.object(bridge, "CLAUDE_HOME", Path(directory) / "claude"):
                 prepared, note = prepare_launch(item)
-            self.assertIn("Copied 2 message(s)", note)
+                self.assertIn("Copied 2 source message(s), assembled as 2 target message(s)", note)
             argv = command_for(prepared, LaunchConfig())
             self.assertEqual(argv[:2], ["claude", "--resume"])
             self.assertNotEqual(argv[2], item.session_id)
@@ -937,6 +1024,7 @@ class LaunchIntegrationTests(unittest.TestCase):
                 write=entry.write,
                 locate=entry.locate,
                 change_status=lambda *_: next(outcomes),
+                budget=entry.budget,
             )
 
             with patch.dict(HARNESSES, {"codex": retrying}):

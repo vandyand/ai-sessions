@@ -30,13 +30,13 @@ from typing import Any, Iterable
 from . import __version__ as VERSION
 from .bridge import (
     BRIDGE_TOOLS,
-    DEFAULT_MAX_CHARS,
     BridgeError,
     append_jsonl,
     bridge,
     complete_jsonl_cursor,
     conversation_change_status,
     native_session_exists,
+    resolve_budget,
 )
 from .config import LAUNCH_MODES, LaunchConfig
 from .diagnostics import clear_warnings, record_warning
@@ -2932,7 +2932,7 @@ def prepare_launch(
     session: Session,
     *,
     state: UserState | None = None,
-    max_chars: int = 0,
+    config: LaunchConfig | None = None,
     tool_calls: bool = True,
     latest_window: bool = True,
 ) -> tuple[Session, str]:
@@ -2998,6 +2998,12 @@ def prepare_launch(
                 f"{stale}Continuing the {TOOL_LABELS[tool]} copy of this session ({existing})."
             )
         conversation_id = state.conversation_id_for(session, create=True)
+    budget = resolve_budget(
+        tool,
+        max_tokens=config.bridge_max_tokens if config is not None else None,
+        max_chars=config.bridge_max_chars if config is not None else None,
+        migrated=config.bridge_max_chars_migrated if config is not None else False,
+    )
     result = bridge(
         source_tool=session.tool,
         target_tool=tool,
@@ -3005,7 +3011,7 @@ def prepare_launch(
         storage=session.storage,
         cwd=strip_extended_prefix(session.cwd) or str(HOME),
         title=session.title,
-        max_chars=max_chars or DEFAULT_MAX_CHARS,
+        budget=budget,
         tool_calls=tool_calls,
         latest_window=latest_window,
         conversation_id=conversation_id,
@@ -3018,13 +3024,27 @@ def prepare_launch(
             str(result.path),
             source_cursor=result.source_cursor,
         )
-    carried = f"{result.turns} message(s)"
+    carried = (
+        f"{result.turns} source message(s), assembled as "
+        f"{result.written_turns} target message(s)"
+    )
     if result.calls:
         carried += f" and {result.calls} summarised tool call(s)"
     dropped = f", {result.dropped} older message(s) dropped to fit" if result.dropped else ""
+    truncated = (
+        f", {result.truncated} anchor message(s) truncated to fit" if result.truncated else ""
+    )
+    budget_notice = ""
+    if result.budget.origin == "target-default-migrated":
+        budget_notice = " Migrated the legacy 950,000-character default to target policy."
+    elif result.budget.over_policy:
+        budget_notice = (
+            " The legacy max_chars override exceeds target policy; delete it or set "
+            "max_tokens to change this."
+        )
     note = (
         f"{stale}Copied {carried} into a new {TOOL_LABELS[tool]} session "
-        f"{result.session_id}{dropped}."
+        f"{result.session_id}{dropped}{truncated}.{budget_notice}"
     )
     return attach(result.session_id, str(result.path)), note
 
@@ -3042,7 +3062,7 @@ def launch(
         session, note = prepare_launch(
             session,
             state=state,
-            max_chars=config.bridge_max_chars,
+            config=config,
             tool_calls=config.bridge_tool_calls,
             latest_window=config.bridge_latest_window,
         )

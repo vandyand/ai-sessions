@@ -197,7 +197,7 @@ Direct `python -` against the working tree. Each phase states the expression and
 
 - [x] Assert real assembled payload bytes alongside the independent join-cost oracle
 - [x] Clarify reader-vs-selector memory instruments and give selection allocation a failing bound
-- [ ] Final focused Opus 5 confirmation must return CLEAN before Phase 1 implementation
+- [x] Final focused Opus 5 confirmation returned **CLEAN and GO** on `e1ad304` using `claude-opus-5` at max effort; no artifact was written
 
 ---
 

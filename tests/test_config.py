@@ -66,6 +66,43 @@ class LaunchConfigTests(unittest.TestCase):
             ["codex", "--sandbox", "workspace-write"],
         )
 
+    def test_missing_budget_stays_unset_when_saved(self) -> None:
+        with TemporaryDirectory() as directory:
+            path = Path(directory) / "config.toml"
+            config = LaunchConfig(path=path)
+            config.save()
+            text = path.read_text(encoding="utf-8")
+            loaded = LaunchConfig.load(path)
+        self.assertIn("version = 2", text)
+        self.assertNotIn("max_chars", text)
+        self.assertNotIn("max_tokens", text)
+        self.assertIsNone(loaded.bridge_max_chars)
+        self.assertIsNone(loaded.bridge_max_tokens)
+
+    def test_schema_one_machine_default_migrates_but_schema_two_is_explicit(self) -> None:
+        with TemporaryDirectory() as directory:
+            path = Path(directory) / "config.toml"
+            path.write_text("version = 1\n[bridge]\nmax_chars = 950000\n", encoding="utf-8")
+            migrated = LaunchConfig.load(path)
+            path.write_text("version = 2\n[bridge]\nmax_chars = 950000\n", encoding="utf-8")
+            explicit = LaunchConfig.load(path)
+        self.assertTrue(migrated.bridge_max_chars_migrated)
+        self.assertIsNone(migrated.bridge_max_chars)
+        self.assertFalse(explicit.bridge_max_chars_migrated)
+        self.assertEqual(explicit.bridge_max_chars, 950_000)
+
+    def test_token_budget_survives_save_without_resurrecting_characters(self) -> None:
+        with TemporaryDirectory() as directory:
+            path = Path(directory) / "config.toml"
+            original = LaunchConfig(path=path, bridge_max_tokens=12_345)
+            original.save()
+            loaded = LaunchConfig.load(path)
+            text = path.read_text(encoding="utf-8")
+        self.assertEqual(loaded.bridge_max_tokens, 12_345)
+        self.assertIsNone(loaded.bridge_max_chars)
+        self.assertIn("max_tokens = 12345", text)
+        self.assertNotIn("max_chars", text)
+
 
 if __name__ == "__main__":
     unittest.main()

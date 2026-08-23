@@ -26,6 +26,7 @@ from __future__ import annotations
 import datetime as dt
 import functools
 import json
+import math
 import os
 import re
 import secrets
@@ -39,7 +40,18 @@ from .paths import CLAUDE_HOME, CODEX_HOME
 
 # A bridged transcript is replayed into the target's context window in full,
 # so the ceiling is a context budget rather than a storage one.
-DEFAULT_MAX_CHARS = 950_000
+LEGACY_DEFAULT_MAX_CHARS = 950_000
+# Compatibility alias for callers of the pre-P3 shaping helper. Production
+# bridge launches resolve a target-owned Budget instead.
+DEFAULT_MAX_CHARS = LEGACY_DEFAULT_MAX_CHARS
+TRUNCATION_MARKER = "\n\n[... message truncated ...]"
+HANDOFF_NOTE_RESERVE_CHARS = 4_096
+MIN_BRIDGE_CHARS = HANDOFF_NOTE_RESERVE_CHARS + 2 * (len(TRUNCATION_MARKER) + 1) + 2
+MIN_BUDGET_TOKENS = 4_096
+CLAUDE_BUDGET_CONTEXT_TOKENS = 200_000
+CODEX_BUDGET_CONTEXT_TOKENS = 256_000
+DEFAULT_USABLE_FRACTION = 0.75
+DEFAULT_CHARS_PER_TOKEN = 2.0
 REQUEST_CHARS = 300
 RESULT_CHARS = 500
 CLAUDE_VERSION = "2.1.227"
@@ -106,14 +118,70 @@ class Turn:
 
 
 @dataclass(frozen=True, slots=True)
+class BudgetPolicy:
+    context_tokens: int
+    usable_fraction: float
+    chars_per_token: float
+    source: str
+
+    def __post_init__(self) -> None:
+        if self.context_tokens <= 0:
+            raise ValueError("budget context_tokens must be positive")
+        if not 0 < self.usable_fraction <= 1:
+            raise ValueError("budget usable_fraction must be in (0, 1]")
+        if self.chars_per_token <= 0:
+            raise ValueError("budget chars_per_token must be positive")
+        if not self.source.strip():
+            raise ValueError("budget policy source must not be empty")
+        default_chars = math.floor(
+            self.context_tokens * self.usable_fraction * self.chars_per_token
+        )
+        if default_chars < MIN_BRIDGE_CHARS:
+            raise ValueError("budget policy default is too small for bridge metadata")
+
+
+@dataclass(frozen=True, slots=True)
+class Budget:
+    target: str
+    tokens: int
+    chars: int
+    origin: str
+    clamped: bool = False
+    over_policy: bool = False
+
+    def __post_init__(self) -> None:
+        if not self.target or not self.origin:
+            raise ValueError("budget target and origin must not be empty")
+        if self.tokens <= 0 or self.chars < MIN_BRIDGE_CHARS:
+            raise ValueError("resolved budget is below the bridge minimum")
+
+
+@dataclass(frozen=True, slots=True)
+class SelectionResult:
+    turns: list[Turn]
+    dropped: int
+    truncated: int
+
+
+@dataclass(frozen=True)
+class SelectionMetric:
+    item_cost: Callable[[Turn], int]
+    join_cost: Callable[[Turn, Turn], int]
+    truncate: Callable[[Turn, int], Turn]
+
+
+@dataclass(frozen=True, slots=True)
 class BridgeResult:
     tool: str
     session_id: str
     path: Path
     turns: int
+    written_turns: int
     calls: int
     dropped: int
+    truncated: int
     source_cursor: int
+    budget: Budget
 
 
 @dataclass(frozen=True, slots=True)
@@ -147,6 +215,7 @@ class Harness:
     write: Callable[..., tuple[str, Path]]
     locate: Callable[[str], bool]
     change_status: Callable[[Path, int], str]
+    budget: BudgetPolicy
 
 
 def append_jsonl(path: Path, payload: dict[str, Any]) -> None:
@@ -595,33 +664,112 @@ def merge_runs(turns: Iterable[Turn]) -> list[Turn]:
     return merged
 
 
-def fit(turns: list[Turn], max_chars: int = DEFAULT_MAX_CHARS) -> tuple[list[Turn], int]:
-    """Trim to a character budget, keeping the opening request and the tail.
+def _item_cost(turn: Turn) -> int:
+    return len(turn.text)
 
-    The first turn is what the conversation was *for*, and the tail is where
-    it currently stands, so both survive while the middle gives way.
-    """
-    if max_chars <= 0 or not turns:
-        return list(turns), 0
-    per_turn = max(1000, max_chars // 2)
-    capped = [
-        turn
-        if len(turn.text) <= per_turn
-        else Turn(turn.role, turn.text[:per_turn] + "\n\n[... message truncated ...]", turn.calls)
-        for turn in turns
-    ]
-    if sum(len(turn.text) for turn in capped) <= max_chars:
-        return capped, 0
-    head, rest = capped[:1], capped[1:]
-    budget = max_chars - len(head[0].text)
-    tail: list[Turn] = []
-    for turn in reversed(rest):
-        if len(turn.text) > budget:
+
+def _join_cost(left: Turn, right: Turn) -> int:
+    return 2 if left.role == right.role else 0
+
+
+def _truncate_turn(turn: Turn, limit: int) -> Turn:
+    if len(turn.text) <= limit:
+        return turn
+    if limit <= len(TRUNCATION_MARKER):
+        raise BridgeError("the bridge budget cannot hold a truncated message anchor")
+    prefix = limit - len(TRUNCATION_MARKER)
+    text = turn.text[:prefix] + TRUNCATION_MARKER
+    retained_calls: tuple[ToolCall, ...] = ()
+    if turn.calls:
+        rendered = render_calls(turn.calls)
+        start = turn.text.rfind(rendered)
+        if start >= 0:
+            count = 0
+            for index in range(1, len(turn.calls) + 1):
+                if start + len(render_calls(turn.calls[:index])) > prefix:
+                    break
+                count = index
+            retained_calls = turn.calls[:count]
+    return Turn(turn.role, text, retained_calls, turn.compaction)
+
+
+TEXT_SELECTION_METRIC = SelectionMetric(_item_cost, _join_cost, _truncate_turn)
+
+
+def selection_cost(turns: Iterable[Turn], metric: SelectionMetric = TEXT_SELECTION_METRIC) -> int:
+    """Return a conservative linear assembly cost for one ordered candidate."""
+    total = 0
+    previous: Turn | None = None
+    for turn in turns:
+        item = metric.item_cost(turn)
+        if item < 0:
+            raise BridgeError("selection metric returned a negative item cost")
+        total += item
+        if previous is not None:
+            joined = metric.join_cost(previous, turn)
+            if joined < 0:
+                raise BridgeError("selection metric returned a negative join cost")
+            total += joined
+        previous = turn
+    return total
+
+
+def _capped(turn: Turn, limit: int, metric: SelectionMetric) -> tuple[Turn, bool]:
+    if metric.item_cost(turn) <= limit:
+        return turn, False
+    result = metric.truncate(turn, limit)
+    if result.role != turn.role or metric.item_cost(result) > limit:
+        raise BridgeError("selection metric produced an invalid truncated anchor")
+    return result, True
+
+
+def select_messages(
+    turns: list[Turn], max_chars: int, metric: SelectionMetric = TEXT_SELECTION_METRIC
+) -> SelectionResult:
+    """Keep the first selected-context message and one contiguous newest suffix."""
+    if max_chars <= 0:
+        raise BridgeError("the bridge selection budget must be positive")
+    if not turns:
+        return SelectionResult([], 0, 0)
+    if selection_cost(turns, metric) <= max_chars:
+        return SelectionResult(list(turns), 0, 0)
+    if len(turns) == 1:
+        only, truncated = _capped(turns[0], max_chars, metric)
+        return SelectionResult([only], 0, int(truncated))
+
+    anchor_share = (max_chars - 2) // 2
+    head, head_truncated = _capped(turns[0], anchor_share, metric)
+    newest, newest_truncated = _capped(turns[-1], anchor_share, metric)
+    suffix_reversed = [newest]
+    suffix_first = newest
+    suffix_cost = metric.item_cost(newest)
+    for index in range(len(turns) - 2, 0, -1):
+        turn = turns[index]
+        item = metric.item_cost(turn)
+        joined = metric.join_cost(turn, suffix_first)
+        if item < 0 or joined < 0:
+            raise BridgeError("selection metric returned a negative cost")
+        candidate_suffix_cost = item + joined + suffix_cost
+        total = metric.item_cost(head) + metric.join_cost(head, turn) + candidate_suffix_cost
+        if total > max_chars:
             break
-        tail.append(turn)
-        budget -= len(turn.text)
-    tail.reverse()
-    return head + tail, len(rest) - len(tail)
+        suffix_reversed.append(turn)
+        suffix_first = turn
+        suffix_cost = candidate_suffix_cost
+    kept = [head, *reversed(suffix_reversed)]
+    if selection_cost(kept, metric) > max_chars:
+        raise BridgeError("selected conversation exceeds its applied budget")
+    return SelectionResult(
+        kept,
+        len(turns) - len(kept),
+        int(head_truncated) + int(newest_truncated),
+    )
+
+
+def fit(turns: list[Turn], max_chars: int = DEFAULT_MAX_CHARS) -> tuple[list[Turn], int]:
+    """Compatibility wrapper around whole-message selection."""
+    selected = select_messages(turns, max_chars)
+    return selected.turns, selected.dropped
 
 
 def handoff_note(
@@ -632,17 +780,24 @@ def handoff_note(
     title: str,
     cwd: str,
     kept: int,
+    assembled: int | None = None,
     calls: int,
     dropped: int,
+    truncated: int = 0,
     compacted: int = 0,
     opaque_compactions: int = 0,
     sealed_summary: bool = False,
     resumes_at_last_summary: bool = True,
     conversation_id: str = "",
+    budget: Budget | None = None,
 ) -> str:
     """The opening message that tells the target where this came from."""
     source = harness(source_tool).label
     target = harness(target_tool).label
+    title = _clip(title, 500)
+    cwd = _clip(cwd, 500)
+    session_id = _clip(session_id, 200)
+    conversation_id = _clip(conversation_id, 100)
     label = f" titled {title!r}" if title else ""
     lines = [
         f"[ai-sessions] This conversation started in {source} and is being continued in {target}.",
@@ -663,8 +818,29 @@ def handoff_note(
         f"Source session{label}: {session_id} ({source})",
         f"Working directory: {cwd or 'unknown'}",
         "",
-        f"The {kept} message(s) below are the real conversation, replayed as plain text.",
+        (
+            f"The {kept} source message(s) below were assembled into "
+            f"{assembled if assembled is not None else kept} target message(s) as plain text."
+        ),
     ]
+    if budget is not None:
+        lines += [
+            "",
+            f"Applied bridge budget: approximately {budget.tokens:,} tokens / "
+            f"{budget.chars:,} projected characters ({budget.origin}).",
+        ]
+        if budget.clamped:
+            lines.append("The configured token budget was raised to the safe bridge minimum.")
+        if budget.origin == "target-default-migrated":
+            lines.append(
+                "The legacy version-1 950,000-character machine default was replaced by this "
+                "target policy; set bridge.max_tokens to choose a different ceiling."
+            )
+        elif budget.over_policy:
+            lines.append(
+                "This legacy character override exceeds the target policy; delete max_chars or "
+                "set max_tokens to adopt an explicit token budget."
+            )
     if calls:
         lines.append(
             f"{calls} tool call(s) are summarised inline as ⟦tool⟧ request → result, with "
@@ -709,7 +885,14 @@ def handoff_note(
         lines += [
             "",
             f"{dropped} message(s) from the middle of the conversation were dropped to fit "
-            "the context budget. The opening request and the most recent exchanges were kept.",
+            "the context budget. The first message of the selected source context and a "
+            "contiguous suffix of its most recent exchanges were kept.",
+        ]
+    if truncated:
+        lines += [
+            "",
+            f"{truncated} anchor message(s) were truncated with an explicit marker to keep "
+            "both the first selected-context message and the newest message within budget.",
         ]
     lines += ["", "Pick up from here as though the conversation had always been yours."]
     return "\n".join(lines)
@@ -990,6 +1173,15 @@ HARNESSES: dict[str, Harness] = {
         write=write_codex_session,
         locate=_codex_exists,
         change_status=_codex_change_status,
+        budget=BudgetPolicy(
+            context_tokens=CODEX_BUDGET_CONTEXT_TOKENS,
+            usable_fraction=DEFAULT_USABLE_FRACTION,
+            chars_per_token=DEFAULT_CHARS_PER_TOKEN,
+            source=(
+                "declared Codex unknown-model compatibility floor, 2026-08-23; "
+                "current flagship model context is larger"
+            ),
+        ),
     ),
     "claude": Harness(
         name="claude",
@@ -998,6 +1190,15 @@ HARNESSES: dict[str, Harness] = {
         write=write_claude_session,
         locate=_claude_exists,
         change_status=_claude_change_status,
+        budget=BudgetPolicy(
+            context_tokens=CLAUDE_BUDGET_CONTEXT_TOKENS,
+            usable_fraction=DEFAULT_USABLE_FRACTION,
+            chars_per_token=DEFAULT_CHARS_PER_TOKEN,
+            source=(
+                "Claude 200k unknown-model floor from official context-window docs, "
+                "2026-08-23; Opus 5 context is larger"
+            ),
+        ),
     ),
 }
 BRIDGE_TOOLS = tuple(HARNESSES)
@@ -1009,6 +1210,48 @@ def harness(name: str) -> Harness:
         return HARNESSES[name]
     except KeyError:
         raise BridgeError(f"unknown harness: {name}") from None
+
+
+def resolve_budget(
+    target: str,
+    *,
+    max_tokens: int | None = None,
+    max_chars: int | None = None,
+    migrated: bool = False,
+) -> Budget:
+    """Resolve config into the one target budget used by the bridge."""
+    policy = harness(target).budget
+    default_tokens = math.floor(policy.context_tokens * policy.usable_fraction)
+    default_chars = math.floor(default_tokens * policy.chars_per_token)
+    if max_tokens is not None:
+        minimum = max(
+            MIN_BUDGET_TOKENS,
+            math.ceil(MIN_BRIDGE_CHARS / policy.chars_per_token),
+        )
+        tokens = max(max_tokens, minimum)
+        return Budget(
+            target=target,
+            tokens=tokens,
+            chars=math.floor(tokens * policy.chars_per_token),
+            origin="config.max_tokens",
+            clamped=tokens != max_tokens,
+        )
+    if migrated:
+        return Budget(target, default_tokens, default_chars, "target-default-migrated")
+    if max_chars is not None:
+        if max_chars < MIN_BRIDGE_CHARS:
+            raise BridgeError(
+                f"bridge.max_chars must be at least {MIN_BRIDGE_CHARS} characters "
+                "to hold required handoff metadata"
+            )
+        return Budget(
+            target=target,
+            tokens=math.ceil(max_chars / policy.chars_per_token),
+            chars=max_chars,
+            origin="config.max_chars",
+            over_policy=max_chars > default_chars,
+        )
+    return Budget(target, default_tokens, default_chars, "target-default")
 
 
 def native_session_exists(tool: str, session_id: str) -> bool:
@@ -1122,7 +1365,7 @@ def bridge(
     storage: str,
     cwd: str,
     title: str = "",
-    max_chars: int = DEFAULT_MAX_CHARS,
+    budget: Budget | None = None,
     tool_calls: bool = True,
     latest_window: bool = True,
     conversation_id: str = "",
@@ -1132,6 +1375,9 @@ def bridge(
     if target_tool == source_tool:
         raise BridgeError("that session already belongs to this harness")
     harness(source_tool)
+    applied_budget = budget or resolve_budget(target_tool)
+    if applied_budget.target != target_tool:
+        raise BridgeError("the resolved bridge budget belongs to a different target")
     # This is deliberately captured before reading and aligned to a complete
     # JSONL record. If the live source is appended while the bridge is
     # materialising it, an earlier frontier may cause one conservative
@@ -1152,7 +1398,11 @@ def bridge(
     compacted = 0
     if latest_window:
         turns, compacted = from_last_compaction(turns)
-    kept, dropped = fit(prepare(turns), max_chars)
+    flattened = flatten(turns)
+    conversation_limit = applied_budget.chars - HANDOFF_NOTE_RESERVE_CHARS
+    selected = select_messages(flattened, conversation_limit)
+    kept = selected.turns
+    assembled_turns = merge_runs(kept)
     summarised = sum(len(turn.calls) for turn in kept)
     note = handoff_note(
         source_tool=source_tool,
@@ -1161,22 +1411,32 @@ def bridge(
         title=title,
         cwd=cwd,
         kept=len(kept),
+        assembled=len(assembled_turns),
         calls=summarised,
-        dropped=dropped,
+        dropped=selected.dropped,
+        truncated=selected.truncated,
         compacted=max(compacted, source.carried_windows),
         opaque_compactions=source.opaque_compactions,
         sealed_summary=source.sealed_summary,
         resumes_at_last_summary=source.resumes_at_last_summary or not source.carried_windows,
         conversation_id=conversation_id,
+        budget=applied_budget,
     )
+    if len(note) + 2 > HANDOFF_NOTE_RESERVE_CHARS:
+        raise BridgeError("the required handoff note exceeds its reserved bridge budget")
     payload = merge_runs([Turn("user", note), *kept])
+    if sum(len(turn.text) for turn in payload) > applied_budget.chars:
+        raise BridgeError("the assembled bridge payload exceeds its applied budget")
     new_id, path = target.write(cwd=cwd, turns=payload, title=bridged_title(title, source_tool))
     return BridgeResult(
         tool=target_tool,
         session_id=new_id,
         path=path,
         turns=len(kept),
+        written_turns=len(assembled_turns),
         calls=summarised,
-        dropped=dropped,
+        dropped=selected.dropped,
+        truncated=selected.truncated,
         source_cursor=source_cursor,
+        budget=applied_budget,
     )

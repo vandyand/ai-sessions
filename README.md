@@ -157,10 +157,18 @@ always explainable.
 
 ### Budget
 
-Whatever survives the above is trimmed to a character budget, since the copy lands in the
-target's context window in full. The opening request and the most recent exchanges are kept
-and the middle gives way; the note says how many messages were dropped. Set `max_chars` in
-`config.toml` to change the budget, or `tool_calls = false` for a conversation-only copy.
+Whatever survives the above is fitted to a target-owned token policy. The default is a
+conservative unknown-model allowance: about 150,000 tokens / 300,000 projected characters
+for Claude Code and 192,000 / 384,000 for Codex. Selection happens at source-message
+boundaries before same-role messages are assembled for the target. The first message of the
+selected context and one contiguous newest suffix survive; oversized anchors carry an
+explicit truncation marker, and the note reports dropped, truncated, source, and assembled
+counts.
+
+Set `max_tokens` in `config.toml` for an explicit token-denominated ceiling, or
+`tool_calls = false` for a conversation-only copy. The deprecated `max_chars` remains an
+exact override. Version-1 files automatically written with `max_chars = 950000` migrate to
+the target default; add `version = 2` or use `max_tokens` to make an override explicit.
 
 Every first bridge creates a utility-owned conversation id. The original and each native
 copy are materializations of that conversation. Equivalent copies share a frontier; byte
@@ -183,7 +191,7 @@ copy wins over its ancestor so old state cannot silently discard work.
 
 Conversions run through a harness-neutral conversation rather than pairwise, so support
 for another CLI costs one adapter rather than a converter per existing harness. The current
-bridge registry requires a name and label plus four operations: read a transcript into
+bridge registry requires a name and label, a conservative budget policy, plus four operations: read a transcript into
 `Turn` objects, write `Turn` objects as a resumable native session, locate a native id, and
 detect meaningful transcript changes after a byte cursor. Bridging and head tracking in
 both directions then work without pairwise logic.
@@ -245,6 +253,8 @@ Configuration is stored in:
 The optional custom profile uses structured argument arrays, avoiding shell interpolation:
 
 ```toml
+version = 2
+
 [launch]
 mode = "custom"
 claude_command = ["claude"]
@@ -255,7 +265,7 @@ claude_args = ["--permission-mode", "acceptEdits"]
 codex_args = ["--sandbox", "workspace-write", "--ask-for-approval", "on-request"]
 
 [bridge]
-max_chars = 950000
+max_tokens = 150000
 tool_calls = true
 latest_window = true
 ```

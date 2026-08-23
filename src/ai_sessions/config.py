@@ -12,7 +12,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
-from .bridge import DEFAULT_MAX_CHARS
+from .bridge import LEGACY_DEFAULT_MAX_CHARS
 from .paths import CONFIG_FILE
 
 LAUNCH_MODES = ("safe", "dangerous", "custom")
@@ -29,7 +29,9 @@ class LaunchConfig:
     # How much conversation a bridged copy carries into the other harness.
     # It is replayed into the target's context window, so the ceiling is a
     # context budget rather than a storage one.
-    bridge_max_chars: int = DEFAULT_MAX_CHARS
+    bridge_max_tokens: int | None = None
+    bridge_max_chars: int | None = None
+    bridge_max_chars_migrated: bool = False
     # Whether tool calls cross over as inline summaries.  They are usually
     # the most valuable context in an engineering session, and also the
     # bulkiest, so they can be dropped for a conversation-only copy.
@@ -46,6 +48,8 @@ class LaunchConfig:
             payload = tomllib.loads(path.read_text(encoding="utf-8"))
         except (OSError, tomllib.TOMLDecodeError):
             return result
+        version = payload.get("version", 1)
+        schema = version if isinstance(version, int) and not isinstance(version, bool) else 1
         launch = payload.get("launch", {})
         if not isinstance(launch, dict):
             return result
@@ -60,9 +64,23 @@ class LaunchConfig:
             result.custom_codex_args = _string_list(custom.get("codex_args"), [])
         bridge = payload.get("bridge", {})
         if isinstance(bridge, dict):
+            max_tokens = bridge.get("max_tokens")
+            if (
+                isinstance(max_tokens, int)
+                and not isinstance(max_tokens, bool)
+                and max_tokens > 0
+            ):
+                result.bridge_max_tokens = max_tokens
             max_chars = bridge.get("max_chars")
             if isinstance(max_chars, int) and not isinstance(max_chars, bool) and max_chars > 0:
-                result.bridge_max_chars = max_chars
+                if (
+                    result.bridge_max_tokens is None
+                    and schema <= 1
+                    and max_chars == LEGACY_DEFAULT_MAX_CHARS
+                ):
+                    result.bridge_max_chars_migrated = True
+                else:
+                    result.bridge_max_chars = max_chars
             tool_calls = bridge.get("tool_calls")
             if isinstance(tool_calls, bool):
                 result.bridge_tool_calls = tool_calls
@@ -123,9 +141,14 @@ class LaunchConfig:
         temporary.replace(self.path)
 
     def as_toml(self) -> str:
+        budget = ""
+        if self.bridge_max_tokens is not None:
+            budget = f"max_tokens = {self.bridge_max_tokens}\n"
+        elif self.bridge_max_chars is not None:
+            budget = f"max_chars = {self.bridge_max_chars}\n"
         return (
             "# ai-sessions configuration\n"
-            "version = 1\n\n"
+            "version = 2\n\n"
             "[launch]\n"
             f"mode = {_toml_string(self.mode)}\n"
             f"claude_command = {_toml_array(self.claude_command)}\n"
@@ -134,7 +157,7 @@ class LaunchConfig:
             f"claude_args = {_toml_array(self.custom_claude_args)}\n"
             f"codex_args = {_toml_array(self.custom_codex_args)}\n\n"
             "[bridge]\n"
-            f"max_chars = {self.bridge_max_chars}\n"
+            f"{budget}"
             f"tool_calls = {str(self.bridge_tool_calls).lower()}\n"
             f"latest_window = {str(self.bridge_latest_window).lower()}\n"
         )
