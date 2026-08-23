@@ -78,9 +78,9 @@ Direct `python -` against the working tree. Each phase states the expression and
 - [ ] Add property-style cases for membership/truncation shape, order, head/tail, fit-through, exact count, monotonicity, determinism, empty/single/all-oversized inputs, `[short, oversized-newest]`, and consecutive same-role runs
 - [ ] Add an end-to-end test beginning at `LaunchConfig.load` and calling `launch(session, config, dry_run=True, state=...)`; force the opposite harness, read the member path from `state.set_bridge`, and use `max_tokens = 5000` on ~40,000 characters to assert payload ≤10,000, dropped notice, and note ≈5,000 tokens/10,000 chars. Without the key, the same fixture keeps every message (T7)
 - [ ] On one ~340,000-character generated transcript with unset config, assert Claude drops messages while Codex keeps them; this kills any hidden `DEFAULT_MAX_CHARS` selector path
-- [ ] Add two same-role stress fixtures dimensioned by survivors: a fits-through edge where raw text fits but item-plus-join cost does not, and an overflowing ≥2,000-message case retaining >1,500 survivors. A test-local oracle computes `sum(len) + 2 × same-role-adjacencies` independently of production metric, asserts selector agreement, and requires `2 × (len(kept) − 1) > reserve − len(note) − 2`; removing join cost must fail deterministically
+- [ ] Add two same-role stress fixtures dimensioned by survivors: a fits-through edge where raw text fits but item-plus-join cost does not, and an overflowing ≥2,000-message case retaining >1,500 survivors. A test-local oracle computes `sum(len) + 2 × same-role-adjacencies`, asserts selector agreement **and real merged `[note, *kept]` text ≤ `Budget.chars`**, and requires `2 × (len(kept) − 1) > reserve − len(note) − 2`; removing join cost must fail deterministically
 - [ ] On every overflow assert survivors are `[first] + input[j:]` for one index `j`; no gap-tail selection
-- [ ] Measure selection on a generated ~1M-character transcript with a counting `SelectionMetric` wrapper (calls bounded by a constant times input turns) plus `tracemalloc` retained-allocation peak and a practical time bound. `PeakRecorder` remains only for P1 reader-memory regressions; it cannot observe selection
+- [ ] Measure selection on a generated ~1M-character transcript with a counting `SelectionMetric` wrapper (calls bounded by a constant times input turns), a practical time bound, and `tracemalloc` peak `<= 2 × Budget.chars + 512 × len(turns) + 1 MiB`. `PeakRecorder` remains only for P1 reader-memory regressions; it cannot observe selection
 - [ ] Assert note and launch-notice text for `[short, oversized-newest]` (`dropped=0`, `truncated=1`) and for a consecutive same-role fixture where source-message count differs from assembled-target count
 
 **Verification**
@@ -190,6 +190,14 @@ Direct `python -` against the working tree. Each phase states the expression and
 - [x] Verify truncated-anchor and source/assembled note/launch text
 - [x] Correct success criteria to T1–T10 including T2b
 - [ ] Re-run Opus 5 and require no HIGH or MEDIUM findings before Phase 1 implementation
+
+### Phase 3h — Opus 5 seventh review
+
+**Verdict: NOT CLEAN — HIGH=0 MEDIUM=2.** Claude Opus 5 (`claude-opus-5`, max effort) reviewed `ec1c890` directly in read-only mode on 2026-08-23; no artifact was written.
+
+- [x] Assert real assembled payload bytes alongside the independent join-cost oracle
+- [x] Clarify reader-vs-selector memory instruments and give selection allocation a failing bound
+- [ ] Final focused Opus 5 confirmation must return CLEAN before Phase 1 implementation
 
 ---
 

@@ -49,7 +49,7 @@ Those measurements made Part B worth reviewing, but did not make it correct. The
 
 Invariants **T1–T10, including T2b,** in [research.md](research.md#requirements). Each is checkable on a generated transcript, on any machine, in CI — per P1's K7.
 
-P1's corrected **R5** still applies: anything claiming a memory property must be **measured**, not inferred from output length, using the `PeakRecorder` harness in `tests/test_codex_window.py`.
+P1's corrected **R5** still applies: any memory property must be **measured**, not inferred from output length. Use `PeakRecorder` for `_Conversation` reader memory and `tracemalloc` for selection, which operates on plain `Turn` lists.
 
 ## Non-Goals
 
