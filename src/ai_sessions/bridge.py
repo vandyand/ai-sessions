@@ -921,9 +921,13 @@ def _records_after(path: Path, offset: int) -> Iterator[dict[str, Any]]:
         with path.open("rb") as handle:
             handle.seek(offset)
             for raw in handle:
+                if not raw.endswith(b"\n"):
+                    yield {"type": "ai_sessions_incomplete"}
+                    continue
                 try:
                     item = json.loads(raw)
                 except (json.JSONDecodeError, UnicodeDecodeError):
+                    yield {"type": "ai_sessions_incomplete"}
                     continue
                 if isinstance(item, dict):
                     yield item
@@ -934,7 +938,11 @@ def _records_after(path: Path, offset: int) -> Iterator[dict[str, Any]]:
 def _codex_changed_since(path: Path, offset: int) -> bool:
     """Whether Codex appended model-visible conversation after ``offset``."""
     for record in _records_after(path, offset):
-        if record.get("type") in ("ai_sessions_replaced", "ai_sessions_missing"):
+        if record.get("type") in (
+            "ai_sessions_replaced",
+            "ai_sessions_missing",
+            "ai_sessions_incomplete",
+        ):
             return True
         if record.get("type") != "response_item":
             continue
@@ -957,7 +965,11 @@ def _codex_changed_since(path: Path, offset: int) -> bool:
 def _claude_changed_since(path: Path, offset: int) -> bool:
     """Whether Claude appended a real turn, ignoring title and metadata records."""
     for record in _records_after(path, offset):
-        if record.get("type") in ("ai_sessions_replaced", "ai_sessions_missing"):
+        if record.get("type") in (
+            "ai_sessions_replaced",
+            "ai_sessions_missing",
+            "ai_sessions_incomplete",
+        ):
             return True
         if record.get("type") not in ("user", "assistant") or record.get("isMeta"):
             continue

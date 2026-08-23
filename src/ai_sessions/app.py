@@ -359,28 +359,49 @@ class UserState:
 
     def _conversation_status(self, conversation_id: str) -> dict[str, Any]:
         conversation = self.conversations[conversation_id]
+        all_members = list(conversation["members"].items())
         members = [
             (key, member)
-            for key, member in conversation["members"].items()
+            for key, member in all_members
             if Path(str(member.get("storage", ""))).is_file()
         ]
-        if not members:
-            return {"conflict": False, "heads": [], "advanced": []}
-        maximum = max(int(member.get("generation", 0)) for _, member in members)
+        maximum = max((int(member.get("generation", 0)) for _, member in all_members), default=0)
         current = [
             (key, member) for key, member in members if int(member.get("generation", 0)) == maximum
         ]
+        current_frontiers = {str(member.get("frontier", "")) for _, member in current}
+        unavailable = [
+            (key, member)
+            for key, member in all_members
+            if int(member.get("generation", 0)) == maximum
+            and not Path(str(member.get("storage", ""))).is_file()
+            and str(member.get("frontier", "")) not in current_frontiers
+        ]
+        if unavailable:
+            return {
+                "conflict": False,
+                "heads": current,
+                "advanced": [],
+                "unavailable": unavailable,
+            }
+        if not members:
+            return {"conflict": False, "heads": [], "advanced": [], "unavailable": []}
         advanced = [(key, member) for key, member in members if self._member_changed(member)]
         if not advanced:
-            return {"conflict": False, "heads": current, "advanced": []}
+            return {"conflict": False, "heads": current, "advanced": [], "unavailable": []}
         if len(advanced) == 1 and int(advanced[0][1].get("generation", 0)) == maximum:
-            return {"conflict": False, "heads": advanced, "advanced": advanced}
+            return {
+                "conflict": False,
+                "heads": advanced,
+                "advanced": advanced,
+                "unavailable": [],
+            }
         # Two members changed independently, or an older materialization moved
         # after a newer frontier existed. Either is a fork, never a timestamp race.
         heads = list(advanced)
         advanced_keys = {key for key, _ in advanced}
         heads.extend((key, member) for key, member in current if key not in advanced_keys)
-        return {"conflict": True, "heads": heads, "advanced": advanced}
+        return {"conflict": True, "heads": heads, "advanced": advanced, "unavailable": []}
 
     def _session_for_member(self, member: dict[str, Any], template: Session) -> Session:
         key = self._member_key(str(member["tool"]), str(member["session_id"]))
@@ -412,6 +433,12 @@ class UserState:
         if not conversation_id:
             return item, item if item.tool == target_tool else None, ""
         status = self._conversation_status(conversation_id)
+        if status["unavailable"]:
+            labels = ", ".join(key for key, _ in status["unavailable"])
+            raise BridgeError(
+                f"conversation {conversation_id[:8]} has unavailable newest materialization(s) "
+                f"({labels}); refusing to resume an older generation"
+            )
         if status["conflict"]:
             labels = ", ".join(key for key, _ in status["heads"])
             raise BridgeError(
@@ -462,7 +489,7 @@ class UserState:
                     continue
                 item.conversation_id = conversation_id
                 item.diverged = bool(status["conflict"] and key in head_keys)
-                item.superseded = bool(not status["conflict"] and key not in head_keys)
+                item.superseded = key not in head_keys
 
     def _migrate_legacy_bridges(self, sessions: list[Session]) -> None:
         by_key = {item.key: item for item in sessions}

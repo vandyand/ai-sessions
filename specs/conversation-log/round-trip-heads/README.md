@@ -17,6 +17,7 @@ materialization regardless of which historical row the user selected.
 6. Concurrent independent advances are divergence and automatic launch refuses to choose.
 7. A bridge records no source byte beyond the frontier captured before reading began.
 8. Migration may duplicate uncertain work but may not silently discard it.
+9. Missing newest storage or a partially written tail fails conservatively.
 
 ## Acceptance evidence
 

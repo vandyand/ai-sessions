@@ -44,8 +44,10 @@ changed_since(path, byte_cursor) -> bool
 `read` projects native records into the shared `Turn` model. `write` must produce a truly
 resumable native transcript, including any separate records needed for both model context
 and visible scrollback. `changed_since` recognizes conversation/tool activity and ignores
-metadata-only appends such as renames. Missing, replaced, or truncated append-only storage
-counts as changed so the core fails conservatively.
+metadata-only appends such as renames. Missing, replaced, truncated, or partially written
+append-only storage counts as changed so the core fails conservatively. If the newest
+generation is unavailable and no equivalent native member survives, launch refuses to
+promote an older generation.
 
 The cursor returned with a bridge is captured before the read begins and aligned after the
 last complete JSONL record. This is intentionally a lower bound: concurrent work may be

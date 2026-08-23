@@ -820,6 +820,63 @@ class LaunchIntegrationTests(unittest.TestCase):
             self.assertTrue(source.diverged)
             self.assertTrue(copy.diverged)
 
+    def test_older_generations_remain_superseded_during_divergence(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            original = session(directory, launch_tool="claude")
+            state = UserState(path=Path(directory) / "state.json")
+            with patch.object(bridge, "CLAUDE_HOME", Path(directory) / "claude"):
+                claude_prepared, _ = prepare_launch(original, state=state)
+            copy = self.claude_copy(
+                original, claude_prepared, state.bridges[original.key]["claude"]["storage"]
+            )
+            with Path(copy.storage).open("a", encoding="utf-8") as handle:
+                handle.write(claude_line("user", "Advance one generation") + "\n")
+            state.apply([original, copy])
+            with patch.object(bridge, "CODEX_HOME", Path(directory) / "codex"):
+                newest, _ = prepare_launch(original, state=state)
+
+            with Path(copy.storage).open("a", encoding="utf-8") as handle:
+                handle.write(claude_line("user", "Claude fork") + "\n")
+            with Path(newest.storage).open("a", encoding="utf-8") as handle:
+                handle.write(codex_line("user", "Codex fork") + "\n")
+            state.apply([original, copy, newest])
+
+            self.assertTrue(original.superseded)
+            self.assertFalse(original.diverged)
+            self.assertTrue(copy.diverged)
+            self.assertTrue(newest.diverged)
+
+    def test_missing_newest_generation_never_promotes_an_older_session(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            original = session(directory, launch_tool="claude")
+            state = UserState(path=Path(directory) / "state.json")
+            with patch.object(bridge, "CLAUDE_HOME", Path(directory) / "claude"):
+                claude_prepared, _ = prepare_launch(original, state=state)
+            copy = self.claude_copy(
+                original, claude_prepared, state.bridges[original.key]["claude"]["storage"]
+            )
+            with Path(copy.storage).open("a", encoding="utf-8") as handle:
+                handle.write(claude_line("user", "Newest work") + "\n")
+            state.apply([original, copy])
+            with patch.object(bridge, "CODEX_HOME", Path(directory) / "codex"):
+                newest, _ = prepare_launch(original, state=state)
+
+            Path(copy.storage).unlink()
+            Path(newest.storage).unlink()
+            state.apply([original])
+            with self.assertRaisesRegex(BridgeError, "unavailable newest"):
+                prepare_launch(original, state=state)
+
+    def test_partial_appended_jsonl_is_conservatively_changed(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            source = session(directory)
+            path = Path(source.storage)
+            cursor = path.stat().st_size
+            with path.open("ab") as handle:
+                handle.write(b'{"type":"response_item","payload":')
+
+            self.assertTrue(bridge.conversation_changed_since("codex", path, cursor))
+
     def test_renaming_a_copy_does_not_advance_the_conversation(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             source = session(directory, launch_tool="claude")
