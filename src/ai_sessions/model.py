@@ -189,3 +189,12 @@ class NativeSession:
             raise ValueError("native session tool and session_id must not be empty")
         if not isinstance(self.source, SourceKind):
             raise ValueError("native session source must be a SourceKind")
+
+
+@dataclass(frozen=True, slots=True)
+class LivenessSession:
+    """Immutable adapter view of one utility row during liveness inspection."""
+
+    session_id: str
+    source: SourceKind
+    storage: str

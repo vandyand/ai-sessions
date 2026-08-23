@@ -9,7 +9,7 @@ import secrets
 import time
 import uuid
 from pathlib import Path
-from typing import Any
+from typing import Any, Iterable
 
 from ..capabilities import HarnessAdapter
 from ..conversion import (
@@ -26,8 +26,10 @@ from ..conversion import (
     append_jsonl,
     scrub,
 )
+from ..diagnostics import record_warning
 from ..discovery import HarnessContext, clean_prompt, normalize_space, prompt_text, timestamp
-from ..model import BudgetPolicy, NativeSession, SourceKind, Transcript, Turn
+from ..liveness import LivenessContext, ProcessInfo
+from ..model import BudgetPolicy, LivenessSession, NativeSession, SourceKind, Transcript, Turn
 from ..paths import APP_CACHE_DIR, CLAUDE_HOME
 from ..registry import REGISTRY
 
@@ -517,6 +519,53 @@ def discover(context: HarnessContext, *, use_cache: bool = True) -> list[NativeS
     return result
 
 
+def _process_start_matches(context: LivenessContext, process: ProcessInfo, expected: str) -> bool:
+    if context.platform == "win32":
+        if not expected:
+            executables = {"claude", "claude.exe", "claude.cmd", "claude.ps1"}
+            command_name = Path(process.command[0]).name.casefold() if process.command else ""
+            return process.name.casefold() in executables or command_name in executables
+        try:
+            return abs(int(process.start_token) - int(expected)) < 10_000_000
+        except (TypeError, ValueError):
+            return False
+    return bool(expected and process.start_token == expected)
+
+
+def inspect_liveness(
+    context: LivenessContext, home: Path, sessions: Iterable[LivenessSession]
+) -> dict[str, int]:
+    """Resolve Claude's process/session registry against the shared process snapshot."""
+    eligible = {item.session_id for item in sessions if item.source is SourceKind.INTERACTIVE}
+    if not eligible:
+        return {}
+    processes = {item.pid: item for item in context.process_snapshot}
+    result: dict[str, int] = {}
+    try:
+        registry_files = sorted((home / "sessions").glob("*.json"))
+    except OSError:
+        registry_files = []
+    for path in registry_files:
+        try:
+            record = json.loads(path.read_text(encoding="utf-8"))
+            pid = int(record.get("pid", 0))
+            session_id = str(record.get("sessionId", ""))
+            expected_start = str(record.get("procStart", ""))
+            kind = str(record.get("kind", ""))
+        except (OSError, ValueError, json.JSONDecodeError, AttributeError):
+            continue
+        process = processes.get(pid)
+        if session_id not in eligible or process is None or (kind and kind != "interactive"):
+            continue
+        if expected_start and not process.start_token:
+            record_warning(f"could not verify Claude process start for PID {pid}")
+            continue
+        if not _process_start_matches(context, process, expected_start):
+            continue
+        result[session_id] = pid
+    return result
+
+
 def publish_name(session: Any, name: str) -> str:
     transcript = Path(session.storage)
     if not transcript.is_file():
@@ -563,6 +612,7 @@ ADAPTER = HarnessAdapter(
     discover=discover,
     resume_args=resume_args,
     publish_name=publish_name,
+    inspect_liveness=inspect_liveness,
     budget=BudgetPolicy(
         context_tokens=CLAUDE_BUDGET_CONTEXT_TOKENS,
         usable_fraction=DEFAULT_USABLE_FRACTION,

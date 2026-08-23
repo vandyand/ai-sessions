@@ -10,9 +10,10 @@ import secrets
 import sqlite3
 import time
 import uuid
+from contextlib import closing
 from dataclasses import replace
 from pathlib import Path
-from typing import Any
+from typing import Any, Iterable
 
 from ..capabilities import HarnessAdapter
 from ..conversion import (
@@ -33,7 +34,8 @@ from ..conversion import (
 )
 from ..diagnostics import record_warning
 from ..discovery import HarnessContext, clean_prompt, normalize_space, prompt_text, timestamp
-from ..model import BudgetPolicy, NativeSession, SourceKind, Transcript, Turn
+from ..liveness import LivenessContext
+from ..model import BudgetPolicy, LivenessSession, NativeSession, SourceKind, Transcript, Turn
 from ..paths import APP_CACHE_DIR, CODEX_HOME
 from ..registry import REGISTRY
 
@@ -598,6 +600,129 @@ def discover(context: HarnessContext, *, use_cache: bool = True) -> list[NativeS
     return result
 
 
+def _numbered_database_key(path: Path) -> tuple[int, float]:
+    try:
+        number = int(path.stem.rsplit("_", 1)[-1])
+    except ValueError:
+        number = 0
+    try:
+        modified = path.stat().st_mtime
+    except OSError:
+        modified = 0.0
+    return number, modified
+
+
+def _spawn_parents(home: Path) -> dict[str, str]:
+    try:
+        databases = list(home.glob("state_*.sqlite"))
+    except OSError:
+        return {}
+    if not databases:
+        return {}
+    database = max(databases, key=_numbered_database_key)
+    try:
+        with closing(
+            sqlite3.connect(f"file:{database}?mode=ro", uri=True, timeout=2)
+        ) as connection:
+            rows = connection.execute(
+                "SELECT parent_thread_id, child_thread_id FROM thread_spawn_edges"
+            )
+            return {str(child): str(parent) for parent, child in rows}
+    except (sqlite3.Error, OSError) as error:
+        record_warning(f"could not read Codex spawn edges from {database}: {error}")
+        return {}
+
+
+def _windows_liveness(context: LivenessContext, home: Path, eligible: set[str]) -> dict[str, int]:
+    candidates = [
+        process
+        for process in context.process_snapshot
+        if (
+            process.name.casefold() in ("codex.exe", "codex")
+            or "codex.exe" in " ".join(process.command).casefold()
+        )
+    ]
+    if any(process.started_at <= 0 for process in candidates):
+        record_warning("could not verify the start time of a live Codex process")
+    live_processes = [process for process in candidates if process.started_at > 0]
+    if not live_processes:
+        return {}
+    try:
+        databases = list(home.glob("logs_*.sqlite"))
+    except OSError:
+        return {}
+    if not databases:
+        return {}
+    database = max(databases, key=_numbered_database_key)
+    parents = _spawn_parents(home)
+    result: dict[str, int] = {}
+    try:
+        with closing(
+            sqlite3.connect(f"file:{database}?mode=ro", uri=True, timeout=2)
+        ) as connection:
+            for process in sorted(live_processes, key=lambda item: (item.started_at, item.pid)):
+                # Codex logs store Unix epoch seconds plus a fractional nanosecond
+                # column. Compare both so a recycled PID in the same second cannot
+                # inherit the previous process instance's final thread.
+                started_second = int(process.started_at)
+                started_nanos = int((process.started_at - started_second) * 1_000_000_000)
+                row = connection.execute(
+                    """
+                    SELECT thread_id FROM logs
+                    WHERE process_uuid LIKE ? AND thread_id IS NOT NULL AND thread_id != ''
+                        AND (ts > ? OR (ts = ? AND ts_nanos >= ?))
+                    ORDER BY ts DESC, ts_nanos DESC LIMIT 1
+                    """,
+                    (
+                        f"pid:{process.pid}:%",
+                        started_second,
+                        started_second,
+                        started_nanos,
+                    ),
+                ).fetchone()
+                if not row:
+                    continue
+                session_id = str(row[0])
+                seen: set[str] = set()
+                while session_id in parents and session_id not in seen:
+                    seen.add(session_id)
+                    session_id = parents[session_id]
+                if session_id in eligible:
+                    result[session_id] = process.pid
+    except (sqlite3.Error, OSError) as error:
+        record_warning(f"could not read Codex activity log {database}: {error}")
+    return result
+
+
+def inspect_liveness(
+    context: LivenessContext, home: Path, sessions: Iterable[LivenessSession]
+) -> dict[str, int]:
+    """Resolve Codex activity using one shared process/lock snapshot."""
+    eligible = {item.session_id for item in sessions if item.source is SourceKind.INTERACTIVE}
+    if not eligible:
+        return {}
+    if context.platform == "win32":
+        return _windows_liveness(context, home, eligible)
+    if context.platform != "linux":
+        return {}
+    live_pids = {process.pid for process in context.process_snapshot}
+    result: dict[str, int] = {}
+    try:
+        lock_files = sorted((home / "thread-writer-locks").glob("*.lock"))
+    except OSError:
+        lock_files = []
+    for path in lock_files:
+        try:
+            stat = path.stat()
+        except OSError:
+            continue
+        identity = (os.major(stat.st_dev), os.minor(stat.st_dev), stat.st_ino)
+        pid = context.lock_map.get(identity, 0)
+        if path.stem in eligible and pid in live_pids:
+            result[path.stem] = pid
+    return result
+
+
 def publish_name(session: Any, name: str) -> str:
     stamp = dt.datetime.now(dt.timezone.utc).isoformat().replace("+00:00", "Z")
     append_jsonl(
@@ -652,6 +777,7 @@ ADAPTER = HarnessAdapter(
     discover=discover,
     resume_args=resume_args,
     publish_name=publish_name,
+    inspect_liveness=inspect_liveness,
     budget=BudgetPolicy(
         context_tokens=CODEX_BUDGET_CONTEXT_TOKENS,
         usable_fraction=DEFAULT_USABLE_FRACTION,

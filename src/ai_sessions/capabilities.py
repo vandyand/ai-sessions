@@ -7,7 +7,8 @@ from pathlib import Path
 from re import Pattern
 from typing import Any, Iterable, Mapping, Protocol
 
-from .model import BudgetPolicy, NativeSession, SourceKind, Transcript, Turn
+from .liveness import LivenessContext
+from .model import BudgetPolicy, LivenessSession, NativeSession, SourceKind, Transcript, Turn
 
 
 class ReadHook(Protocol):
@@ -49,7 +50,9 @@ class PublishNameHook(Protocol):
 
 
 class LivenessHook(Protocol):
-    def __call__(self, context: Any, sessions: Iterable[Any]) -> Mapping[str, int]: ...
+    def __call__(
+        self, context: LivenessContext, home: Path, sessions: Iterable[LivenessSession]
+    ) -> Mapping[str, int]: ...
 
 
 @dataclass(frozen=True, slots=True)

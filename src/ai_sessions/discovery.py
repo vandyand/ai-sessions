@@ -5,9 +5,11 @@ from __future__ import annotations
 import datetime as dt
 import hashlib
 import re
+import sys
 from dataclasses import dataclass, field
 from typing import Any
 
+from .liveness import ProcessInfo
 from .registry import REGISTRY
 
 MAX_EVIDENCE_IDS = 4_096
@@ -107,13 +109,17 @@ class EvidenceAccumulator:
 
 @dataclass(slots=True)
 class HarnessContext:
+    """Mutable orchestration state scoped to exactly one discovery/refresh pass."""
+
     use_cache: bool
     patterns: tuple[re.Pattern[bytes], ...]
     pattern_signature: str
     evidence: dict[tuple[str, str], tuple[list[str], bool]] = field(default_factory=dict)
     origin_hints: dict[tuple[str, str], str] = field(default_factory=dict)
-    process_snapshot: tuple[Any, ...] = ()
-    lock_map: dict[Any, int] = field(default_factory=dict)
+    platform: str = sys.platform
+    process_snapshot: tuple[ProcessInfo, ...] = ()
+    lock_map: dict[tuple[int, int, int], int] = field(default_factory=dict)
+    liveness_ready: bool = False
 
     @classmethod
     def create(cls, *, use_cache: bool = True) -> "HarnessContext":

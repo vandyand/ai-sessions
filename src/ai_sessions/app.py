@@ -22,12 +22,13 @@ import subprocess
 import sys
 import textwrap
 import uuid
+from collections.abc import Mapping
 from dataclasses import asdict, replace
 from pathlib import Path
 from typing import Any, Iterable
 
 from . import __version__ as VERSION
-from .capabilities import Unsupported
+from .capabilities import HarnessAdapter, Unsupported
 from .config import LAUNCH_MODES, LaunchConfig
 from .conversion import (
     BridgeError,
@@ -46,10 +47,11 @@ from .discovery import clean_prompt as clean_prompt
 from .discovery import normalize_space as normalize_space
 from .discovery import prompt_text as prompt_text
 from .discovery import timestamp as timestamp
-from .model import NativeSession, Session, SourceKind
+from .liveness import immutable_context as immutable_liveness_context
+from .liveness import populate_context as populate_liveness_context
+from .liveness import process_start_token
+from .model import LivenessSession, NativeSession, Session, SourceKind
 from .paths import (
-    CLAUDE_HOME,
-    CODEX_HOME,
     HOME,
     IS_WINDOWS,
     STATE_FILE,
@@ -1082,103 +1084,59 @@ def load_sessions(use_cache: bool = True, state: UserState | None = None) -> lis
     reconcile_evidence(result, context)
     if state is not None:
         state.apply(result)
-    detect_open_sessions(result)
+    detect_open_sessions(result, context=context)
     return result
 
 
-def process_start_token(pid: int) -> str:
-    """Return Linux /proc start ticks, which protects against PID reuse."""
-    try:
-        value = Path(f"/proc/{pid}/stat").read_text(encoding="utf-8")
-        # The executable name is parenthesized and may contain spaces.  Field
-        # 22 (starttime) is index 19 after the closing parenthesis.
-        fields = value[value.rfind(")") + 2 :].split()
-        return fields[19]
-    except (OSError, IndexError):
-        return ""
-
-
-def held_file_locks() -> dict[tuple[int, int, int], int]:
-    """Map Linux locked-file device/inode triples to their owning PID."""
-    result: dict[tuple[int, int, int], int] = {}
-    try:
-        lines = Path("/proc/locks").read_text(encoding="utf-8").splitlines()
-    except OSError:
-        return result
-    for line in lines:
-        fields = line.split()
-        if len(fields) < 6 or fields[1] != "FLOCK":
-            continue
-        try:
-            major_text, minor_text, inode_text = fields[5].split(":", 2)
-            result[(int(major_text, 16), int(minor_text, 16), int(inode_text))] = int(fields[4])
-        except (ValueError, IndexError):
-            continue
-    return result
-
-
-def detect_open_sessions(sessions: Iterable[Session]) -> None:
-    """Mark sessions owned by live Claude/Codex processes anywhere on the host.
-
-    Claude publishes a PID/session registry. Codex holds an advisory lock whose
-    filename is the thread ID. Both mechanisms work independently of terminal,
-    pseudoterminal, and tmux layout.
-    """
+def detect_open_sessions(
+    sessions: Iterable[Session], *, context: HarnessContext | None = None
+) -> None:
+    """Fan one shared host snapshot through registered adapter liveness hooks."""
     session_list = list(sessions)
-    by_identity = {(item.tool, item.session_id): item for item in session_list}
     for item in session_list:
         item.is_open = False
         item.open_pid = 0
-
-    if IS_WINDOWS:
-        from .platforms.windows import detect_open_sessions as detect_windows_sessions
-
-        detect_windows_sessions(session_list, CLAUDE_HOME, CODEX_HOME)
+    pending: list[tuple[HarnessAdapter, list[Session]]] = []
+    for adapter in REGISTRY.adapters():
+        if isinstance(adapter.inspect_liveness, Unsupported):
+            continue
+        own = [
+            item
+            for item in session_list
+            if item.tool == adapter.name and item.source is SourceKind.INTERACTIVE
+        ]
+        if own:
+            pending.append((adapter, own))
+    if not pending:
         return
-
-    registry = CLAUDE_HOME / "sessions"
-    try:
-        registry_files = registry.glob("*.json")
-    except OSError:
-        registry_files = ()
-    for path in registry_files:
+    shared = context or HarnessContext.create()
+    populate_liveness_context(shared)
+    snapshot = immutable_liveness_context(shared)
+    live_pids = {process.pid for process in snapshot.process_snapshot}
+    for adapter, own in pending:
+        hook = adapter.inspect_liveness
+        assert not isinstance(hook, Unsupported)
+        views = tuple(LivenessSession(item.session_id, item.source, item.storage) for item in own)
         try:
-            record = json.loads(path.read_text(encoding="utf-8"))
-            pid = int(record.get("pid", 0))
-            sid = str(record.get("sessionId", ""))
-            expected_start = str(record.get("procStart", ""))
-            kind = str(record.get("kind", ""))
-        except (OSError, ValueError, json.JSONDecodeError, AttributeError):
+            detected = hook(snapshot, adapter.home, views)
+            if not isinstance(detected, Mapping):
+                raise TypeError("liveness hook did not return a mapping")
+            pairs = tuple(detected.items())
+        except Exception as error:
+            record_warning(f"could not inspect {adapter.label} liveness: {error}")
             continue
-        if (
-            not pid
-            or not sid
-            or not expected_start
-            or (kind and kind != "interactive")
-            or process_start_token(pid) != expected_start
-        ):
-            continue
-        item = by_identity.get(("claude", sid))
-        if item and item.source == "interactive":
-            item.is_open = True
-            item.open_pid = pid
-
-    locks = held_file_locks()
-    try:
-        writer_locks = (CODEX_HOME / "thread-writer-locks").glob("*.lock")
-    except OSError:
-        writer_locks = ()
-    for path in writer_locks:
-        try:
-            stat = path.stat()
-        except OSError:
-            continue
-        identity = (os.major(stat.st_dev), os.minor(stat.st_dev), stat.st_ino)
-        pid = locks.get(identity, 0)
-        if not pid or not process_start_token(pid):
-            continue
-        item = by_identity.get(("codex", path.stem))
-        if item and item.source == "interactive":
+        by_id = {item.session_id: item for item in own}
+        for session_id, pid in pairs:
+            item = by_id.get(session_id) if isinstance(session_id, str) else None
+            if (
+                item is None
+                or item.source is not SourceKind.INTERACTIVE
+                or not isinstance(pid, int)
+                or isinstance(pid, bool)
+                or pid <= 0
+                or pid not in live_pids
+            ):
+                continue
             item.is_open = True
             item.open_pid = pid
 
