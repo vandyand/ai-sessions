@@ -4,7 +4,7 @@
 
 ## Planned
 
-- [Window-Aligned Selection and a Token Budget](conversation-log/window-aligned-selection/README.md)
+- [Target-Aware Token Budget and Whole-Message Selection](conversation-log/window-aligned-selection/README.md)
 
 ## Completed
 

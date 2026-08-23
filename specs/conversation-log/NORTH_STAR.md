@@ -10,7 +10,7 @@ Priorities are ordered by evidence strength and independence, not by architectur
 
 ## Current state
 
-`ai-sessions` 3.1.5 plus the P2 branch. Bridging has a neutral `Turn` model, per-harness readers and writers, and a `HARNESSES` registry in `bridge.py`. P1 fixed selection at Codex compaction boundaries. P2 adds utility-owned conversation ids, native members, equivalence frontiers, append cursors, head routing, and explicit divergence. The remaining identity work is finer-grained provenance: ordered live segments and original-form projection.
+`ai-sessions` 3.1.5 plus merged P2 (`5e5503e`). Bridging has a neutral `Turn` model, per-harness readers and writers, and a `HARNESSES` registry in `bridge.py`. P1 fixed selection at Codex compaction boundaries. P2 adds utility-owned conversation ids, native members, equivalence frontiers, append cursors, head routing, and explicit divergence. The remaining identity work is finer-grained provenance: ordered live segments and original-form projection.
 
 The two failures that started this effort were:
 
@@ -91,11 +91,13 @@ never routing authority.
   Its target copy is conservatively treated as advanced until it is re-materialized under
   the new schema.
 
-### P3 — Window-aligned selection and a token budget
+### P3 — Target-aware token budget and whole-message selection
 
-Replace head-and-tail character trimming with whole-window selection: always carry the newest boundary's carry-over, then add whole windows newest-first until the budget fills, trimming inside a single window only when that one window alone overflows. Re-express `DEFAULT_MAX_CHARS` — currently **950,000 characters**, roughly 240–270k tokens against 1M-token context windows — as a per-harness token budget.
+Replace the single global character ceiling with an explicit token-denominated policy derived for the target harness. Keep the source reader's newest carried window plus live tail unchanged, and fit that context at whole-message boundaries. Truncate inside a message only when an individual message cannot fit by itself.
 
-Done when: the budget names its unit, is derived per target harness, and truncation is a documented backstop rather than the primary mechanism.
+Do **not** merge older `replacement_history` windows. The newest replacement history is the context Codex itself resumes from; merging earlier windows could resurrect superseded instructions and create a transcript no harness ever held.
+
+Done when: the budget names its unit, is derived per target harness, legacy `max_chars` configuration retains its meaning, and end-to-end tests prove selection drops complete messages rather than slicing arbitrary transcript text.
 
 ### P4 — The full conversation log
 
@@ -120,11 +122,12 @@ Done when: a Codex → Claude → Codex trip keeps the Codex-origin portion in n
 - **Stale-data fallbacks when a load fails.** Masking an unknown failure is the wrong response to not understanding it. 3.1.3 made failures legible instead.
 - **Our own LLM-based compaction.** It would add API keys, cost, latency, and an offline failure mode to a stdlib-plus-`psutil` tool. Codex already demonstrates a deterministic compaction worth copying: keep user messages verbatim, condense agent and tool activity.
 - **Editing provider transcripts in place.** Renaming appends a title entry to append-only provider data; nothing else writes to provider storage.
+- **Merging older Codex replacement windows into live context.** The newest `replacement_history` is authoritative source context. Older windows may contain superseded instructions, lack stable message identity for safe deduplication, and cannot be unioned with a memory bound independent of window count.
 
 ## Red flags
 
 - **The Codex writer is the risky surface.** Constructing valid records means honouring the `response_item` versus `user_message`/`agent_message` split and the `task_started`/`task_complete` framing. Getting it wrong produces a session that resumes with full context and a blank screen — indistinguishable from a failed bridge. Verify visually, not by asking the model what it remembers.
-- **Window alignment is asymmetric.** 366 boundaries in Codex versus one in a 5,397-record Claude session. P3 is transformative for Codex sources and close to a no-op for Claude ones. It demotes the character budget; it does not retire it.
+- **Target budgets are estimates.** Engineering transcripts mix prose, code, JSON, diffs, and tool output, while provider tokenizers and harness overhead differ. P3 must fail toward underfilling, document its safety margin, and retain an oversized-single-message escape hatch.
 - **Session proliferation.** Each hop writes a new native session. Superseded members are marked, not hidden — whether a long chain should ever be collapsed is unresolved.
 - **Specs written against one machine's data.** The P1 spec initially defined done in terms of a single local 530 MB rollout. Invariants over the format, verified on generated fixtures, are the correct shape — a criterion nobody else can check is not a criterion.
 - **A failed load leaks its SQLite connection.** The exception traceback keeps the frame alive, so on Windows the file stays handle-locked until garbage collection. Wants a `finally: connection.close()`.
@@ -153,4 +156,4 @@ Every `/feature plan` generated from this doc ends with a final Doc Sync phase t
 - `src/ai_sessions/app.py` — `prepare_launch`, `command_for`, `UserState.resolve_launch`, `UserState.set_bridge`
 - [`HARNESS_CONTRACT.md`](HARNESS_CONTRACT.md) — current adapter seam and the complete target contract
 - Measured against `~/.codex/sessions/2026/07/13/rollout-…-019f59af-….jsonl` and `~/.claude/projects/…/776daa15-….jsonl`
-- Released through 3.1.5; P2 is implemented on `conversation-log/round-trip-heads`
+- Released through 3.1.5; P2 merged to `main` as `5e5503e`

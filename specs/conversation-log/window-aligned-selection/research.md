@@ -1,4 +1,4 @@
-# Window-Aligned Selection and a Token Budget — Research
+# Target-Aware Token Budget and Whole-Message Selection — Research
 
 Parent north star: [`../NORTH_STAR.md`](../NORTH_STAR.md) — priority **P3**.
 Depends on **P1** (`codex-compaction-window`, shipped v3.1.4/3.1.5).

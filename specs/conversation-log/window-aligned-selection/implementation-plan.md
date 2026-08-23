@@ -1,4 +1,4 @@
-# Window-Aligned Selection and a Token Budget — Implementation Plan
+# Target-Aware Token Budget and Whole-Message Selection — Implementation Plan
 
 See [README.md](README.md) for decisions and [research.md](research.md) for measurements and invariants.
 
@@ -10,7 +10,7 @@ The plan review ran **first**, not after Phases 0–2 as originally sequenced. T
 
 ## Prerequisites
 
-- Branch off `main` at or after `0ea8e69` (v3.1.5).
+- Branch off `main` at or after `5e5503e` (merged P2).
 - **No external fixture.** Generated transcripts only, per P1's K7. `make_codex_rollout` and `PeakRecorder` already exist in `tests/test_codex_window.py` and should be reused rather than reinvented.
 - Verification with `PYTHONPATH=$PWD/src`.
 
@@ -118,4 +118,4 @@ Decided against in Phase 3. Recorded in the north star's *explicitly decided NOT
 
 ## Rollback
 
-Part A touches `config.py` and `bridge.py`'s budget plumbing; reverting restores the character budget with no data migration, since the config key is read, not written. Part B touches the reader's accumulation strategy; reverting restores P1's replace-on-boundary. Neither writes provider data.
+The implementation touches `config.py` and `bridge.py`'s budget and selection plumbing. Reverting restores the character budget and character-slice selection with no data migration, since the legacy config key is read but provider data is never rewritten. Part B is closed and must not alter the reader.

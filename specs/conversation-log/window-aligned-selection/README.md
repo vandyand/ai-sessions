@@ -1,26 +1,26 @@
 ---
-title: "Window-Aligned Selection and a Token Budget"
+title: "Target-Aware Token Budget and Whole-Message Selection"
 status: planned
-date: 2026-08-21
+date: 2026-08-23
 priority: 20
 ---
-# Window-Aligned Selection and a Token Budget
+# Target-Aware Token Budget and Whole-Message Selection
 
 Parent north star: [`../NORTH_STAR.md`](../NORTH_STAR.md) — priority **P3**.
 Measurements and invariants: [research.md](research.md).
 Phased tasks: [implementation-plan.md](implementation-plan.md).
 
-Depends on P1 ([`../codex-compaction-window/`](../codex-compaction-window/)), shipped in v3.1.4 and corrected in v3.1.5.
+Depends on P1 ([`../codex-compaction-window/`](../codex-compaction-window/)), shipped in v3.1.4 and corrected in v3.1.5. P2 was subsequently merged to `main` in `5e5503e`.
 
 ## What this is
 
-The north star bundled two changes. The evidence says they are independent and carry very different risk, so this spec keeps them separable and ships them in that order.
+The original north star bundled two changes. Review showed that only the first should ship:
 
-**Part A — one budget, in characters, for every target.** `DEFAULT_MAX_CHARS = 950_000` counts *characters* while the thing it protects is measured in tokens, and the same ceiling is applied whatever the target is. A Claude-bound copy is capped at roughly Codex's context window.
+**Part A — one budget, in characters, for every target.** `DEFAULT_MAX_CHARS = 950_000` counts *characters* while the thing it protects is measured in tokens, and the same ceiling is applied whatever the target is. A Claude-bound copy is therefore governed by a ceiling derived for Codex instead of by an explicit target policy.
 
 **Part B — recovering content from older windows. Decided against on review.** P1 made the reader adopt the newest window and discard what preceded it, so the north star's "add whole windows newest-first" was not implementable as written. The review answered whether the discarded windows were worth recovering: no. See [research.md](research.md#part-b--decided-against).
 
-## What the measurements say
+## What the rejected Part B measurements said
 
 | Finding | Consequence |
 |---|---|
@@ -29,7 +29,7 @@ The north star bundled two changes. The evidence says they are independent and c
 | Worst observed: newest window holds **59%** of the union (195-window session) | Occasionally large |
 | The union is only fractionally bigger than the newest window (482 vs 449; 217 vs 129) | Recovery is affordable — dedup costs ~one window, not ~366 |
 
-That last row is what makes Part B thinkable at all: a deduplicated union does not reintroduce the memory problem P1's R5 exists to prevent.
+Those measurements made Part B worth reviewing, but did not make it correct. They describe observed local sessions, not an invariant, and a deduplicated union would still create context no harness actually held.
 
 ## Key Decisions
 
@@ -52,7 +52,7 @@ P1's corrected **R5** still applies: anything claiming a memory property must be
 ## Non-Goals
 
 - The conversation log, per-message provenance, verbatim carry-forward — that is P4.
-- Round-trip head tracking — that is P2, still unstarted.
+- Round-trip head tracking — that is completed P2 (`5e5503e` on `main`).
 - Decoding `encrypted_content` — impossible by construction.
 - Shipping a tokenizer.
 
