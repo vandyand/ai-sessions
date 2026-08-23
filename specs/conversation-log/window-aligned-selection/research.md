@@ -70,9 +70,9 @@ class Budget:
     over_policy: bool = False
 ```
 
-`resolve_budget(target, max_tokens=None, max_chars=None)` is the only production path to a ceiling:
+`resolve_budget(target, max_tokens=None, max_chars=None, migrated=False)` is the only production path to a ceiling. `LaunchConfig.bridge_max_chars_migrated` carries the otherwise-lost schema-1 migration state.
 
-Constants are defined once: `TRUNCATION_MARKER = "\n\n[... message truncated ...]"`, `HANDOFF_NOTE_RESERVE_CHARS = 4096`, and `MIN_BRIDGE_CHARS = HANDOFF_NOTE_RESERVE_CHARS + 2 × (len(TRUNCATION_MARKER) + 1)`.
+Constants are defined once: `TRUNCATION_MARKER = "\n\n[... message truncated ...]"`, `HANDOFF_NOTE_RESERVE_CHARS = 4096`, and `MIN_BRIDGE_CHARS = HANDOFF_NOTE_RESERVE_CHARS + 2 × (len(TRUNCATION_MARKER) + 1) + 2`. The final `+2` reserves a possible same-role join between the two minimum anchors; the note reserve itself must hold `len(note) + 2` for its possible join to the first message.
 
 1. A positive, non-boolean `max_tokens` wins. Its applied floor is `max(4096, ceil(MIN_BRIDGE_CHARS / chars_per_token))` tokens and any clamp is reported.
 2. Otherwise, a positive, non-boolean legacy `max_chars` is kept exactly; `tokens = ceil(chars / chars_per_token)` is reporting metadata only.
@@ -135,15 +135,15 @@ Invariants over an arbitrary transcript, in the style established by P1.
 | T2 | Except for the exact version-1 machine default, an existing positive `max_chars` keeps its exact character ceiling; it is estimated into tokens for reporting but never round-tripped through the estimate. Too-small or over-policy values are surfaced explicitly rather than silently changed |
 | T2b | With neither key set, each target receives the documented target default; the intentional default reduction is stated in the handoff note and release documentation |
 | T3 | The effective ceiling is derived **per target harness**, not one global constant |
-| T4 | If all prepared messages fit the conversation allowance, they are byte-identical. On overflow, selection happens before same-role merging; `anchor_share = (Budget.chars − HANDOFF_NOTE_RESERVE_CHARS) // 2` with no 1,000-character floor, both first/newest anchors are capped marker-inclusive to that share, and only intervening messages are dropped whole |
+| T4 | If all prepared messages fit the conversation allowance, they are byte-identical. On overflow, selection happens before same-role merging; `anchor_share = (Budget.chars − HANDOFF_NOTE_RESERVE_CHARS − 2) // 2` with no 1,000-character floor, both first/newest anchors are capped marker-inclusive, and survivors after the first are one contiguous suffix of the input |
 | T5 | The first message of the **selected source context** survives whenever anything survives; after compaction this is not necessarily the original conversation request |
-| T6 | The note is rendered from the resolved `Budget`, states the actually applied token estimate and character ceiling, and is included in the total payload ceiling |
+| T6 | The note is rendered from the resolved `Budget`, states the applied token estimate and character ceiling, fits its reserve including the possible join, and distinguishes source-message count from assembled target-message count |
 | T7 | The conversion is exercised **end to end** — `LaunchConfig.load` → production launch path → `prepare_launch` → `bridge` → selection → note → written payload |
 | T8 | Existing P1 invariants R1–R10 continue to hold, including R10 (`latest_window=False`) |
 | T9 | Selection preserves order, is deterministic and monotone with increasing budgets, and reports dropped source-message count before same-role merging |
-| T10 | Budget policy belongs to the target `Harness`; the core contains no target-name budget branches. Selection uses a monotone sequence-cost hook denominated in `Budget.chars` plus a matching truncation hook; P3 validates hook results, and P4 may replace both for native projection/assembly sizing |
+| T10 | Budget policy belongs to the target `Harness`; the core contains no target-name budget branches. Selection uses a linear `SelectionMetric` with non-negative `item_cost(turn)`, `join_cost(left, right)`, and matching `truncate(turn, limit)`, all denominated in `Budget.chars`; P3 validates hook results, and P4 may replace the metric for native projection/assembly sizing |
 
-**T4 was wrong twice in earlier drafts.** `fit()` currently caps every prepared run at `max(1000, max_chars // 2)` before it even knows whether the conversation fits, and it runs after `merge_runs`, where source messages no longer exist as units. P3 deliberately changes this: a fits-within-allowance conversation is untouched; overflow selection operates on `flatten(turns)` before same-role merging; both anchors use exactly half the post-note conversation allowance so first and newest context can survive without exceeding the ceiling.
+**T4 was wrong twice in earlier drafts.** `fit()` currently caps every prepared run at `max(1000, max_chars // 2)` before it even knows whether the conversation fits, and it runs after `merge_runs`, where source messages no longer exist as units. P3 deliberately changes this: a fits-within-allowance conversation is untouched; overflow selection operates on `flatten(turns)` before same-role merging; both anchors use the post-note allowance minus their worst-case join so first and newest context can survive without exceeding the ceiling.
 
 **T7 exists because of a named mutation.** Adding a `max_tokens` key, printing it in the note, and leaving the character path active would pass every config-level and note-level test while behavior stayed in characters. That is the same shape as P1's proxy-tested R5, so the invariant is written to forbid it.
 

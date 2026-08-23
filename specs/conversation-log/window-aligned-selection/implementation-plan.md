@@ -42,15 +42,15 @@ Direct `python -` against the working tree. Each phase states the expression and
 
 - [ ] Add validated immutable `BudgetPolicy` and `Budget`; put one policy on every `Harness` and extend registry tests to require `context_tokens > 0`, `0 < usable_fraction <= 1`, `chars_per_token > 0`, and non-empty provenance (T3/T10)
 - [ ] Give Codex budget policy its own declared `CODEX_BUDGET_CONTEXT_TOKENS = 256_000` compatibility-floor constant and provenance; never reuse writer-only `CODEX_CONTEXT_WINDOW = 258_400`. Add a structural/source assertion that the registry policy names the budget constant
-- [ ] Make `bridge_max_tokens` and `bridge_max_chars` independently optional so unset differs from explicit legacy configuration (T2/T2b)
+- [ ] Make `bridge_max_tokens` and `bridge_max_chars` independently optional, plus `bridge_max_chars_migrated: bool`, so never-configured, explicit legacy, and migrated machine-default states remain distinguishable (T2/T2b)
 - [ ] Implement one pure resolver: positive `max_tokens` wins and is clamped to `max(4096, ceil(MIN_BRIDGE_CHARS / chars_per_token))`; otherwise positive `max_chars` is kept verbatim; otherwise use target policy. Invalid/bool/non-positive values are unset. No resolved budget is non-positive
-- [ ] Bump saved config schema to 2. Missing/non-integer version is schema 1; migrate exact `max_chars = 950000` to `target-default-migrated`, preserve other positive values. `as_toml()` writes `max_tokens` when set, otherwise an explicit `max_chars`, and neither for target default; never write both
+- [ ] Bump saved config schema to 2. Missing/non-integer version is schema 1; exact `max_chars = 950000` sets the migrated carrier, while other positive values remain explicit. `as_toml()` writes `max_tokens` when set, otherwise explicit `max_chars`, and neither default; never write both
 - [ ] Add load → save → load tests that preserve the effective budget and do not resurrect `max_chars`
 - [ ] Replace `prepare_launch(max_chars=...)` and `bridge(max_chars=...)` with the resolved `Budget`; remove the `or DEFAULT_MAX_CHARS` fallback so there is one path
 - [ ] Render the handoff note and returned launch notice from the same `Budget`; report origin, estimate/ceiling, clamping, and any legacy value above target policy with migration guidance (T6)
-- [ ] Define `TRUNCATION_MARKER`, `HANDOFF_NOTE_RESERVE_CHARS = 4096`, and `MIN_BRIDGE_CHARS = reserve + 2 × (len(marker) + 1)` once. Remove `fit`'s unlimited sentinel. Validate every constructed `Budget` (target/origin non-empty, tokens positive, chars at least the floor) and every adapter's derived default
+- [ ] Define `TRUNCATION_MARKER`, `HANDOFF_NOTE_RESERVE_CHARS = 4096`, and `MIN_BRIDGE_CHARS = reserve + 2 × (len(marker) + 1) + 2` once. Remove `fit`'s unlimited sentinel. Validate every constructed `Budget` and every adapter default
 - [ ] Add a non-1.0 fixture policy (2.5 chars/token) proving both conversion directions apply the ratio and at least one shipped policy has `Budget.chars != Budget.tokens`
-- [ ] Document `max_tokens`, precedence, legacy preservation, and default migration in the repo README
+- [ ] Document `max_tokens`, precedence, legacy preservation, and default migration in repo README prose and the copyable config example; the example gains `version = 2` and uses `max_tokens` rather than the old auto-default
 
 **Verification**
 
@@ -61,6 +61,7 @@ Direct `python -` against the working tree. Each phase states the expression and
 # max_tokens resolves through the target policy and wins if both keys exist
 # load(max_tokens only) -> save -> load preserves the same Budget and never adds max_chars
 # the note is rendered from the applied Budget, including a deliberately clamped case
+# migrated and never-configured defaults render different note/launch explanations
 ```
 
 ---
@@ -69,15 +70,17 @@ Direct `python -` against the working tree. Each phase states the expression and
 
 - [ ] Split preparation into `flatten(turns)` → selection → `merge_runs(survivors)` so source messages remain the selection/counting unit (T4/T9)
 - [ ] If the complete flattened conversation fits the post-note allowance, return it byte-identical with zero drops; only the overflow path applies the two post-note anchor shares (T4/K9)
-- [ ] On overflow set `conversation_limit = Budget.chars - HANDOFF_NOTE_RESERVE_CHARS` and `anchor_share = conversation_limit // 2` with no old 1,000-character floor. Cap **both** anchors marker-inclusive before the tail loop; keep both for `[short, oversized-newest]` and drop only intervening messages whole
+- [ ] On overflow set `conversation_limit = Budget.chars - HANDOFF_NOTE_RESERVE_CHARS` and `anchor_share = (conversation_limit - 2) // 2` with no old 1,000-character floor. Cap both anchors marker-inclusive before the tail loop; survivors after the first must be one contiguous input suffix
 - [ ] Count dropped pre-merge source messages exactly. A truncated turn retains only `ToolCall` entries whose complete rendered blocks survive; the note count may never exceed summaries present in payload
-- [ ] Bound every interpolated note field (title, cwd, session id, conversation id), enforce the 4,096-character reserve with a runtime `BridgeError`, and test floor−1/floor/floor+1 with maximal bounded metadata and two oversized anchors (T6/K8)
-- [ ] Use `cost: Callable[[Sequence[Turn]], int]` plus matching `truncate(turn, limit) -> Turn`, denominated in `Budget.chars`. Default cost is `sum(len(t.text) for t in merge_runs(candidate))`; it includes all separators/stripping. Require cost monotonic under sequence extension and validate truncated output against its share (T10)
-- [ ] Replace the handoff claim "opening request" with "first message of the selected source context"
+- [ ] Bound every interpolated note field, require `len(note) + 2 <= 4096` at runtime, and define `MIN_BRIDGE_CHARS = reserve + 2 × (len(marker) + 1) + 2`. Test floor−1/floor/floor+1 with maximal metadata and two oversized **same-role** anchors (T6/K8)
+- [ ] Use a linear `SelectionMetric` with `item_cost(turn)`, `join_cost(left, right)`, and `truncate(turn, limit)`, all in `Budget.chars`. P3 uses `len(text)` plus conservative 2-character same-role joins, validates non-negative costs/truncation, and scans the tail once; P4 may replace all three operations (T10)
+- [ ] Replace the handoff claim "opening request" and report both units honestly: `N source message(s), assembled into M target message(s) below`; expose both counts in `BridgeResult`/launch notice
 - [ ] Add property-style cases for membership/truncation shape, order, head/tail, fit-through, exact count, monotonicity, determinism, empty/single/all-oversized inputs, `[short, oversized-newest]`, and consecutive same-role runs
-- [ ] Add an end-to-end test beginning at `LaunchConfig.load` and calling `launch(session, config, dry_run=True, state=...)`; fixture sets `launch_tool` to the opposite harness and includes it in `available_launch_tools`, then reads the written member path recorded by `state.set_bridge` (T7)
+- [ ] Add an end-to-end test beginning at `LaunchConfig.load` and calling `launch(session, config, dry_run=True, state=...)`; force the opposite harness, read the member path from `state.set_bridge`, and use `max_tokens = 5000` on ~40,000 characters to assert payload ≤10,000, dropped notice, and note ≈5,000 tokens/10,000 chars. Without the key, the same fixture keeps every message (T7)
 - [ ] On one ~340,000-character generated transcript with unset config, assert Claude drops messages while Codex keeps them; this kills any hidden `DEFAULT_MAX_CHARS` selector path
-- [ ] Add ≥1,000 consecutive same-role messages and assert `sum(len(t.text) for t in merge_runs([note, *kept])) <= Budget.chars`
+- [ ] On an overflowing ≥2,000-message same-role fixture assert metric cost of `kept` ≤ conversation allowance and actual merged `[note, *kept]` text ≤ `Budget.chars`; this must fail if join cost is removed
+- [ ] On every overflow assert survivors are `[first] + input[j:]` for one index `j`; no gap-tail selection
+- [ ] Measure selection on a generated ~1M-character transcript with `PeakRecorder`; require linear metric calls/retained allocation and a practical time bound, not a whole-candidate reprice per tail step
 
 **Verification**
 
@@ -150,6 +153,19 @@ Direct `python -` against the working tree. Each phase states the expression and
 - [x] Define/validate `MIN_BRIDGE_CHARS` for every origin and adapter default
 - [x] Make truncated tool-call counts reflect complete rendered blocks only
 - [x] Force a real opposite-harness dry-run bridge and bound every note field
+- [ ] Re-run Opus 5 and require no HIGH or MEDIUM findings before Phase 1 implementation
+
+### Phase 3e — Opus 5 fourth review
+
+**Verdict: NOT CLEAN — HIGH=1 MEDIUM=6.** Claude Opus 5 (`claude-opus-5`, max effort) reviewed `66c655b` directly in read-only mode on 2026-08-23; no artifact was written.
+
+- [x] Restore a behavioral `max_tokens` assertion to the production dry-run test
+- [x] Carry and surface the schema-1 migrated-default state
+- [x] Reserve both possible assembly joins and correct `MIN_BRIDGE_CHARS`
+- [x] Re-dimension same-role testing against the conversation allowance
+- [x] Restore the contiguous newest-suffix invariant
+- [x] Replace whole-sequence repricing with a linear item/join/truncate metric
+- [x] Report source-message and assembled-target counts separately
 - [ ] Re-run Opus 5 and require no HIGH or MEDIUM findings before Phase 1 implementation
 
 ---
