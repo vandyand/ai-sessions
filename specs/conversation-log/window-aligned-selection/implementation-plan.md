@@ -43,7 +43,7 @@ Direct `python -` against the working tree. Each phase states the expression and
 - [ ] Add validated immutable `BudgetPolicy` and `Budget`; put one policy on every `Harness` and extend registry tests to require `context_tokens > 0`, `0 < usable_fraction <= 1`, `chars_per_token > 0`, and non-empty provenance (T3/T10)
 - [ ] Give Codex budget policy its own declared `CODEX_BUDGET_CONTEXT_TOKENS = 256_000` compatibility-floor constant and provenance; never reuse writer-only `CODEX_CONTEXT_WINDOW = 258_400`. Add a structural/source assertion that the registry policy names the budget constant
 - [ ] Make `bridge_max_tokens` and `bridge_max_chars` independently optional, plus `bridge_max_chars_migrated: bool`, so never-configured, explicit legacy, and migrated machine-default states remain distinguishable (T2/T2b)
-- [ ] Implement one pure resolver: positive `max_tokens` wins and is clamped to `max(4096, ceil(MIN_BRIDGE_CHARS / chars_per_token))`; otherwise positive `max_chars` is kept verbatim; otherwise use target policy. Invalid/bool/non-positive values are unset. No resolved budget is non-positive
+- [ ] Implement one pure resolver: positive `max_tokens` wins and is clamped; otherwise `migrated=True` uses target policy with its distinct origin; otherwise positive `max_chars` stays verbatim; otherwise use ordinary target policy. Invalid/bool/non-positive values are unset and no resolved budget is non-positive
 - [ ] Bump saved config schema to 2. Missing/non-integer version is schema 1; exact `max_chars = 950000` sets the migrated carrier, while other positive values remain explicit. `as_toml()` writes `max_tokens` when set, otherwise explicit `max_chars`, and neither default; never write both
 - [ ] Add load → save → load tests that preserve the effective budget and do not resurrect `max_chars`
 - [ ] Replace `prepare_launch(max_chars=...)` and `bridge(max_chars=...)` with the resolved `Budget`; remove the `or DEFAULT_MAX_CHARS` fallback so there is one path
@@ -69,16 +69,16 @@ Direct `python -` against the working tree. Each phase states the expression and
 ## Phase 2: Source-message selection before merging (Part A)
 
 - [ ] Split preparation into `flatten(turns)` → selection → `merge_runs(survivors)` so source messages remain the selection/counting unit (T4/T9)
-- [ ] If the complete flattened conversation fits the post-note allowance, return it byte-identical with zero drops; only the overflow path applies the two post-note anchor shares (T4/K9)
+- [ ] Use the same `SelectionMetric` item-plus-join total for the fit-through check and overflow loop. If the complete flattened list fits the post-note allowance under that metric, return it byte-identical with zero drops; only overflow applies anchor shares (T4/K9)
 - [ ] On overflow set `conversation_limit = Budget.chars - HANDOFF_NOTE_RESERVE_CHARS` and `anchor_share = (conversation_limit - 2) // 2` with no old 1,000-character floor. Cap both anchors marker-inclusive before the tail loop; survivors after the first must be one contiguous input suffix
 - [ ] Count dropped pre-merge source messages exactly. A truncated turn retains only `ToolCall` entries whose complete rendered blocks survive; the note count may never exceed summaries present in payload
-- [ ] Bound every interpolated note field, require `len(note) + 2 <= 4096` at runtime, and define `MIN_BRIDGE_CHARS = reserve + 2 × (len(marker) + 1) + 2`. Test floor−1/floor/floor+1 with maximal metadata and two oversized **same-role** anchors (T6/K8)
+- [ ] Bound every interpolated note field; if `len(note) + 2 > 4096`, raise `BridgeError` rather than truncate metadata. Test the runtime error plus floor−1/floor/floor+1 with maximal metadata and two oversized **same-role** anchors (T6/K8)
 - [ ] Use a linear `SelectionMetric` with `item_cost(turn)`, `join_cost(left, right)`, and `truncate(turn, limit)`, all in `Budget.chars`. P3 uses `len(text)` plus conservative 2-character same-role joins, validates non-negative costs/truncation, and scans the tail once; P4 may replace all three operations (T10)
-- [ ] Replace the handoff claim "opening request" and report both units honestly: `N source message(s), assembled into M target message(s) below`; expose both counts in `BridgeResult`/launch notice
+- [ ] Replace the handoff claim "opening request" and report both units honestly: `N source message(s), assembled into M target message(s) below`; expose both counts in `BridgeResult`/launch notice. When anchors are capped, note and launch notice also report the truncated-anchor count even if dropped is zero
 - [ ] Add property-style cases for membership/truncation shape, order, head/tail, fit-through, exact count, monotonicity, determinism, empty/single/all-oversized inputs, `[short, oversized-newest]`, and consecutive same-role runs
 - [ ] Add an end-to-end test beginning at `LaunchConfig.load` and calling `launch(session, config, dry_run=True, state=...)`; force the opposite harness, read the member path from `state.set_bridge`, and use `max_tokens = 5000` on ~40,000 characters to assert payload ≤10,000, dropped notice, and note ≈5,000 tokens/10,000 chars. Without the key, the same fixture keeps every message (T7)
 - [ ] On one ~340,000-character generated transcript with unset config, assert Claude drops messages while Codex keeps them; this kills any hidden `DEFAULT_MAX_CHARS` selector path
-- [ ] On an overflowing ≥2,000-message same-role fixture assert metric cost of `kept` ≤ conversation allowance and actual merged `[note, *kept]` text ≤ `Budget.chars`; this must fail if join cost is removed
+- [ ] Add two same-role stress fixtures dimensioned by survivors: a fits-through edge where raw text fits but item-plus-join cost does not, and an overflowing ≥2,000-message case retaining >1,500 survivors. Assert metric cost of `kept` ≤ conversation allowance and merged `[note, *kept]` text ≤ `Budget.chars`; both must fail if either branch drops join cost
 - [ ] On every overflow assert survivors are `[first] + input[j:]` for one index `j`; no gap-tail selection
 - [ ] Measure selection on a generated ~1M-character transcript with `PeakRecorder`; require linear metric calls/retained allocation and a practical time bound, not a whole-candidate reprice per tail step
 
@@ -166,6 +166,18 @@ Direct `python -` against the working tree. Each phase states the expression and
 - [x] Restore the contiguous newest-suffix invariant
 - [x] Replace whole-sequence repricing with a linear item/join/truncate metric
 - [x] Report source-message and assembled-target counts separately
+- [ ] Re-run Opus 5 and require no HIGH or MEDIUM findings before Phase 1 implementation
+
+### Phase 3f — Opus 5 fifth review
+
+**Verdict: NOT CLEAN — HIGH=1 MEDIUM=5.** Claude Opus 5 (`claude-opus-5`, max effort) reviewed `f05906d` directly in read-only mode on 2026-08-23; no artifact was written.
+
+- [x] Make join-aware metric pricing normative in fit-through as well as overflow
+- [x] Consume the migrated carrier in resolver precedence
+- [x] Restore `BridgeError` as the note-reserve failure mode
+- [x] Disclose truncated anchors even when no messages are dropped
+- [x] Remove the superseded whole-sequence callback from the harness contract
+- [x] Add the schema-1 carve-out and minimum default to shared adapter fixtures
 - [ ] Re-run Opus 5 and require no HIGH or MEDIUM findings before Phase 1 implementation
 
 ---

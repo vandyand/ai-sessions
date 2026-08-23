@@ -75,10 +75,11 @@ class Budget:
 Constants are defined once: `TRUNCATION_MARKER = "\n\n[... message truncated ...]"`, `HANDOFF_NOTE_RESERVE_CHARS = 4096`, and `MIN_BRIDGE_CHARS = HANDOFF_NOTE_RESERVE_CHARS + 2 × (len(TRUNCATION_MARKER) + 1) + 2`. The final `+2` reserves a possible same-role join between the two minimum anchors; the note reserve itself must hold `len(note) + 2` for its possible join to the first message.
 
 1. A positive, non-boolean `max_tokens` wins. Its applied floor is `max(4096, ceil(MIN_BRIDGE_CHARS / chars_per_token))` tokens and any clamp is reported.
-2. Otherwise, a positive, non-boolean legacy `max_chars` is kept exactly; `tokens = ceil(chars / chars_per_token)` is reporting metadata only.
-3. Otherwise, `tokens = floor(context_tokens × usable_fraction)` from the target adapter and `chars = floor(tokens × chars_per_token)`. Adapter registration rejects a policy whose default cannot meet `MIN_BRIDGE_CHARS`.
-4. Invalid, boolean, zero, or negative config values are treated as unset, matching current forgiving config behavior.
-5. The resolved `Budget` is passed unchanged through launch, selection, and note rendering. No raw ceiling or fallback travels in parallel.
+2. Otherwise, if `migrated` is true, resolve through target policy with `origin = "target-default-migrated"`; the discarded schema-1 machine default never reaches the explicit-character branch.
+3. Otherwise, a positive, non-boolean legacy `max_chars` is kept exactly; `tokens = ceil(chars / chars_per_token)` is reporting metadata only.
+4. Otherwise, `tokens = floor(context_tokens × usable_fraction)` from the target adapter and `chars = floor(tokens × chars_per_token)`. Adapter registration rejects a policy whose default cannot meet `MIN_BRIDGE_CHARS`.
+5. Invalid, boolean, zero, or negative config values are treated as unset, matching current forgiving config behavior.
+6. The resolved `Budget` is passed unchanged through launch, selection, and note rendering. No raw ceiling or fallback travels in parallel.
 
 If both keys are present, `max_tokens` wins and the next config save removes the ignored deprecated key. A newly saved target-default config writes neither key and uses config schema version 2. A missing-version/version-1 `max_chars = 950000` becomes `target-default-migrated`; any other explicit legacy character budget is retained exactly. When it exceeds target policy, `over_policy` makes both the handoff note and launch notice say so and tell the user to delete `max_chars` or set `max_tokens`. A legacy ceiling below `MIN_BRIDGE_CHARS` fails with `BridgeError`; it is never silently enlarged and every constructed `Budget` validates non-empty target/origin, positive tokens, and `chars >= MIN_BRIDGE_CHARS`.
 
@@ -135,9 +136,9 @@ Invariants over an arbitrary transcript, in the style established by P1.
 | T2 | Except for the exact version-1 machine default, an existing positive `max_chars` keeps its exact character ceiling; it is estimated into tokens for reporting but never round-tripped through the estimate. Too-small or over-policy values are surfaced explicitly rather than silently changed |
 | T2b | With neither key set, each target receives the documented target default; the intentional default reduction is stated in the handoff note and release documentation |
 | T3 | The effective ceiling is derived **per target harness**, not one global constant |
-| T4 | If all prepared messages fit the conversation allowance, they are byte-identical. On overflow, selection happens before same-role merging; `anchor_share = (Budget.chars − HANDOFF_NOTE_RESERVE_CHARS − 2) // 2` with no 1,000-character floor, both first/newest anchors are capped marker-inclusive, and survivors after the first are one contiguous suffix of the input |
+| T4 | Both fit-through and overflow use the same `SelectionMetric` item-plus-join cost. If the complete flattened list fits the conversation allowance under that metric it is byte-identical; otherwise both anchors are capped marker-inclusive with `anchor_share = (Budget.chars − HANDOFF_NOTE_RESERVE_CHARS − 2) // 2`, and survivors after the first are one contiguous suffix |
 | T5 | The first message of the **selected source context** survives whenever anything survives; after compaction this is not necessarily the original conversation request |
-| T6 | The note is rendered from the resolved `Budget`, states the applied token estimate and character ceiling, fits its reserve including the possible join, and distinguishes source-message count from assembled target-message count |
+| T6 | The note is rendered from the resolved `Budget`, states the applied token estimate and character ceiling, fits its reserve including the possible join, distinguishes source/assembled counts, and discloses both dropped-message and truncated-anchor counts |
 | T7 | The conversion is exercised **end to end** — `LaunchConfig.load` → production launch path → `prepare_launch` → `bridge` → selection → note → written payload |
 | T8 | Existing P1 invariants R1–R10 continue to hold, including R10 (`latest_window=False`) |
 | T9 | Selection preserves order, is deterministic and monotone with increasing budgets, and reports dropped source-message count before same-role merging |

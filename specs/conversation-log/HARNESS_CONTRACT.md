@@ -96,13 +96,11 @@ Adding a third harness is complete when its adapter passes shared contract fixtu
 - concurrent append safety and explicit divergence.
 
 Shared budget fixtures additionally require `context_tokens > 0`,
-`0 < usable_fraction <= 1`, `chars_per_token > 0`, and non-empty provenance,
-an unset configuration to resolve through that policy, and the same explicit legacy
-`max_chars` value to remain identical across all targets. Selection accepts a cost callback so
-the full conversation-log phase can account for native-versus-projected forms and assembly
-overhead without rewriting the selection algorithm. That callback prices a complete candidate
-sequence in the applied budget's character unit; a per-message callback is insufficient because
-same-role merge separators depend on adjacency. `SelectionMetric` therefore supplies
+`0 < usable_fraction <= 1`, `chars_per_token > 0`, non-empty provenance, and a derived default
+at or above `MIN_BRIDGE_CHARS`. Unset config resolves through target policy. An explicit legacy
+`max_chars` other than schema-1 `950000` remains identical across targets; that exact schema-1
+machine default migrates to each target's policy. A bare per-message cost is insufficient because
+same-role merge separators depend on adjacency, so `SelectionMetric` supplies
 `item_cost(turn)`, `join_cost(left, right)`, and `truncate(turn, limit)` in `Budget.chars`.
 Core validates non-negative costs and truncated anchors against their shares; the selector
 scans once with a running total rather than repricing whole candidates. P3's default uses
