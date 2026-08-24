@@ -35,6 +35,7 @@ class SharedStoreFixture:
         self.name = name
         self.path = root / f"{name}.sqlite"
         self.prepared_commands: list[tuple[str, ...]] = []
+        self.prepared_options: list[dict[str, object]] = []
         self.during_snapshot: Callable[[], None] | None = None
 
     def initialize(self) -> None:
@@ -220,9 +221,12 @@ class SharedStoreFixture:
             return "unstable"
         return "unchanged" if current == checkpoint else "changed"
 
-    def prepare_target(self, command: tuple[str, ...], cwd: str) -> PreparedTarget:
+    def prepare_target(
+        self, command: tuple[str, ...], cwd: str, options: dict[str, object]
+    ) -> PreparedTarget:
         del cwd
         self.prepared_commands.append(command)
+        self.prepared_options.append(dict(options))
         return PreparedTarget(command, self.adapter().budget)
 
     def write(

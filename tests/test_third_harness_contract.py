@@ -113,7 +113,9 @@ class ThirdHarnessContractTests(unittest.TestCase):
             self.assertEqual(item.session_id, session_id)
             self.assertTrue(item.is_open)
             self.assertEqual(item.open_pid, os.getpid())
-            self.assertEqual(available_launch_tools(item), ("fixture", "codex", "claude"))
+            self.assertEqual(
+                available_launch_tools(item), ("fixture", "codex", "claude", "opencode")
+            )
             self.assertTrue(native_session_exists("fixture", session_id))
             self.assertIn("fixture", app.build_parser()._option_string_actions["--tool"].choices)
             self.assertIn("fixture", Browser._pair_layout())

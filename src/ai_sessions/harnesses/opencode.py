@@ -7,29 +7,36 @@ import functools
 import json
 import os
 import re
+import secrets
 import shutil
 import signal
 import sqlite3
 import stat
 import subprocess
+import tempfile
 import threading
 import time
 import urllib.parse
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Iterator
+from typing import Any, Iterable, Iterator
 
-from ..capabilities import HarnessAdapter, Unsupported
+from ..capabilities import HarnessAdapter
 from ..conversion import DEFAULT_CHARS_PER_TOKEN, DEFAULT_USABLE_FRACTION, BridgeError
 from ..diagnostics import record_warning
 from ..discovery import EvidenceAccumulator, HarnessContext, clean_prompt, timestamp
+from ..liveness import LivenessContext
 from ..model import (
     Availability,
     BudgetPolicy,
+    LivenessSession,
     NativeRef,
     NativeSession,
+    NativeWrite,
+    PreparedTarget,
     ReadSnapshot,
     SourceKind,
+    Turn,
 )
 from ..paths import HOME, IS_WINDOWS, env_path
 from ..registry import REGISTRY
@@ -41,6 +48,13 @@ from .opencode_semantics import (
     select_compacted_newest,
     semantic_checkpoint,
 )
+from .opencode_write import (
+    GeneratedExport,
+    build_export,
+    choose_model,
+    parse_model_ids,
+    parse_verbose_models,
+)
 
 OPENCODE_CONTEXT_FLOOR_TOKENS = 128_000
 DB_PATH_TIMEOUT_SECONDS = 3.0
@@ -50,6 +64,9 @@ OPENCODE_EVIDENCE_BYTES = 16_777_216
 DISCOVERY_PREVIEW_CHARS = 4_096
 DISCOVERY_WARNING_CHARS = 512
 SEMANTIC_BUSY_TIMEOUT_SECONDS = 2.0
+MODEL_TIMEOUT_SECONDS = 10.0
+IMPORT_TIMEOUT_SECONDS = 30.0
+IMPORT_VERIFY_DELAYS = (0.0, 0.05, 0.1, 0.2, 0.4)
 _DEFAULT_TITLE = re.compile(
     r"^(?:New session - |Child session - )\d{4}-\d{2}-\d{2}T"
     r"\d{2}:\d{2}:\d{2}\.\d{3}Z$"
@@ -69,6 +86,7 @@ _REQUIRED_COLUMNS = {
 }
 _SEMANTIC_REQUIRED_COLUMNS = {"session": {"revert"}}
 _SEMANTIC_CHECKPOINT = re.compile(rf"{re.escape(CHECKPOINT_SCHEME)}[0-9a-f]{{64}}\Z")
+_IMPORTED_SESSION = re.compile(r"(?m)^Imported session:\s*(ses_[0-9A-Za-z]{26})\s*$")
 
 
 def _default_home() -> Path:
@@ -89,6 +107,7 @@ class MaintenanceResult:
     stdout: str
     stderr: str
     truncated: bool = False
+    timed_out: bool = False
 
 
 @dataclass(frozen=True, slots=True)
@@ -346,6 +365,7 @@ def run_maintenance(
     *,
     cwd: str,
     timeout: float,
+    return_timeout: bool = False,
 ) -> MaintenanceResult:
     """Run one bounded, non-interactive provider maintenance command."""
     if not command:
@@ -470,7 +490,8 @@ def run_maintenance(
                 # is nonblocking/polled and stop is set, so give it one final
                 # scheduling interval and report timeout if it still cannot exit.
                 reader.join(timeout=0.1)
-    if timed_out or any(reader.is_alive() for reader in readers):
+    timed_out = timed_out or any(reader.is_alive() for reader in readers)
+    if timed_out and not return_timeout:
         raise BridgeError(f"OpenCode maintenance command timed out after {timeout:g} seconds")
     return MaintenanceResult(
         argv,
@@ -478,6 +499,7 @@ def run_maintenance(
         stdout_raw.decode("utf-8", "replace"),
         stderr_raw.decode("utf-8", "replace"),
         stdout_truncated[0] or stderr_truncated[0],
+        timed_out,
     )
 
 
@@ -501,6 +523,126 @@ def _parse_database_path(output: str, cwd: str) -> Path:
     if not candidate.is_absolute():
         candidate = Path(cwd) / candidate
     return candidate.resolve()
+
+
+def _maintenance_detail(result: MaintenanceResult) -> str:
+    if result.timed_out:
+        return "maintenance command timed out"
+    detail = clean_prompt(result.stderr) or clean_prompt(result.stdout)
+    if len(detail) > DISCOVERY_WARNING_CHARS:
+        detail = detail[: DISCOVERY_WARNING_CHARS - 2].rstrip() + " …"
+    return detail or f"exit {result.returncode}"
+
+
+def _command_database_path(command: tuple[str, ...], cwd: str) -> Path:
+    result = run_maintenance(
+        command,
+        ("db", "path"),
+        cwd=cwd,
+        timeout=DB_PATH_TIMEOUT_SECONDS,
+    )
+    if result.returncode != 0 or result.truncated:
+        raise BridgeError(f"OpenCode db path failed: {_maintenance_detail(result)}")
+    return _parse_database_path(result.stdout, cwd)
+
+
+def _prepare_opencode_target(
+    command: tuple[str, ...], cwd: str, options: dict[str, Any]
+) -> PreparedTarget:
+    operation_cwd = str(Path(cwd or os.getcwd()).resolve())
+    if not Path(operation_cwd).is_dir():
+        raise BridgeError(f"OpenCode target working directory does not exist: {operation_cwd}")
+    configured_model = options.get("bridge_model", "")
+    if configured_model is None:
+        configured_model = ""
+    if not isinstance(configured_model, str):
+        raise BridgeError("OpenCode provider bridge_model must be a string")
+    installed_result = run_maintenance(
+        command,
+        ("models",),
+        cwd=operation_cwd,
+        timeout=MODEL_TIMEOUT_SECONDS,
+    )
+    if installed_result.returncode != 0 or installed_result.truncated:
+        raise BridgeError(
+            f"OpenCode models failed while preparing the target: "
+            f"{_maintenance_detail(installed_result)}"
+        )
+    installed = parse_model_ids(installed_result.stdout)
+    if configured_model and configured_model not in installed:
+        raise BridgeError(
+            f"configured OpenCode bridge_model {configured_model!r} is not installed; "
+            "choose a model listed by `opencode models`"
+        )
+    database = _command_database_path(command, operation_cwd)
+    verbose_result = run_maintenance(
+        command,
+        ("models", "--verbose"),
+        cwd=operation_cwd,
+        timeout=MODEL_TIMEOUT_SECONDS,
+    )
+    notices: list[str] = []
+    selected_full = configured_model or installed[0]
+    provider_id, model_id = selected_full.split("/", 1)
+    policy = BudgetPolicy(
+        OPENCODE_CONTEXT_FLOOR_TOKENS,
+        DEFAULT_USABLE_FRACTION,
+        DEFAULT_CHARS_PER_TOKEN,
+        "OpenCode 128k fallback because verbose model metadata was unavailable",
+        hard_limit=True,
+    )
+    verbose_models = None
+    verbose_error: BridgeError | None = None
+    try:
+        if verbose_result.returncode != 0 or verbose_result.truncated:
+            raise BridgeError(_maintenance_detail(verbose_result))
+        verbose_models = parse_verbose_models(verbose_result.stdout)
+    except BridgeError as error:
+        verbose_error = error
+    if verbose_models is None:
+        notices.append(
+            "OpenCode verbose model metadata could not be used; applying the conservative "
+            f"128,000-token fallback for {selected_full}; its real limit is unknown and may be "
+            f"smaller ({verbose_error})"
+        )
+    else:
+        selected = choose_model(
+            installed,
+            verbose_models,
+            explicit=configured_model,
+            minimum_input_tokens=OPENCODE_CONTEXT_FLOOR_TOKENS,
+        )
+        selected_full = selected.full_id
+        provider_id = selected.provider_id
+        model_id = selected.model_id
+        try:
+            policy = BudgetPolicy(
+                selected.effective_input_tokens,
+                DEFAULT_USABLE_FRACTION,
+                DEFAULT_CHARS_PER_TOKEN,
+                f"OpenCode model {selected.full_id} effective input limit",
+                hard_limit=True,
+            )
+        except ValueError as error:
+            raise BridgeError(
+                f"OpenCode model {selected.full_id!r} has too little usable input capacity "
+                "for required bridge metadata; configure a larger bridge_model"
+            ) from error
+    return PreparedTarget(
+        command,
+        policy,
+        (
+            ("database", str(database)),
+            ("model", selected_full),
+            ("provider_id", provider_id),
+            ("model_id", model_id),
+        ),
+        tuple(notices),
+        (
+            f"OpenCode target model {selected_full}; prepared semantic input policy "
+            f"{policy.context_tokens:,} tokens.",
+        ),
+    )
 
 
 def _binding(context: HarnessContext) -> DatabaseBinding:
@@ -672,6 +814,12 @@ def _sqlite_readonly_uri(path: Path) -> str:
     posix = resolved.as_posix()
     prefix = "file://" if posix.startswith("//") else "file:"
     return f"{prefix}{urllib.parse.quote(posix, safe='/:')}?mode=ro"
+
+
+def _sqlite_readwrite_uri(path: Path) -> str:
+    posix = path.resolve().as_posix()
+    prefix = "file:/" if IS_WINDOWS and not posix.startswith("/") else "file:"
+    return f"{prefix}{urllib.parse.quote(posix, safe='/:')}?mode=rw"
 
 
 def _connect_existing(path: Path, *, timeout_seconds: float = 0.25) -> sqlite3.Connection:
@@ -1317,6 +1465,360 @@ def _opencode_change_status(ref: NativeRef, checkpoint: int | str) -> str:
         return "unstable"
 
 
+class _PersistedImportMismatch(BridgeError):
+    """A proven imported row differs from the payload and must never be recorded."""
+
+
+class _ImportNotVisible(BridgeError):
+    """The authoritative database is readable but contains no import candidate."""
+
+
+def _target_root(cwd: str) -> str:
+    current = Path(cwd).resolve()
+    for candidate in (current, *current.parents):
+        if (candidate / ".git").exists():
+            return str(candidate)
+    return str(Path(current.anchor)) if current.anchor else str(current)
+
+
+def _chunked(values: tuple[str, ...], size: int = 400) -> Iterator[tuple[str, ...]]:
+    for index in range(0, len(values), size):
+        yield values[index : index + size]
+
+
+def _preflight_export(path: Path, generated: GeneratedExport) -> None:
+    state = _storage_state(path)
+    if state is Availability.UNAVAILABLE:
+        return
+    if state is not Availability.AVAILABLE:
+        raise BridgeError(f"OpenCode target database cannot be inspected before import: {path}")
+    connection = _connect_existing(path, timeout_seconds=SEMANTIC_BUSY_TIMEOUT_SECONDS)
+    try:
+        _schema_columns(connection, semantic=True)
+        groups = (
+            ("session", (generated.session_id,)),
+            ("message", generated.message_ids),
+            ("part", generated.part_ids),
+        )
+        for table, identifiers in groups:
+            for chunk in _chunked(identifiers):
+                placeholders = ",".join("?" for _ in chunk)
+                row = connection.execute(
+                    f"SELECT CAST(id AS BLOB) FROM {table} WHERE id IN ({placeholders}) LIMIT 1",
+                    chunk,
+                ).fetchone()
+                if row is not None:
+                    identity = _native_identifier(row[0])
+                    label = identity[1] if identity is not None else "<malformed>"
+                    raise BridgeError(
+                        f"OpenCode import ID conflict: {table} identifier {label} already exists"
+                    )
+    except BridgeError:
+        raise
+    except (OSError, ValueError, sqlite3.Error) as error:
+        raise BridgeError(f"could not preflight OpenCode import IDs in {path}: {error}") from error
+    finally:
+        connection.close()
+
+
+def _candidate_import_session(
+    connection: sqlite3.Connection,
+    path: Path,
+    generated: GeneratedExport,
+    reported_id: str,
+) -> str:
+    direct = tuple(dict.fromkeys(value for value in (generated.session_id, reported_id) if value))
+    for candidate in direct:
+        row = connection.execute(
+            "SELECT CAST(id AS BLOB) FROM session WHERE id=?", (candidate,)
+        ).fetchone()
+        if row is not None:
+            identity = _native_identifier(row[0])
+            if identity is None:
+                raise BridgeError(f"OpenCode imported session identity is malformed in {path}")
+            return identity[1]
+    columns = _schema_columns(connection, semantic=True)["session"]
+    if "metadata" not in columns:
+        return ""
+    rows = connection.execute(
+        "SELECT CAST(id AS BLOB), CAST(metadata AS BLOB) FROM session "
+        "WHERE time_created BETWEEN ? AND ? ORDER BY time_created, id LIMIT 1001",
+        (generated.created_ms - 60_000, generated.created_ms + 60_000),
+    )
+    matches: list[str] = []
+    for index, (raw_id, raw_metadata) in enumerate(rows):
+        if index >= 1_000:
+            raise BridgeError(
+                "OpenCode import provenance window contains too many sessions to identify safely"
+            )
+        identity = _native_identifier(raw_id)
+        if identity is None:
+            raise BridgeError(f"OpenCode imported session identity is malformed in {path}")
+        metadata = _optional_strict_json_object(raw_metadata, f"session {identity[1]} metadata")
+        if metadata and metadata.get("ai_sessions_import_nonce") == generated.nonce:
+            matches.append(identity[1])
+    if len(matches) > 1:
+        raise BridgeError("OpenCode import provenance marker matched multiple persisted sessions")
+    return matches[0] if matches else ""
+
+
+def _strict_identifier_rows(rows: Iterator[tuple[Any, ...]], label: str) -> list[tuple[str, ...]]:
+    result: list[tuple[str, ...]] = []
+    for row in rows:
+        decoded: list[str] = []
+        for value in row:
+            identity = _native_identifier(value)
+            if identity is None:
+                raise BridgeError(f"OpenCode persisted {label} identity is malformed")
+            decoded.append(identity[1])
+        result.append(tuple(decoded))
+    return result
+
+
+def _verify_import(
+    path: Path,
+    generated: GeneratedExport,
+    reported_id: str,
+) -> NativeWrite:
+    connection = _connect_existing(path, timeout_seconds=SEMANTIC_BUSY_TIMEOUT_SECONDS)
+    try:
+        _schema_columns(connection, semantic=True)
+        actual_id = _candidate_import_session(connection, path, generated, reported_id)
+        if not actual_id:
+            raise _ImportNotVisible("OpenCode import row is not visible yet")
+        message_rows = _strict_identifier_rows(
+            iter(
+                connection.execute(
+                    "SELECT CAST(id AS BLOB) FROM message WHERE session_id=? "
+                    "ORDER BY time_created, id",
+                    (actual_id,),
+                )
+            ),
+            "message",
+        )
+        if tuple(row[0] for row in message_rows) != generated.message_ids:
+            raise _PersistedImportMismatch(
+                f"OpenCode imported session {actual_id} has different message IDs/content"
+            )
+        part_rows = _strict_identifier_rows(
+            iter(
+                connection.execute(
+                    "SELECT CAST(message_id AS BLOB), CAST(id AS BLOB) FROM part "
+                    "WHERE session_id=? ORDER BY message_id, id",
+                    (actual_id,),
+                )
+            ),
+            "part",
+        )
+        expected_parts = tuple(sorted(zip(generated.message_ids, generated.part_ids, strict=True)))
+        if tuple(part_rows) != expected_parts:
+            raise _PersistedImportMismatch(
+                f"OpenCode imported session {actual_id} has different part IDs/content"
+            )
+    except (_PersistedImportMismatch, BridgeError):
+        raise
+    except (OSError, ValueError, sqlite3.Error) as error:
+        raise BridgeError(f"could not verify OpenCode import in {path}: {error}") from error
+    finally:
+        connection.close()
+    ref = NativeRef(actual_id, str(path))
+    checkpoint = _opencode_checkpoint(ref)
+    if checkpoint != generated.expected_checkpoint:
+        raise _PersistedImportMismatch(
+            f"OpenCode imported session {actual_id} does not match the submitted semantic content"
+        )
+    notices = ()
+    if actual_id != generated.session_id:
+        notices = (
+            f"OpenCode reminted imported session {generated.session_id} as {actual_id}; "
+            "the verified persisted ID is authoritative",
+        )
+    return NativeWrite(ref, checkpoint, notices)
+
+
+def _write_temporary_export(payload: dict[str, Any]) -> Path:
+    descriptor, name = tempfile.mkstemp(prefix="ai-sessions-opencode-", suffix=".json")
+    path = Path(name)
+    try:
+        try:
+            os.chmod(path, stat.S_IRUSR | stat.S_IWUSR)
+        except OSError:
+            pass
+        with os.fdopen(descriptor, "w", encoding="utf-8", newline="\n") as handle:
+            descriptor = -1
+            json.dump(payload, handle, ensure_ascii=False, allow_nan=False, separators=(",", ":"))
+            handle.write("\n")
+            handle.flush()
+            os.fsync(handle.fileno())
+    except Exception:
+        if descriptor >= 0:
+            os.close(descriptor)
+        try:
+            path.unlink()
+        except OSError:
+            pass
+        raise
+    return path
+
+
+def _run_import_and_cleanup(
+    command: tuple[str, ...], operation_cwd: str, temporary: Path
+) -> MaintenanceResult:
+    result: MaintenanceResult | None = None
+    failure: Exception | None = None
+    try:
+        result = run_maintenance(
+            command,
+            ("import", str(temporary)),
+            cwd=operation_cwd,
+            timeout=IMPORT_TIMEOUT_SECONDS,
+            return_timeout=True,
+        )
+    except Exception as error:
+        failure = error
+    cleanup_error: OSError | None = None
+    try:
+        temporary.unlink()
+    except FileNotFoundError:
+        pass
+    except OSError as error:
+        cleanup_error = error
+    if failure is not None:
+        if cleanup_error is not None:
+            raise BridgeError(
+                f"{failure}; the temporary OpenCode import file also could not be removed: "
+                f"{cleanup_error}"
+            ) from failure
+        raise failure
+    if cleanup_error is not None:
+        raise BridgeError(
+            f"could not remove the temporary OpenCode import file: {cleanup_error}"
+        ) from cleanup_error
+    assert result is not None
+    return result
+
+
+def _verify_import_with_backoff(
+    path: Path, generated: GeneratedExport, reported_id: str
+) -> tuple[NativeWrite | None, BridgeError | None]:
+    last_error: BridgeError | None = None
+    mismatch: _PersistedImportMismatch | None = None
+    for delay in IMPORT_VERIFY_DELAYS:
+        if delay:
+            time.sleep(delay)
+        try:
+            return _verify_import(path, generated, reported_id), None
+        except _PersistedImportMismatch as error:
+            mismatch = error
+            last_error = error
+        except BridgeError as error:
+            last_error = error
+    if mismatch is not None:
+        raise mismatch
+    return None, last_error
+
+
+def _write_opencode(
+    *,
+    cwd: str,
+    turns: list[Turn],
+    prepared: PreparedTarget,
+    title: str = "",
+    created: float | None = None,
+) -> NativeWrite:
+    operation_cwd = str(Path(cwd).resolve())
+    if not Path(operation_cwd).is_dir():
+        raise BridgeError(f"OpenCode target working directory does not exist: {operation_cwd}")
+    database_option = prepared.option("database")
+    if not database_option:
+        raise BridgeError("OpenCode target preparation did not resolve an import database")
+    database = Path(database_option)
+    if (
+        not prepared.option("model")
+        or not prepared.option("provider_id")
+        or not prepared.option("model_id")
+    ):
+        raise BridgeError("OpenCode target preparation did not select an import model")
+    current_database = _command_database_path(prepared.command, operation_cwd)
+    if current_database != database:
+        raise BridgeError(
+            "OpenCode authoritative database changed after target preparation; retry the bridge"
+        )
+    created_value = time.time() if created is None else created
+    if isinstance(created_value, bool) or not isinstance(created_value, (int, float)):
+        raise BridgeError("OpenCode import creation time must be numeric")
+    if not (created_value >= 0 and created_value < float("inf")):
+        raise BridgeError("OpenCode import creation time must be finite and non-negative")
+    generated = build_export(
+        cwd=operation_cwd,
+        root=_target_root(operation_cwd),
+        turns=turns,
+        title=title,
+        provider_id=prepared.option("provider_id"),
+        model_id=prepared.option("model_id"),
+        nonce=secrets.token_hex(16),
+        created_ms=int(created_value * 1_000),
+    )
+    _preflight_export(database, generated)
+    temporary = _write_temporary_export(generated.payload)
+    result = _run_import_and_cleanup(prepared.command, operation_cwd, temporary)
+    matches = tuple(dict.fromkeys(_IMPORTED_SESSION.findall(result.stdout)))
+    reported_id = matches[0] if len(matches) == 1 else ""
+    try:
+        final_database = _command_database_path(prepared.command, operation_cwd)
+    except BridgeError as authority_error:
+        written, verification_error = _verify_import_with_backoff(database, generated, reported_id)
+        if written is not None:
+            return NativeWrite(
+                written.native,
+                None,
+                (
+                    "OpenCode import content was found in the previously authoritative database, "
+                    "but authority could not be re-resolved; the new member remains unstable "
+                    f"({authority_error})",
+                ),
+            )
+        raise BridgeError(
+            "OpenCode import completed without a verifiable authoritative database "
+            f"({verification_error})"
+        ) from authority_error
+    written, last_error = _verify_import_with_backoff(final_database, generated, reported_id)
+    if written is not None:
+        notices = list(written.notices)
+        if result.timed_out:
+            notices.append("OpenCode import timed out after persisting and verifying the session")
+        elif result.returncode != 0:
+            notices.append(
+                "OpenCode returned a nonzero import status after persisting and verifying the session"
+            )
+        if result.truncated:
+            notices.append("OpenCode import output was truncated after the session was verified")
+        if not reported_id or reported_id != written.native.session_id:
+            notices.append(
+                "OpenCode import output did not name the verified session ID; persisted content "
+                "was used as authority"
+            )
+        return NativeWrite(written.native, written.checkpoint, tuple(notices))
+    if result.timed_out or result.returncode != 0:
+        raise BridgeError(f"OpenCode import failed: {_maintenance_detail(result)}") from last_error
+    if isinstance(last_error, _ImportNotVisible):
+        raise BridgeError(
+            "OpenCode import returned success but no persisted session row became visible"
+        ) from last_error
+    if reported_id:
+        return NativeWrite(
+            NativeRef(reported_id, str(final_database)),
+            None,
+            (
+                "OpenCode reported a successful import, but persisted content could not be "
+                f"verified; this member remains unstable ({last_error})",
+            ),
+        )
+    raise BridgeError(
+        "OpenCode import returned success but no persisted session or recoverable ID could be verified"
+    ) from last_error
+
+
 def _availability(ref: NativeRef) -> Availability:
     path = Path(ref.storage)
     state = _storage_state(path)
@@ -1347,6 +1849,167 @@ def _resolve(session_id: str) -> NativeRef | None:
     return ref if _availability(ref) is Availability.AVAILABLE else None
 
 
+def publish_name(session: Any, name: str) -> str:
+    """Publish one exact title through a bounded existing-database transaction."""
+    ref = NativeRef(str(session.session_id), str(session.storage))
+    path = Path(ref.storage)
+    if _storage_state(path) is not Availability.AVAILABLE:
+        raise BridgeError(f"OpenCode title database is not available: {path}")
+    connection: sqlite3.Connection | None = None
+    try:
+        connection = sqlite3.connect(
+            _sqlite_readwrite_uri(path),
+            uri=True,
+            timeout=SEMANTIC_BUSY_TIMEOUT_SECONDS,
+        )
+        connection.execute(f"PRAGMA busy_timeout={round(SEMANTIC_BUSY_TIMEOUT_SECONDS * 1_000)}")
+        _schema_columns(connection)
+        connection.execute("BEGIN IMMEDIATE")
+        before = connection.execute(
+            "SELECT title FROM session WHERE id=?", (ref.session_id,)
+        ).fetchone()
+        if before is None:
+            raise BridgeError(f"OpenCode session {ref.session_id} is not present in {path}")
+        cursor = connection.execute(
+            "UPDATE session SET title=? WHERE id=?", (str(name), ref.session_id)
+        )
+        if cursor.rowcount != 1:
+            raise BridgeError(f"OpenCode title update affected {cursor.rowcount} rows")
+        after = connection.execute(
+            "SELECT title FROM session WHERE id=?", (ref.session_id,)
+        ).fetchone()
+        if after is None or after[0] != str(name):
+            raise BridgeError("OpenCode title update could not be verified")
+        connection.commit()
+        visible = connection.execute(
+            "SELECT title FROM session WHERE id=?", (ref.session_id,)
+        ).fetchone()
+    except BridgeError:
+        if connection is not None:
+            connection.rollback()
+        raise
+    except (OSError, ValueError, sqlite3.Error) as error:
+        if connection is not None:
+            connection.rollback()
+        raise BridgeError(f"could not update OpenCode title in {path}: {error}") from error
+    finally:
+        if connection is not None:
+            connection.close()
+    if visible is None or visible[0] != str(name):
+        return "provider accepted the title, but another OpenCode writer replaced it immediately"
+    return "provider title updated; a running OpenCode TUI may refresh or replace it later"
+
+
+def _process_basename(value: str) -> str:
+    return re.split(r"[\\/]", value.strip(" \t\"'"))[-1].casefold()
+
+
+_OPENCODE_PROCESS_NAMES = frozenset(
+    {
+        "opencode",
+        "opencode.exe",
+        "opencode.cmd",
+        "opencode.ps1",
+        "opencode-ai",
+        "opencode.js",
+        "opencode.mjs",
+    }
+)
+
+
+def _opencode_process_identity(process: Any, before_session: tuple[str, ...]) -> int:
+    """Return 2 for a native process, 1 for a recognized direct wrapper, or 0."""
+    if not before_session:
+        return 0
+    executable = _process_basename(before_session[0])
+    if (
+        _process_basename(process.name) in _OPENCODE_PROCESS_NAMES
+        or executable in _OPENCODE_PROCESS_NAMES
+    ):
+        return 2
+    wrapped_index = -1
+    if executable in ("node", "node.exe", "bun", "bun.exe", "deno", "deno.exe"):
+        wrapped_index = 1
+    elif executable in ("sh", "bash", "zsh", "env", "env.exe"):
+        wrapped_index = 1
+    elif executable in ("cmd", "cmd.exe"):
+        wrapped_index = next(
+            (
+                index + 1
+                for index, value in enumerate(before_session[:-1])
+                if value.casefold() in ("/c", "/k")
+            ),
+            -1,
+        )
+    elif executable in ("pwsh", "pwsh.exe", "powershell", "powershell.exe"):
+        wrapped_index = next(
+            (
+                index + 1
+                for index, value in enumerate(before_session[:-1])
+                if value.casefold() == "-file"
+            ),
+            -1,
+        )
+    if 0 <= wrapped_index < len(before_session):
+        return (
+            1 if _process_basename(before_session[wrapped_index]) in _OPENCODE_PROCESS_NAMES else 0
+        )
+    return 0
+
+
+def _opencode_session_argument(process: Any) -> tuple[str, int]:
+    command = process.command
+    matches: list[tuple[int, str]] = []
+    malformed = False
+    for index, argument in enumerate(command):
+        if argument == "--":
+            break
+        if argument in ("--session", "-s"):
+            if index + 1 >= len(command) or not command[index + 1]:
+                malformed = True
+            else:
+                matches.append((index, command[index + 1]))
+        elif argument.startswith("--session=") or argument.startswith("-s="):
+            value = argument.split("=", 1)[1]
+            if value:
+                matches.append((index, value))
+            else:
+                malformed = True
+        elif argument.startswith("-s") and not argument.startswith("--"):
+            matches.append((index, argument[2:]))
+    if malformed or len(matches) != 1:
+        return "", 0
+    index, session_id = matches[0]
+    if re.fullmatch(r"ses_[0-9A-Za-z]{26}", session_id) is None:
+        return "", 0
+    identity = _opencode_process_identity(process, command[:index])
+    return (session_id, identity) if identity else ("", 0)
+
+
+def inspect_liveness(
+    context: LivenessContext, home: Path, sessions: Iterable[LivenessSession]
+) -> dict[str, int]:
+    """Match only live OpenCode processes whose argv names one exact session."""
+    del home
+    eligible = {item.session_id for item in sessions}
+    candidates: dict[str, list[tuple[int, int]]] = {}
+    for process in context.process_snapshot:
+        # A start token prevents an inaccessible/raced process snapshot from being
+        # treated as exact evidence. Both Linux and Windows populate this token.
+        if not process.start_token and process.started_at <= 0:
+            continue
+        session_id, rank = _opencode_session_argument(process)
+        if session_id in eligible:
+            candidates.setdefault(session_id, []).append((rank, process.pid))
+    result: dict[str, int] = {}
+    for session_id, matches in candidates.items():
+        best_rank = max(rank for rank, _ in matches)
+        best_pids = {pid for rank, pid in matches if rank == best_rank}
+        if len(best_pids) == 1:
+            result[session_id] = best_pids.pop()
+    return result
+
+
 def resume_args(
     *,
     session_id: str,
@@ -1370,13 +2033,17 @@ ADAPTER = HarnessAdapter(
     source_kinds=frozenset((SourceKind.INTERACTIVE, SourceKind.SUBAGENT)),
     id_patterns=(re.compile(rb"(?<![0-9A-Za-z])ses_[0-9A-Za-z]{26}(?![0-9A-Za-z])"),),
     read=_read_opencode_snapshot,
-    write=Unsupported("OpenCode writer is not installed yet"),
+    write=_write_opencode,
     resolve=_resolve,
     availability=_availability,
     checkpoint=_opencode_checkpoint,
     change_status=_opencode_change_status,
+    liveness_source_kinds=frozenset((SourceKind.INTERACTIVE, SourceKind.SUBAGENT)),
     discover=discover,
     resume_args=resume_args,
+    publish_name=publish_name,
+    inspect_liveness=inspect_liveness,
+    prepare_target=_prepare_opencode_target,
     budget=BudgetPolicy(
         context_tokens=OPENCODE_CONTEXT_FLOOR_TOKENS,
         usable_fraction=DEFAULT_USABLE_FRACTION,

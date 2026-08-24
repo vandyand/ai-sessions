@@ -209,25 +209,25 @@
 
 ## Phase 3: Writer and native mutations
 
-- [ ] Capture dated real 1.18.21 `db path` and `import` stdout/stderr/exit behavior plus persisted-row
+- [x] Capture dated real 1.18.21 `db path` and `import` stdout/stderr/exit behavior plus persisted-row
   diffs as fixtures before implementing parsers. Current official source and isolated behavior
   preserve submitted session/message/part IDs; keep a remint recovery branch for future drift.
-- [ ] Capture dated real `models --verbose` and non-verbose outputs as parser fixtures. Validate only
+- [x] Capture dated real `models --verbose` and non-verbose outputs as parser fixtures. Validate only
   fields the current CLI actually emits: model/provider IDs, status when present, context/input
   limits, and cost. Honor optional provider `bridge_model`; otherwise retain CLI order and use cost
   only as a deterministic tie-break. Unparseable verbose output falls back to non-verbose IDs plus
   the conservative 128k policy with a notice; it never guesses a numeric limit.
-- [ ] Implement OpenCode `prepare_target`: choose the exact import model first and derive a dynamic
+- [x] Implement OpenCode `prepare_target`: choose the exact import model first and derive a dynamic
   `BudgetPolicy` from its declared input limit minus a bounded output reserve. Resolve/default-select
   against that policy before assembly. Reject an explicit budget above it with guidance to change
   `bridge_model`/budget. Thread the selected model unchanged into writer and provenance note.
-- [ ] Generate strictly monotone native-shape sortable `ses_`/`msg_`/`prt_` IDs—including hundreds
+- [x] Generate strictly monotone native-shape sortable `ses_`/`msg_`/`prt_` IDs—including hundreds
   generated in one millisecond—and a minimal schema-valid export:
   session info, alternating user/assistant messages, text parts, parent links, model references,
   target cwd/root, timestamps, finish state, and zero accounting for imported history.
-- [ ] Pin ID direction from the dated capture: session IDs use OpenCode's descending time encoding;
+- [x] Pin ID direction from the dated capture: session IDs use OpenCode's descending time encoding;
   message/part IDs use ascending encoding with a per-millisecond counter.
-- [ ] Resolve `<command> db path` before import using the exact command/cwd/environment that import
+- [x] Resolve `<command> db path` before import using the exact command/cwd/environment that import
   will use, preflight that the generated session ID is absent, write export JSON to a
   permission-restricted temporary file, and call configured `<command> import <file>` in target cwd. Persisted-row
   verification is authoritative; stdout ID text is a secondary consistency check and a verified
@@ -235,30 +235,46 @@
   require the row in that DB and verify exact generated message/part IDs plus a semantic checkpoint
   equal to the generated payload. ID/content conflict is a hard error naming the recoverable ID.
   Always remove the temporary file.
-- [ ] If import returns or persists a different session ID, bind the actual persisted ID and verify
+- [x] If import returns or persists a different session ID, bind the actual persisted ID and verify
   its exact content. Locate it first from CLI output, then from a unique provenance marker plus the
   bounded creation window. The marker contains a per-attempt random nonce recorded before import,
   so a retry cannot match an earlier attempt. If neither identifies one row, fail without naming the requested ID as
   recoverable. Every error after commit names only an ID proven to exist.
-- [ ] Detect nonexistent command, timeout, malformed model output, no suitable model, unwritable cwd,
+- [x] Detect nonexistent command, timeout, malformed model output, no suitable model, unwritable cwd,
   import rejection, wrong/reused ID, ambiguous DB path, and missing post-import row with actionable
   `BridgeError`s. Never expose subprocess environment or credentials in errors.
-- [ ] Add bounded retry/backoff for post-import row/content/checkpoint verification while OpenCode's
+- [x] Add bounded retry/backoff for post-import row/content/checkpoint verification while OpenCode's
   write lock settles. On exhausted UNKNOWN after a successful import, return a recorded
   `NativeWrite` ref with `checkpoint=None` plus warning so conversation state retains the
   recoverable ID and blocks promotion; never record an expected-but-unobserved checkpoint and never
   retry the import itself automatically.
-- [ ] Implement explicitly best-effort title publication with URI `mode=rw`, bounded busy timeout,
+- [x] Implement explicitly best-effort title publication with URI `mode=rw`, bounded busy timeout,
   `BEGIN IMMEDIATE`, parameterized exact-ref update, exactly-one-row verification, commit/re-read,
   and a live-TUI caveat. Verify rollback on errors, no DB/sidecar creation for a missing ref, and
   semantic checkpoint unchanged. Local title remains authoritative.
-- [ ] Add exact resume args `--session <id>`, source kinds, ID pattern, label/order, OpenCode-only
+- [x] Add exact resume args `--session <id>`, source kinds, ID pattern, label/order, OpenCode-only
   dangerous `--auto`, scratch policy, and a 128k/0.75/2.0 warned fallback budget with dated
   provenance; prepared model policy is the normal path.
-- [ ] Extend the shared Linux process snapshot to include name/cmdline safely (Windows already has
+- [x] Extend the shared Linux process snapshot to include name/cmdline safely (Windows already has
   them). Implement exact-only cross-platform
   OpenCode liveness for `--session`/`-s` syntaxes, executable/wrapper forms, PID reuse evidence, and
   roots/subagents; prove bare or ambiguous processes produce no match.
+
+### Phase 3 validation
+
+- Real isolated OpenCode 1.18.21 captures pin ordinary/verbose model output, `db path`, import
+  stdout/exit behavior, the submitted export, and every persisted session/message/part row. The
+  fixture proves official import preserves generated IDs, nonce metadata, and the semantic
+  checkpoint while documenting that the importer rewrites non-semantic part timestamps.
+- Writer tests cover configured and fallback models, hard budgets, 5,000 same-millisecond IDs,
+  official-import authority checks, session collisions before spawn, localized/reminted output,
+  nonce recovery, timeout-after-commit recovery, transient mismatch settlement, rejected/missing
+  imports, temporary cleanup, exact title transactions, and tool-call-bearing production bridges.
+- Two focused Opus 5 reviews initially returned NO-GO (HIGH=2, MEDIUM=14 across writer and
+  liveness/seam passes). Every HIGH/MEDIUM was fixed. The writer follow-up returned **GO
+  (HIGH=0, MEDIUM=0)**; its two remaining LOW findings were also closed before the gate.
+- Phase 3 gate: 433 tests pass on native Windows (one skip) and Ubuntu WSL (two skips); Ruff 0.16.3
+  lint/format and `git diff --check` pass.
 
 ## Phase 4: Pairwise and conversation-routing validation
 

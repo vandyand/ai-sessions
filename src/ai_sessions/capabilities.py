@@ -56,7 +56,9 @@ class ChangeStatusHook(Protocol):
 
 
 class PrepareTargetHook(Protocol):
-    def __call__(self, command: tuple[str, ...], cwd: str) -> PreparedTarget: ...
+    def __call__(
+        self, command: tuple[str, ...], cwd: str, options: Mapping[str, Any]
+    ) -> PreparedTarget: ...
 
 
 class DiscoverHook(Protocol):
@@ -108,6 +110,7 @@ class HarnessAdapter:
     checkpoint: CheckpointHook | Unsupported
     change_status: ChangeStatusHook | Unsupported
     budget: BudgetPolicy
+    liveness_source_kinds: frozenset[SourceKind] = frozenset((SourceKind.INTERACTIVE,))
     scratch_patterns: tuple[Pattern[str], ...] = ()
     discover: DiscoverHook | Unsupported = Unsupported("discovery is not installed")
     resume_args: ResumeArgsHook | Unsupported = Unsupported("resume is not installed")
@@ -152,6 +155,14 @@ class HarnessAdapter:
             raise ValueError("harness scratch_patterns must contain compiled text patterns")
         if not isinstance(self.budget, BudgetPolicy):
             raise ValueError("harness budget must be a BudgetPolicy")
+        if not isinstance(self.liveness_source_kinds, frozenset) or not all(
+            isinstance(value, SourceKind) for value in self.liveness_source_kinds
+        ):
+            raise ValueError("harness liveness source kinds must contain SourceKind values")
+        if not isinstance(self.inspect_liveness, Unsupported) and not (
+            self.liveness_source_kinds.issubset(self.source_kinds)
+        ):
+            raise ValueError("harness liveness source kinds must be declared source kinds")
         required = (
             self.read,
             self.write,

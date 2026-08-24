@@ -54,7 +54,7 @@ from ai_sessions.bridge import (
 from ai_sessions.capabilities import HarnessAdapter
 from ai_sessions.config import LaunchConfig
 from ai_sessions.harnesses import codex as codex_harness
-from ai_sessions.model import NativeRef
+from ai_sessions.model import NativeRef, PreparedTarget
 from ai_sessions.registry import REGISTRY
 
 
@@ -353,6 +353,36 @@ class ShapingTests(unittest.TestCase):
         self.assertEqual((from_tokens.tokens, from_tokens.chars), (10_000, 25_000))
         self.assertEqual((from_chars.tokens, from_chars.chars), (10_001, 25_001))
 
+    def test_prepared_hard_budget_rejects_token_and_character_overrides(self) -> None:
+        policy = BudgetPolicy(10_000, 0.75, 2.0, "prepared target", hard_limit=True)
+        self.assertEqual(resolve_budget("claude", policy=policy).tokens, 7_500)
+        with self.assertRaisesRegex(BridgeError, "exceeds the prepared claude target limit"):
+            resolve_budget("claude", max_tokens=7_501, policy=policy)
+        with self.assertRaisesRegex(BridgeError, "exceeds the prepared claude target limit"):
+            resolve_budget("claude", max_chars=15_001, policy=policy)
+
+    def test_prepared_target_context_is_typed_bounded_and_rendered_within_note_reserve(
+        self,
+    ) -> None:
+        policy = BudgetPolicy(10_000, 1.0, 2.0, "prepared target")
+        with self.assertRaisesRegex(ValueError, "handoff context"):
+            PreparedTarget(("target",), policy, handoff_context="abc")  # type: ignore[arg-type]
+        with self.assertRaisesRegex(ValueError, "reserved budget"):
+            PreparedTarget(("target",), policy, handoff_context=("x" * 300, "y" * 300))
+        note = handoff_note(
+            source_tool="codex",
+            target_tool="claude",
+            session_id="source",
+            title="title",
+            cwd="/tmp",
+            kept=1,
+            calls=0,
+            dropped=0,
+            target_context=("x" * 1_000,) * 4,
+        )
+        self.assertIn("Target preparation:", note)
+        self.assertLessEqual(len(note) + 2, HANDOFF_NOTE_RESERVE_CHARS)
+
     def test_too_small_legacy_character_budget_fails(self) -> None:
         with self.assertRaisesRegex(BridgeError, "must be at least"):
             resolve_budget("claude", max_chars=100)
@@ -582,6 +612,8 @@ class ShapingTests(unittest.TestCase):
         for values in invalid:
             with self.subTest(values=values), self.assertRaises(ValueError):
                 BudgetPolicy(*values)
+        with self.assertRaisesRegex(ValueError, "hard_limit"):
+            BudgetPolicy(10_000, 0.75, 2.0, "source", hard_limit="yes")  # type: ignore[arg-type]
         with self.assertRaises(ValueError):
             Budget("claude", 1, 1, "target-default")
 
@@ -725,7 +757,7 @@ class HarnessRegistryTests(unittest.TestCase):
         targets = REGISTRY.bridge_targets()
         self.assertIn("codex", targets)
         self.assertIn("claude", targets)
-        self.assertNotIn("opencode", targets)
+        self.assertIn("opencode", targets)
         for name in targets:
             entry = REGISTRY.get(name)
             self.assertTrue(entry.label)
@@ -1139,7 +1171,7 @@ class LaunchIntegrationTests(unittest.TestCase):
     def test_a_session_with_a_transcript_offers_both_harnesses(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             item = session(directory)
-            self.assertEqual(available_launch_tools(item), ("codex", "claude"))
+            self.assertEqual(available_launch_tools(item), ("codex", "claude", "opencode"))
             self.assertTrue(can_bridge(item))
 
     def test_a_session_without_a_transcript_offers_only_its_own(self) -> None:

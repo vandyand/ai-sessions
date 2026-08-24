@@ -85,7 +85,8 @@ an opaque, JSON-serializable semantic checkpoint before the OpenCode adapter is 
 - [x] Storage-neutral cursor/reference refinement *(273-test Windows/WSL gate; final Opus 5 GO)*
 - [x] OpenCode authoritative storage and discovery *(11 reviews; final GO: HIGH=0, MEDIUM=0)*
 - [x] OpenCode semantic reader, staged revert, compaction windows, and checkpoints *(397-test Windows/WSL gate; completed-only compaction policy pinned)*
-- [ ] OpenCode read/write/resume/rename/liveness adapter
+- [x] OpenCode read/write/resume/rename/liveness adapter *(433-test Windows/WSL gate; focused Opus
+  writer follow-up GO with HIGH=0, MEDIUM=0)*
 - [ ] Six-direction and real-CLI validation
 - [ ] Final Opus 5 reviews, documentation, PR/CI, and completion audit
 

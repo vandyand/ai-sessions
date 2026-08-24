@@ -6,6 +6,7 @@ from the provider's own configuration.  Bypass flags require an explicit mode.
 
 from __future__ import annotations
 
+import copy
 import json
 import os
 import tomllib
@@ -169,6 +170,12 @@ class LaunchConfig:
             raise ValueError(f"unknown harness: {provider}") from None
         profile = self._profile(provider)
         return list(profile.command or adapter.default_command)
+
+    def provider_options(self, provider: str) -> dict[str, Any]:
+        """Opaque adapter preparation options from one provider profile."""
+        # Resolve through _profile so registered defaults and legacy built-ins
+        # follow the same provider-neutral path as commands and custom args.
+        return copy.deepcopy(self._profile(provider).extra)
 
     def save(self) -> None:
         self.path.parent.mkdir(parents=True, exist_ok=True)

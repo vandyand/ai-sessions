@@ -814,7 +814,7 @@ def publish_name(
                 f"{adapter.label} cannot publish titles: {publisher.reason}; name kept local only"
             )
         note = publisher(item, name)
-    except OSError as error:
+    except (BridgeError, OSError) as error:
         return f"could not update the provider title: {error}"
     if note:
         return note
@@ -1177,7 +1177,7 @@ def detect_open_sessions(
         own = [
             item
             for item in session_list
-            if item.tool == adapter.name and item.source is SourceKind.INTERACTIVE
+            if item.tool == adapter.name and item.source in adapter.liveness_source_kinds
         ]
         if own:
             pending.append((adapter, own))
@@ -1204,7 +1204,7 @@ def detect_open_sessions(
             item = by_id.get(session_id) if isinstance(session_id, str) else None
             if (
                 item is None
-                or item.source is not SourceKind.INTERACTIVE
+                or item.source not in adapter.liveness_source_kinds
                 or not isinstance(pid, int)
                 or isinstance(pid, bool)
                 or pid <= 0
@@ -2582,6 +2582,7 @@ def prepare_launch(
         tool,
         command=target_command,
         cwd=target_cwd,
+        options=config.provider_options(tool) if config is not None else None,
     )
     budget = resolve_budget(
         tool,

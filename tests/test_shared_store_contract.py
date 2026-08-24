@@ -25,8 +25,11 @@ from ai_sessions.conversion import (
 )
 from ai_sessions.model import (
     Availability,
+    Budget,
+    BudgetPolicy,
     NativeRef,
     NativeWrite,
+    PreparedTarget,
     ReadSnapshot,
     Transcript,
     Turn,
@@ -237,12 +240,17 @@ class SharedStoreContractTests(unittest.TestCase):
         )
         config = LaunchConfig(
             mode="dangerous",
-            providers={"shared": ProviderProfile(["configured-shared"], ["--custom-only"])},
+            providers={
+                "shared": ProviderProfile(
+                    ["configured-shared"], ["--custom-only"], {"bridge_model": "fixture/model"}
+                )
+            },
         )
         with REGISTRY.temporary(self.fixture.adapter()):
             prepared, _ = prepare_launch(source, config=config)
             command = command_for(prepared, config)
         self.assertEqual(self.fixture.prepared_commands, [("configured-shared",)])
+        self.assertEqual(self.fixture.prepared_options, [{"bridge_model": "fixture/model"}])
         self.assertEqual(command[:2], ["configured-shared", "--unsafe"])
 
     def test_maintenance_paths_structurally_never_use_launch_prefix(self) -> None:
@@ -280,6 +288,43 @@ class SharedStoreContractTests(unittest.TestCase):
                 cwd=str(self.root),
             )
         self.assertEqual(self.fixture.prepared_commands, [("shared-cli",)])
+        self.assertEqual(self.fixture.prepared_options, [{}])
+
+    def test_direct_budget_cannot_bypass_a_prepared_target_hard_limit(self) -> None:
+        source = self.root / "hard-limit-source.jsonl"
+        source.write_text(
+            json.dumps(
+                {
+                    "type": "response_item",
+                    "payload": {
+                        "type": "message",
+                        "role": "user",
+                        "content": [{"type": "input_text", "text": "source"}],
+                    },
+                }
+            )
+            + "\n",
+            encoding="utf-8",
+        )
+        prepared = PreparedTarget(
+            ("shared-cli",),
+            BudgetPolicy(5_000, 1.0, 2.0, "fixture hard limit", hard_limit=True),
+        )
+        with (
+            REGISTRY.temporary(self.fixture.adapter()),
+            self.assertRaisesRegex(
+                BridgeError, "exceeds the prepared Shared Store Harness target limit"
+            ),
+        ):
+            bridge(
+                source_tool="codex",
+                target_tool="shared",
+                session_id="source",
+                storage=str(source),
+                cwd=str(self.root),
+                prepared_target=prepared,
+                budget=Budget("shared", 6_000, 12_000, "test"),
+            )
 
     def test_schema_six_producer_and_persistence_preserve_checkpoint_shapes(self) -> None:
         path = self.root / "state.json"

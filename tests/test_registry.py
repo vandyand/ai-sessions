@@ -72,6 +72,8 @@ class RegistryTests(unittest.TestCase):
             {"id_patterns": ("not compiled",)},
             {"scratch_patterns": [re.compile("scratch")]},
             {"scratch_patterns": (re.compile(b"scratch"),)},
+            {"liveness_source_kinds": frozenset({SourceKind.SDK})},
+            {"liveness_source_kinds": frozenset({"interactive"})},
             {"read": "not callable"},
             {"change_status": Unsupported("")},
             {"budget": None},
@@ -81,6 +83,14 @@ class RegistryTests(unittest.TestCase):
                 replace(base, **mutation)
         with self.assertRaisesRegex(ValueError, "budget must be a BudgetPolicy"):
             replace(base, budget=Unsupported("budget policy is unavailable"))
+
+    def test_adapter_without_liveness_does_not_need_an_interactive_source_kind(self) -> None:
+        adapter = replace(
+            REGISTRY.get("codex"),
+            source_kinds=frozenset({SourceKind.SDK}),
+            inspect_liveness=Unsupported("no process evidence"),
+        )
+        self.assertEqual(adapter.source_kinds, frozenset({SourceKind.SDK}))
 
     def test_every_mutation_advances_generation_monotonically(self) -> None:
         registry = Registry()

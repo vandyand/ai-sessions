@@ -51,21 +51,34 @@ def process_snapshot(platform: str | None = None) -> tuple[ProcessInfo, ...]:
     """Enumerate live processes once without retaining provider-specific state."""
     current_platform = platform or sys.platform
     result: list[ProcessInfo] = []
-    attributes = (
-        ("pid", "name", "cmdline", "create_time") if current_platform == "win32" else ("pid",)
-    )
-    for process in psutil.process_iter(attributes):
+    attributes = ("pid", "name", "cmdline", "create_time")
+    try:
+        processes = iter(psutil.process_iter(attributes))
+    except Exception:
+        return ()
+    iterator_failures = 0
+    while True:
+        try:
+            process = next(processes)
+        except StopIteration:
+            break
+        except Exception:
+            # Some psutil backends resolve explicit attributes inside the
+            # iterator and can fail before a Process object reaches the body.
+            # Retain the point-in-time evidence already collected.
+            iterator_failures += 1
+            if iterator_failures >= 16:
+                break
+            continue
+        iterator_failures = 0
         try:
             pid = int(process.info["pid"])
+            name = str(process.info.get("name") or "")
+            command = tuple(str(value) for value in (process.info.get("cmdline") or ()))
+            started_at = float(process.info.get("create_time") or 0)
             if current_platform == "win32":
-                name = str(process.info.get("name") or "")
-                command = tuple(str(value) for value in (process.info.get("cmdline") or ()))
-                started_at = float(process.info.get("create_time") or 0)
                 start = _windows_start_token(started_at) if started_at > 0 else ""
             else:
-                name = ""
-                command = ()
-                started_at = 0.0
                 start = process_start_token(pid)
             result.append(ProcessInfo(pid, name, command, start, started_at))
         except (psutil.Error, KeyError, TypeError, ValueError, OverflowError):

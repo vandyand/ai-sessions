@@ -29,7 +29,7 @@ import os
 import re
 from dataclasses import replace
 from pathlib import Path
-from typing import Any, Callable, Iterable, Iterator
+from typing import Any, Callable, Iterable, Iterator, Mapping
 
 from .capabilities import HarnessAdapter, Unsupported
 from .model import (
@@ -37,6 +37,7 @@ from .model import (
     HANDOFF_NOTE_RESERVE_CHARS,
     MIN_BRIDGE_CHARS,
     MIN_BUDGET_TOKENS,
+    TARGET_CONTEXT_RESERVE_CHARS,
     TRUNCATION_MARKER,
     Availability,
     BridgeResult,
@@ -617,6 +618,7 @@ def handoff_note(
     resumes_at_last_summary: bool = True,
     conversation_id: str = "",
     budget: Budget | None = None,
+    target_context: tuple[str, ...] = (),
 ) -> str:
     """The opening message that tells the target where this came from."""
     source = harness(source_tool).label
@@ -653,6 +655,15 @@ def handoff_note(
             f"{assembled if assembled is not None else kept} target message(s) as plain text."
         ),
     ]
+    remaining_context = TARGET_CONTEXT_RESERVE_CHARS
+    for detail in target_context[:4]:
+        prefix = "Target preparation: "
+        available = remaining_context - len(prefix) - 1
+        if available <= 0:
+            break
+        rendered = f"{prefix}{_clip(detail, min(300, available))}"
+        lines.append(rendered)
+        remaining_context -= len(rendered) + 1
     if budget is not None:
         lines += [
             "",
@@ -852,6 +863,12 @@ def resolve_budget(
             math.ceil(MIN_BRIDGE_CHARS / policy.chars_per_token),
         )
         tokens = max(max_tokens, minimum)
+        if policy.hard_limit and tokens > default_tokens:
+            raise BridgeError(
+                f"bridge.max_tokens={max_tokens} exceeds the prepared {target} target limit "
+                f"of {default_tokens}; choose a larger target model or lower the budget "
+                f"({policy.source})"
+            )
         try:
             chars = math.floor(tokens * policy.chars_per_token)
         except (OverflowError, ValueError) as error:
@@ -870,6 +887,12 @@ def resolve_budget(
             raise BridgeError(
                 f"bridge.max_chars must be at least {MIN_BRIDGE_CHARS} characters "
                 "to hold required handoff metadata"
+            )
+        if policy.hard_limit and max_chars > default_chars:
+            raise BridgeError(
+                f"bridge.max_chars={max_chars} exceeds the prepared {target} target limit "
+                f"of {default_chars}; choose a larger target model or lower the budget "
+                f"({policy.source})"
             )
         try:
             tokens = math.ceil(max_chars / policy.chars_per_token)
@@ -890,6 +913,7 @@ def prepare_target(
     *,
     command: tuple[str, ...] | None = None,
     cwd: str = "",
+    options: Mapping[str, Any] | None = None,
 ) -> PreparedTarget:
     """Resolve one immutable target plan before budgeting and materialization."""
     adapter = harness(target)
@@ -898,7 +922,7 @@ def prepare_target(
     if isinstance(hook, Unsupported):
         return PreparedTarget(tuple(resolved_command), adapter.budget)
     try:
-        prepared = hook(tuple(resolved_command), cwd)
+        prepared = hook(tuple(resolved_command), cwd, dict(options or {}))
     except OSError as error:
         raise BridgeError(f"could not prepare the {adapter.label} target: {error}") from error
     if not isinstance(prepared, PreparedTarget) or not isinstance(
@@ -1081,6 +1105,16 @@ def bridge(
     applied_budget = budget or resolve_budget(target_tool, policy=prepared.budget_policy)
     if applied_budget.target != target_tool:
         raise BridgeError("the resolved bridge budget belongs to a different target")
+    if prepared.budget_policy.hard_limit:
+        token_limit = math.floor(
+            prepared.budget_policy.context_tokens * prepared.budget_policy.usable_fraction
+        )
+        character_limit = math.floor(token_limit * prepared.budget_policy.chars_per_token)
+        if applied_budget.tokens > token_limit or applied_budget.chars > character_limit:
+            raise BridgeError(
+                f"the applied bridge budget exceeds the prepared {target.label} target limit; "
+                "choose a larger target model or lower the budget"
+            )
     source_ref = NativeRef(session_id, storage)
     captured = read_snapshot(
         source_tool,
@@ -1127,6 +1161,7 @@ def bridge(
         resumes_at_last_summary=source.resumes_at_last_summary or not source.carried_windows,
         conversation_id=conversation_id,
         budget=applied_budget,
+        target_context=prepared.handoff_context,
     )
     if len(note) + 2 > HANDOFF_NOTE_RESERVE_CHARS:
         raise BridgeError("the required handoff note exceeds its reserved bridge budget")

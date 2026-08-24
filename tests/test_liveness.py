@@ -71,6 +71,147 @@ class LivenessTests(unittest.TestCase):
         self.assertEqual(snapshot[0].started_at, 0)
         self.assertEqual(snapshot[0].start_token, "")
 
+    def test_linux_process_snapshot_includes_name_command_and_start_evidence(self) -> None:
+        process = type(
+            "FakeProcess",
+            (),
+            {
+                "info": {
+                    "pid": 7,
+                    "name": "opencode",
+                    "cmdline": ["/usr/bin/opencode", "--session", "ses_" + "A" * 26],
+                    "create_time": 1.25,
+                }
+            },
+        )()
+        with (
+            patch.object(liveness.psutil, "process_iter", return_value=[process]),
+            patch.object(liveness, "process_start_token", return_value="start-token"),
+        ):
+            snapshot = liveness.process_snapshot("linux")
+        self.assertEqual(snapshot[0].name, "opencode")
+        self.assertEqual(snapshot[0].command[0], "/usr/bin/opencode")
+        self.assertEqual(snapshot[0].start_token, "start-token")
+
+    def test_process_snapshot_retains_partial_results_when_iterator_raises(self) -> None:
+        first = type(
+            "FakeProcess",
+            (),
+            {"info": {"pid": 1, "name": None, "cmdline": None, "create_time": None}},
+        )()
+        second = type(
+            "FakeProcess",
+            (),
+            {"info": {"pid": 2, "name": "opencode", "cmdline": [], "create_time": 1}},
+        )()
+
+        class BrokenIterator:
+            def __init__(self) -> None:
+                self.index = 0
+
+            def __iter__(self):
+                return self
+
+            def __next__(self):
+                self.index += 1
+                if self.index == 1:
+                    return first
+                if self.index == 2:
+                    raise NotImplementedError("one inaccessible process")
+                if self.index == 3:
+                    return second
+                raise StopIteration
+
+        with (
+            patch.object(liveness.psutil, "process_iter", return_value=BrokenIterator()),
+            patch.object(liveness, "process_start_token", side_effect=("one", "two")),
+        ):
+            snapshot = liveness.process_snapshot("linux")
+        self.assertEqual([item.pid for item in snapshot], [1, 2])
+        self.assertEqual((snapshot[0].name, snapshot[0].command), ("", ()))
+
+    def test_opencode_liveness_requires_exact_identity_session_and_start(self) -> None:
+        root = "ses_" + "A" * 26
+        child = "ses_" + "b" * 26
+        ambiguous = "ses_" + "C" * 26
+        duplicate = "ses_" + "D" * 26
+        inline = "ses_" + "E" * 26
+        rows = [
+            Session("opencode", root, "", "", 0, 0, "", False, "storage"),
+            Session(
+                "opencode",
+                child,
+                "",
+                "",
+                0,
+                0,
+                "",
+                False,
+                "storage",
+                source=SourceKind.SUBAGENT,
+            ),
+            Session("opencode", ambiguous, "", "", 0, 0, "", False, "storage"),
+            Session("opencode", duplicate, "", "", 0, 0, "", False, "storage"),
+            Session("opencode", inline, "", "", 0, 0, "", False, "storage"),
+        ]
+        context = self.context(
+            "linux",
+            ProcessInfo(10, "opencode", ("opencode", "--session", root), "one"),
+            ProcessInfo(
+                11,
+                "node",
+                ("node", "/opt/opencode", f"-s={child}"),
+                "two",
+            ),
+            ProcessInfo(
+                12,
+                "opencode",
+                ("opencode", "--session", ambiguous, "-s", root),
+                "three",
+            ),
+            ProcessInfo(13, "python", ("python", "app.py", "--session", ambiguous), "four"),
+            ProcessInfo(14, "opencode", ("opencode", "--session", ambiguous), ""),
+            ProcessInfo(15, "opencode", ("opencode",), "bare"),
+            ProcessInfo(16, "vim", ("vim", "opencode", "--session", ambiguous), "spoof"),
+            ProcessInfo(17, "sudo", ("sudo", "opencode", "--session", ambiguous), "spoof"),
+            ProcessInfo(
+                18,
+                "cmd.exe",
+                ("cmd.exe", "/c", "opencode.cmd", "--session", duplicate),
+                "wrapper",
+            ),
+            ProcessInfo(19, "opencode", ("opencode", "-s" + duplicate), "native"),
+            ProcessInfo(20, "opencode", ("opencode", "--session=" + inline), "inline"),
+        )
+        detect_open_sessions(rows, context=context)
+        self.assertEqual((rows[0].is_open, rows[0].open_pid), (True, 10))
+        self.assertEqual((rows[1].is_open, rows[1].open_pid), (True, 11))
+        self.assertEqual((rows[2].is_open, rows[2].open_pid), (False, 0))
+        self.assertEqual((rows[3].is_open, rows[3].open_pid), (True, 19))
+        self.assertEqual((rows[4].is_open, rows[4].open_pid), (True, 20))
+
+    def test_opencode_liveness_handles_windows_command_wrappers(self) -> None:
+        session_id = "ses_" + "z" * 26
+        item = Session("opencode", session_id, "", "", 0, 0, "", False, "storage")
+        context = self.context(
+            "win32",
+            ProcessInfo(
+                44,
+                "cmd.exe",
+                (
+                    "C:\\Windows\\System32\\cmd.exe",
+                    "/c",
+                    "C:\\Users\\vandy\\AppData\\Roaming\\npm\\opencode.cmd",
+                    "--session",
+                    session_id,
+                ),
+                "verified-start",
+                started_at=1,
+            ),
+        )
+        detect_open_sessions([item], context=context)
+        self.assertEqual((item.is_open, item.open_pid), (True, 44))
+
     def test_claude_windows_registry_uses_shared_start_token(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             home = Path(directory)
@@ -314,8 +455,20 @@ class LivenessTests(unittest.TestCase):
             "storage",
             source=SourceKind.NON_INTERACTIVE,
         )
+        claude_subagent = Session(
+            "claude",
+            "agent",
+            "",
+            "",
+            0,
+            0,
+            "",
+            False,
+            "storage",
+            source=SourceKind.SUBAGENT,
+        )
         with patch("ai_sessions.app.populate_liveness_context") as populate:
-            detect_open_sessions([item])
+            detect_open_sessions([item, claude_subagent])
         populate.assert_not_called()
 
 
