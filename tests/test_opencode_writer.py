@@ -269,7 +269,10 @@ class OpenCodeWriterIntegrationTests(unittest.TestCase):
     def test_prepare_selects_cli_order_adequate_model_and_dynamic_hard_budget(self) -> None:
         prepared = self.prepared()
         self.assertEqual(prepared.option("model"), "provider/large")
-        self.assertEqual(prepared.option("database"), str(self.database))
+        prepared_database = prepared.option("database")
+        self.assertIsInstance(prepared_database, str)
+        assert isinstance(prepared_database, str)
+        self.assertTrue(Path(prepared_database).samefile(self.database))
         self.assertEqual(prepared.budget_policy.context_tokens, 160_000)
         self.assertTrue(prepared.budget_policy.hard_limit)
         self.assertIn("provider/large", prepared.handoff_context[0])
