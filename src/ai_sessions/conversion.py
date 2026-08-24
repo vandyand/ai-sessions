@@ -29,7 +29,7 @@ import os
 import re
 from dataclasses import replace
 from pathlib import Path
-from typing import Any, Iterable, Iterator
+from typing import Any, Callable, Iterable, Iterator, Mapping
 
 from .capabilities import HarnessAdapter, Unsupported
 from .model import (
@@ -37,14 +37,22 @@ from .model import (
     HANDOFF_NOTE_RESERVE_CHARS,
     MIN_BRIDGE_CHARS,
     MIN_BUDGET_TOKENS,
+    TARGET_CONTEXT_RESERVE_CHARS,
     TRUNCATION_MARKER,
+    Availability,
     BridgeResult,
     Budget,
+    Checkpoint,
+    NativeRef,
+    NativeWrite,
+    PreparedTarget,
+    ReadSnapshot,
     SelectionMetric,
     SelectionResult,
     ToolCall,
     Transcript,
     Turn,
+    is_checkpoint,
 )
 from .model import (
     LEGACY_DEFAULT_MAX_CHARS as LEGACY_DEFAULT_MAX_CHARS,
@@ -243,18 +251,23 @@ def flatten(turns: Iterable[Turn]) -> list[Turn]:
     return result
 
 
-def _records(path: Path) -> Iterator[dict[str, Any]]:
+def _records(path: Path, *, end: int | None = None) -> Iterator[dict[str, Any]]:
     try:
-        handle = path.open("r", encoding="utf-8", errors="replace")
+        handle = path.open("rb")
     except OSError as error:
         raise BridgeError(f"could not read {path}: {error}") from error
     with handle:
-        for line in handle:
+        while end is None or handle.tell() < end:
+            line = handle.readline() if end is None else handle.readline(end - handle.tell())
+            if not line:
+                break
+            if end is not None and not line.endswith(b"\n"):
+                break
             line = line.strip()
             if not line:
                 continue
             try:
-                record = json.loads(line)
+                record = json.loads(line.decode("utf-8", "replace"))
             except json.JSONDecodeError:
                 continue
             if isinstance(record, dict):
@@ -346,35 +359,83 @@ class _Conversation:
 
 
 def read_transcript(
-    tool: str, storage: str | Path, *, tool_calls: bool = True, latest_window: bool = True
+    tool: str,
+    native: NativeRef,
+    *,
+    tool_calls: bool = True,
+    latest_window: bool = True,
 ) -> Transcript:
     """Extract the conversation from a transcript, oldest first.
 
     Turns come back structured, with tool calls still attached, so callers
     can count or inspect them before ``prepare`` renders them to text.
     """
-    path = Path(storage)
-    if not storage or not path.is_file():
-        raise BridgeError("the source transcript is missing, so there is nothing to carry over")
-    reader = harness(tool).read
+    return read_snapshot(
+        tool,
+        native,
+        tool_calls=tool_calls,
+        latest_window=latest_window,
+    ).transcript
+
+
+def read_snapshot(
+    tool: str,
+    native: NativeRef,
+    *,
+    tool_calls: bool = True,
+    latest_window: bool = True,
+) -> ReadSnapshot:
+    """Read one adapter-owned native snapshot and its opaque checkpoint."""
+    adapter = harness(tool)
+    if not isinstance(native, NativeRef):
+        raise TypeError("native session reads require an explicit NativeRef")
+    if isinstance(adapter.availability, Unsupported):
+        raise BridgeError(
+            f"{adapter.label} cannot verify exact native availability: "
+            f"{adapter.availability.reason}"
+        )
+    availability = native_session_availability(tool, native)
+    if availability == "unavailable":
+        raise BridgeError(
+            f"the {adapter.label} source session is unavailable, so there is nothing to carry over"
+        )
+    if availability != "available":
+        raise BridgeError(
+            f"the {adapter.label} source session could not be verified safely; "
+            "restore storage access or retry"
+        )
+    reader = adapter.read
     if isinstance(reader, Unsupported):
-        raise BridgeError(f"{harness(tool).label} cannot read native transcripts: {reader.reason}")
-    result = reader(path, latest_window=latest_window)
-    turns = result.turns
+        raise BridgeError(f"{adapter.label} cannot read native transcripts: {reader.reason}")
+    try:
+        result = reader(native, latest_window=latest_window)
+    except OSError as error:
+        raise BridgeError(f"could not read the {adapter.label} source session: {error}") from error
+    if (
+        not isinstance(result, ReadSnapshot)
+        or not isinstance(result.transcript, Transcript)
+        or not is_checkpoint(result.checkpoint)
+    ):
+        raise BridgeError(f"{adapter.label} returned an invalid native read checkpoint")
+    transcript = result.transcript
+    turns = transcript.turns
     if not tool_calls:
         turns = [replace(turn, calls=()) for turn in turns]
-    return Transcript(
-        [turn for turn in turns if turn.text or turn.calls],
-        result.opaque_compactions,
-        result.carried_windows,
-        result.sealed_summary,
-        result.resumes_at_last_summary,
+    return ReadSnapshot(
+        Transcript(
+            [turn for turn in turns if turn.text or turn.calls],
+            transcript.opaque_compactions,
+            transcript.carried_windows,
+            transcript.sealed_summary,
+            transcript.resumes_at_last_summary,
+        ),
+        result.checkpoint,
     )
 
 
-def read_turns(tool: str, storage: str | Path, *, tool_calls: bool = True) -> list[Turn]:
+def read_turns(tool: str, native: NativeRef, *, tool_calls: bool = True) -> list[Turn]:
     """The conversation alone, for callers that do not need the rest."""
-    return read_transcript(tool, storage, tool_calls=tool_calls).turns
+    return read_transcript(tool, native, tool_calls=tool_calls).turns
 
 
 def prepare(turns: Iterable[Turn]) -> list[Turn]:
@@ -557,6 +618,7 @@ def handoff_note(
     resumes_at_last_summary: bool = True,
     conversation_id: str = "",
     budget: Budget | None = None,
+    target_context: tuple[str, ...] = (),
 ) -> str:
     """The opening message that tells the target where this came from."""
     source = harness(source_tool).label
@@ -593,6 +655,15 @@ def handoff_note(
             f"{assembled if assembled is not None else kept} target message(s) as plain text."
         ),
     ]
+    remaining_context = TARGET_CONTEXT_RESERVE_CHARS
+    for detail in target_context[:4]:
+        prefix = "Target preparation: "
+        available = remaining_context - len(prefix) - 1
+        if available <= 0:
+            break
+        rendered = f"{prefix}{_clip(detail, min(300, available))}"
+        lines.append(rendered)
+        remaining_context -= len(rendered) + 1
     if budget is not None:
         lines += [
             "",
@@ -673,21 +744,23 @@ def handoff_note(
     return "\n".join(lines)
 
 
-def _records_after(path: Path, offset: int) -> Iterator[dict[str, Any]]:
+def _records_after(path: Path, offset: int, *, end: int | None = None) -> Iterator[dict[str, Any]]:
     """Yield complete JSONL records appended after a recorded byte frontier."""
     try:
         size = path.stat().st_size
-        if offset < 0 or size < offset:
+        captured = size if end is None else end
+        if offset < 0 or captured < offset or size < captured:
             # Provider transcripts are append-only. Shrinking means the native
             # history was replaced, which is necessarily a new revision.
             yield {"type": "ai_sessions_replaced"}
             return
         with path.open("rb") as handle:
             handle.seek(offset)
-            for raw in handle:
+            while handle.tell() < captured:
+                raw = handle.readline(captured - handle.tell())
                 if not raw.endswith(b"\n"):
                     yield {"type": "ai_sessions_incomplete"}
-                    continue
+                    break
                 try:
                     item = json.loads(raw)
                 except (json.JSONDecodeError, UnicodeDecodeError):
@@ -697,6 +770,63 @@ def _records_after(path: Path, offset: int) -> Iterator[dict[str, Any]]:
                     yield item
     except OSError:
         yield {"type": "ai_sessions_missing"}
+
+
+class _UnstableJsonlSnapshot(RuntimeError):
+    """Prevent a transient or racing JSONL classification from entering the cache."""
+
+
+@functools.lru_cache(maxsize=2048)
+def _cached_jsonl_change_status(
+    classifier: Callable[[NativeRef, Checkpoint, int], str],
+    registry_generation: int,
+    ref: NativeRef,
+    checkpoint: Checkpoint,
+    device: int,
+    inode: int,
+    size: int,
+    mtime_ns: int,
+) -> str:
+    """Classify one immutable file snapshot once for an adapter hook generation."""
+    del registry_generation
+    status = classifier(ref, checkpoint, size)
+    if status == "unstable":
+        raise _UnstableJsonlSnapshot
+    try:
+        after = Path(ref.storage).stat()
+    except OSError as error:
+        raise _UnstableJsonlSnapshot from error
+    if (after.st_dev, after.st_ino, after.st_size, after.st_mtime_ns) != (
+        device,
+        inode,
+        size,
+        mtime_ns,
+    ):
+        raise _UnstableJsonlSnapshot
+    return status
+
+
+def _jsonl_change_status(
+    ref: NativeRef,
+    checkpoint: Checkpoint,
+    classifier: Callable[[NativeRef, Checkpoint, int], str],
+    registry_generation: int,
+) -> str:
+    """Use adapter-owned JSONL semantics with exact-ref, race-safe snapshot caching."""
+    try:
+        stat = Path(ref.storage).stat()
+        return _cached_jsonl_change_status(
+            classifier,
+            registry_generation,
+            ref,
+            checkpoint,
+            stat.st_dev,
+            stat.st_ino,
+            stat.st_size,
+            stat.st_mtime_ns,
+        )
+    except (OSError, _UnstableJsonlSnapshot):
+        return "unstable"
 
 
 def harness(name: str) -> HarnessAdapter:
@@ -717,9 +847,10 @@ def resolve_budget(
     max_tokens: int | None = None,
     max_chars: int | None = None,
     migrated: bool = False,
+    policy: BudgetPolicy | None = None,
 ) -> Budget:
     """Resolve config into the one target budget used by the bridge."""
-    policy = harness(target).budget
+    policy = policy or harness(target).budget
     if not isinstance(max_tokens, int) or isinstance(max_tokens, bool) or max_tokens <= 0:
         max_tokens = None
     if not isinstance(max_chars, int) or isinstance(max_chars, bool) or max_chars <= 0:
@@ -732,6 +863,12 @@ def resolve_budget(
             math.ceil(MIN_BRIDGE_CHARS / policy.chars_per_token),
         )
         tokens = max(max_tokens, minimum)
+        if policy.hard_limit and tokens > default_tokens:
+            raise BridgeError(
+                f"bridge.max_tokens={max_tokens} exceeds the prepared {target} target limit "
+                f"of {default_tokens}; choose a larger target model or lower the budget "
+                f"({policy.source})"
+            )
         try:
             chars = math.floor(tokens * policy.chars_per_token)
         except (OverflowError, ValueError) as error:
@@ -751,6 +888,12 @@ def resolve_budget(
                 f"bridge.max_chars must be at least {MIN_BRIDGE_CHARS} characters "
                 "to hold required handoff metadata"
             )
+        if policy.hard_limit and max_chars > default_chars:
+            raise BridgeError(
+                f"bridge.max_chars={max_chars} exceeds the prepared {target} target limit "
+                f"of {default_chars}; choose a larger target model or lower the budget "
+                f"({policy.source})"
+            )
         try:
             tokens = math.ceil(max_chars / policy.chars_per_token)
         except (OverflowError, ValueError) as error:
@@ -765,8 +908,50 @@ def resolve_budget(
     return Budget(target, default_tokens, default_chars, "target-default")
 
 
-def native_session_exists(tool: str, session_id: str) -> bool:
-    """Whether ``tool`` still has a session with this id on disk.
+def prepare_target(
+    target: str,
+    *,
+    command: tuple[str, ...] | None = None,
+    cwd: str = "",
+    options: Mapping[str, Any] | None = None,
+) -> PreparedTarget:
+    """Resolve one immutable target plan before budgeting and materialization."""
+    adapter = harness(target)
+    resolved_command = command or adapter.default_command
+    hook = adapter.prepare_target
+    if isinstance(hook, Unsupported):
+        return PreparedTarget(tuple(resolved_command), adapter.budget)
+    try:
+        prepared = hook(tuple(resolved_command), cwd, dict(options or {}))
+    except OSError as error:
+        raise BridgeError(f"could not prepare the {adapter.label} target: {error}") from error
+    if not isinstance(prepared, PreparedTarget) or not isinstance(
+        prepared.budget_policy, BudgetPolicy
+    ):
+        raise BridgeError(f"{adapter.label} returned an invalid target preparation")
+    if prepared.command != tuple(resolved_command):
+        raise BridgeError("target preparation changed the configured command")
+    return prepared
+
+
+def resolve_native_session(tool: str, session_id: str) -> NativeRef | None:
+    """Resolve an ID through its adapter without borrowing another store."""
+    if not session_id or tool not in REGISTRY:
+        return None
+    resolver = REGISTRY.get(tool).resolve
+    if isinstance(resolver, Unsupported):
+        return None
+    try:
+        resolved = resolver(session_id)
+    except Exception:
+        return None
+    if not isinstance(resolved, NativeRef) or resolved.session_id != session_id:
+        return None
+    return resolved
+
+
+def native_session_exists(tool: str, session_id: str, storage: str = "") -> bool:
+    """Whether ``tool`` still has this exact native session.
 
     Cross-provider references are recovered by matching id-shaped strings out
     of transcripts, so they also pick up unrelated identifiers that share the
@@ -774,75 +959,90 @@ def native_session_exists(tool: str, session_id: str) -> bool:
     Codex session id.  Sessions also get deleted.  Either way a reference has
     to be checked before a CLI is asked to resume it.
     """
-    if not session_id or tool not in REGISTRY:
+    if not session_id:
         return False
+    ref = NativeRef(session_id, storage) if storage else resolve_native_session(tool, session_id)
+    if ref is None:
+        return False
+    return native_session_availability(tool, ref) == "available"
+
+
+def native_session_availability(tool: str, ref: NativeRef) -> str:
+    """Return available, unavailable, or unknown for one exact native ref."""
+    if tool not in REGISTRY:
+        return "unknown"
+    probe = REGISTRY.get(tool).availability
+    if isinstance(probe, Unsupported):
+        return "unknown"
     try:
-        locator = REGISTRY.get(tool).locate
-        if isinstance(locator, Unsupported):
-            return False
-        return locator(session_id)
-    except OSError:
-        return False
+        value = probe(ref)
+    except (BridgeError, OSError):
+        return "unknown"
+    return native_session_availability_value(value)
 
 
-@functools.lru_cache(maxsize=2048)
-def _snapshot_change_status(
+def native_checkpoint(tool: str, ref: NativeRef) -> Checkpoint | None:
+    """Capture a current adapter-owned checkpoint, or None when it is not reliable."""
+    if tool not in REGISTRY:
+        return None
+    capture = REGISTRY.get(tool).checkpoint
+    if isinstance(capture, Unsupported):
+        return None
+    try:
+        value = capture(ref)
+    except Exception:
+        return None
+    if not is_checkpoint(value):
+        return None
+    return value
+
+
+def conversation_change_status(
     tool: str,
-    generation: int,
-    storage: str,
-    offset: int,
-    device: int,
-    inode: int,
-    size: int,
-    mtime_ns: int,
+    native: NativeRef,
+    checkpoint: Checkpoint | None,
+    *,
+    availability: Availability | str | None = None,
 ) -> str:
-    """Classify one immutable file snapshot once per process."""
-    del generation, device, inode, size, mtime_ns
-    classifier = harness(tool).change_status
-    if isinstance(classifier, Unsupported):
-        return "unsupported"
-    status = classifier(Path(storage), offset)
-    if status == "unstable":
-        # lru_cache does not retain exceptions. A sharing violation or other
-        # transient read failure must be retried even if file metadata did not
-        # change while access was unavailable.
-        raise _UnstableSnapshot
-    return status
-
-
-class _UnstableSnapshot(RuntimeError):
-    """Internal signal that a snapshot must not enter the status cache."""
-
-
-def conversation_change_status(tool: str, storage: str | Path, offset: int) -> str:
     """Classify semantic activity, instability, or unavailable harness support."""
     if tool not in REGISTRY:
         return "unknown"
-    path = Path(storage)
-    if not storage or not path.is_file():
+    if not is_checkpoint(checkpoint):
         return "unstable"
+    resolved_availability = (
+        native_session_availability(tool, native)
+        if availability is None
+        else native_session_availability_value(availability)
+    )
+    if resolved_availability != "available":
+        return "unstable" if resolved_availability == "unavailable" else "unknown"
+    classifier = REGISTRY.get(tool).change_status
+    if isinstance(classifier, Unsupported):
+        return "unsupported"
     try:
-        stat = path.stat()
-    except OSError:
+        status = classifier(native, checkpoint)
+    except Exception:
         return "unstable"
-    try:
-        return _snapshot_change_status(
-            tool,
-            REGISTRY.generation,
-            str(path),
-            offset,
-            stat.st_dev,
-            stat.st_ino,
-            stat.st_size,
-            stat.st_mtime_ns,
-        )
-    except _UnstableSnapshot:
+    if status not in ("unchanged", "changed", "unstable", "unknown"):
         return "unstable"
+    return status
 
 
-def conversation_changed_since(tool: str, storage: str | Path, offset: int) -> bool:
+def native_session_availability_value(value: object) -> str:
+    """Normalize an availability value, failing closed for malformed hooks."""
+    try:
+        return Availability(value).value
+    except (TypeError, ValueError):
+        return "unknown"
+
+
+def conversation_changed_since(
+    tool: str,
+    native: NativeRef,
+    checkpoint: Checkpoint | None,
+) -> bool:
     """Compatibility predicate for callers that do not need instability detail."""
-    return conversation_change_status(tool, storage, offset) != "unchanged"
+    return conversation_change_status(tool, native, checkpoint) != "unchanged"
 
 
 def bridged_title(title: str, source_tool: str) -> str:
@@ -887,6 +1087,8 @@ def bridge(
     cwd: str,
     title: str = "",
     budget: Budget | None = None,
+    prepared_target: PreparedTarget | None = None,
+    target_command: tuple[str, ...] | None = None,
     tool_calls: bool = True,
     latest_window: bool = True,
     conversation_id: str = "",
@@ -896,18 +1098,33 @@ def bridge(
     if target_tool == source_tool:
         raise BridgeError("that session already belongs to this harness")
     harness(source_tool)
-    applied_budget = budget or resolve_budget(target_tool)
+    prepared = prepared_target or prepare_target(target_tool, command=target_command, cwd=cwd)
+    if prepared_target is not None and target_command is not None:
+        if prepared.command != target_command:
+            raise BridgeError("prepared target does not match the configured command")
+    applied_budget = budget or resolve_budget(target_tool, policy=prepared.budget_policy)
     if applied_budget.target != target_tool:
         raise BridgeError("the resolved bridge budget belongs to a different target")
-    # This is deliberately captured before reading and aligned to a complete
-    # JSONL record. If the live source is appended while the bridge is
-    # materialising it, an earlier frontier may cause one conservative
-    # re-copy; a later or partial EOF could mark unread work as already carried.
-    source_cursor = complete_jsonl_cursor(Path(storage))
-    source = read_transcript(
-        source_tool, storage, tool_calls=tool_calls, latest_window=latest_window
+    if prepared.budget_policy.hard_limit:
+        token_limit = math.floor(
+            prepared.budget_policy.context_tokens * prepared.budget_policy.usable_fraction
+        )
+        character_limit = math.floor(token_limit * prepared.budget_policy.chars_per_token)
+        if applied_budget.tokens > token_limit or applied_budget.chars > character_limit:
+            raise BridgeError(
+                f"the applied bridge budget exceeds the prepared {target.label} target limit; "
+                "choose a larger target model or lower the budget"
+            )
+    source_ref = NativeRef(session_id, storage)
+    captured = read_snapshot(
+        source_tool,
+        source_ref,
+        tool_calls=tool_calls,
+        latest_window=latest_window,
     )
-    change_status = conversation_change_status(source_tool, storage, source_cursor)
+    source_checkpoint = captured.checkpoint
+    source = captured.transcript
+    change_status = conversation_change_status(source_tool, source_ref, source_checkpoint)
     if change_status != "unchanged":
         raise BridgeError(
             "the source transcript changed or became incomplete while it was being read; "
@@ -944,6 +1161,7 @@ def bridge(
         resumes_at_last_summary=source.resumes_at_last_summary or not source.carried_windows,
         conversation_id=conversation_id,
         budget=applied_budget,
+        target_context=prepared.handoff_context,
     )
     if len(note) + 2 > HANDOFF_NOTE_RESERVE_CHARS:
         raise BridgeError("the required handoff note exceeds its reserved bridge budget")
@@ -953,16 +1171,33 @@ def bridge(
     writer = target.write
     if isinstance(writer, Unsupported):
         raise BridgeError(f"{target.label} cannot write native transcripts: {writer.reason}")
-    new_id, path = writer(cwd=cwd, turns=payload, title=bridged_title(title, source_tool))
+    try:
+        written = writer(
+            cwd=cwd,
+            turns=payload,
+            title=bridged_title(title, source_tool),
+            prepared=prepared,
+        )
+    except (OSError, ValueError) as error:
+        raise BridgeError(f"could not write the {target.label} target session: {error}") from error
+    if (
+        not isinstance(written, NativeWrite)
+        or not isinstance(written.native, NativeRef)
+        or (written.checkpoint is not None and not is_checkpoint(written.checkpoint))
+        or not isinstance(written.notices, tuple)
+        or not all(isinstance(notice, str) for notice in written.notices)
+    ):
+        raise BridgeError(f"{target.label} returned an invalid native write result")
     return BridgeResult(
         tool=target_tool,
-        session_id=new_id,
-        path=path,
+        native=written.native,
         turns=len(kept),
         written_turns=assembled_count,
         calls=summarised,
         dropped=selected.dropped,
         truncated=selected.truncated,
-        source_cursor=source_cursor,
+        source_checkpoint=source_checkpoint,
+        target_checkpoint=written.checkpoint,
         budget=applied_budget,
+        notices=(*prepared.notices, *written.notices),
     )

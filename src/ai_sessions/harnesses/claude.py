@@ -6,6 +6,7 @@ import json
 import os
 import re
 import secrets
+import stat
 import time
 import uuid
 from pathlib import Path
@@ -21,15 +22,29 @@ from ..conversion import (
     _Conversation,
     _digest_arguments,
     _iso,
+    _jsonl_change_status,
     _records,
     _records_after,
     append_jsonl,
+    complete_jsonl_cursor,
     scrub,
 )
 from ..diagnostics import record_warning
 from ..discovery import HarnessContext, clean_prompt, normalize_space, prompt_text, timestamp
 from ..liveness import LivenessContext, ProcessInfo
-from ..model import BudgetPolicy, LivenessSession, NativeSession, SourceKind, Transcript, Turn
+from ..model import (
+    Availability,
+    BudgetPolicy,
+    LivenessSession,
+    NativeRef,
+    NativeSession,
+    NativeWrite,
+    PreparedTarget,
+    ReadSnapshot,
+    SourceKind,
+    Transcript,
+    Turn,
+)
 from ..paths import APP_CACHE_DIR, HOME, env_path
 from ..registry import REGISTRY
 
@@ -45,11 +60,11 @@ def claude_project_dir(cwd: str) -> Path:
     return REGISTRY.get("claude").home / "projects" / slug
 
 
-def read_claude(path: Path, *, latest_window: bool = True) -> Transcript:
+def read_claude(path: Path, *, latest_window: bool = True, end: int | None = None) -> Transcript:
     """Read mainline Claude messages, using sidechain only for an agent-only file."""
     main = _Conversation()
     sidechain = _Conversation()
-    for record in _records(path):
+    for record in _records(path, end=end):
         role = record.get("type")
         if role not in ("user", "assistant") or record.get("isMeta"):
             continue
@@ -138,10 +153,56 @@ def _claude_exists(session_id: str) -> bool:
     return any((REGISTRY.get("claude").home / "projects").rglob(f"{session_id}.jsonl"))
 
 
-def _claude_change_status(path: Path, offset: int) -> str:
+def _claude_resolve(session_id: str) -> NativeRef | None:
+    try:
+        paths = sorted((REGISTRY.get("claude").home / "projects").rglob(f"{session_id}.jsonl"))
+    except OSError:
+        return None
+    return NativeRef(session_id, str(paths[0])) if paths else None
+
+
+def _claude_availability(ref: NativeRef) -> Availability:
+    path = Path(ref.storage)
+    try:
+        metadata = path.stat()
+    except FileNotFoundError:
+        return Availability.UNAVAILABLE
+    except OSError:
+        return Availability.UNKNOWN
+    return Availability.AVAILABLE if stat.S_ISREG(metadata.st_mode) else Availability.UNAVAILABLE
+
+
+def _claude_checkpoint(ref: NativeRef) -> int:
+    return complete_jsonl_cursor(Path(ref.storage))
+
+
+def _read_claude_snapshot(ref: NativeRef, *, latest_window: bool = True) -> ReadSnapshot:
+    checkpoint = _claude_checkpoint(ref)
+    return ReadSnapshot(
+        read_claude(Path(ref.storage), latest_window=latest_window, end=checkpoint), checkpoint
+    )
+
+
+def _write_claude(
+    *,
+    cwd: str,
+    turns: list[Turn],
+    prepared: PreparedTarget,
+    title: str = "",
+    created: float | None = None,
+) -> NativeWrite:
+    del prepared
+    session_id, path = write_claude_session(cwd=cwd, turns=turns, title=title, created=created)
+    ref = NativeRef(session_id, str(path))
+    return NativeWrite(ref, _claude_checkpoint(ref))
+
+
+def _classify_claude_tail(ref: NativeRef, checkpoint: int | str, end: int) -> str:
     """Ignore title/metadata appends and classify only semantic messages."""
+    if not isinstance(checkpoint, int) or isinstance(checkpoint, bool):
+        return "unstable"
     changed = False
-    for record in _records_after(path, offset):
+    for record in _records_after(Path(ref.storage), checkpoint, end=end):
         if record.get("type") in (
             "ai_sessions_replaced",
             "ai_sessions_missing",
@@ -154,6 +215,10 @@ def _claude_change_status(path: Path, offset: int) -> str:
         if isinstance(message, dict) and message.get("content") not in (None, "", []):
             changed = True
     return "changed" if changed else "unchanged"
+
+
+def _claude_change_status(ref: NativeRef, checkpoint: int | str) -> str:
+    return _jsonl_change_status(ref, checkpoint, _classify_claude_tail, REGISTRY.generation)
 
 
 def load_history() -> dict[str, dict[str, Any]]:
@@ -606,9 +671,11 @@ ADAPTER = HarnessAdapter(
         ),
     ),
     scratch_patterns=(re.compile(r"(?:/tmp/claude-|\\Temp\\claude-)", re.I),),
-    read=read_claude,
-    write=write_claude_session,
-    locate=_claude_exists,
+    read=_read_claude_snapshot,
+    write=_write_claude,
+    resolve=_claude_resolve,
+    availability=_claude_availability,
+    checkpoint=_claude_checkpoint,
     change_status=_claude_change_status,
     discover=discover,
     resume_args=resume_args,

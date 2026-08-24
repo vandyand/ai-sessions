@@ -5,7 +5,7 @@ build-backend = "hatchling.build"
 [project]
 name = "ai-sessions"
 dynamic = ["version"]
-description = "A friendly terminal browser for local Codex CLI and Claude Code sessions"
+description = "A terminal browser and cross-harness bridge for Codex, Claude Code, and OpenCode"
 readme = "README.md"
 requires-python = ">=3.11"
 license = "MIT"
@@ -45,7 +45,15 @@ path = "src/ai_sessions/__init__.py"
 packages = ["src/ai_sessions"]
 
 [tool.hatch.build.targets.sdist]
-include = ["src/ai_sessions", "tests", "README.md", "LICENSE", "pyproject.toml"]
+include = [
+    "src/ai_sessions",
+    "tests",
+    "tools",
+    "README.md",
+    "CHANGELOG.md",
+    "LICENSE",
+    "pyproject.toml",
+]
 
 [tool.ruff]
 target-version = "py311"

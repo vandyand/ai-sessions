@@ -6,9 +6,10 @@ and no bridge path may be implemented pairwise.
 
 ## Domain boundaries
 
-A **native session** is an append-only transcript that one harness can resume by its own
-id. A **conversation** is the utility-owned identity that survives movement between
-harnesses. A **member** is one native materialization of that conversation.
+A **native session** is the exact `(session_id, storage)` reference that one harness can resume.
+Storage may be a per-session append-only file or a shared mutable store containing many identities.
+A **conversation** is the utility-owned identity that survives movement between harnesses. A
+**member** is one native materialization of that conversation.
 
 Each member records:
 
@@ -17,10 +18,11 @@ Each member records:
 | `tool`, `session_id`, `storage` | Native identity and transcript location |
 | `generation` | Causal materialization step; never inferred from wall-clock time |
 | `frontier` | Equivalence token shared by members containing the same carried history |
-| `cursor` | Safe byte boundary consumed from this append-only transcript |
+| `checkpoint` | Opaque JSON-safe semantic state captured by the owning adapter |
+| `cursor` | Legacy integer JSONL checkpoint retained for schema-6 rollback |
 | `cwd`, `title`, `updated` | Discovery/display metadata, not routing authority |
 
-If no member has meaningful records after its cursor, every member at the maximum
+If no member has meaningful records after its checkpoint, every member at the maximum
 generation is an equivalent head. If exactly one maximum-generation member advances, it is
 the head. Two advanced members, or an older member advancing after a newer generation
 exists, is divergence. Automatic launch must stop on divergence.
@@ -40,10 +42,13 @@ source_kinds, id_patterns, scratch_patterns
 discover(context) -> Iterable[NativeSession]
 publish_name(session, title) -> note
 inspect_liveness(context, home, sessions) -> Mapping[id, pid]
-read(path, options) -> Transcript
-write(cwd, turns, title) -> (native_id, path)
-locate(native_id) -> bool
-change_status(path, byte_cursor) -> unchanged | changed | unstable
+read(ref, latest_window) -> ReadSnapshot(transcript, checkpoint)
+write(cwd, turns, title, prepared) -> NativeWrite(ref, checkpoint | None, notices)
+resolve(native_id) -> NativeRef | None
+availability(ref) -> available | unavailable | unknown
+checkpoint(ref) -> int | str
+change_status(ref, checkpoint) -> unchanged | changed | unstable | unknown | unsupported
+prepare_target(command, cwd, options) -> PreparedTarget
 budget -> BudgetPolicy(context_tokens, usable_fraction, chars_per_token, source)
 ```
 
@@ -52,23 +57,25 @@ package initialization; the registry never imports providers. Core consumers que
 time, so scoped late registration participates in CLI choices, configuration, discovery,
 rendering, liveness, naming, and conversion without refreshing an import-time snapshot.
 
-`read` projects native records into the shared `Turn` model. `write` must produce a truly
+`read` atomically projects native records and captures their adapter-owned checkpoint. `write` must
+produce a truly
 resumable native transcript, including any separate records needed for both model context
 and visible scrollback. `change_status` recognizes conversation/tool activity and ignores
-metadata-only appends such as renames. Missing, replaced, truncated, or partially written
-append-only storage is `unstable` so the core fails conservatively. If the newest
+metadata-only changes such as renames. Missing, replaced, truncated, malformed, locked, or
+partially written native storage is unavailable, unknown, or unstable as appropriate, so the core
+fails conservatively. If the newest
 generation is unavailable and no equivalent native member survives, launch refuses to
 promote an older generation.
 
-The cursor returned with a bridge is captured before the read begins and aligned after the
-last complete JSONL record. Provisional state uses the same alignment, so completing a
-partial record cannot strand later retries inside that record. This is intentionally a
-lower bound: concurrent work may be copied twice on a later hop, but it cannot be marked
-as consumed without having been observed.
+JSONL adapters use a complete-record byte boundary. Shared-store adapters instead own a semantic
+digest over every native field that can alter either latest- or full-window projection. Core treats
+both as opaque: it never orders, increments, subtracts, or tests checkpoint truthiness. A bridge
+reads content/checkpoint from one native snapshot, then asks the source adapter to prove it remained
+unchanged before writing the target.
 
-Validated status is cached only for an unchanged native file snapshot. `unstable` results
-are never cached, because a sharing violation or other temporary read failure must remain
-retryable without requiring the provider to modify the transcript first.
+Validated status may be cached only against an adapter-correct native snapshot token. `unstable`,
+`unknown`, and unsupported results are never cached, because temporary failures must remain
+retryable without requiring the provider to modify native storage first.
 
 The budget policy is target-owned because context assumptions are adapter capabilities, not
 core routing rules. It is a conservative unknown-model default, not a claim that the bridge
@@ -111,7 +118,7 @@ Provider-specific caches and
 database schemas belong inside the adapter. The core owns filtering, display, conversation
 state, head resolution, launch policy, and error presentation.
 
-Adding a third harness is complete when its adapter passes shared contract fixtures for:
+Adding another harness is complete when its adapter passes shared contract fixtures for:
 
 - discovery and stable native identity;
 - native resume command construction in every launch mode;
@@ -135,15 +142,16 @@ produced by `merge_runs`; P4 can replace the complete metric.
 
 ## Persistence and recovery
 
-State schema 6 stores conversations and member cursors in `state.json`; this is the routing
+State schema 6 stores conversations and member checkpoints in `state.json`; this is the routing
 authority. New materializations also carry an `[ai-sessions-provenance v1]` JSON marker with
 the conversation id and immediate source. The marker is currently for auditability and a
 future recovery tool. Losing `state.json` still loses group identity; scanning transcripts
 to rebuild it belongs to the full conversation-log phase.
 
-Version 5 bridge records have no safe cursor. Migration marks a surviving target copy as
+Version 5 bridge records have no safe checkpoint. Migration marks a surviving target copy as
 possibly advanced so the utility may duplicate history but will not silently choose its
-ancestor. Provider transcripts remain append-only and are never rewritten in place.
+ancestor. Provider conversation content is never rewritten in place; metadata-only title
+publication follows the exact bounded operation declared by its adapter.
 
 State and configuration are forward-compatible data. A build whose registry does not know a
 harness may hide or refuse to operate on that harness, but load/save must preserve its bridge

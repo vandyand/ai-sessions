@@ -179,6 +179,18 @@ class LaunchConfigTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "unknown harness"):
             LaunchConfig().provider_prefix("other")
 
+    def test_provider_options_are_opaque_copies(self) -> None:
+        profile = ProviderProfile(
+            ["opencode-custom"], [], {"bridge_model": "provider/model", "future": [1, 2]}
+        )
+        config = LaunchConfig(providers={"opencode": profile})
+        options = config.provider_options("opencode")
+        self.assertEqual(options, {"bridge_model": "provider/model", "future": [1, 2]})
+        options["bridge_model"] = "changed"
+        options["future"].append(3)
+        self.assertEqual(config.provider_options("opencode")["bridge_model"], "provider/model")
+        self.assertEqual(config.provider_options("opencode")["future"], [1, 2])
+
     def test_schema_three_unknown_profile_survives_rewrite(self) -> None:
         with TemporaryDirectory() as directory:
             path = Path(directory) / "config.toml"

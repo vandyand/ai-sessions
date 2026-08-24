@@ -20,7 +20,7 @@ COMPATIBILITY_FUNCTIONS = {
     ("src/ai_sessions/config.py", "LaunchConfig._profile"),
 }
 COMPATIBILITY_MODULE_CONSTANTS = {"src/ai_sessions/config.py"}
-PROVIDERS = {"claude", "codex"}
+PROVIDERS = {"claude", "codex", "opencode"}
 
 
 def function_owner(node: ast.AST, parents: dict[ast.AST, ast.AST]) -> str:
@@ -64,7 +64,11 @@ class SourceStructureTests(unittest.TestCase):
     def test_provider_home_constants_only_feed_adapter_registration(self) -> None:
         self.assertNotIn("CODEX_HOME", (SOURCE_ROOT / "paths.py").read_text(encoding="utf-8"))
         self.assertNotIn("CLAUDE_HOME", (SOURCE_ROOT / "paths.py").read_text(encoding="utf-8"))
-        for provider, constant in (("codex", "CODEX_HOME"), ("claude", "CLAUDE_HOME")):
+        for provider, constant in (
+            ("codex", "CODEX_HOME"),
+            ("claude", "CLAUDE_HOME"),
+            ("opencode", "OPENCODE_HOME"),
+        ):
             path = SOURCE_ROOT / "harnesses" / f"{provider}.py"
             for other in SOURCE_ROOT.rglob("*.py"):
                 if other != path:

@@ -5,13 +5,21 @@ from __future__ import annotations
 import math
 from dataclasses import dataclass, field
 from enum import StrEnum
-from pathlib import Path
 from typing import Callable
+
+Checkpoint = int | str
+
+
+def is_checkpoint(value: object) -> bool:
+    """Whether a value is an opaque, JSON-safe native checkpoint."""
+    return not isinstance(value, bool) and isinstance(value, (int, str))
+
 
 LEGACY_DEFAULT_MAX_CHARS = 950_000
 DEFAULT_MAX_CHARS = LEGACY_DEFAULT_MAX_CHARS
 TRUNCATION_MARKER = "\n\n[... message truncated ...]"
 HANDOFF_NOTE_RESERVE_CHARS = 4_096
+TARGET_CONTEXT_RESERVE_CHARS = 512
 MIN_BRIDGE_CHARS = HANDOFF_NOTE_RESERVE_CHARS + 2 * (len(TRUNCATION_MARKER) + 1) + 2
 MIN_BUDGET_TOKENS = 4_096
 
@@ -21,6 +29,26 @@ class SourceKind(StrEnum):
     NON_INTERACTIVE = "non-interactive"
     SUBAGENT = "subagent"
     SDK = "sdk"
+
+
+class Availability(StrEnum):
+    AVAILABLE = "available"
+    UNAVAILABLE = "unavailable"
+    UNKNOWN = "unknown"
+
+
+@dataclass(frozen=True, slots=True)
+class NativeRef:
+    """One native session in its adapter-owned storage."""
+
+    session_id: str
+    storage: str
+
+    def __post_init__(self) -> None:
+        if not self.session_id:
+            raise ValueError("native session id must not be empty")
+        if not self.storage:
+            raise ValueError("native session storage must not be empty")
 
 
 @dataclass(frozen=True, slots=True)
@@ -44,6 +72,7 @@ class BudgetPolicy:
     usable_fraction: float
     chars_per_token: float
     source: str
+    hard_limit: bool = False
 
     def __post_init__(self) -> None:
         if self.context_tokens <= 0:
@@ -54,8 +83,12 @@ class BudgetPolicy:
             raise ValueError("budget chars_per_token must be positive")
         if not self.source.strip():
             raise ValueError("budget policy source must not be empty")
+        if not isinstance(self.hard_limit, bool):
+            raise ValueError("budget policy hard_limit must be a boolean")
         default_tokens = math.floor(self.context_tokens * self.usable_fraction)
         default_chars = math.floor(default_tokens * self.chars_per_token)
+        if default_tokens < MIN_BUDGET_TOKENS:
+            raise ValueError("budget policy default is below the minimum token budget")
         if default_chars < MIN_BRIDGE_CHARS:
             raise ValueError("budget policy default is too small for bridge metadata")
 
@@ -93,15 +126,24 @@ class SelectionMetric:
 @dataclass(frozen=True, slots=True)
 class BridgeResult:
     tool: str
-    session_id: str
-    path: Path
+    native: NativeRef
     turns: int
     written_turns: int
     calls: int
     dropped: int
     truncated: int
-    source_cursor: int
+    source_checkpoint: Checkpoint
+    target_checkpoint: Checkpoint | None
     budget: Budget
+    notices: tuple[str, ...] = ()
+
+    @property
+    def session_id(self) -> str:
+        return self.native.session_id
+
+    @property
+    def storage(self) -> str:
+        return self.native.storage
 
 
 @dataclass(frozen=True, slots=True)
@@ -111,6 +153,45 @@ class Transcript:
     carried_windows: int = 0
     sealed_summary: bool = False
     resumes_at_last_summary: bool = False
+
+
+@dataclass(frozen=True, slots=True)
+class ReadSnapshot:
+    transcript: Transcript
+    checkpoint: Checkpoint
+
+
+@dataclass(frozen=True, slots=True)
+class PreparedTarget:
+    command: tuple[str, ...]
+    budget_policy: BudgetPolicy
+    writer_options: tuple[tuple[str, str], ...] = ()
+    notices: tuple[str, ...] = ()
+    handoff_context: tuple[str, ...] = ()
+
+    def __post_init__(self) -> None:
+        if not self.command or not all(isinstance(item, str) and item for item in self.command):
+            raise ValueError("prepared target command must contain non-empty strings")
+        if not isinstance(self.handoff_context, tuple) or not all(
+            isinstance(item, str) and item.strip() for item in self.handoff_context
+        ):
+            raise ValueError("prepared target handoff context must contain non-empty strings")
+        rendered_context = sum(
+            len("Target preparation: ") + min(len(item), 300) + 1
+            for item in self.handoff_context[:4]
+        )
+        if rendered_context > TARGET_CONTEXT_RESERVE_CHARS:
+            raise ValueError("prepared target handoff context exceeds its reserved budget")
+
+    def option(self, name: str, default: str = "") -> str:
+        return next((value for key, value in self.writer_options if key == name), default)
+
+
+@dataclass(frozen=True, slots=True)
+class NativeWrite:
+    native: NativeRef
+    checkpoint: Checkpoint | None
+    notices: tuple[str, ...] = ()
 
 
 @dataclass(slots=True)

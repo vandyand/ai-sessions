@@ -15,6 +15,7 @@ from ai_sessions.app import (
     rename_session,
 )
 from ai_sessions.capabilities import Unsupported
+from ai_sessions.conversion import BridgeError
 from ai_sessions.registry import REGISTRY
 
 
@@ -93,6 +94,23 @@ class PublishNameTests(unittest.TestCase):
             self.assertIn("cannot publish titles", note)
             self.assertIn("kept local", note)
             self.assertEqual(list(home.iterdir()), [])
+
+    def test_provider_bridge_error_still_commits_authoritative_local_name(self) -> None:
+        with TemporaryDirectory() as directory:
+            state = UserState(Path(directory) / "state.json")
+            item = session(tool="codex", session_id="019f-thread", title="Before")
+
+            def fail(_item: object, _name: str) -> str:
+                raise BridgeError("provider database is busy")
+
+            adapter = replace(REGISTRY.get("codex"), publish_name=fail)
+            with REGISTRY.temporary(adapter):
+                note = rename_session(state, item, "After")
+            reloaded = session(tool="codex", session_id="019f-thread", title="Before")
+            state.apply([reloaded])
+        self.assertIn("provider database is busy", note)
+        self.assertEqual(reloaded.title, "After")
+        self.assertTrue(reloaded.renamed)
 
     def test_claude_rename_appends_custom_title(self) -> None:
         with TemporaryDirectory() as directory:

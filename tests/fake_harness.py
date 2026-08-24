@@ -10,12 +10,18 @@ from pathlib import Path
 from typing import Iterable
 
 from ai_sessions.capabilities import HarnessAdapter
+from ai_sessions.conversion import complete_jsonl_cursor
 from ai_sessions.discovery import HarnessContext
 from ai_sessions.liveness import LivenessContext
 from ai_sessions.model import (
+    Availability,
     BudgetPolicy,
     LivenessSession,
+    NativeRef,
     NativeSession,
+    NativeWrite,
+    PreparedTarget,
+    ReadSnapshot,
     SourceKind,
     Transcript,
     Turn,
@@ -47,9 +53,13 @@ def make_adapter(home: Path) -> HarnessAdapter:
     def path_for(session_id: str) -> Path:
         return adapter_home() / "threads" / f"{session_id}.thread"
 
-    def read(path: Path, *, latest_window: bool = True) -> Transcript:
+    def read_path(path: Path, *, latest_window: bool = True, end: int | None = None) -> Transcript:
         turns: list[Turn] = []
-        for _, record in _records(path):
+        consumed = 0
+        for raw, record in _records(path):
+            consumed += len(raw)
+            if end is not None and consumed > end:
+                break
             if record.get("kind") != "utterance":
                 continue
             role = {"person": "user", "machine": "assistant"}.get(record.get("actor"))
@@ -63,9 +73,25 @@ def make_adapter(home: Path) -> HarnessAdapter:
                     turns.append(turn)
         return Transcript(turns)
 
+    def checkpoint(ref: NativeRef) -> int:
+        return complete_jsonl_cursor(Path(ref.storage))
+
+    def read(ref: NativeRef, *, latest_window: bool = True) -> ReadSnapshot:
+        captured = checkpoint(ref)
+        return ReadSnapshot(
+            read_path(Path(ref.storage), latest_window=latest_window, end=captured),
+            captured,
+        )
+
     def write(
-        *, cwd: str, turns: list[Turn], title: str = "", created: float | None = None
-    ) -> tuple[str, Path]:
+        *,
+        cwd: str,
+        turns: list[Turn],
+        prepared: PreparedTarget,
+        title: str = "",
+        created: float | None = None,
+    ) -> NativeWrite:
+        del prepared
         session_id = str(uuid.uuid4())
         path = path_for(session_id)
         path.parent.mkdir(parents=True, exist_ok=True)
@@ -92,12 +118,25 @@ def make_adapter(home: Path) -> HarnessAdapter:
         with path.open("xb") as handle:
             for record in records:
                 handle.write(_encode(record))
-        return session_id, path
+        ref = NativeRef(session_id, str(path))
+        return NativeWrite(ref, checkpoint(ref))
 
-    def locate(session_id: str) -> bool:
-        return path_for(session_id).is_file()
+    def resolve(session_id: str) -> NativeRef | None:
+        path = path_for(session_id)
+        return NativeRef(session_id, str(path)) if path.is_file() else None
 
-    def change_status(path: Path, offset: int) -> str:
+    def availability(ref: NativeRef) -> Availability:
+        try:
+            return (
+                Availability.AVAILABLE if Path(ref.storage).is_file() else Availability.UNAVAILABLE
+            )
+        except OSError:
+            return Availability.UNKNOWN
+
+    def change_status(ref: NativeRef, offset: int | str) -> str:
+        if not isinstance(offset, int) or isinstance(offset, bool):
+            return "unstable"
+        path = Path(ref.storage)
         try:
             size = path.stat().st_size
             if offset < 0 or size < offset:
@@ -244,7 +283,9 @@ def make_adapter(home: Path) -> HarnessAdapter:
         ),
         read=read,
         write=write,
-        locate=locate,
+        resolve=resolve,
+        availability=availability,
+        checkpoint=checkpoint,
         change_status=change_status,
         budget=BudgetPolicy(50_000, 0.5, 3.0, "test-only fixture policy"),
         discover=discover,

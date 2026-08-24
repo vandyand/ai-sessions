@@ -2,9 +2,10 @@
 """Browse and resume local Claude Code and Codex CLI sessions.
 
 Core browsing uses only Python's standard library. Desktop focusing optionally
-uses local tmux/wmctrl/xdotool commands. Browsing never modifies provider data.
-Renaming is the one exception: it appends a title entry to the provider's own
-append-only index so the new name also shows up in Claude Code and Codex.
+uses local tmux/wmctrl/xdotool commands. Browsing never modifies provider records;
+SQLite may create derived WAL sidecars—an empty write-ahead log and initialized
+shared index—while opening an existing OpenCode store read-only. Renaming is the
+one content exception: it publishes a title when that harness supports it.
 """
 
 from __future__ import annotations
@@ -34,9 +35,11 @@ from .conversion import (
     BridgeError,
     bridge,
     bridge_tools,
-    complete_jsonl_cursor,
     conversation_change_status,
+    native_checkpoint,
+    native_session_availability,
     native_session_exists,
+    prepare_target,
     resolve_budget,
 )
 from .conversion import append_jsonl as append_jsonl
@@ -50,7 +53,7 @@ from .discovery import timestamp as timestamp
 from .liveness import immutable_context as immutable_liveness_context
 from .liveness import populate_context as populate_liveness_context
 from .liveness import process_start_token
-from .model import LivenessSession, NativeSession, Session, SourceKind
+from .model import Checkpoint, LivenessSession, NativeRef, NativeSession, Session, SourceKind
 from .paths import (
     HOME,
     IS_WINDOWS,
@@ -78,6 +81,7 @@ CODEX_ID_PATTERN = re.compile(
     rb"019[0-9a-f]{5}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}",
     re.I,
 )
+_UNSET_CHECKPOINT = object()
 
 
 def tool_label(name: str, *, short: bool = True) -> str:
@@ -105,7 +109,13 @@ def available_launch_tools(item: Session) -> tuple[str, ...]:
 
 
 def can_bridge(item: Session) -> bool:
-    return bool(item.storage)
+    if not item.storage:
+        return False
+    try:
+        reader = REGISTRY.get(item.tool).read
+    except KeyError:
+        return False
+    return not isinstance(reader, Unsupported)
 
 
 def active_launch_tool(item: Session) -> str:
@@ -256,11 +266,10 @@ class UserState:
         return value
 
     @staticmethod
-    def _cursor(storage: str) -> int:
-        try:
-            return complete_jsonl_cursor(Path(storage))
-        except (BridgeError, OSError):
-            return -1
+    def _checkpoint(item: Session) -> Checkpoint | None:
+        if not item.session_id or not item.storage:
+            return None
+        return native_checkpoint(item.tool, NativeRef(item.session_id, item.storage))
 
     @staticmethod
     def _member_key(tool: str, session_id: str) -> str:
@@ -272,9 +281,9 @@ class UserState:
         *,
         generation: int,
         frontier: str,
-        cursor: int | None = None,
+        checkpoint: Checkpoint | None | object = _UNSET_CHECKPOINT,
     ) -> dict[str, Any]:
-        return {
+        result: dict[str, Any] = {
             "tool": item.tool,
             "session_id": item.session_id,
             "storage": item.storage,
@@ -283,8 +292,13 @@ class UserState:
             "updated": item.updated,
             "generation": generation,
             "frontier": frontier,
-            "cursor": self._cursor(item.storage) if cursor is None else cursor,
         }
+        resolved = self._checkpoint(item) if checkpoint is _UNSET_CHECKPOINT else checkpoint
+        if resolved is not None:
+            result["checkpoint"] = resolved
+            if isinstance(resolved, int) and not isinstance(resolved, bool):
+                result["cursor"] = resolved
+        return result
 
     def _ensure_conversation(self, item: Session) -> tuple[str, dict[str, Any]]:
         key = self.stable_key(item.key)
@@ -316,24 +330,40 @@ class UserState:
     def _member_changed(self, member: dict[str, Any]) -> bool:
         return self._member_change_status(member) != "unchanged"
 
-    def _member_change_status(self, member: dict[str, Any]) -> str:
-        cursor = member.get("cursor")
-        if not isinstance(cursor, int):
+    def _member_change_status(self, member: dict[str, Any], availability: str | None = None) -> str:
+        tool = str(member.get("tool", ""))
+        session_id = str(member.get("session_id", ""))
+        storage = str(member.get("storage", ""))
+        if not tool or not session_id or not storage:
+            return "unknown"
+        checkpoint = member.get("checkpoint", member.get("cursor"))
+        if isinstance(checkpoint, bool) or not isinstance(checkpoint, (int, str)):
             return "unstable"
         return conversation_change_status(
-            str(member.get("tool", "")), str(member.get("storage", "")), cursor
+            tool,
+            NativeRef(session_id, storage),
+            checkpoint,
+            availability=availability,
         )
+
+    @staticmethod
+    def _member_availability(member: dict[str, Any]) -> str:
+        tool = str(member.get("tool", ""))
+        session_id = str(member.get("session_id", ""))
+        storage = str(member.get("storage", ""))
+        if not tool or not session_id or not storage:
+            return "unknown"
+        return native_session_availability(tool, NativeRef(session_id, storage))
 
     def _conversation_status(self, conversation_id: str) -> dict[str, Any]:
         conversation = self.conversations[conversation_id]
         all_members = list(conversation["members"].items())
-        members = [
-            (key, member)
-            for key, member in all_members
-            if Path(str(member.get("storage", ""))).is_file()
-        ]
+        availability = {key: self._member_availability(member) for key, member in all_members}
+        members = [pair for pair in all_members if availability[pair[0]] == "available"]
         maximum = max((int(member.get("generation", 0)) for _, member in all_members), default=0)
-        changes = {key: self._member_change_status(member) for key, member in members}
+        changes = {
+            key: self._member_change_status(member, availability[key]) for key, member in members
+        }
         known_members = [
             pair for pair in members if changes[pair[0]] not in ("unknown", "unsupported")
         ]
@@ -347,7 +377,7 @@ class UserState:
             (key, member)
             for key, member in all_members
             if int(member.get("generation", 0)) == maximum
-            and not Path(str(member.get("storage", ""))).is_file()
+            and availability[key] == "unavailable"
             and str(member.get("frontier", "")) not in current_frontiers
         ]
         if unavailable:
@@ -359,22 +389,21 @@ class UserState:
                 "unstable": [],
                 "unknown": [],
             }
-        if not members:
-            return {
-                "conflict": False,
-                "heads": [],
-                "advanced": [],
-                "unavailable": [],
-                "unstable": [],
-                "unknown": [],
-            }
         unknown = [
+            pair
+            for pair in all_members
+            if availability[pair[0]] == "unknown"
+            and int(pair[1].get("generation", 0)) == maximum
+            and str(pair[1].get("frontier", "")) not in current_frontiers
+        ]
+        unknown.extend(
             pair
             for pair in members
             if changes[pair[0]] in ("unknown", "unsupported")
             and int(pair[1].get("generation", 0)) == maximum
             and str(pair[1].get("frontier", "")) not in current_frontiers
-        ]
+            and pair not in unknown
+        )
         if unknown:
             return {
                 "conflict": False,
@@ -671,7 +700,16 @@ class UserState:
         if not entry:
             return ""
         storage = str(entry.get("storage", ""))
-        if storage and not Path(storage).is_file():
+        session_id = str(entry.get("session_id", ""))
+        if not session_id or not storage:
+            return ""
+        availability = native_session_availability(tool, NativeRef(session_id, storage))
+        if availability == "unknown":
+            raise BridgeError(
+                f"the recorded {tool_label(tool)} copy {session_id} could not be verified; "
+                "restore storage access or retry; refusing to create a duplicate"
+            )
+        if availability != "available":
             return ""
         recorded = entry.get("source_updated")
         if not isinstance(recorded, (int, float)) or item.updated > float(recorded) + 1:
@@ -685,7 +723,8 @@ class UserState:
         session_id: str,
         storage: str,
         *,
-        source_cursor: int,
+        source_checkpoint: Checkpoint,
+        target_checkpoint: Checkpoint | None,
     ) -> None:
         key = self.stable_key(item.key)
         self.bridges.setdefault(key, {})[tool] = {
@@ -709,7 +748,7 @@ class UserState:
                 item,
                 generation=generation,
                 frontier=frontier,
-                cursor=source_cursor,
+                checkpoint=source_checkpoint,
             )
         )
         target_key = self._member_key(tool, session_id)
@@ -730,7 +769,7 @@ class UserState:
             target,
             generation=generation,
             frontier=frontier,
-            cursor=self._cursor(storage),
+            checkpoint=target_checkpoint,
         )
         self.session_conversations[target_key] = conversation_id
         self._sessions_by_key[item.key] = item
@@ -775,7 +814,7 @@ def publish_name(
                 f"{adapter.label} cannot publish titles: {publisher.reason}; name kept local only"
             )
         note = publisher(item, name)
-    except OSError as error:
+    except (BridgeError, OSError) as error:
         return f"could not update the provider title: {error}"
     if note:
         return note
@@ -948,6 +987,7 @@ def reconcile_evidence(sessions: list[Session], context: HarnessContext) -> None
     locate_cache: dict[tuple[str, str], bool] = {}
     probes = 0
     probe_limit_reported = False
+    incomplete_publishers: list[str] = []
 
     def evidence_rank(
         entry: tuple[tuple[str, str], tuple[list[str], bool]],
@@ -972,10 +1012,7 @@ def reconcile_evidence(sessions: list[Session], context: HarnessContext) -> None
             )
             continue
         if truncated:
-            record_warning(
-                f"ID evidence was truncated or incomplete for {publisher_tool}:{publisher_id}; "
-                "negative counterpart conclusions were suppressed"
-            )
+            incomplete_publishers.append(f"{publisher_tool}:{publisher_id}")
         for token in tokens:
             # Native writers always mint a fresh target id. An own-id token is
             # therefore transcript metadata, not evidence that an unrelated
@@ -1004,8 +1041,8 @@ def reconcile_evidence(sessions: list[Session], context: HarnessContext) -> None
                         pattern.fullmatch(raw) for pattern in adapter.id_patterns
                     ):
                         continue
-                    locator = adapter.locate
-                    if isinstance(locator, Unsupported):
+                    resolver = adapter.resolve
+                    if isinstance(resolver, Unsupported):
                         continue
                     cache_key = (adapter.name, token)
                     if cache_key not in locate_cache:
@@ -1019,7 +1056,7 @@ def reconcile_evidence(sessions: list[Session], context: HarnessContext) -> None
                             continue
                         probes += 1
                         try:
-                            locate_cache[cache_key] = locator(token)
+                            locate_cache[cache_key] = resolver(token) is not None
                         except OSError:
                             locate_cache[cache_key] = False
                     exists = locate_cache[cache_key]
@@ -1041,6 +1078,15 @@ def reconcile_evidence(sessions: list[Session], context: HarnessContext) -> None
                     target.origin = "cross"
                 if publisher is not None:
                     target.launch_targets.setdefault(publisher_tool, publisher.session_id)
+    if incomplete_publishers:
+        examples = ", ".join(incomplete_publishers[:3])
+        remainder = len(incomplete_publishers) - 3
+        if remainder > 0:
+            examples += f", and {remainder} more"
+        record_warning(
+            f"ID evidence was truncated or incomplete for {len(incomplete_publishers)} "
+            f"session(s) ({examples}); negative counterpart conclusions were suppressed"
+        )
 
 
 def collect_scratch_origin_hints(sessions: list[Session], context: HarnessContext) -> None:
@@ -1072,9 +1118,18 @@ def dedupe_sessions(sessions: Iterable[Session]) -> list[Session]:
     return list(unique.values())
 
 
-def load_sessions(use_cache: bool = True, state: UserState | None = None) -> list[Session]:
+def load_sessions(
+    use_cache: bool = True,
+    state: UserState | None = None,
+    config: LaunchConfig | None = None,
+) -> list[Session]:
     clear_warnings()
-    context = HarnessContext.create(use_cache=use_cache)
+    commands = (
+        {name: tuple(config.provider_command(name)) for name in REGISTRY.names()}
+        if config is not None
+        else None
+    )
+    context = HarnessContext.create(use_cache=use_cache, provider_commands=commands)
     sessions: list[Session] = []
     for adapter in REGISTRY.adapters():
         discover = adapter.discover
@@ -1122,7 +1177,7 @@ def detect_open_sessions(
         own = [
             item
             for item in session_list
-            if item.tool == adapter.name and item.source is SourceKind.INTERACTIVE
+            if item.tool == adapter.name and item.source in adapter.liveness_source_kinds
         ]
         if own:
             pending.append((adapter, own))
@@ -1149,7 +1204,7 @@ def detect_open_sessions(
             item = by_id.get(session_id) if isinstance(session_id, str) else None
             if (
                 item is None
-                or item.source is not SourceKind.INTERACTIVE
+                or item.source not in adapter.liveness_source_kinds
                 or not isinstance(pid, int)
                 or isinstance(pid, bool)
                 or pid <= 0
@@ -1907,12 +1962,21 @@ class Browser:
             )
             latest_user_message = clean_prompt(item.preview)
             detail_row = detail_top + 5
-            if item.parent_id:
+            if item.parent_id and item.resume_target != item.session_id:
                 self.add(
                     detail_row,
                     2,
                     "Opens      parent session " + item.resume_target,
                     self.style("warning"),
+                    width - 4,
+                )
+                detail_row += 1
+            elif item.parent_id:
+                self.add(
+                    detail_row,
+                    2,
+                    "Parent     " + item.parent_id + " · resumes this child directly",
+                    self.style("muted"),
                     width - 4,
                 )
                 detail_row += 1
@@ -2370,7 +2434,11 @@ class Browser:
                 previous = self.selected_id()
                 self.message = "Refreshing…"
                 self.draw()
-                self.sessions = load_sessions(use_cache=self.use_cache, state=self.state)
+                self.sessions = load_sessions(
+                    use_cache=self.use_cache,
+                    state=self.state,
+                    config=self.launch_config,
+                )
                 self.message = "; ".join(load_warnings())
                 self.keep_selection(previous)
             elif key == "\x06" or (not self.searching and key == "/"):  # Ctrl-F or /
@@ -2515,20 +2583,33 @@ def prepare_launch(
                 f"{stale}Continuing the {tool_label(tool)} copy of this session ({existing})."
             )
         conversation_id = state.conversation_id_for(session, create=True)
+    target_cwd = strip_extended_prefix(session.cwd) or str(HOME)
+    target_command = tuple(
+        config.provider_command(tool) if config is not None else REGISTRY.get(tool).default_command
+    )
+    prepared = prepare_target(
+        tool,
+        command=target_command,
+        cwd=target_cwd,
+        options=config.provider_options(tool) if config is not None else None,
+    )
     budget = resolve_budget(
         tool,
         max_tokens=config.bridge_max_tokens if config is not None else None,
         max_chars=config.bridge_max_chars if config is not None else None,
         migrated=config.bridge_max_chars_migrated if config is not None else False,
+        policy=prepared.budget_policy,
     )
     result = bridge(
         source_tool=session.tool,
         target_tool=tool,
         session_id=session.session_id,
         storage=session.storage,
-        cwd=strip_extended_prefix(session.cwd) or str(HOME),
+        cwd=target_cwd,
         title=session.title,
         budget=budget,
+        prepared_target=prepared,
+        target_command=target_command,
         tool_calls=tool_calls,
         latest_window=latest_window,
         conversation_id=conversation_id,
@@ -2538,8 +2619,9 @@ def prepare_launch(
             session,
             tool,
             result.session_id,
-            str(result.path),
-            source_cursor=result.source_cursor,
+            result.storage,
+            source_checkpoint=result.source_checkpoint,
+            target_checkpoint=result.target_checkpoint,
         )
     carried = (
         f"{result.turns} source message(s), assembled as {result.written_turns} target message(s)"
@@ -2572,7 +2654,9 @@ def prepare_launch(
         f"{stale}Copied {carried} into a new {tool_label(tool)} session "
         f"{result.session_id}{dropped}{truncated}.{budget_notice}"
     )
-    return attach(result.session_id, str(result.path)), note
+    if result.notices:
+        note += " " + " ".join(result.notices)
+    return attach(result.session_id, result.storage), note
 
 
 def launch(
@@ -2767,7 +2851,11 @@ def main(argv: list[str] | None = None) -> int:
         return 0
     if args.launch_mode:
         launch_config.mode = args.launch_mode
-    sessions = load_sessions(use_cache=not args.no_cache, state=state)
+    sessions = load_sessions(
+        use_cache=not args.no_cache,
+        state=state,
+        config=launch_config,
+    )
     for note in load_warnings():
         print(f"sessions: {note}", file=sys.stderr)
 

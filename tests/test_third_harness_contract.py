@@ -35,22 +35,32 @@ from ai_sessions.conversion import (
     read_transcript,
     resolve_budget,
 )
-from ai_sessions.model import SourceKind, Turn
+from ai_sessions.model import NativeRef, PreparedTarget, SourceKind, Turn
 from ai_sessions.registry import REGISTRY
 
 
 @contextmanager
-def isolated_registry(root: Path, fixture: HarnessAdapter):
+def isolated_registry(
+    root: Path,
+    fixture: HarnessAdapter,
+    *,
+    preserve_discovery: frozenset[str] = frozenset(),
+):
     """Keep conversion hooks real while suppressing discovery of user sessions."""
     with ExitStack() as stack:
-        for name in ("codex", "claude"):
+        for name in REGISTRY.names():
             adapter = REGISTRY.get(name)
+            discovery = (
+                adapter.discover
+                if name in preserve_discovery
+                else Unsupported("isolated contract test")
+            )
             stack.enter_context(
                 REGISTRY.temporary(
                     replace(
                         adapter,
                         home=root / name,
-                        discover=Unsupported("isolated contract test"),
+                        discover=discovery,
                         inspect_liveness=Unsupported("isolated contract test"),
                     )
                 )
@@ -74,7 +84,13 @@ class ThirdHarnessContractTests(unittest.TestCase):
     def write_fixture(self, *turns: Turn, title: str = "Fixture title") -> tuple[str, Path]:
         writer = self.fixture.write
         assert not isinstance(writer, Unsupported)
-        return writer(cwd="/fixture/work", turns=list(turns), title=title)
+        written = writer(
+            cwd="/fixture/work",
+            turns=list(turns),
+            title=title,
+            prepared=PreparedTarget(self.fixture.default_command, self.fixture.budget),
+        )
+        return written.native.session_id, Path(written.native.storage)
 
     def test_unknown_harness_has_no_budget_fallback(self) -> None:
         with self.assertRaisesRegex(BridgeError, "unknown harness: not-registered"):
@@ -97,7 +113,9 @@ class ThirdHarnessContractTests(unittest.TestCase):
             self.assertEqual(item.session_id, session_id)
             self.assertTrue(item.is_open)
             self.assertEqual(item.open_pid, os.getpid())
-            self.assertEqual(available_launch_tools(item), ("fixture", "codex", "claude"))
+            self.assertEqual(
+                available_launch_tools(item), ("fixture", "codex", "claude", "opencode")
+            )
             self.assertTrue(native_session_exists("fixture", session_id))
             self.assertIn("fixture", app.build_parser()._option_string_actions["--tool"].choices)
             self.assertIn("fixture", Browser._pair_layout())
@@ -170,30 +188,14 @@ class ThirdHarnessContractTests(unittest.TestCase):
         self.assertNotIn("fixture", Browser._pair_layout())
 
     def test_overlapping_native_id_is_not_misattributed_between_discovered_harnesses(self) -> None:
-        with ExitStack() as stack:
-            codex = REGISTRY.get("codex")
-            stack.enter_context(
-                REGISTRY.temporary(
-                    replace(
-                        codex,
-                        home=self.root / "codex",
-                        discover=Unsupported("isolated contract test"),
-                        inspect_liveness=Unsupported("isolated contract test"),
-                    )
-                )
-            )
+        with isolated_registry(
+            self.root,
+            self.fixture,
+            preserve_discovery=frozenset(("claude",)),
+        ):
             claude_home = self.root / "claude"
             claude = REGISTRY.get("claude")
-            stack.enter_context(
-                REGISTRY.temporary(
-                    replace(
-                        claude,
-                        home=claude_home,
-                        inspect_liveness=Unsupported("isolated contract test"),
-                    )
-                )
-            )
-            stack.enter_context(REGISTRY.temporary(self.fixture))
+            self.assertEqual(claude.home, claude_home)
             shared_id, fixture_path = self.write_fixture(
                 Turn("user", "fixture's own id is metadata")
             )
@@ -351,7 +353,12 @@ class ThirdHarnessContractTests(unittest.TestCase):
                 Turn("user", "portable request"), Turn("assistant", "portable response")
             )
             self.assertEqual(
-                [(turn.role, turn.text) for turn in read_transcript("fixture", source_path).turns],
+                [
+                    (turn.role, turn.text)
+                    for turn in read_transcript(
+                        "fixture", NativeRef(source_id, str(source_path))
+                    ).turns
+                ],
                 [("user", "portable request"), ("assistant", "portable response")],
             )
             for target in ("codex", "claude"):
@@ -364,7 +371,7 @@ class ThirdHarnessContractTests(unittest.TestCase):
                         cwd="/fixture/work",
                         title="Portable",
                     )
-                    native = read_transcript(target, outbound.path)
+                    native = read_transcript(target, outbound.native)
                     outbound_relevant = [
                         turn
                         for turn in native.turns
@@ -379,11 +386,11 @@ class ThirdHarnessContractTests(unittest.TestCase):
                         source_tool=target,
                         target_tool="fixture",
                         session_id=outbound.session_id,
-                        storage=str(outbound.path),
+                        storage=outbound.storage,
                         cwd="/fixture/work",
                         title="Returned",
                     )
-                    fixture_copy = read_transcript("fixture", returned.path)
+                    fixture_copy = read_transcript("fixture", returned.native)
                     returned_relevant = [
                         turn
                         for turn in fixture_copy.turns
@@ -403,8 +410,9 @@ class ThirdHarnessContractTests(unittest.TestCase):
                 Turn("user", "fixture summary", compaction=True),
                 Turn("assistant", "current response"),
             )
-            latest = read_transcript("fixture", path, latest_window=True)
-            whole = read_transcript("fixture", path, latest_window=False)
+            ref = NativeRef(session_id, str(path))
+            latest = read_transcript("fixture", ref, latest_window=True)
+            whole = read_transcript("fixture", ref, latest_window=False)
             self.assertEqual(
                 [(turn.text, turn.compaction) for turn in latest.turns],
                 [("fixture summary", True), ("current response", False)],
@@ -417,7 +425,7 @@ class ThirdHarnessContractTests(unittest.TestCase):
                 storage=str(path),
                 cwd="/fixture/work",
             )
-            written = read_transcript("codex", outbound.path)
+            written = read_transcript("codex", outbound.native)
         joined = "\n".join(turn.text for turn in written.turns)
         self.assertIn("fixture summary", joined)
         self.assertIn("current response", joined)
@@ -455,7 +463,10 @@ class ThirdHarnessContractTests(unittest.TestCase):
             cursor = complete_jsonl_cursor(path)
             item = Session("fixture", session_id, "", "", 0, 0, "", False, str(path))
             self.assertEqual(publish_name(item, "metadata only"), "")
-            self.assertEqual(conversation_change_status("fixture", path, cursor), "unchanged")
+            self.assertEqual(
+                conversation_change_status("fixture", NativeRef(session_id, str(path)), cursor),
+                "unchanged",
+            )
             with path.open("ab") as handle:
                 handle.write(
                     (
@@ -470,7 +481,10 @@ class ThirdHarnessContractTests(unittest.TestCase):
                         + "\n"
                     ).encode("utf-8")
                 )
-            self.assertEqual(conversation_change_status("fixture", path, cursor), "unchanged")
+            self.assertEqual(
+                conversation_change_status("fixture", NativeRef(session_id, str(path)), cursor),
+                "unchanged",
+            )
             with path.open("ab") as handle:
                 handle.write(
                     (
@@ -485,19 +499,26 @@ class ThirdHarnessContractTests(unittest.TestCase):
                         + "\n"
                     ).encode("utf-8")
                 )
-            self.assertEqual(conversation_change_status("fixture", path, cursor), "changed")
+            self.assertEqual(
+                conversation_change_status("fixture", NativeRef(session_id, str(path)), cursor),
+                "changed",
+            )
 
-            _, unstable_path = self.write_fixture(Turn("user", "stable"))
+            unstable_id, unstable_path = self.write_fixture(Turn("user", "stable"))
             unstable_cursor = complete_jsonl_cursor(unstable_path)
             with unstable_path.open("ab") as handle:
                 handle.write(b'{"kind":"utterance"')
             self.assertEqual(
-                conversation_change_status("fixture", unstable_path, unstable_cursor),
+                conversation_change_status(
+                    "fixture", NativeRef(unstable_id, str(unstable_path)), unstable_cursor
+                ),
                 "unstable",
             )
             self.assertEqual(
                 conversation_change_status(
-                    "fixture", unstable_path, unstable_path.stat().st_size + 1
+                    "fixture",
+                    NativeRef(unstable_id, str(unstable_path)),
+                    unstable_path.stat().st_size + 1,
                 ),
                 "unstable",
             )
@@ -516,9 +537,9 @@ class ThirdHarnessContractTests(unittest.TestCase):
             reader = self.fixture.read
             assert not isinstance(reader, Unsupported)
 
-            def racing_reader(path: Path, *, latest_window: bool = True):
-                transcript = reader(path, latest_window=latest_window)
-                with path.open("ab") as handle:
+            def racing_reader(ref: NativeRef, *, latest_window: bool = True):
+                snapshot = reader(ref, latest_window=latest_window)
+                with Path(ref.storage).open("ab") as handle:
                     handle.write(
                         (
                             json.dumps(
@@ -531,7 +552,7 @@ class ThirdHarnessContractTests(unittest.TestCase):
                             + "\n"
                         ).encode()
                     )
-                return transcript
+                return snapshot
 
             with REGISTRY.temporary(replace(self.fixture, read=racing_reader)):
                 with self.assertRaisesRegex(

@@ -7,6 +7,7 @@ from pathlib import Path
 from tempfile import TemporaryDirectory
 
 from ai_sessions import app, diagnostics
+from ai_sessions.capabilities import Unsupported
 from ai_sessions.registry import REGISTRY
 
 
@@ -106,6 +107,12 @@ class UnreadableCodexStateTests(unittest.TestCase):
                     replace(REGISTRY.get("claude"), home=Path(directory) / "claude")
                 ),
                 REGISTRY.temporary(replace(REGISTRY.get("codex"), home=Path(directory) / "absent")),
+                REGISTRY.temporary(
+                    replace(
+                        REGISTRY.get("opencode"),
+                        discover=Unsupported("isolated diagnostics test"),
+                    )
+                ),
             ):
                 app.load_sessions(use_cache=False)
         self.assertNotIn("stale note from an earlier load", diagnostics.warnings())

@@ -74,8 +74,17 @@ class Registry:
         return tuple(
             adapter.name
             for adapter in self.adapters()
-            if not isinstance(adapter.read, Unsupported)
-            and not isinstance(adapter.write, Unsupported)
+            if all(
+                not isinstance(capability, Unsupported)
+                for capability in (
+                    adapter.read,
+                    adapter.write,
+                    adapter.resolve,
+                    adapter.availability,
+                    adapter.checkpoint,
+                    adapter.change_status,
+                )
+            )
         )
 
     def label(self, name: str, *, short: bool = False) -> str:

@@ -8,6 +8,7 @@ import os
 import re
 import secrets
 import sqlite3
+import stat
 import time
 import uuid
 from contextlib import closing
@@ -27,15 +28,29 @@ from ..conversion import (
     _digest_arguments,
     _digest_codex_input,
     _iso,
+    _jsonl_change_status,
     _records,
     _records_after,
     append_jsonl,
+    complete_jsonl_cursor,
     scrub,
 )
 from ..diagnostics import record_warning
 from ..discovery import HarnessContext, clean_prompt, normalize_space, prompt_text, timestamp
 from ..liveness import LivenessContext
-from ..model import BudgetPolicy, LivenessSession, NativeSession, SourceKind, Transcript, Turn
+from ..model import (
+    Availability,
+    BudgetPolicy,
+    LivenessSession,
+    NativeRef,
+    NativeSession,
+    NativeWrite,
+    PreparedTarget,
+    ReadSnapshot,
+    SourceKind,
+    Transcript,
+    Turn,
+)
 from ..paths import APP_CACHE_DIR, HOME, env_path
 from ..registry import REGISTRY
 
@@ -80,14 +95,14 @@ def _codex_window_turns(payload: dict[str, Any]) -> tuple[list[Turn], bool] | No
     return [replace(carried[0], compaction=True), *carried[1:]], sealed
 
 
-def read_codex(path: Path, *, latest_window: bool = True) -> Transcript:
+def read_codex(path: Path, *, latest_window: bool = True, end: int | None = None) -> Transcript:
     """Read Codex response items and honor replacement-history window semantics.
 
     With ``latest_window`` the newest carried context replaces superseded history;
     without it each window is appended as a marked boundary for whole-log replay.
     """
     conversation = _Conversation()
-    for record in _records(path):
+    for record in _records(path, end=end):
         if record.get("type") == "compacted":
             payload = record.get("payload")
             window = _codex_window_turns(payload) if isinstance(payload, dict) else None
@@ -262,10 +277,58 @@ def _codex_exists(session_id: str) -> bool:
     return any((REGISTRY.get("codex").home / "sessions").rglob(f"rollout-*-{session_id}.jsonl"))
 
 
-def _codex_change_status(path: Path, offset: int) -> str:
+def _codex_resolve(session_id: str) -> NativeRef | None:
+    try:
+        paths = sorted(
+            (REGISTRY.get("codex").home / "sessions").rglob(f"rollout-*-{session_id}.jsonl")
+        )
+    except OSError:
+        return None
+    return NativeRef(session_id, str(paths[0])) if paths else None
+
+
+def _codex_availability(ref: NativeRef) -> Availability:
+    path = Path(ref.storage)
+    try:
+        metadata = path.stat()
+    except FileNotFoundError:
+        return Availability.UNAVAILABLE
+    except OSError:
+        return Availability.UNKNOWN
+    return Availability.AVAILABLE if stat.S_ISREG(metadata.st_mode) else Availability.UNAVAILABLE
+
+
+def _codex_checkpoint(ref: NativeRef) -> int:
+    return complete_jsonl_cursor(Path(ref.storage))
+
+
+def _read_codex_snapshot(ref: NativeRef, *, latest_window: bool = True) -> ReadSnapshot:
+    checkpoint = _codex_checkpoint(ref)
+    return ReadSnapshot(
+        read_codex(Path(ref.storage), latest_window=latest_window, end=checkpoint), checkpoint
+    )
+
+
+def _write_codex(
+    *,
+    cwd: str,
+    turns: list[Turn],
+    prepared: PreparedTarget,
+    title: str = "",
+    created: float | None = None,
+) -> NativeWrite:
+    del prepared
+    session_id, path = write_codex_session(cwd=cwd, turns=turns, title=title, created=created)
+    ref = NativeRef(session_id, str(path))
+    return NativeWrite(ref, _codex_checkpoint(ref))
+
+
+def _classify_codex_tail(ref: NativeRef, checkpoint: int | str, end: int) -> str:
     """Ignore UI metadata while treating messages and tool traffic as work."""
+    if not isinstance(checkpoint, int) or isinstance(checkpoint, bool):
+        return "unstable"
     changed = False
-    for record in _records_after(path, offset):
+    for record in _records_after(Path(ref.storage), checkpoint, end=end):
         if record.get("type") in (
             "ai_sessions_replaced",
             "ai_sessions_missing",
@@ -288,6 +351,10 @@ def _codex_change_status(path: Path, offset: int) -> str:
         ):
             changed = True
     return "changed" if changed else "unchanged"
+
+
+def _codex_change_status(ref: NativeRef, checkpoint: int | str) -> str:
+    return _jsonl_change_status(ref, checkpoint, _classify_codex_tail, REGISTRY.generation)
 
 
 def load_history() -> dict[str, dict[str, Any]]:
@@ -771,9 +838,11 @@ ADAPTER = HarnessAdapter(
         ),
     ),
     scratch_patterns=(),
-    read=read_codex,
-    write=write_codex_session,
-    locate=_codex_exists,
+    read=_read_codex_snapshot,
+    write=_write_codex,
+    resolve=_codex_resolve,
+    availability=_codex_availability,
+    checkpoint=_codex_checkpoint,
     change_status=_codex_change_status,
     discover=discover,
     resume_args=resume_args,

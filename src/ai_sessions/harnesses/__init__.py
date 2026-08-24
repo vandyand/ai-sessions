@@ -13,8 +13,9 @@ def install() -> None:
     """Install every built-in adapter exactly once."""
     from .claude import ADAPTER as CLAUDE
     from .codex import ADAPTER as CODEX
+    from .opencode import ADAPTER as OPENCODE
 
-    for adapter in (CODEX, CLAUDE):
+    for adapter in (CODEX, CLAUDE, OPENCODE):
         if adapter.name not in REGISTRY:
             REGISTRY.register(adapter)
         elif REGISTRY.get(adapter.name) is not adapter:

@@ -1,0 +1,211 @@
+{
+  "binary": "isolated /tmp/opencode-ai-sessions-bin/opencode",
+  "capture_date": "2026-08-23",
+  "platform": "Ubuntu WSL isolated XDG homes",
+  "opencode_version": "1.18.21",
+  "import": {
+    "argv_tail": ["import", "<permission-restricted temporary JSON>"],
+    "stdout": "Imported session: ses_fcf815f84ffe0xjrQUONLvpM0W\n",
+    "stderr": "",
+    "exit_code": 0,
+    "timed_out": false,
+    "truncated": false
+  },
+  "observed": {
+    "submitted_session_id_preserved": true,
+    "submitted_message_ids_preserved": true,
+    "submitted_part_ids_preserved": true,
+    "metadata_nonce_preserved": true,
+    "part_time_created_rewritten_by_importer": true
+  },
+  "submitted": {
+    "info": {
+      "id": "ses_fcf815f84ffe0xjrQUONLvpM0W",
+      "slug": "ai-sessions-phase3-real-",
+      "projectID": "global",
+      "directory": "/tmp/opencode-ai-sessions-import-cwd",
+      "title": "ai-sessions phase3 persisted-row capture",
+      "agent": "build",
+      "model": {"id": "big-pickle", "providerID": "opencode"},
+      "version": "1.18.21",
+      "metadata": {"ai_sessions_import_nonce": "phase3-real-1-18-21-capture"},
+      "time": {"created": 1787520000123, "updated": 1787520000127}
+    },
+    "messages": [
+      {
+        "info": {
+          "id": "msg_0307ea07c001J6gHABe1P0hw23",
+          "sessionID": "ses_fcf815f84ffe0xjrQUONLvpM0W",
+          "role": "user",
+          "time": {"created": 1787520000124},
+          "agent": "build",
+          "model": {"providerID": "opencode", "modelID": "big-pickle"}
+        },
+        "parts": [
+          {
+            "id": "prt_0307ea07c002UdBuftxCr5aQ28",
+            "sessionID": "ses_fcf815f84ffe0xjrQUONLvpM0W",
+            "messageID": "msg_0307ea07c001J6gHABe1P0hw23",
+            "type": "text",
+            "text": "phase3 capture user"
+          }
+        ]
+      },
+      {
+        "info": {
+          "id": "msg_0307ea07d001QC1eweB1HBcbLd",
+          "sessionID": "ses_fcf815f84ffe0xjrQUONLvpM0W",
+          "parentID": "msg_0307ea07c001J6gHABe1P0hw23",
+          "role": "assistant",
+          "mode": "build",
+          "agent": "build",
+          "path": {"cwd": "/tmp/opencode-ai-sessions-import-cwd", "root": "/tmp"},
+          "cost": 0,
+          "tokens": {
+            "total": 0,
+            "input": 0,
+            "output": 0,
+            "reasoning": 0,
+            "cache": {"write": 0, "read": 0}
+          },
+          "modelID": "big-pickle",
+          "providerID": "opencode",
+          "time": {"created": 1787520000125, "completed": 1787520000125},
+          "finish": "stop"
+        },
+        "parts": [
+          {
+            "id": "prt_0307ea07d002HQK3IiX7T5RhFg",
+            "sessionID": "ses_fcf815f84ffe0xjrQUONLvpM0W",
+            "messageID": "msg_0307ea07d001QC1eweB1HBcbLd",
+            "type": "text",
+            "text": "phase3 capture assistant"
+          }
+        ]
+      },
+      {
+        "info": {
+          "id": "msg_0307ea07e001cFh4Mwl8KfPQSe",
+          "sessionID": "ses_fcf815f84ffe0xjrQUONLvpM0W",
+          "role": "user",
+          "time": {"created": 1787520000126},
+          "agent": "build",
+          "model": {"providerID": "opencode", "modelID": "big-pickle"}
+        },
+        "parts": [
+          {
+            "id": "prt_0307ea07e002tXLblULQjxpK3N",
+            "sessionID": "ses_fcf815f84ffe0xjrQUONLvpM0W",
+            "messageID": "msg_0307ea07e001cFh4Mwl8KfPQSe",
+            "type": "text",
+            "text": "phase3 capture tail"
+          }
+        ]
+      }
+    ]
+  },
+  "persisted": {
+    "session": {
+      "id": "ses_fcf815f84ffe0xjrQUONLvpM0W",
+      "project_id": "global",
+      "workspace_id": null,
+      "parent_id": null,
+      "slug": "ai-sessions-phase3-real-",
+      "directory": "/tmp/opencode-ai-sessions-import-cwd",
+      "path": "tmp/opencode-ai-sessions-import-cwd",
+      "title": "ai-sessions phase3 persisted-row capture",
+      "version": "1.18.21",
+      "share_url": null,
+      "summary_additions": null,
+      "summary_deletions": null,
+      "summary_files": null,
+      "summary_diffs": null,
+      "revert": null,
+      "permission": null,
+      "agent": "build",
+      "model": "{\"id\":\"big-pickle\",\"providerID\":\"opencode\"}",
+      "metadata": "{\"ai_sessions_import_nonce\":\"phase3-real-1-18-21-capture\"}",
+      "time_compacting": null,
+      "time_created": 1787520000123,
+      "time_updated": 1787520000127,
+      "time_archived": null,
+      "cost": 0.0,
+      "tokens_input": 0,
+      "tokens_output": 0,
+      "tokens_reasoning": 0,
+      "tokens_cache_read": 0,
+      "tokens_cache_write": 0
+    },
+    "messages": [
+      {
+        "id": "msg_0307ea07c001J6gHABe1P0hw23",
+        "session_id": "ses_fcf815f84ffe0xjrQUONLvpM0W",
+        "time_created": 1787520000124,
+        "data": {
+          "agent": "build",
+          "model": {"modelID": "big-pickle", "providerID": "opencode"},
+          "role": "user",
+          "time": {"created": 1787520000124}
+        }
+      },
+      {
+        "id": "msg_0307ea07d001QC1eweB1HBcbLd",
+        "session_id": "ses_fcf815f84ffe0xjrQUONLvpM0W",
+        "time_created": 1787520000125,
+        "data": {
+          "agent": "build",
+          "cost": 0,
+          "finish": "stop",
+          "mode": "build",
+          "modelID": "big-pickle",
+          "parentID": "msg_0307ea07c001J6gHABe1P0hw23",
+          "path": {"cwd": "/tmp/opencode-ai-sessions-import-cwd", "root": "/tmp"},
+          "providerID": "opencode",
+          "role": "assistant",
+          "time": {"completed": 1787520000125, "created": 1787520000125},
+          "tokens": {
+            "cache": {"read": 0, "write": 0},
+            "input": 0,
+            "output": 0,
+            "reasoning": 0,
+            "total": 0
+          }
+        }
+      },
+      {
+        "id": "msg_0307ea07e001cFh4Mwl8KfPQSe",
+        "session_id": "ses_fcf815f84ffe0xjrQUONLvpM0W",
+        "time_created": 1787520000126,
+        "data": {
+          "agent": "build",
+          "model": {"modelID": "big-pickle", "providerID": "opencode"},
+          "role": "user",
+          "time": {"created": 1787520000126}
+        }
+      }
+    ],
+    "parts": [
+      {
+        "id": "prt_0307ea07c002UdBuftxCr5aQ28",
+        "message_id": "msg_0307ea07c001J6gHABe1P0hw23",
+        "session_id": "ses_fcf815f84ffe0xjrQUONLvpM0W",
+        "time_created": 1787532065500,
+        "data": {"text": "phase3 capture user", "type": "text"}
+      },
+      {
+        "id": "prt_0307ea07d002HQK3IiX7T5RhFg",
+        "message_id": "msg_0307ea07d001QC1eweB1HBcbLd",
+        "session_id": "ses_fcf815f84ffe0xjrQUONLvpM0W",
+        "time_created": 1787532065501,
+        "data": {"text": "phase3 capture assistant", "type": "text"}
+      },
+      {
+        "id": "prt_0307ea07e002tXLblULQjxpK3N",
+        "message_id": "msg_0307ea07e001cFh4Mwl8KfPQSe",
+        "session_id": "ses_fcf815f84ffe0xjrQUONLvpM0W",
+        "time_created": 1787532065504,
+        "data": {"text": "phase3 capture tail", "type": "text"}
+      }
+    ]
+  }
+}
