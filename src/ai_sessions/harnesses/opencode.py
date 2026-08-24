@@ -1380,7 +1380,7 @@ def _staged_boundary(
     return row[0], identity[1], part_id is not None, part_id or ""
 
 
-def _read_opencode_snapshot(ref: NativeRef, *, latest_window: bool = True) -> ReadSnapshot:
+def _read_opencode_snapshot_inner(ref: NativeRef, *, latest_window: bool = True) -> ReadSnapshot:
     with _semantic_snapshot(ref) as (connection, expected_session, revert):
         normalized_revert = normalize_revert(revert)
         checkpoint = semantic_checkpoint(
@@ -1415,6 +1415,18 @@ def _read_opencode_snapshot(ref: NativeRef, *, latest_window: bool = True) -> Re
             summary_ids=summary_ids,
         )
         return ReadSnapshot(transcript, checkpoint)
+
+
+def _read_opencode_snapshot(ref: NativeRef, *, latest_window: bool = True) -> ReadSnapshot:
+    try:
+        return _read_opencode_snapshot_inner(ref, latest_window=latest_window)
+    except BridgeError as error:
+        if ".type has unknown value" in str(error):
+            record_warning(
+                f"OpenCode session {ref.session_id} contains an unknown semantic part kind; "
+                "the session was not bridged until that native kind can be classified safely"
+            )
+        raise
 
 
 def _opencode_checkpoint(ref: NativeRef) -> str:

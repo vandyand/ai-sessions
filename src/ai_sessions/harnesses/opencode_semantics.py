@@ -1,4 +1,8 @@
-"""Pure OpenCode conversation semantics shared by SQLite reads and status checks."""
+"""Pure OpenCode conversation semantics shared by SQLite reads and status checks.
+
+Compaction selection is ported from OpenCode 1.18.21's ``MessageV2.filterCompacted`` behavior:
+https://github.com/anomalyco/opencode/blob/3a31c4ea801915c0b050df4b3842997ea62b6e93/packages/opencode/src/session/message-v2.ts
+"""
 
 from __future__ import annotations
 

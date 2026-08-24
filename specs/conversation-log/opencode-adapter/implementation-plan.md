@@ -338,16 +338,16 @@
 
 ## Phase 5: Real CLI, review, and release gates
 
-- [ ] Run an isolated real OpenCode integration on Linux: create a native session, discover/read it,
+- [x] Run an isolated real OpenCode integration on Linux: create a native session, discover/read it,
   bridge Claude and Codex copies into OpenCode, export/reread them, resume/append one via
   `opencode run --session`, observe semantic advancement, bridge back, and verify head routing.
-- [ ] Create/observe a real compaction and differentially compare the adapter's latest-window
+- [x] Create/observe a real compaction and differentially compare the adapter's latest-window
   content and ordinary order with current OpenCode behavior, plus the documented K5 abort/retry
   reorder exception. Record tested CLI/session versions and warn on unknown semantic part kinds;
   do not reject every future patch version solely by its version string.
-- [ ] Attribute the compaction port and behavioral fixtures in adapter/test comments to OpenCode
+- [x] Attribute the compaction port and behavioral fixtures in adapter/test comments to OpenCode
   1.18.21 `packages/opencode/src/session/message-v2.ts`; retain the source URL in documentation.
-- [ ] Run the corresponding temporary native-Windows OpenCode import/discovery/read/resume-command
+- [x] Run the corresponding temporary native-Windows OpenCode import/discovery/read/resume-command
   checks without installing persistently or touching the user's provider data.
 - [ ] Run full native Windows and WSL suites, Ruff lint/format, build/sdist/wheel/twine checks, and
   GitHub Actions on Python 3.11–3.13 for both OSes.
@@ -365,6 +365,35 @@
   change the checkpoint and selected context, and no reverted member may be promoted as unchanged.
 - [ ] Round-trip a committed-but-unverified OpenCode member with `checkpoint=None` through schema-6
   state and prove every status decision is unstable/unknown, never unchanged or promotable.
+
+### Phase 5 runtime findings
+
+- `tools/verify_opencode_real.py` is a repeatable destructive-to-temporary-storage Linux gate. It
+  creates a fresh XDG tree, uses a supplied real binary/model, and removes the tree in `finally`.
+  Against `/tmp/opencode-ai-sessions-bin/opencode` 1.18.21 with `opencode/big-pickle`, it created
+  and discovered/read native session `ses_fce7b9362ffeClIe3oTOEhbBbE`; imported, exported, and
+  reread Claude copy `ses_fce7b23b3ffeKuVB2ZDynMCya9` and Codex copy
+  `ses_fce7af16affepCSI6gCT9xeNVG`; resumed the exact Claude-derived OpenCode ID, observed its
+  semantic checkpoint advance, bridged the new `REAL-ADVANCE-OK` work back to Codex session
+  `01a03185-35e1-73a5-b410-b9ec668f5d6e`, and proved the routing head reused that copy.
+- The same verifier invokes the real localhost-only summarize API and terminates only its owned
+  server process. The native export ended in a user message with a `compaction` part followed by a
+  completed `summary=true`, `finish=stop` assistant message. The adapter's full projection retained
+  the prior exchange, while its two-turn latest projection exactly equalled the full projection's
+  final request/summary boundary in native order. The completed-only K5 abort/retry exception
+  remains pinned by behavioral mutations: an incomplete/error attempt never governs; a successful
+  retry retains its tail after the completed boundary instead of adopting 1.18.21's unsafe failed
+  attempt anchor.
+- The compaction selection port and its tests now cite the pinned 1.18.21
+  `MessageV2.filterCompacted` source URL. An unknown future semantic part kind still blocks the
+  bridge conservatively, but now emits a user-visible warning naming why; there is no version-string
+  rejection, so future patch releases with known semantics remain readable.
+- `tools/verify_opencode_maintenance.py` supplies the model-free real-CLI subset used on native
+  Windows. An exact `opencode-windows-x64@1.18.21` package was extracted to a temporary directory,
+  never installed. In a separate disposable XDG tree it proved authoritative `db path`, real
+  import, discovery, semantic reread, native export, and exact safe/dangerous resume argv for
+  imported session `ses_fce772619ffe62PYq5R5l3suRR`. Both provider storage and package directory
+  were removed afterward; the package directory was sent to the Recycle Bin rather than erased.
 
 ## Rollback
 

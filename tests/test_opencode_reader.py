@@ -126,6 +126,8 @@ def stored(
 
 
 class OpenCodeSemanticAlgorithmTests(unittest.TestCase):
+    # Behavioral fixtures pin OpenCode 1.18.21 MessageV2.filterCompacted:
+    # https://github.com/anomalyco/opencode/blob/3a31c4ea801915c0b050df4b3842997ea62b6e93/packages/opencode/src/session/message-v2.ts
     def test_audited_part_kind_list_is_exact_and_unknown_kinds_fail(self) -> None:
         captured = json.loads(SEMANTICS_FIXTURE.read_text(encoding="utf-8"))
         self.assertEqual(captured["opencode_version"], "1.18.21")
@@ -1877,8 +1879,12 @@ class OpenCodeReaderIntegrationTests(unittest.TestCase):
     def test_malformed_semantic_json_unknown_kind_and_missing_revert_schema_fail(self) -> None:
         self.add_message("msg_bad", "user", {"type": "future"}, created=1)
         self.connection.commit()
+        diagnostics.clear_warnings()
         with self.assertRaisesRegex(BridgeError, "unknown value 'future'"):
             opencode._read_opencode_snapshot(self.ref)
+        self.assertTrue(
+            any("unknown semantic part kind" in warning for warning in diagnostics.warnings())
+        )
         self.connection.execute("UPDATE part SET data='not-json' WHERE id='prt_msg_bad_0'")
         self.connection.commit()
         with self.assertRaisesRegex(BridgeError, "malformed JSON"):
