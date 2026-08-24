@@ -349,14 +349,14 @@
   1.18.21 `packages/opencode/src/session/message-v2.ts`; retain the source URL in documentation.
 - [x] Run the corresponding temporary native-Windows OpenCode import/discovery/read/resume-command
   checks without installing persistently or touching the user's provider data.
-- [ ] Run full native Windows and WSL suites, Ruff lint/format, build/sdist/wheel/twine checks, and
+- [x] Run full native Windows and WSL suites, Ruff lint/format, build/sdist/wheel/twine checks, and
   GitHub Actions on Python 3.11–3.13 for both OSes.
 - [x] Ask Claude Opus 5 for a follow-up plan verdict and focused reviews after Phase 0, Phase 2/3,
   and the final integrated diff.
   Resolve/disprove every HIGH/MEDIUM and rerun affected mutation gates.
-- [ ] Update `HARNESS_CONTRACT.md`, `NORTH_STAR.md`, README/config examples/help, spec index, changelog,
+- [x] Update `HARNESS_CONTRACT.md`, `NORTH_STAR.md`, README/config examples/help, spec index, changelog,
   and an evidence-backed retro. Open a PR with the WSL `vandyand` account and complete CI/review.
-- [ ] Perform a requirement-by-requirement completion audit against this plan and the active user
+- [x] Perform a requirement-by-requirement completion audit against this plan and the active user
   objective before declaring the three-harness system complete.
 - [x] Prove digest/read closure in both window modes by changing an assistant summary from
   incomplete/errored to completed without changing its text; checkpoint and selected window must

@@ -11,7 +11,7 @@ Priorities are ordered by evidence strength and independence, not by architectur
 ## Current state
 
 `ai-sessions` 3.2.0 plus merged P2 (`5e5503e`), completed P3 (`e15f73f`), the generic
-harness boundary (`ac16e41`), and the production OpenCode proof through `a5cd43d`. P1 fixed
+harness boundary (`ac16e41`), and the production OpenCode proof through `23099cf`. P1 fixed
 selection at native compaction boundaries. P2 adds utility-owned conversation IDs, native members,
 equivalence frontiers, opaque checkpoints, head routing, and explicit divergence. P3 adds
 target-owned token budgets and whole-source-message selection. One dynamic registry now routes the
@@ -156,7 +156,7 @@ liveness, budgets, and bidirectional bridges, then reverses cleanly on context e
 named mutation gates, a provider-name AST gate, 247-test Windows/Linux runs, and repeated Opus 5
 reviews established the seam before OpenCode exercised it in production.
 
-### P4 production proof — OpenCode third harness **(COMPLETE as of a5cd43d)**
+### P4 production proof — OpenCode third harness **(COMPLETE as of 23099cf)**
 
 OpenCode now exercises the boundary with a genuinely different storage model: `(session ID,
 database path)` identifies one row inside a shared WAL-mode SQLite store, and an opaque semantic
@@ -203,6 +203,10 @@ proof establishes storage- and harness-decoupling, not verbatim per-message carr
 - A Codex window whose spine is unreadable carries nothing across. Silently skipping it is wrong; the copy should say what is missing and where.
 - Provider-native token measurement may eventually replace P3's conservative character projection, but only if every target adapter can supply it without adding a heavyweight runtime dependency.
 - Two harnesses resuming the same conversation concurrently produces two heads. Detection and safe refusal now exist; user-directed branch selection or merge is not designed.
+- The next adapter sequence is researched as **Gemini CLI, Qwen Code, then GitHub Copilot CLI**.
+  Gemini has the best combination of reach and an emerging provider-owned import path; Qwen has
+  the strongest supported transcript/export/resume API; Copilot requires an isolated no-sync writer
+  feasibility gate. See [`NEXT_HARNESSES.md`](NEXT_HARNESSES.md).
 
 ## Doc-sync protocol
 
@@ -222,5 +226,6 @@ Every `/feature plan` generated from this doc ends with a final Doc Sync phase t
 - `src/ai_sessions/harnesses/` — isolated Claude, Codex, and OpenCode native adapters
 - `src/ai_sessions/app.py` — `prepare_launch`, `command_for`, `UserState.resolve_launch`, `UserState.set_bridge`
 - [`HARNESS_CONTRACT.md`](HARNESS_CONTRACT.md) — current adapter seam and the complete target contract
+- [`NEXT_HARNESSES.md`](NEXT_HARNESSES.md) — source-backed ranking and Phase 0 gates for the next adapters
 - Measured against `~/.codex/sessions/2026/07/13/rollout-…-019f59af-….jsonl` and `~/.claude/projects/…/776daa15-….jsonl`
 - Released through 3.1.5; P2 merged to `main` as `5e5503e`; P3 completed as `e15f73f`; the generic harness prerequisite completed as `ac16e41`

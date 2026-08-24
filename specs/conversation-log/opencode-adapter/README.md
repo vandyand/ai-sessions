@@ -1,6 +1,6 @@
 ---
 title: "OpenCode Native Harness Adapter"
-status: in-progress
+status: completed
 date: 2026-08-23
 priority: 40
 ---
@@ -89,7 +89,7 @@ an opaque, JSON-serializable semantic checkpoint before the OpenCode adapter is 
   writer follow-up GO with HIGH=0, MEDIUM=0)*
 - [x] Six-direction and real-CLI validation *(451-test Windows/WSL gate; repeatable native Linux
   create/import/export/resume/compaction/bridge-back and native-Windows maintenance verifiers)*
-- [ ] Final Opus 5 reviews, documentation, PR/CI, and completion audit
+- [x] Final Opus 5 reviews, documentation, PR/CI, and completion audit
 
 ## Phase 2 validation
 
