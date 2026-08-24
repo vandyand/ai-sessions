@@ -1,20 +1,24 @@
 # ai-sessions
 
-`ai-sessions` is a searchable terminal browser for local [Codex CLI](https://developers.openai.com/codex/cli/) and Claude Code conversations. It indexes each provider's existing on-disk history. Browsing is read-only; an explicit rename appends the provider's supported title record so the name also appears in that provider.
+`ai-sessions` is a searchable terminal browser for local
+[Codex CLI](https://developers.openai.com/codex/cli/), Claude Code, and
+[OpenCode](https://opencode.ai/) conversations. It indexes each harness's existing native history.
+Browsing is read-only; explicit rename and bridge actions use the provider-specific operations
+described below.
 
 It runs as `sessions` on Linux and native Windows PowerShell.
 
 ## Features
 
-- One navigable list for Codex and Claude sessions
+- One navigable list for Codex, Claude Code, and OpenCode sessions
 - Search and filters for provider, directory, origin, open state, and visibility
 - Human, cross-provider, and subagent/automation origin labels
 - Started and updated timestamps plus user-message counts across compactions
-- Rename that carries through to Claude Code and Codex, plus utility-local hiding
+- Rename that carries through to all three harnesses, plus utility-local hiding
 - Nickname and parent labels that tell sibling subagent threads apart
 - Detection of currently open sessions on Linux and Windows
 - tmux pane and desktop-terminal focus on Linux when the environment exposes it
-- Cross-harness resume: continue any session in Codex or Claude regardless of where it was created
+- Cross-harness resume: continue any session in any of the three harnesses
 - Safe, dangerous, and custom launch profiles
 - Native paths and argument handling on both operating systems
 
@@ -23,7 +27,7 @@ Windows Terminal does not expose a stable session-ID-to-tab interface. On Window
 ## Requirements
 
 - Python 3.11 or newer
-- Codex CLI, Claude Code, or both
+- Codex CLI, Claude Code, OpenCode, or any combination
 - Linux or native Windows PowerShell
 
 The Windows-only `windows-curses` dependency is installed automatically. `psutil` is used for portable process inspection.
@@ -80,29 +84,33 @@ sessions --list --visibility hidden
 sessions --resume SESSION_ID
 sessions --resume SESSION_ID --launch-tool claude
 sessions --resume SESSION_ID --launch-tool codex
+sessions --resume SESSION_ID --launch-tool opencode
 sessions --resume SESSION_ID --dry-run
 ```
 
 ## What is written, and when
 
 Resuming a session in the harness that recorded it is a pure read: `sessions` runs
-`codex resume ID` or `claude --resume ID` against the original id and touches nothing.
+`codex resume ID`, `claude --resume ID`, or `opencode --session ID` against the original ID and
+touches nothing.
 Sessions at rest are never rewritten, and no transcript is ever edited in place.
 
-Only two actions write to provider storage, and both are additive:
+Only two actions write to provider storage:
 
-- **Rename** (`r`) appends a title entry — a `custom-title` line to a Claude transcript, or
-  a `thread_name` line to `~/.codex/session_index.jsonl`.
-- **Bridging** creates a *new* session file next to the existing ones and appends its title.
-  The source transcript is opened read-only and left byte for byte unchanged.
+- **Rename** (`r`) appends a `custom-title` record for Claude or a `thread_name` record for Codex.
+  OpenCode has no rename command, so its adapter performs one bounded, transactional update of the
+  exact existing session title and verifies the row afterward; semantic checkpoints exclude this
+  metadata-only change.
+- **Bridging** creates a *new* native target session. Claude and Codex receive new session files;
+  OpenCode receives export JSON through its official `import` command. The source remains read-only.
 
 Everything else — hiding, sort order, per-session harness preference — stays in this
 utility's own `state.json`.
 
 ## Cross-harness resume
 
-Codex and Claude Code store transcripts in different formats, and neither recognises the
-other's session id, so a conversation cannot simply be handed across by reference. Press
+The three harnesses store sessions differently and do not recognise one another's native IDs, so a
+conversation cannot simply be handed across by reference. Press
 `x` (or pass `--launch-tool`) and `ai-sessions` bridges it instead: it reads the source
 transcript, converts the conversation into the target harness's own on-disk format, and
 writes it there as a new native session. That copy is an ordinary session — the target CLI
@@ -111,6 +119,8 @@ resumes it, appends to it, and lists it like any other.
 ```bash
 sessions --resume CODEX_SESSION_ID --launch-tool claude
 sessions --resume CLAUDE_SESSION_ID --launch-tool codex
+sessions --resume OPENCODE_SESSION_ID --launch-tool claude
+sessions --resume CLAUDE_SESSION_ID --launch-tool opencode
 ```
 
 The user/assistant conversation crosses over as messages. Tool calls cross over
@@ -131,7 +141,8 @@ to the shell command it actually ran. Reasoning and attachments are dropped enti
 
 Because a summary is a record and not a result, the copy opens with a note saying where it
 came from and warning that the filesystem state is unverified. The source transcript is
-never modified, and the copy is named `<title> (from Codex)` or `<title> (from Claude)` so
+never modified, and the copy is named `<title> (from Codex)`, `<title> (from Claude)`, or
+`<title> (from OpenCode)` so
 the two are never confused in the list.
 
 ### Sessions that have been compacted
@@ -146,7 +157,7 @@ picks up. On a real 7-compaction session here that is the difference between 949
 characters with 739 messages silently dropped to fit, and 147,000 characters with nothing
 dropped at all. Set `latest_window = false` to replay the whole transcript instead.
 
-The two harnesses record this differently, and both are usable. Claude Code writes a
+The harnesses record this differently, and all three are usable. Claude Code writes a
 plain-text summary. Codex seals its summary as `encrypted_content` — unreadable to anyone
 but the provider, including Codex itself — but records the messages it carries forward
 beside it, so the copy resumes from those. What crosses is the conversation the source
@@ -155,11 +166,18 @@ own work in that window. Only a compaction with no carried context falls back to
 the pre-compaction history. The handoff note says which happened, so an over-large copy is
 always explainable.
 
+OpenCode stores a readable summary, compaction request, and retained-tail boundary in its shared
+SQLite database. The adapter follows the newest *completed* summary. A failed-only attempt retains
+full history, and a successful retry keeps the retained tail after its completed summary; this is a
+deliberate safety correction to OpenCode 1.18.21's failed-attempt reorder behavior.
+
 ### Budget
 
 Whatever survives the above is fitted to a target-owned token policy. The default is a
 conservative unknown-model allowance: about 150,000 tokens / 300,000 projected characters
-for Claude Code and 192,000 / 384,000 for Codex. Selection happens at source-message
+for Claude Code and 192,000 / 384,000 for Codex. OpenCode target preparation queries installed
+models and uses the selected model's effective input limit; when verbose metadata is unavailable it
+warns and falls back to a 128,000-token compatibility floor. Selection happens at source-message
 boundaries before same-role messages are assembled for the target. The first message of the
 selected context and one contiguous newest suffix survive; oversized anchors carry an
 explicit truncation marker, and the note reports dropped, truncated, source, and assembled
@@ -191,19 +209,21 @@ copy wins over its ancestor so old state cannot silently discard work.
 
 ### Adding a harness
 
-Conversions run through a harness-neutral conversation rather than pairwise, so support
-for another CLI costs one adapter rather than a converter per existing harness. The current
-bridge registry requires a name and label, a conservative budget policy, plus four operations: read a transcript into
-`Turn` objects, write `Turn` objects as a resumable native session, locate a native id, and
-detect meaningful transcript changes after a byte cursor. The same adapter also owns native
+Conversions run through a harness-neutral conversation rather than pairwise. OpenCode is the first
+production proof: all six ordered cross-harness directions and all three same-harness identities use
+one core, with no pairwise converter. Support for another CLI costs one adapter rather than a
+converter per existing harness. The registry requires a name and label, a conservative budget
+policy, plus operations to read a `NativeRef` into `Turn` objects with an opaque checkpoint, write
+turns as a resumable native session, resolve a native ID, test exact availability, and compare
+meaningful native state against that checkpoint. The same adapter also owns native
 discovery, resume arguments, title publication, liveness evidence, native-id patterns, labels,
 ordering, home-directory semantics, and its launch/budget policy. Bridging and head tracking in
 both directions then work without pairwise logic.
 
 The registry is dynamic: CLI choices, keyed schema-3 provider profiles, list/browser rendering,
 discovery, liveness, naming, and conversion all query it at runtime. Unsupported capabilities
-and unknown harnesses fail explicitly instead of borrowing Claude or Codex behavior. A test-only
-third on-disk format exercises the whole contract without reusing either built-in adapter. The
+and unknown harnesses fail explicitly instead of borrowing built-in behavior. An independent
+fourth-format fixture exercises the whole contract without reusing a built-in adapter. The
 complete target contract is specified in
 [`specs/conversation-log/HARNESS_CONTRACT.md`](specs/conversation-log/HARNESS_CONTRACT.md).
 
@@ -218,7 +238,7 @@ it remembers.
 One more wrinkle: Codex enumerates its sessions from a local state database rather than
 from the rollout files, so a copy bridged into Codex is resumable immediately but only
 appears in the `sessions` list after Codex itself has opened it once. Copies bridged into
-Claude Code are listed straight away.
+Claude Code and OpenCode are listed straight away.
 
 ## Launch safety
 
@@ -227,6 +247,7 @@ The package defaults to `safe`. This leaves approval and sandbox behavior to eac
 ```text
 claude --resume SESSION_ID
 codex resume SESSION_ID
+opencode --session SESSION_ID
 ```
 
 Dangerous mode adds the providers' explicit bypass flags:
@@ -234,6 +255,7 @@ Dangerous mode adds the providers' explicit bypass flags:
 ```text
 claude --dangerously-skip-permissions --resume SESSION_ID
 codex --dangerously-bypass-approvals-and-sandbox resume SESSION_ID
+opencode --auto --session SESSION_ID
 ```
 
 These options disable important protections. Use them only where you have consciously accepted that risk.
@@ -257,12 +279,16 @@ Configuration is stored in:
 The optional custom profile uses structured argument arrays, avoiding shell interpolation:
 
 ```toml
-version = 2
+version = 3
 
 [launch]
 mode = "custom"
 claude_command = ["claude"]
 codex_command = ["codex"]
+
+[launch.providers.opencode]
+command = ["opencode"]
+bridge_model = "provider/model" # optional; must appear in `opencode models`
 
 [launch.custom]
 claude_args = ["--permission-mode", "acceptEdits"]
@@ -276,17 +302,20 @@ latest_window = true
 
 Rename/hide state is kept alongside the configuration as `state.json`. Per-session
 launch-harness preferences, conversation ids, native members, equivalence frontiers, and
-byte cursors are stored there too. Unset sessions default to the harness where they were
+opaque native checkpoints are stored there too. Unset sessions default to the harness where they were
 started. Caches use `~/.cache/ai-sessions` on
 Linux and `%LOCALAPPDATA%\ai-sessions` on Windows. Environment overrides are available
-through `AI_SESSIONS_CONFIG_FILE`, `AI_SESSIONS_STATE_FILE`, `CODEX_HOME`, and
-`CLAUDE_CONFIG_DIR`.
+through `AI_SESSIONS_CONFIG_FILE`, `AI_SESSIONS_STATE_FILE`, `CODEX_HOME`,
+`CLAUDE_CONFIG_DIR`, and `OPENCODE_DB`. Prefer the configured OpenCode command's authoritative
+`db path`; `OPENCODE_DB` is the explicit fallback override when that command cannot report one.
 
 ## How open-session detection works
 
 - Claude Code publishes a live PID/session registry.
 - Codex on Linux holds per-thread writer locks.
 - Codex on Windows records thread IDs alongside process IDs in its local log database.
+- OpenCode is marked open only when a process command line names its exact `--session`/`-s` ID;
+  a bare OpenCode process is never guessed to own a particular session.
 - Linux focus support follows the process into tmux and then uses `wmctrl`/`xdotool` when available.
 
 Detection is best-effort and read-only. See [What is written, and when](#what-is-written-and-when) for the complete list of operations that touch provider storage.

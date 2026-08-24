@@ -6,7 +6,7 @@ import tempfile
 import unittest
 from pathlib import Path
 from types import SimpleNamespace
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
 from ai_sessions.conversion import BridgeError, bridge, resolve_budget
 from ai_sessions.harnesses import opencode
@@ -345,6 +345,125 @@ class OpenCodeWriterIntegrationTests(unittest.TestCase):
         import_path = Path(Path(str(self.database) + ".import-path").read_text(encoding="utf-8"))
         self.assertFalse(import_path.exists())
 
+    def test_temporary_export_creation_failure_closes_descriptor_and_removes_file(self) -> None:
+        descriptor, name = tempfile.mkstemp(dir=self.root)
+        path = Path(name)
+        with (
+            patch.object(opencode.tempfile, "mkstemp", return_value=(descriptor, name)),
+            patch.object(opencode.os, "fdopen", side_effect=OSError("fdopen failed")),
+            self.assertRaisesRegex(OSError, "fdopen failed"),
+        ):
+            opencode._write_temporary_export({"session": "not written"})
+
+        self.assertFalse(path.exists())
+        with self.assertRaises(OSError):
+            os.fstat(descriptor)
+
+    def test_temporary_export_preserves_creation_error_if_cleanup_also_fails(self) -> None:
+        descriptor, name = tempfile.mkstemp(dir=self.root)
+        path = Path(name)
+        creation_error = OSError("fdopen failed")
+        with (
+            patch.object(opencode.tempfile, "mkstemp", return_value=(descriptor, name)),
+            patch.object(opencode.os, "fdopen", side_effect=creation_error),
+            patch.object(Path, "unlink", side_effect=OSError("unlink denied")),
+            self.assertRaises(OSError) as raised,
+        ):
+            opencode._write_temporary_export({"session": "not written"})
+
+        self.assertIs(raised.exception, creation_error)
+        self.assertTrue(path.exists())
+        with self.assertRaises(OSError):
+            os.fstat(descriptor)
+        path.unlink()
+
+    def test_import_failure_reports_a_secondary_cleanup_failure(self) -> None:
+        temporary = self.root / "failed-import.json"
+        temporary.write_text("sensitive transcript", encoding="utf-8")
+        with (
+            patch.object(opencode, "run_maintenance", side_effect=BridgeError("import failed")),
+            patch.object(Path, "unlink", side_effect=OSError("unlink denied")),
+            self.assertRaisesRegex(
+                BridgeError,
+                "import failed; the temporary OpenCode import file also could not be removed: "
+                "unlink denied",
+            ),
+        ):
+            opencode._run_import_and_cleanup(self.command(), str(self.root), temporary)
+
+        self.assertTrue(temporary.exists())
+
+    def test_import_failure_propagates_after_successful_cleanup(self) -> None:
+        temporary = self.root / "ordinary-failed-import.json"
+        temporary.write_text("sensitive transcript", encoding="utf-8")
+        failure = BridgeError("ordinary import failure")
+        with (
+            patch.object(opencode, "run_maintenance", side_effect=failure),
+            self.assertRaises(BridgeError) as raised,
+        ):
+            opencode._run_import_and_cleanup(self.command(), str(self.root), temporary)
+
+        self.assertIs(raised.exception, failure)
+        self.assertFalse(temporary.exists())
+
+    def test_import_accepts_a_temporary_file_already_removed_by_provider(self) -> None:
+        temporary = self.root / "provider-removed-import.json"
+        result = opencode.MaintenanceResult(self.command(), 0, "Imported session", "")
+        with patch.object(opencode, "run_maintenance", return_value=result):
+            actual = opencode._run_import_and_cleanup(self.command(), str(self.root), temporary)
+
+        self.assertIs(actual, result)
+
+    def test_successful_import_treats_cleanup_failure_as_an_error(self) -> None:
+        temporary = self.root / "successful-import.json"
+        temporary.write_text("sensitive transcript", encoding="utf-8")
+        result = opencode.MaintenanceResult(self.command(), 0, "Imported session", "")
+        with (
+            patch.object(opencode, "run_maintenance", return_value=result),
+            patch.object(Path, "unlink", side_effect=OSError("unlink denied")),
+            self.assertRaisesRegex(
+                BridgeError,
+                "could not remove the temporary OpenCode import file: unlink denied",
+            ),
+        ):
+            opencode._run_import_and_cleanup(self.command(), str(self.root), temporary)
+
+        self.assertTrue(temporary.exists())
+
+    def test_windows_final_wait_rekills_a_process_that_survives_initial_cleanup(self) -> None:
+        process = Mock()
+        process.stdout = Mock()
+        process.stderr = Mock()
+        process.returncode = None
+        process.poll.return_value = None
+        process.wait.side_effect = (
+            opencode.subprocess.TimeoutExpired("fixture", 0.01),
+            opencode.subprocess.TimeoutExpired("fixture", 0.1),
+            9,
+        )
+        readers = (Mock(), Mock())
+        for reader in readers:
+            reader.is_alive.return_value = False
+
+        with (
+            patch.object(opencode, "IS_WINDOWS", True),
+            patch.object(opencode._WindowsJob, "assign", return_value=None),
+            patch.object(opencode.subprocess, "Popen", return_value=process),
+            patch.object(opencode.threading, "Thread", side_effect=readers),
+        ):
+            result = opencode.run_maintenance(
+                (sys.executable,),
+                ("--fixture",),
+                cwd=str(self.root),
+                timeout=0.01,
+                return_timeout=True,
+            )
+
+        self.assertTrue(result.timed_out)
+        self.assertEqual(result.returncode, 9)
+        self.assertEqual(process.kill.call_count, 2)
+        self.assertEqual(process.wait.call_count, 3)
+
     def test_reminted_localized_and_marker_recovery_bind_verified_persisted_rows(self) -> None:
         reminted = opencode._write_opencode(
             cwd=str(self.root),
@@ -431,6 +550,25 @@ class OpenCodeWriterIntegrationTests(unittest.TestCase):
         prepared = self.prepared("no-persist")
         with self.assertRaisesRegex(BridgeError, "no persisted session row became visible"):
             opencode._write_opencode(cwd=str(self.root), turns=self.turns(), prepared=prepared)
+
+    def test_success_without_verified_content_or_recoverable_id_is_an_error(self) -> None:
+        verification_error = BridgeError("persisted verification unavailable")
+        with (
+            patch.object(
+                opencode,
+                "_verify_import_with_backoff",
+                return_value=(None, verification_error),
+            ),
+            self.assertRaisesRegex(
+                BridgeError,
+                "no persisted session or recoverable ID could be verified",
+            ),
+        ):
+            opencode._write_opencode(
+                cwd=str(self.root),
+                turns=self.turns(),
+                prepared=self.prepared("localized"),
+            )
 
     def test_timed_out_import_recovers_a_committed_verified_session(self) -> None:
         with patch.object(opencode, "IMPORT_TIMEOUT_SECONDS", 1.0):

@@ -10,7 +10,14 @@ Priorities are ordered by evidence strength and independence, not by architectur
 
 ## Current state
 
-`ai-sessions` 3.1.5 plus merged P2 (`5e5503e`), completed P3 (`e15f73f`), and the generic harness boundary completed through `ac16e41`. P1 fixed selection at Codex compaction boundaries. P2 adds utility-owned conversation ids, native members, equivalence frontiers, append cursors, head routing, and explicit divergence. P3 adds target-owned token budgets and whole-source-message selection. One dynamic registry now routes the complete Claude/Codex runtime surface through immutable `HarnessAdapter` objects, and an independent third-format fixture proves late registration without core edits. The remaining identity work is finer-grained provenance: ordered live segments and original-form projection.
+`ai-sessions` 3.2.0 plus merged P2 (`5e5503e`), completed P3 (`e15f73f`), the generic
+harness boundary (`ac16e41`), and the production OpenCode proof through `a5cd43d`. P1 fixed
+selection at native compaction boundaries. P2 adds utility-owned conversation IDs, native members,
+equivalence frontiers, opaque checkpoints, head routing, and explicit divergence. P3 adds
+target-owned token budgets and whole-source-message selection. One dynamic registry now routes the
+complete Claude/Codex/OpenCode runtime surface through immutable `HarnessAdapter` objects, and an
+independent fourth-format fixture proves late registration without core edits. The remaining
+identity work is finer-grained provenance: ordered live segments and original-form projection.
 
 The two failures that started this effort were:
 
@@ -147,7 +154,24 @@ A genuine test-only third format supplies its own records and every runtime hook
 after `app` import changes discovery, CLI choices, browser rendering, resume commands, naming,
 liveness, budgets, and bidirectional bridges, then reverses cleanly on context exit. Twenty-six
 named mutation gates, a provider-name AST gate, 247-test Windows/Linux runs, and repeated Opus 5
-reviews establish the seam before OpenCode is allowed to exercise it in production.
+reviews established the seam before OpenCode exercised it in production.
+
+### P4 production proof — OpenCode third harness **(COMPLETE as of a5cd43d)**
+
+OpenCode now exercises the boundary with a genuinely different storage model: `(session ID,
+database path)` identifies one row inside a shared WAL-mode SQLite store, and an opaque semantic
+digest replaces file offsets. Discovery includes native roots, archived sessions, and parent-ID
+children from the database authoritative for the configured command. Reads reproduce staged
+revert, completed compaction windows, tool summaries, and full/latest modes; writes use OpenCode's
+official import command after dynamic model/context preparation.
+
+All six ordered cross-harness directions and all three exact same-harness resumes pass production
+paths. Routing mutations prove equivalent reuse, source/target advance, return hops, missing and
+unavailable materializations, concurrent updates, and divergence. Isolated real OpenCode 1.18.21
+gates on Linux and Windows prove native create/discover/read, Claude and Codex imports/exports,
+exact resume/semantic advancement, real compaction order, bridge-back, and head reuse without
+touching user provider data. The full conversation-log provenance phase remains separate: this
+proof establishes storage- and harness-decoupling, not verbatim per-message carry-forward.
 
 ## Key decisions
 
@@ -195,7 +219,7 @@ Every `/feature plan` generated from this doc ends with a final Doc Sync phase t
 - Design pass, rendered: https://claude.ai/code/artifact/d3dc3a4d-fbc8-48f5-bc7f-6fe2e26f8d17
 - `src/ai_sessions/model.py`, `capabilities.py`, and `registry.py` — neutral types, the complete adapter contract, and dynamic registration
 - `src/ai_sessions/conversion.py` — harness-neutral reading, selection, materialization, and semantic-tail routing
-- `src/ai_sessions/harnesses/` — isolated Claude and Codex native adapters
+- `src/ai_sessions/harnesses/` — isolated Claude, Codex, and OpenCode native adapters
 - `src/ai_sessions/app.py` — `prepare_launch`, `command_for`, `UserState.resolve_launch`, `UserState.set_bridge`
 - [`HARNESS_CONTRACT.md`](HARNESS_CONTRACT.md) — current adapter seam and the complete target contract
 - Measured against `~/.codex/sessions/2026/07/13/rollout-…-019f59af-….jsonl` and `~/.claude/projects/…/776daa15-….jsonl`

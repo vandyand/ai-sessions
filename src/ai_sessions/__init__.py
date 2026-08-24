@@ -1,6 +1,6 @@
-"""Browse and resume local Codex CLI and Claude Code sessions."""
+"""Browse, bridge, and resume Codex CLI, Claude Code, and OpenCode sessions."""
 
-__version__ = "3.1.5"
+__version__ = "3.2.0"
 
 from .harnesses import install as _install_harnesses
 

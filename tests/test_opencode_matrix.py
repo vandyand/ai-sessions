@@ -689,6 +689,58 @@ class OpenCodeMatrixTests(unittest.TestCase):
         self.assertTrue(middle_row.diverged)
         self.assertTrue(newest.diverged)
 
+    def test_unverified_opencode_member_stays_unstable_through_schema_six_round_trip(self) -> None:
+        source_ref = self.write_native("codex")
+        prepared = self.prepared_opencode()
+        verification_error = BridgeError("persisted verification unavailable")
+        with patch.object(
+            opencode,
+            "_verify_import_with_backoff",
+            return_value=(None, verification_error),
+        ):
+            target_written = opencode._write_opencode(
+                cwd=str(self.cwd),
+                turns=self.portable_turns(),
+                prepared=prepared,
+                title="unverified OpenCode import",
+            )
+        self.assertIsNone(target_written.checkpoint)
+        self.assertTrue(any("remains unstable" in note for note in target_written.notices))
+        target_ref = target_written.native
+        source = self.row("codex", source_ref, launch_tool="opencode")
+        target = self.row("opencode", target_ref, launch_tool="codex")
+        source_checkpoint = REGISTRY.get("codex").checkpoint
+        assert not isinstance(source_checkpoint, Unsupported)
+        state_path = self.root / "unverified-state.json"
+        state = UserState(state_path)
+        state.set_bridge(
+            source,
+            "opencode",
+            target_ref.session_id,
+            target_ref.storage,
+            source_checkpoint=source_checkpoint(source_ref),
+            target_checkpoint=target_written.checkpoint,
+        )
+        payload = json.loads(state_path.read_text(encoding="utf-8"))
+        self.assertEqual(payload["version"], 6)
+
+        restored = UserState(state_path)
+        conversation_id = restored.conversation_id_for(source)
+        member = restored.conversations[conversation_id]["members"][target.key]
+        self.assertNotIn("checkpoint", member)
+        self.assertNotIn("cursor", member)
+        self.assertEqual(restored._member_change_status(member), "unstable")
+        status = restored._conversation_status(conversation_id)
+        self.assertEqual([key for key, _ in status["unstable"]], [target.key])
+        self.assertEqual(status["advanced"], [])
+
+        restored.apply([source, target])
+        for selected, launch_tool in ((source, "opencode"), (target, "codex")):
+            with self.subTest(selected=selected.tool):
+                selected.launch_tool = launch_tool
+                with self.assertRaisesRegex(BridgeError, "incomplete or unstable"):
+                    prepare_launch(selected, state=restored, config=self.config)
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -1349,6 +1349,46 @@ class OpenCodeReaderIntegrationTests(unittest.TestCase):
             ["old", COMPACTION_PROMPT, "summary"],
         )
 
+    def test_summary_completion_changes_checkpoint_and_both_window_views(self) -> None:
+        self.add_message("msg_old", "user", text("old"), created=1)
+        self.add_message("msg_compact", "user", {"type": "compaction", "auto": True}, created=2)
+        self.add_message(
+            "msg_summary",
+            "assistant",
+            text("unchanged summary text"),
+            created=3,
+            parentID="msg_compact",
+            summary=True,
+            finish="",
+        )
+        self.connection.commit()
+        before_latest = opencode._read_opencode_snapshot(self.ref, latest_window=True)
+        before_full = opencode._read_opencode_snapshot(self.ref, latest_window=False)
+        self.assertEqual(before_latest, before_full)
+        self.assertFalse(any(turn.compaction for turn in before_latest.transcript.turns))
+
+        info = json.loads(
+            self.connection.execute("SELECT data FROM message WHERE id='msg_summary'").fetchone()[0]
+        )
+        info["finish"] = "stop"
+        self.connection.execute(
+            "UPDATE message SET data=? WHERE id='msg_summary'", (json.dumps(info),)
+        )
+        self.connection.commit()
+        after_latest = opencode._read_opencode_snapshot(self.ref, latest_window=True)
+        after_full = opencode._read_opencode_snapshot(self.ref, latest_window=False)
+
+        self.assertNotEqual(after_latest.checkpoint, before_latest.checkpoint)
+        self.assertEqual(after_latest.checkpoint, after_full.checkpoint)
+        self.assertNotEqual(after_latest.transcript, before_latest.transcript)
+        self.assertNotEqual(after_full.transcript, before_full.transcript)
+        self.assertEqual(
+            [turn.text for turn in after_latest.transcript.turns],
+            [COMPACTION_PROMPT, "unchanged summary text"],
+        )
+        self.assertTrue(after_latest.transcript.turns[-1].compaction)
+        self.assertTrue(after_full.transcript.turns[-1].compaction)
+
     def test_revert_and_unrevert_change_view_and_checkpoint_without_row_cleanup(self) -> None:
         self.add_message("msg_u1", "user", text("one"), created=1)
         self.add_message("msg_u2", "user", text("two"), created=2)
@@ -1445,6 +1485,72 @@ class OpenCodeReaderIntegrationTests(unittest.TestCase):
         before_compaction = opencode._read_opencode_snapshot(self.ref)
         self.assertEqual([turn.text for turn in before_compaction.transcript.turns], ["old"])
         self.assertNotEqual(before_compaction.checkpoint, after_compaction.checkpoint)
+
+    def test_message_and_part_revert_unrevert_on_both_sides_of_compaction(self) -> None:
+        self.add_message(
+            "msg_old",
+            "user",
+            text("old first", part_id="prt_old_1"),
+            text("old second", part_id="prt_old_2"),
+            created=1,
+        )
+        self.add_message(
+            "msg_compact",
+            "user",
+            {"type": "compaction", "auto": True, "_id": "prt_compact"},
+            created=2,
+        )
+        self.add_message(
+            "msg_summary",
+            "assistant",
+            text("summary"),
+            created=3,
+            parentID="msg_compact",
+            summary=True,
+            finish="stop",
+        )
+        self.add_message(
+            "msg_after",
+            "user",
+            text("after first", part_id="prt_after_1"),
+            text("after second", part_id="prt_after_2"),
+            created=4,
+        )
+        self.connection.commit()
+        baseline = opencode._read_opencode_snapshot(self.ref, latest_window=True)
+        boundaries = (
+            ("message before compaction", {"messageID": "msg_compact"}),
+            (
+                "part before compaction",
+                {"messageID": "msg_compact", "partID": "prt_compact"},
+            ),
+            ("message after compaction", {"messageID": "msg_after"}),
+            (
+                "part after compaction",
+                {"messageID": "msg_after", "partID": "prt_after_2"},
+            ),
+        )
+        for label, boundary in boundaries:
+            with self.subTest(boundary=label):
+                self.connection.execute(
+                    "UPDATE session SET revert=? WHERE id=?",
+                    (json.dumps(boundary), self.SESSION_ID),
+                )
+                self.connection.commit()
+                reverted = opencode._read_opencode_snapshot(self.ref, latest_window=True)
+                self.assertNotEqual(reverted.checkpoint, baseline.checkpoint)
+                self.assertNotEqual(reverted.transcript, baseline.transcript)
+                self.assertEqual(
+                    conversation_change_status("opencode", self.ref, baseline.checkpoint),
+                    "changed",
+                )
+
+                self.connection.execute(
+                    "UPDATE session SET revert=NULL WHERE id=?", (self.SESSION_ID,)
+                )
+                self.connection.commit()
+                restored = opencode._read_opencode_snapshot(self.ref, latest_window=True)
+                self.assertEqual(restored, baseline)
 
     def test_checkpoint_ignores_title_unrelated_session_and_bookkeeping_payloads(self) -> None:
         self.add_message("msg_u1", "user", text("semantic"), created=1)

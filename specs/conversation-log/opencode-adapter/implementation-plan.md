@@ -351,19 +351,19 @@
   checks without installing persistently or touching the user's provider data.
 - [ ] Run full native Windows and WSL suites, Ruff lint/format, build/sdist/wheel/twine checks, and
   GitHub Actions on Python 3.11–3.13 for both OSes.
-- [ ] Ask Claude Opus 5 for a follow-up plan verdict and focused reviews after Phase 0, Phase 2/3,
+- [x] Ask Claude Opus 5 for a follow-up plan verdict and focused reviews after Phase 0, Phase 2/3,
   and the final integrated diff.
   Resolve/disprove every HIGH/MEDIUM and rerun affected mutation gates.
 - [ ] Update `HARNESS_CONTRACT.md`, `NORTH_STAR.md`, README/config examples/help, spec index, changelog,
   and an evidence-backed retro. Open a PR with the WSL `vandyand` account and complete CI/review.
 - [ ] Perform a requirement-by-requirement completion audit against this plan and the active user
   objective before declaring the three-harness system complete.
-- [ ] Prove digest/read closure in both window modes by changing an assistant summary from
+- [x] Prove digest/read closure in both window modes by changing an assistant summary from
   incomplete/errored to completed without changing its text; checkpoint and selected window must
   both change.
-- [ ] Revert then unrevert a message and a part, before and after compaction. Each transition must
+- [x] Revert then unrevert a message and a part, before and after compaction. Each transition must
   change the checkpoint and selected context, and no reverted member may be promoted as unchanged.
-- [ ] Round-trip a committed-but-unverified OpenCode member with `checkpoint=None` through schema-6
+- [x] Round-trip a committed-but-unverified OpenCode member with `checkpoint=None` through schema-6
   state and prove every status decision is unstable/unknown, never unchanged or promotable.
 
 ### Phase 5 runtime findings
@@ -394,6 +394,11 @@
   import, discovery, semantic reread, native export, and exact safe/dangerous resume argv for
   imported session `ses_fce772619ffe62PYq5R5l3suRR`. Both provider storage and package directory
   were removed afterward; the package directory was sent to the Recycle Bin rather than erased.
+- The final integrated Opus 5 review returned **GO** with no HIGH findings. Its one remaining MEDIUM
+  and three inexpensive LOW mutations covered ordinary import failure, provider-removed temporary
+  files, nested creation/cleanup failure, and successful import without a recoverable ID. Four
+  production-path tests killed all four mutations in a focused follow-up; Opus returned **GO** with
+  no remaining HIGH/MEDIUM/LOW findings. The resulting local suite contains 462 tests.
 
 ## Rollback
 
