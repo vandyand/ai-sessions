@@ -1,4 +1,5 @@
 import json
+import os
 import sqlite3
 import sys
 import tempfile
@@ -321,11 +322,26 @@ class OpenCodeWriterIntegrationTests(unittest.TestCase):
                     (written.native.session_id,),
                 ).fetchone()[0]
             )
+            message_ids = [
+                row[0]
+                for row in connection.execute(
+                    "SELECT id FROM message WHERE session_id=?", (written.native.session_id,)
+                )
+            ]
+            part_ids = [
+                row[0]
+                for row in connection.execute(
+                    "SELECT id FROM part WHERE session_id=?", (written.native.session_id,)
+                )
+            ]
         finally:
             connection.close()
         self.assertEqual(title, "Imported title")
         self.assertIn("ai_sessions_import_nonce", json.loads(metadata))
         self.assertEqual(user["model"], {"providerID": "provider", "modelID": "large"})
+        self.assertRegex(written.native.session_id, r"^ses_[0-9A-Za-z]{26}$")
+        for native_id in (*message_ids, *part_ids):
+            self.assertRegex(native_id, r"^(?:msg|prt)_[0-9A-Za-z]{26}$")
         import_path = Path(Path(str(self.database) + ".import-path").read_text(encoding="utf-8"))
         self.assertFalse(import_path.exists())
 
@@ -620,6 +636,53 @@ class OpenCodeWriterIntegrationTests(unittest.TestCase):
             opencode._write_opencode(
                 cwd=str(self.root), turns=self.turns(), prepared=without_database
             )
+
+    @unittest.skipUnless(os.name == "nt", "Windows command-shim import fidelity")
+    def test_windows_cmd_fake_preserves_metacharacter_paths_with_shell_false(self) -> None:
+        command_root = self.root / "cmd & caret^ bang! parens()"
+        command_root.mkdir()
+        shim = command_root / "open-code.cmd"
+        shim.write_text(
+            f'@echo off\r\n"{sys.executable}" "{FAKE_CLI}" "{self.database}" standard %*\r\n',
+            encoding="utf-8",
+        )
+        with patch.dict(
+            os.environ,
+            {
+                "PATH": str(command_root) + os.pathsep + os.environ.get("PATH", ""),
+                "PATHEXT": ".CMD;.EXE;.BAT;.COM",
+            },
+        ):
+            prepared = opencode._prepare_opencode_target(("open-code",), str(self.root), {})
+            with patch.object(tempfile, "tempdir", str(command_root)):
+                written = opencode._write_opencode(
+                    cwd=str(self.root), turns=self.turns(), prepared=prepared
+                )
+        self.assertIsNotNone(written.checkpoint)
+        import_path = Path(Path(str(self.database) + ".import-path").read_text(encoding="utf-8"))
+        self.assertEqual(import_path.parent, command_root)
+        self.assertFalse(import_path.exists())
+        self.assertRegex(written.native.session_id, r"^ses_[0-9A-Za-z]{26}$")
+        connection = sqlite3.connect(self.database)
+        try:
+            message_ids = [
+                row[0]
+                for row in connection.execute(
+                    "SELECT id FROM message WHERE session_id=?", (written.native.session_id,)
+                )
+            ]
+            part_ids = [
+                row[0]
+                for row in connection.execute(
+                    "SELECT id FROM part WHERE session_id=?", (written.native.session_id,)
+                )
+            ]
+        finally:
+            connection.close()
+        self.assertTrue(message_ids)
+        self.assertTrue(part_ids)
+        for native_id in (*message_ids, *part_ids):
+            self.assertRegex(native_id, r"^(?:msg|prt)_[0-9A-Za-z]{26}$")
 
 
 if __name__ == "__main__":

@@ -278,30 +278,63 @@
 
 ## Phase 4: Pairwise and conversation-routing validation
 
-- [ ] Add deterministic fake OpenCode executables used on Windows and Linux—including a `.cmd`
+- [x] Add deterministic fake OpenCode executables used on Windows and Linux—including a `.cmd`
   resolved through `PATHEXT` with `shell=False`—for
   models/import/db-path behavior, while all storage/read/discovery logic uses real SQLite fixtures.
-- [ ] Give `.cmd`/`.bat` fakes metacharacter-bearing temp paths and assert argv fidelity under the
+- [x] Give `.cmd`/`.bat` fakes metacharacter-bearing temp paths and assert argv fidelity under the
   platform's unavoidable command-shim parsing; generated IDs remain restricted to the enforced
   native-safe character set.
-- [ ] Add a discovery fake whose `db path` never exits. The shared pass must return within the
+- [x] Add a discovery fake whose `db path` never exits. The shared pass must return within the
   timeout, discover Claude/Codex normally, use an inferred OpenCode binding, and emit one notice.
-- [ ] Run all six ordered bridge directions through production `bridge()` and `prepare_launch()`.
+- [x] Run all six ordered bridge directions through production `bridge()` and `prepare_launch()`.
   For each, reread the target natively and compare semantic roles/text/tool summaries/order.
-- [ ] Validate the three same-harness identities separately through production native resume:
+- [x] Validate the three same-harness identities separately through production native resume:
   Claude→Claude, Codex→Codex, and OpenCode→OpenCode create no copy and no second member. The bridge
   API continues to reject same-harness materialization explicitly.
-- [ ] For OpenCode as source and target, prove target budget selection, latest/full windows,
+- [x] For OpenCode as source and target, prove target budget selection, latest/full windows,
   provenance note, title suffix, custom command, safe/dangerous/custom resume argv, local/provider
   rename, discovery refresh, hidden/search/list/JSON/detail UI, and native exact resume.
-- [ ] Exercise archived and parent-ID child sessions as sources and routing heads. Real CLI
+- [x] Exercise archived and parent-ID child sessions as sources and routing heads. Real CLI
   validation must prove exact resume/advance before either kind is offered as resumable; otherwise
   discovery marks it explicitly non-resumable instead of constructing an unverified command.
-- [ ] Extend head-routing tests with OpenCode equivalents: equivalent target reuse, source advance,
+- [x] Extend head-routing tests with OpenCode equivalents: equivalent target reuse, source advance,
   target advance, return hop, missing row, unavailable newest generation, concurrent source update,
   two-way divergence, title-only nonadvance, and unrelated-DB-write nonadvance.
-- [ ] Generalize the shared third-harness matrix so a fourth adapter still requires no core edits;
+- [x] Generalize the shared third-harness matrix so a fourth adapter still requires no core edits;
   retain structural gates against provider-name branches and pairwise converters.
+
+### Phase 4 findings
+
+- The deterministic matrix runs all six ordered pairs through both `bridge()` and
+  `prepare_launch()`, rereads each native target without filtering the result, and checks exact
+  roles, source-message order, tool request, and tool result. OpenCode-specific routing mutations
+  cover source/target advance, equivalent reuse, return hops, missing rows, unavailable newest
+  generations, concurrent source updates before target writes, two-way and older-generation
+  divergence, and semantic checkpoint neutrality for title-only and unrelated-database writes.
+- The Windows command-shim gate resolves extensionless `open-code` through an isolated `PATH` and
+  `PATHEXT`, keeps `shell=False`, crosses a metacharacter-bearing directory and import path, and
+  checks the persisted `ses_`, `msg_`, and `prt_` identifiers against the native-safe alphabet.
+  The same identifier checks also run platform-neutrally through the ordinary fake executable.
+- Exact child and archived-root resume was captured on 2026-08-23 with the isolated
+  `/tmp/opencode-ai-sessions-bin/opencode` **1.18.21** binary and XDG store rooted at
+  `/tmp/opencode-ai-sessions-target`; no user provider store or persistent installation was used.
+  A native root `ses_fce906be4ffedaYGIdmpDd93mt` invoked the real `task` tool, which created child
+  `ses_fce8f35ffffessMLX90EfjLF3s` with `parent_id` equal to the root. Running
+  `opencode run --pure --format json --model opencode/big-pickle --session
+  ses_fce8f35ffffessMLX90EfjLF3s ...` returned that exact child `sessionID`, appended
+  `CHILD-RESUME-OK`, and advanced its `time_updated` from `1787535872484` to `1787535900692`
+  without changing its parent. After setting the isolated root's native `time_archived` to its
+  then-current `1787535874900`, the corresponding exact-root invocation returned root
+  `sessionID` `ses_fce906be4ffedaYGIdmpDd93mt`, appended `ARCHIVED-RESUME-OK`, advanced
+  `time_updated` to `1787535930378`, and left `time_archived=1787535874900`. This provider-native
+  evidence satisfies the precondition for offering both discovered row kinds as directly
+  resumable via `--session <their-own-id>`.
+- The first Opus 5 Phase 4 review returned **NO-GO (HIGH=2, MEDIUM=6, LOW=3)**. All HIGH/MEDIUM
+  findings and two material LOW gaps were fixed. The follow-up reread the diff, ran 451 Windows
+  tests, the 16-test matrix, the 90-test writer/discovery set, and Ruff, then returned **GO**
+  conditional only on recording this capture, checking this phase, and committing its evidence.
+- Phase 4 gate: 451 tests pass on native Windows (one skip) and Ubuntu WSL (three Windows-only
+  skips); Ruff 0.16.3 lint/format and `git diff --check` pass.
 
 ## Phase 5: Real CLI, review, and release gates
 

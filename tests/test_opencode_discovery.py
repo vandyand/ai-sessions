@@ -1194,7 +1194,7 @@ class OpenCodeDiscoveryTests(unittest.TestCase):
         started = time.monotonic()
         with self.assertRaisesRegex(BridgeError, "timed out"):
             opencode.run_maintenance(command, (), cwd=str(self.root), timeout=0.1)
-        self.assertLess(time.monotonic() - started, 3)
+        self.assertLess(time.monotonic() - started, 1)
 
     def test_maintenance_runner_cleans_up_when_reader_start_fails(self) -> None:
         processes: list[subprocess.Popen[bytes]] = []
@@ -1336,9 +1336,69 @@ class OpenCodeDiscoveryTests(unittest.TestCase):
             patch.dict(os.environ, {"OPENCODE_DB": ""}),
         ):
             rows = opencode.discover(context, use_cache=False)
-        self.assertLess(time.monotonic() - started, 3)
+        self.assertLess(time.monotonic() - started, 1)
         self.assertEqual(len(rows), 2)
         self.assertTrue(any("binding is inferred" in note for note in diagnostics.warnings()))
+
+    def test_hanging_db_path_does_not_block_other_harnesses_in_shared_refresh(self) -> None:
+        home = self.root / "home"
+        database = home / "opencode.db"
+        self.populated_database(database)
+
+        def native_discover(tool: str):
+            def discover(context: HarnessContext, *, use_cache: bool = True):
+                del context, use_cache
+                return [
+                    NativeSession(
+                        tool=tool,
+                        session_id=f"{tool}-survives",
+                        title=f"{tool.title()} survives",
+                        cwd="/work",
+                        updated=2,
+                        created=1,
+                        preview="survives",
+                        named=True,
+                        storage=str(self.root / f"{tool}.jsonl"),
+                    )
+                ]
+
+            return discover
+
+        config = LaunchConfig(
+            providers={
+                "opencode": ProviderProfile(
+                    command=[sys.executable, "-c", "import time; time.sleep(30)"]
+                )
+            }
+        )
+        started = time.monotonic()
+        with (
+            opencode_home(home),
+            REGISTRY.temporary(
+                replace(
+                    REGISTRY.get("claude"),
+                    discover=native_discover("claude"),
+                    inspect_liveness=Unsupported("isolated test"),
+                )
+            ),
+            REGISTRY.temporary(
+                replace(
+                    REGISTRY.get("codex"),
+                    discover=native_discover("codex"),
+                    inspect_liveness=Unsupported("isolated test"),
+                )
+            ),
+            REGISTRY.temporary(
+                replace(REGISTRY.get("opencode"), inspect_liveness=Unsupported("isolated test"))
+            ),
+            patch.object(opencode, "DB_PATH_TIMEOUT_SECONDS", 0.1),
+            patch.dict(os.environ, {"OPENCODE_DB": ""}),
+        ):
+            loaded = load_sessions(use_cache=False, config=config)
+        self.assertLess(time.monotonic() - started, 1)
+        self.assertEqual({item.tool for item in loaded}, {"claude", "codex", "opencode"})
+        binding_notices = [note for note in diagnostics.warnings() if "binding is inferred" in note]
+        self.assertEqual(len(binding_notices), 1)
 
     def test_failed_binding_probe_is_memoized_across_refresh_contexts(self) -> None:
         home = self.root / "home"

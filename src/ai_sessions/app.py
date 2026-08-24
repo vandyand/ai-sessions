@@ -1962,12 +1962,21 @@ class Browser:
             )
             latest_user_message = clean_prompt(item.preview)
             detail_row = detail_top + 5
-            if item.parent_id:
+            if item.parent_id and item.resume_target != item.session_id:
                 self.add(
                     detail_row,
                     2,
                     "Opens      parent session " + item.resume_target,
                     self.style("warning"),
+                    width - 4,
+                )
+                detail_row += 1
+            elif item.parent_id:
+                self.add(
+                    detail_row,
+                    2,
+                    "Parent     " + item.parent_id + " · resumes this child directly",
+                    self.style("muted"),
                     width - 4,
                 )
                 detail_row += 1
