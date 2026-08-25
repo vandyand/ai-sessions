@@ -238,6 +238,95 @@ class LivenessTests(unittest.TestCase):
         self.assertTrue(item.is_open)
         self.assertEqual(item.open_pid, 41)
 
+    def claimed(self, directory: str, *claims: dict[str, object]) -> Session:
+        """Run detection over a registry holding the given entries."""
+        home = Path(directory)
+        registry = home / "sessions"
+        registry.mkdir()
+        for claim in claims:
+            pid = int(str(claim["pid"]))
+            record = {
+                "sessionId": "shared",
+                "kind": "interactive",
+                "procStart": f"start-{pid}",
+                **claim,
+            }
+            (registry / f"{pid}.json").write_text(json.dumps(record), encoding="utf-8")
+        item = Session("claude", "shared", "", "", 0, 0, "", False, "storage")
+        processes = tuple(
+            ProcessInfo(
+                int(str(claim["pid"])), "claude", ("claude",), f"start-{int(str(claim['pid']))}"
+            )
+            for claim in claims
+        )
+        context = self.context("linux", *processes)
+        with REGISTRY.temporary(replace(REGISTRY.get("claude"), home=home)):
+            detect_open_sessions([item], context=context)
+        return item
+
+    def test_the_still_refreshed_claim_wins_when_two_processes_claim_one_session(self) -> None:
+        # A process that moves to another session without rewriting its entry
+        # keeps claiming the old one, and picking the wrong claimant focuses
+        # an unrelated terminal.
+        diagnostics.clear_warnings()
+        with tempfile.TemporaryDirectory() as directory:
+            item = self.claimed(
+                directory,
+                {"pid": 1135153, "updatedAt": 1787282562349},
+                {"pid": 2974016, "updatedAt": 1787605966685},
+            )
+        self.assertTrue(item.is_open)
+        self.assertEqual(item.open_pid, 2974016)
+        collision = [w for w in diagnostics.warnings() if "claim session shared" in w]
+        self.assertEqual(len(collision), 1)
+        self.assertIn("PID 2974016, not 1135153", collision[0])
+
+    def test_the_abandoned_claim_loses_regardless_of_file_ordering(self) -> None:
+        # Entries are named after the PID, so sort order is unrelated to which
+        # claim is current; the freshest must win from either arrangement.
+        for stale, live in ((11, 22), (22, 11)):
+            with self.subTest(stale=stale, live=live), tempfile.TemporaryDirectory() as directory:
+                item = self.claimed(
+                    directory,
+                    {"pid": stale, "updatedAt": 1_000},
+                    {"pid": live, "updatedAt": 9_000},
+                )
+                self.assertEqual(item.open_pid, live)
+
+    def test_equally_fresh_claims_resolve_the_same_way_every_run(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            first = self.claimed(
+                directory, {"pid": 42, "updatedAt": 5_000}, {"pid": 7, "updatedAt": 5_000}
+            )
+        with tempfile.TemporaryDirectory() as directory:
+            second = self.claimed(
+                directory, {"pid": 7, "updatedAt": 5_000}, {"pid": 42, "updatedAt": 5_000}
+            )
+        self.assertEqual(first.open_pid, second.open_pid)
+
+    def test_a_single_claim_is_used_without_complaint(self) -> None:
+        diagnostics.clear_warnings()
+        with tempfile.TemporaryDirectory() as directory:
+            item = self.claimed(directory, {"pid": 99, "updatedAt": 5_000})
+        self.assertEqual(item.open_pid, 99)
+        self.assertEqual([w for w in diagnostics.warnings() if "claim session" in w], [])
+
+    def test_a_claim_without_timestamps_falls_back_to_its_file(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            registry = Path(directory) / "sessions"
+            registry.mkdir()
+            path = registry / "5.json"
+            path.write_text(json.dumps({"pid": 5, "sessionId": "s"}), encoding="utf-8")
+            os.utime(path, (1_000, 1_000))
+            from ai_sessions.harnesses import claude as claude_harness
+
+            self.assertEqual(claude_harness._claim_refreshed_at({"pid": 5}, path), 1_000_000.0)
+            self.assertEqual(claude_harness._claim_refreshed_at({"startedAt": 42}, path), 42.0)
+            # A boolean is not a timestamp, and must not be read as one.
+            self.assertEqual(
+                claude_harness._claim_refreshed_at({"updatedAt": True}, path), 1_000_000.0
+            )
+
     def test_claude_linux_registry_rejects_pid_reuse(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             home = Path(directory)
