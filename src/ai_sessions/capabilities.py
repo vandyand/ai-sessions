@@ -111,6 +111,7 @@ class HarnessAdapter:
     change_status: ChangeStatusHook | Unsupported
     budget: BudgetPolicy
     liveness_source_kinds: frozenset[SourceKind] = frozenset((SourceKind.INTERACTIVE,))
+    liveness_executables: frozenset[str] = frozenset()
     scratch_patterns: tuple[Pattern[str], ...] = ()
     discover: DiscoverHook | Unsupported = Unsupported("discovery is not installed")
     resume_args: ResumeArgsHook | Unsupported = Unsupported("resume is not installed")
@@ -159,6 +160,11 @@ class HarnessAdapter:
             isinstance(value, SourceKind) for value in self.liveness_source_kinds
         ):
             raise ValueError("harness liveness source kinds must contain SourceKind values")
+        if not isinstance(self.liveness_executables, frozenset) or not all(
+            isinstance(value, str) and value.strip() and value == value.casefold()
+            for value in self.liveness_executables
+        ):
+            raise ValueError("harness liveness executables must be lowercase non-empty strings")
         if not isinstance(self.inspect_liveness, Unsupported) and not (
             self.liveness_source_kinds.issubset(self.source_kinds)
         ):

@@ -30,8 +30,33 @@ class LivenessTests(unittest.TestCase):
         ):
             populate_context(context)
             populate_context(context)
-        processes.assert_called_once_with(context.platform)
+        processes.assert_called_once_with(
+            context.platform,
+            start_time_executables=context.liveness_executables,
+        )
         locks.assert_called_once_with(context.platform)
+
+    def test_selective_snapshot_queries_start_only_for_declared_executables(self) -> None:
+        class FakeProcess:
+            def __init__(self, pid: int, name: str, command: list[str]) -> None:
+                self.info = {"pid": pid, "name": name, "cmdline": command}
+                self.start_queries = 0
+
+            def create_time(self) -> float:
+                self.start_queries += 1
+                return 1.25
+
+        unrelated = FakeProcess(7, "python.exe", ["python.exe", "worker.py"])
+        wrapped = FakeProcess(8, "node.exe", ["node.exe", "C:/tools/opencode.cmd"])
+        with patch.object(liveness.psutil, "process_iter", return_value=[unrelated, wrapped]):
+            snapshot = liveness.process_snapshot(
+                "win32",
+                start_time_executables=frozenset(("opencode.cmd",)),
+            )
+        self.assertEqual(unrelated.start_queries, 0)
+        self.assertEqual(snapshot[0].start_token, "")
+        self.assertEqual(wrapped.start_queries, 1)
+        self.assertNotEqual(snapshot[1].start_token, "")
 
     def test_windows_process_snapshot_emits_filetime_start_token(self) -> None:
         process = type(

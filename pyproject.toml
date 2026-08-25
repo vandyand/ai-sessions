@@ -50,6 +50,7 @@ include = [
     "tests",
     "tools",
     "README.md",
+    "DESIGN.md",
     "CHANGELOG.md",
     "LICENSE",
     "pyproject.toml",

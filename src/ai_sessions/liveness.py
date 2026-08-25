@@ -47,11 +47,33 @@ def _windows_start_token(value: Any) -> str:
         return ""
 
 
-def process_snapshot(platform: str | None = None) -> tuple[ProcessInfo, ...]:
+def _basename(value: str) -> str:
+    return value.replace("\\", "/").rsplit("/", 1)[-1].casefold()
+
+
+def _needs_start_time(
+    name: str,
+    command: tuple[str, ...],
+    executables: frozenset[str] | None,
+) -> bool:
+    if executables is None:
+        return True
+    if _basename(name) in executables:
+        return True
+    return any(_basename(value.strip(" \t\"'")) in executables for value in command)
+
+
+def process_snapshot(
+    platform: str | None = None,
+    *,
+    start_time_executables: frozenset[str] | None = None,
+) -> tuple[ProcessInfo, ...]:
     """Enumerate live processes once without retaining provider-specific state."""
     current_platform = platform or sys.platform
     result: list[ProcessInfo] = []
-    attributes = ("pid", "name", "cmdline", "create_time")
+    attributes = ["pid", "name", "cmdline"]
+    if start_time_executables is None:
+        attributes.append("create_time")
     try:
         processes = iter(psutil.process_iter(attributes))
     except Exception:
@@ -75,13 +97,19 @@ def process_snapshot(platform: str | None = None) -> tuple[ProcessInfo, ...]:
             pid = int(process.info["pid"])
             name = str(process.info.get("name") or "")
             command = tuple(str(value) for value in (process.info.get("cmdline") or ()))
-            started_at = float(process.info.get("create_time") or 0)
-            if current_platform == "win32":
-                start = _windows_start_token(started_at) if started_at > 0 else ""
-            else:
-                start = process_start_token(pid)
+            started_at = 0.0
+            start = ""
+            if _needs_start_time(name, command, start_time_executables):
+                raw_started = process.info.get("create_time")
+                if raw_started is None and start_time_executables is not None:
+                    raw_started = process.create_time()
+                started_at = float(raw_started or 0)
+                if current_platform == "win32":
+                    start = _windows_start_token(started_at) if started_at > 0 else ""
+                else:
+                    start = process_start_token(pid)
             result.append(ProcessInfo(pid, name, command, start, started_at))
-        except (psutil.Error, KeyError, TypeError, ValueError, OverflowError):
+        except (AttributeError, psutil.Error, KeyError, TypeError, ValueError, OverflowError):
             continue
     return tuple(result)
 
@@ -111,7 +139,10 @@ def populate_context(context: Any) -> None:
     """Populate a HarnessContext exactly once, including when both snapshots are empty."""
     if context.liveness_ready:
         return
-    context.process_snapshot = process_snapshot(context.platform)
+    context.process_snapshot = process_snapshot(
+        context.platform,
+        start_time_executables=context.liveness_executables,
+    )
     context.lock_map = held_file_locks(context.platform)
     context.liveness_ready = True
 

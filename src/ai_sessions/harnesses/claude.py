@@ -50,7 +50,7 @@ from ..registry import REGISTRY
 
 CLAUDE_VERSION = "2.1.227"
 CLAUDE_HOME = env_path("CLAUDE_CONFIG_DIR", HOME / ".claude")
-DISCOVERY_CACHE_VERSION = 5
+DISCOVERY_CACHE_VERSION = 6
 DISCOVERY_CACHE_FILE = APP_CACHE_DIR / f"claude-discovery-v{DISCOVERY_CACHE_VERSION}.json"
 
 
@@ -385,7 +385,6 @@ class DiscoveryCache:
                         incomplete = True
                         break
                     meta["offset"] = handle.tell()
-                    evidence.scan(line)
                     if not any(marker in line for marker in self.INTERESTING):
                         continue
                     try:
@@ -393,6 +392,10 @@ class DiscoveryCache:
                     except (json.JSONDecodeError, UnicodeDecodeError):
                         continue
                     kind = item.get("type")
+                    if kind in ("user", "assistant") and not item.get("isMeta"):
+                        semantic_text = prompt_text(item.get("message"))
+                        if semantic_text:
+                            evidence.scan(semantic_text.encode("utf-8", "replace"))
                     if allow_sidechain:
                         agent_id = item.get("agentId")
                         parent_id = item.get("sessionId")
@@ -489,9 +492,17 @@ def discover(context: HarnessContext, *, use_cache: bool = True) -> list[NativeS
     cache = DiscoveryCache(context)
     result: list[NativeSession] = []
     try:
-        files = sorted(projects.glob("*/*.jsonl"))
+        all_files = sorted(projects.rglob("*.jsonl"))
     except OSError:
-        files = []
+        all_files = []
+        index_complete = False
+    else:
+        index_complete = True
+    for path in all_files:
+        context.index_native("claude", path.stem, str(path))
+    if index_complete:
+        context.complete_native_index("claude")
+    files = [path for path in all_files if len(path.relative_to(projects).parts) == 2]
     for path in files:
         session_id = path.stem
         if not re.fullmatch(r"[0-9a-fA-F-]{32,36}", session_id):
@@ -537,12 +548,9 @@ def discover(context: HarnessContext, *, use_cache: bool = True) -> list[NativeS
             )
         )
 
-    try:
-        agent_files = sorted(
-            path for path in projects.rglob("agent-*.jsonl") if "subagents" in path.parts
-        )
-    except OSError:
-        agent_files = []
+    agent_files = [
+        path for path in all_files if path.name.startswith("agent-") and "subagents" in path.parts
+    ]
     for path in agent_files:
         fallback_agent_id = path.stem.removeprefix("agent-")
         try:
@@ -558,6 +566,7 @@ def discover(context: HarnessContext, *, use_cache: bool = True) -> list[NativeS
         parent_id = str(meta.get("parent_session_id") or fallback_parent_id)
         if not agent_id or not parent_id:
             continue
+        context.index_native("claude", agent_id, str(path))
         context.publish("claude", agent_id, evidence)
         first = clean_prompt(meta.get("first_prompt"))
         last = clean_prompt(meta.get("last_prompt"))
@@ -718,6 +727,7 @@ ADAPTER = HarnessAdapter(
     resume_args=resume_args,
     publish_name=publish_name,
     inspect_liveness=inspect_liveness,
+    liveness_executables=frozenset(("claude", "claude.exe", "claude.cmd", "claude.ps1")),
     budget=BudgetPolicy(
         context_tokens=CLAUDE_BUDGET_CONTEXT_TOKENS,
         usable_fraction=DEFAULT_USABLE_FRACTION,

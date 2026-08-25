@@ -9,7 +9,9 @@ import sys
 from dataclasses import dataclass, field
 from typing import Any, Mapping
 
+from .capabilities import Unsupported
 from .liveness import ProcessInfo
+from .model import NativeRef
 from .registry import REGISTRY
 
 MAX_EVIDENCE_IDS = 4_096
@@ -181,6 +183,9 @@ class HarnessContext:
     lock_map: dict[tuple[int, int, int], int] = field(default_factory=dict)
     liveness_ready: bool = False
     provider_commands: dict[str, tuple[str, ...]] = field(default_factory=dict)
+    liveness_executables: frozenset[str] = frozenset()
+    native_refs: dict[tuple[str, str], list[NativeRef]] = field(default_factory=dict)
+    complete_native_indexes: set[str] = field(default_factory=set)
     adapter_state: dict[str, Any] = field(default_factory=dict)
 
     @classmethod
@@ -212,11 +217,18 @@ class HarnessContext:
             ):
                 raise ValueError(f"provider command for {name} must be a non-empty string sequence")
             commands[name] = tuple(command)
+        executables: set[str] = set()
+        for adapter in REGISTRY.adapters():
+            if not isinstance(adapter.inspect_liveness, Unsupported):
+                executables.update(adapter.liveness_executables)
+                command = commands.get(adapter.name, adapter.default_command)
+                executables.add(re.split(r"[\\/]", command[0])[-1].casefold())
         return cls(
             use_cache=use_cache,
             patterns=tuple(patterns),
             pattern_signature=digest.hexdigest(),
             provider_commands=commands,
+            liveness_executables=frozenset(executables),
         )
 
     def provider_command(self, name: str) -> tuple[str, ...]:
@@ -241,3 +253,16 @@ class HarnessContext:
 
     def mark_cross_origin(self, tool: str, session_id: str, source_tool: str) -> None:
         self.origin_hints[(tool, session_id)] = source_tool
+
+    def index_native(self, tool: str, session_id: str, storage: str) -> None:
+        if not tool or not session_id or not storage:
+            return
+        key = (tool, session_id)
+        ref = NativeRef(session_id, storage)
+        refs = self.native_refs.setdefault(key, [])
+        if ref not in refs:
+            refs.append(ref)
+
+    def complete_native_index(self, tool: str) -> None:
+        if tool:
+            self.complete_native_indexes.add(tool)

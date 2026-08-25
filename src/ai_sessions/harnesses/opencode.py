@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import contextlib
 import functools
+import hashlib
 import json
 import os
 import re
@@ -17,7 +18,7 @@ import tempfile
 import threading
 import time
 import urllib.parse
-from dataclasses import dataclass
+from dataclasses import asdict, dataclass, fields
 from pathlib import Path
 from typing import Any, Iterable, Iterator
 
@@ -38,7 +39,7 @@ from ..model import (
     SourceKind,
     Turn,
 )
-from ..paths import HOME, IS_WINDOWS, env_path
+from ..paths import APP_CACHE_DIR, HOME, IS_WINDOWS, env_path
 from ..registry import REGISTRY
 from .opencode_semantics import (
     CHECKPOINT_SCHEME,
@@ -151,6 +152,9 @@ _AUTHORITATIVE_BINDINGS: dict[tuple[tuple[str, ...], str], DatabaseBinding] = {}
 _DISCOVERY_CACHE_LOCK = threading.RLock()
 _DISCOVERY_CACHE: dict[tuple[str, str, tuple[Any, ...]], _CachedDiscovery] = {}
 _DISCOVERY_CACHE_SIZE = 8
+_DISCOVERY_CACHE_VERSION = 1
+_DISCOVERY_CACHE_MAX_BYTES = 64 * 1024 * 1024
+OPENCODE_DISCOVERY_CACHE_FILE = APP_CACHE_DIR / "opencode-discovery-v1.json"
 
 
 class _WindowsJob:
@@ -771,19 +775,126 @@ def _store_stamp(path: Path) -> tuple[Any, ...] | None:
     return tuple(values)
 
 
+def _discovery_cache_fingerprint(key: tuple[str, str, tuple[Any, ...]]) -> str:
+    return hashlib.sha256(repr(key).encode("utf-8", "surrogatepass")).hexdigest()
+
+
+def _load_persistent_discovery(
+    key: tuple[str, str, tuple[Any, ...]],
+) -> _CachedDiscovery | None:
+    path = OPENCODE_DISCOVERY_CACHE_FILE
+    try:
+        if path.stat().st_size > _DISCOVERY_CACHE_MAX_BYTES:
+            return None
+        document = json.loads(path.read_text(encoding="utf-8"))
+        if (
+            not isinstance(document, dict)
+            or document.get("version") != _DISCOVERY_CACHE_VERSION
+            or document.get("fingerprint") != _discovery_cache_fingerprint(key)
+        ):
+            return None
+        raw_sessions = document.get("sessions")
+        raw_evidence = document.get("evidence")
+        malformed = document.get("malformed")
+        oversized = document.get("oversized")
+        if (
+            not isinstance(raw_sessions, list)
+            or not isinstance(raw_evidence, list)
+            or not isinstance(malformed, bool)
+            or not isinstance(oversized, bool)
+            or len(raw_sessions) > 100_000
+            or len(raw_evidence) > 100_000
+        ):
+            return None
+        session_fields = {field.name for field in fields(NativeSession)}
+        sessions: list[NativeSession] = []
+        for raw in raw_sessions:
+            if not isinstance(raw, dict) or set(raw) != session_fields:
+                return None
+            values = dict(raw)
+            if values.get("tool") != "opencode" or values.get("storage") != key[0]:
+                return None
+            values["source"] = SourceKind(values["source"])
+            sessions.append(NativeSession(**values))
+        evidence: list[tuple[str, tuple[str, ...], bool]] = []
+        for raw in raw_evidence:
+            if (
+                not isinstance(raw, list)
+                or len(raw) != 3
+                or not isinstance(raw[0], str)
+                or not isinstance(raw[1], list)
+                or not all(isinstance(token, str) for token in raw[1])
+                or not isinstance(raw[2], bool)
+            ):
+                return None
+            evidence.append((raw[0], tuple(raw[1]), raw[2]))
+        if {item.session_id for item in sessions} != {item[0] for item in evidence}:
+            return None
+        return _CachedDiscovery(tuple(sessions), tuple(evidence), malformed, oversized)
+    except (OSError, UnicodeError, ValueError, TypeError):
+        return None
+
+
+def _save_persistent_discovery(
+    key: tuple[str, str, tuple[Any, ...]], cached: _CachedDiscovery
+) -> None:
+    path = OPENCODE_DISCOVERY_CACHE_FILE
+    document = {
+        "version": _DISCOVERY_CACHE_VERSION,
+        "fingerprint": _discovery_cache_fingerprint(key),
+        "sessions": [asdict(session) for session in cached.sessions],
+        "evidence": [
+            [session_id, list(tokens), truncated]
+            for session_id, tokens, truncated in cached.evidence
+        ],
+        "malformed": cached.malformed,
+        "oversized": cached.oversized,
+    }
+    temporary = path.with_name(f".{path.name}.tmp-{os.getpid()}-{threading.get_ident()}")
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        temporary.write_text(
+            json.dumps(document, ensure_ascii=False, separators=(",", ":")),
+            encoding="utf-8",
+        )
+        try:
+            temporary.chmod(0o600)
+        except OSError:
+            pass
+        temporary.replace(path)
+    except (OSError, TypeError, ValueError):
+        try:
+            temporary.unlink(missing_ok=True)
+        except OSError:
+            pass
+
+
+def _publish_cached_discovery(cached: _CachedDiscovery, context: HarnessContext) -> None:
+    for session_id, tokens, truncated in cached.evidence:
+        context.evidence[("opencode", session_id)] = (list(tokens), truncated)
+    for session in cached.sessions:
+        context.index_native("opencode", session.session_id, session.storage)
+    context.complete_native_index("opencode")
+    if cached.malformed:
+        record_warning("OpenCode discovery skipped malformed session data")
+    if cached.oversized:
+        record_warning("OpenCode discovery omitted details from oversized session data")
+
+
 def _cached_discovery(
     key: tuple[str, str, tuple[Any, ...]], context: HarnessContext
 ) -> list[NativeSession] | None:
     with _DISCOVERY_CACHE_LOCK:
         cached = _DISCOVERY_CACHE.get(key)
     if cached is None:
-        return None
-    for session_id, tokens, truncated in cached.evidence:
-        context.evidence[("opencode", session_id)] = (list(tokens), truncated)
-    if cached.malformed:
-        record_warning("OpenCode discovery skipped malformed session data")
-    if cached.oversized:
-        record_warning("OpenCode discovery omitted details from oversized session data")
+        cached = _load_persistent_discovery(key)
+        if cached is None:
+            return None
+        with _DISCOVERY_CACHE_LOCK:
+            _DISCOVERY_CACHE[key] = cached
+            while len(_DISCOVERY_CACHE) > _DISCOVERY_CACHE_SIZE:
+                _DISCOVERY_CACHE.pop(next(iter(_DISCOVERY_CACHE)))
+    _publish_cached_discovery(cached, context)
     return list(cached.sessions)
 
 
@@ -807,6 +918,7 @@ def _remember_discovery(
         _DISCOVERY_CACHE[key] = cached
         while len(_DISCOVERY_CACHE) > _DISCOVERY_CACHE_SIZE:
             _DISCOVERY_CACHE.pop(next(iter(_DISCOVERY_CACHE)))
+    _save_persistent_discovery(key, cached)
 
 
 def _sqlite_readonly_uri(path: Path) -> str:
@@ -1077,7 +1189,12 @@ def discover(context: HarnessContext, *, use_cache: bool = True) -> list[NativeS
             message_key = row[2] if isinstance(row[2], bytes) else b""
             return session_key, message_key
 
-        def read_part(row: tuple[Any, ...], state: _DiscoveryState | None) -> dict[str, Any] | None:
+        def read_part(
+            row: tuple[Any, ...],
+            state: _DiscoveryState | None,
+            *,
+            semantic: bool = False,
+        ) -> dict[str, Any] | None:
             nonlocal malformed, oversized
             if any(_native_identifier(row[index]) is None for index in (1, 2, 4)):
                 malformed = True
@@ -1086,11 +1203,23 @@ def discover(context: HarnessContext, *, use_cache: bool = True) -> list[NativeS
                 "part",
                 int(row[0]),
                 str(row[5] or ""),
-                state.evidence if state is not None else None,
+                None,
             )
             part = _json_object(raw)
             if part is None and not row_oversized:
                 malformed = True
+            if semantic and state is not None:
+                part_text = (
+                    part.get("text") if part is not None and part.get("type") == "text" else None
+                )
+                if isinstance(part_text, str):
+                    state.evidence.scan(part_text.encode("utf-8", "replace"))
+                elif row_oversized:
+                    # The bounded prefix cannot be parsed, so retain conservative
+                    # evidence from it and mark the negative conclusion incomplete.
+                    state.evidence.scan(raw)
+                if row_oversized:
+                    state.evidence.truncated = True
             oversized = oversized or row_oversized
             return part
 
@@ -1120,7 +1249,7 @@ def discover(context: HarnessContext, *, use_cache: bool = True) -> list[NativeS
                 "message",
                 int(rowid),
                 str(storage_type or ""),
-                current_state.evidence if current_state is not None else None,
+                None,
             )
             message = _json_object(message_raw)
             if message is None and not message_oversized:
@@ -1130,7 +1259,11 @@ def discover(context: HarnessContext, *, use_cache: bool = True) -> list[NativeS
             current_parts: list[str] = []
             current_preview_chars = 0
             while part_row is not None and part_key(part_row) == key:
-                part = read_part(part_row, current_state)
+                part = read_part(
+                    part_row,
+                    current_state,
+                    semantic=role in ("user", "assistant"),
+                )
                 if role == "user" and part is not None and part.get("type") == "text":
                     part_text = part.get("text")
                     if isinstance(part_text, str):
@@ -1173,24 +1306,25 @@ def discover(context: HarnessContext, *, use_cache: bool = True) -> list[NativeS
             if named
             else item.first_user or item.native_title or "untitled OpenCode session"
         )
-        result.append(
-            NativeSession(
-                tool="opencode",
-                session_id=item.session_id,
-                title=title,
-                cwd=item.directory,
-                updated=item.updated,
-                created=item.created,
-                preview=item.latest_user,
-                named=named,
-                storage=str(binding.path),
-                source=SourceKind.SUBAGENT if item.parent_id else SourceKind.INTERACTIVE,
-                archived=item.archived,
-                parent_id=item.parent_id,
-                message_count=item.user_messages,
-                agent_nickname=item.agent,
-            )
+        native = NativeSession(
+            tool="opencode",
+            session_id=item.session_id,
+            title=title,
+            cwd=item.directory,
+            updated=item.updated,
+            created=item.created,
+            preview=item.latest_user,
+            named=named,
+            storage=str(binding.path),
+            source=SourceKind.SUBAGENT if item.parent_id else SourceKind.INTERACTIVE,
+            archived=item.archived,
+            parent_id=item.parent_id,
+            message_count=item.user_messages,
+            agent_nickname=item.agent,
         )
+        result.append(native)
+        context.index_native("opencode", native.session_id, native.storage)
+    context.complete_native_index("opencode")
     if cache_key is not None and cache_stable:
         _remember_discovery(cache_key, result, context, malformed, oversized)
     return result
@@ -2051,6 +2185,7 @@ ADAPTER = HarnessAdapter(
     checkpoint=_opencode_checkpoint,
     change_status=_opencode_change_status,
     liveness_source_kinds=frozenset((SourceKind.INTERACTIVE, SourceKind.SUBAGENT)),
+    liveness_executables=_OPENCODE_PROCESS_NAMES,
     discover=discover,
     resume_args=resume_args,
     publish_name=publish_name,
