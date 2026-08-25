@@ -22,9 +22,10 @@ import shutil
 import subprocess
 import sys
 import textwrap
+import threading
 import uuid
 from collections.abc import Mapping
-from dataclasses import asdict, replace
+from dataclasses import asdict, fields, replace
 from pathlib import Path
 from typing import Any, Iterable
 
@@ -55,6 +56,7 @@ from .liveness import populate_context as populate_liveness_context
 from .liveness import process_start_token
 from .model import Checkpoint, LivenessSession, NativeRef, NativeSession, Session, SourceKind
 from .paths import (
+    APP_CACHE_DIR,
     HOME,
     IS_WINDOWS,
     STATE_FILE,
@@ -82,6 +84,8 @@ CODEX_ID_PATTERN = re.compile(
     re.I,
 )
 _UNSET_CHECKPOINT = object()
+CATALOG_CACHE_VERSION = 1
+CATALOG_CACHE_FILE = APP_CACHE_DIR / f"session-catalog-v{CATALOG_CACHE_VERSION}.json"
 
 
 def tool_label(name: str, *, short: bool = True) -> str:
@@ -94,6 +98,16 @@ def tool_label(name: str, *, short: bool = True) -> str:
 
 def tool_order() -> tuple[str, ...]:
     return ("all", *REGISTRY.names())
+
+
+def tool_filter_label(tools: Iterable[str]) -> str:
+    selected = set(tools)
+    ordered = [adapter for adapter in REGISTRY.adapters() if adapter.name in selected]
+    if len(ordered) == len(REGISTRY.adapters()):
+        return "All tools"
+    if not ordered:
+        return "No tools"
+    return " + ".join(adapter.short_label for adapter in ordered)
 
 
 def tool_column_width(minimum: int) -> int:
@@ -1046,7 +1060,12 @@ def reconcile_evidence(sessions: list[Session], context: HarnessContext) -> None
                         continue
                     cache_key = (adapter.name, token)
                     if cache_key not in locate_cache:
-                        if probes >= MAX_EXISTENCE_PROBES_PER_PASS:
+                        indexed = context.native_refs.get(cache_key)
+                        if indexed:
+                            locate_cache[cache_key] = True
+                        elif adapter.name in context.complete_native_indexes:
+                            locate_cache[cache_key] = False
+                        elif probes >= MAX_EXISTENCE_PROBES_PER_PASS:
                             if not probe_limit_reported:
                                 record_warning(
                                     "native existence probes were capped for this discovery "
@@ -1054,11 +1073,12 @@ def reconcile_evidence(sessions: list[Session], context: HarnessContext) -> None
                                 )
                                 probe_limit_reported = True
                             continue
-                        probes += 1
-                        try:
-                            locate_cache[cache_key] = resolver(token) is not None
-                        except OSError:
-                            locate_cache[cache_key] = False
+                        else:
+                            probes += 1
+                            try:
+                                locate_cache[cache_key] = resolver(token) is not None
+                            except OSError:
+                                locate_cache[cache_key] = False
                     exists = locate_cache[cache_key]
                     if exists:
                         resolved.append((adapter.name, token, by_key.get((adapter.name, token))))
@@ -1160,6 +1180,142 @@ def load_sessions(
         state.apply(result)
     detect_open_sessions(result, context=context)
     return result
+
+
+def _catalog_signature() -> list[dict[str, Any]]:
+    return [
+        {"name": adapter.name, "order": adapter.order, "home": str(adapter.home)}
+        for adapter in REGISTRY.adapters()
+    ]
+
+
+def save_session_catalog(sessions: Iterable[Session], path: Path = CATALOG_CACHE_FILE) -> None:
+    """Persist a safe first-paint catalog; live and utility-owned state is recomputed."""
+    rows: list[dict[str, Any]] = []
+    for item in sessions:
+        payload = asdict(item)
+        payload.update(
+            renamed=False,
+            hidden=False,
+            launch_tool="",
+            conversation_id="",
+            superseded=False,
+            diverged=False,
+            is_open=False,
+            open_pid=0,
+        )
+        rows.append(payload)
+    document = {
+        "version": CATALOG_CACHE_VERSION,
+        "registry": _catalog_signature(),
+        "sessions": rows,
+    }
+    temporary = path.with_suffix(f".tmp-{os.getpid()}-{threading.get_ident()}")
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        temporary.write_text(
+            json.dumps(document, ensure_ascii=False, separators=(",", ":")),
+            encoding="utf-8",
+        )
+        try:
+            temporary.chmod(0o600)
+        except OSError:
+            pass
+        temporary.replace(path)
+    except OSError:
+        try:
+            temporary.unlink(missing_ok=True)
+        except OSError:
+            pass
+
+
+def load_session_catalog(
+    state: UserState | None = None,
+    path: Path = CATALOG_CACHE_FILE,
+) -> list[Session]:
+    """Load the last complete catalog without touching any provider-owned storage."""
+    try:
+        document = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError, UnicodeError):
+        return []
+    if (
+        not isinstance(document, dict)
+        or document.get("version") != CATALOG_CACHE_VERSION
+        or document.get("registry") != _catalog_signature()
+        or not isinstance(document.get("sessions"), list)
+    ):
+        return []
+    field_names = {field.name for field in fields(Session)}
+    result: list[Session] = []
+    for payload in document["sessions"][:100_000]:
+        if not isinstance(payload, dict) or set(payload) != field_names:
+            continue
+        try:
+            item = Session(**payload)
+        except (TypeError, ValueError):
+            continue
+        if item.tool in REGISTRY:
+            item.is_open = False
+            item.open_pid = 0
+            result.append(item)
+    result = dedupe_sessions(result)
+    if state is not None:
+        state.apply(result)
+    return result
+
+
+class SessionRefresh:
+    """One background provider refresh with a pollable, single-consumer result."""
+
+    def __init__(
+        self,
+        *,
+        use_cache: bool,
+        state: UserState,
+        config: LaunchConfig,
+        catalog_path: Path = CATALOG_CACHE_FILE,
+    ) -> None:
+        self._use_cache = use_cache
+        self._state = state
+        self._config = config
+        self._catalog_path = catalog_path
+        self._done = threading.Event()
+        self._taken = False
+        self._sessions: list[Session] | None = None
+        self._warnings: tuple[str, ...] = ()
+        self._error = ""
+        self._thread = threading.Thread(
+            target=self._run,
+            name="ai-sessions-refresh",
+            daemon=True,
+        )
+        self._thread.start()
+
+    def _run(self) -> None:
+        try:
+            sessions = load_sessions(
+                use_cache=self._use_cache,
+                state=self._state,
+                config=self._config,
+            )
+            save_session_catalog(sessions, self._catalog_path)
+            self._sessions = sessions
+            self._warnings = tuple(load_warnings())
+        except Exception as error:
+            self._error = f"refresh failed: {error}"
+        finally:
+            self._done.set()
+
+    def ready(self) -> bool:
+        return self._done.is_set()
+
+    def take(self, *, wait: bool = False) -> tuple[list[Session] | None, tuple[str, ...], str]:
+        if wait:
+            self._done.wait()
+        if not self._done.is_set() or self._taken:
+            return None, (), ""
+        self._taken = True
+        return self._sessions, self._warnings, self._error
 
 
 def detect_open_sessions(
@@ -1496,6 +1652,7 @@ def query_match(session: Session, query: str) -> tuple[bool, int]:
 def filtered_sessions(
     sessions: Iterable[Session],
     tool: str = "all",
+    tools: Iterable[str] | None = None,
     directory: str = "",
     query: str = "",
     origin: str = "human",
@@ -1514,7 +1671,10 @@ def filtered_sessions(
             continue
         if visibility == "hidden" and not item.hidden:
             continue
-        if tool != "all" and item.tool != tool:
+        if tools is not None:
+            if item.tool not in tools:
+                continue
+        elif tool != "all" and item.tool != tool:
             continue
         if directory and item.cwd != directory:
             continue
@@ -1638,13 +1798,15 @@ class Browser:
         state: UserState,
         launch_config: LaunchConfig,
         use_cache: bool = True,
+        refresh: SessionRefresh | None = None,
     ) -> None:
         self.screen = screen
         self.sessions = sessions
         self.state = state
         self.launch_config = launch_config
         self.use_cache = use_cache
-        self.tool = "all"
+        self.refresh = refresh
+        self._tools = set(REGISTRY.names())
         self.origin = "human"
         self.visibility = "visible"
         self.directory = ""
@@ -1653,10 +1815,93 @@ class Browser:
         self.selected = 0
         self.offset = 0
         self.searching = False
-        self.message = ""
+        self.message = (
+            "Loading sessions…"
+            if refresh is not None and not sessions
+            else "Refreshing sessions…"
+            if refresh is not None
+            else ""
+        )
         self.result: Session | None = None
         self.pairs = self._pair_layout()
         self.setup_colors()
+
+    @property
+    def tools(self) -> frozenset[str]:
+        return frozenset(self._tools)
+
+    @tools.setter
+    def tools(self, values: Iterable[str]) -> None:
+        available = set(REGISTRY.names())
+        selected = {value for value in values if value in available}
+        self._tools = selected or available
+
+    @property
+    def tool(self) -> str:
+        available = set(REGISTRY.names())
+        if self._tools == available:
+            return "all"
+        if len(self._tools) == 1:
+            return next(iter(self._tools))
+        return "multiple"
+
+    @tool.setter
+    def tool(self, value: str) -> None:
+        if value == "all":
+            self._tools = set(REGISTRY.names())
+        elif value in REGISTRY:
+            self._tools = {value}
+
+    def _set_input_timeout(self, milliseconds: int) -> None:
+        timeout = getattr(self.screen, "timeout", None)
+        if timeout is not None:
+            timeout(milliseconds)
+
+    def run_modal(self, action: Any) -> None:
+        """Suspend refresh polling while a modal owns keyboard input."""
+        self._set_input_timeout(-1)
+        try:
+            action()
+        finally:
+            if self.refresh is not None:
+                self._set_input_timeout(100)
+
+    def apply_refresh(self, *, wait: bool = False) -> bool:
+        if self.refresh is None:
+            return False
+        sessions, warnings, error = self.refresh.take(wait=wait)
+        if sessions is None and not error:
+            return False
+        previous = self.selected_id()
+        self.refresh = None
+        self._set_input_timeout(-1)
+        if error:
+            self.message = error + "; press Ctrl-R to retry"
+            return True
+        assert sessions is not None
+        self.sessions = sessions
+        self.keep_selection(previous)
+        self.message = "; ".join(warnings) or "Sessions refreshed."
+        return True
+
+    def finish_refresh(self) -> None:
+        if self.refresh is None:
+            return
+        self.message = "Finishing session refresh…"
+        self.draw()
+        self.apply_refresh(wait=True)
+
+    def begin_refresh(self) -> None:
+        if self.refresh is not None:
+            self.message = "A session refresh is already running."
+            return
+        self.refresh = SessionRefresh(
+            use_cache=self.use_cache,
+            state=self.state,
+            config=self.launch_config,
+        )
+        self.message = "Refreshing sessions…"
+        self._set_input_timeout(100)
 
     @staticmethod
     def _pair_layout() -> dict[str, int]:
@@ -1762,7 +2007,7 @@ class Browser:
     def current(self) -> list[Session]:
         return filtered_sessions(
             self.sessions,
-            tool=self.tool,
+            tools=self.tools,
             directory=self.directory,
             query=self.query,
             origin=self.origin,
@@ -1790,7 +2035,6 @@ class Browser:
 
     def draw(self) -> None:
         self.screen.erase()
-        detect_open_sessions(self.sessions)
         height, width = self.screen.getmaxyx()
         items = self.current()
         if height < 12 or width < 65:
@@ -1804,10 +2048,13 @@ class Browser:
         mode_text = f"Launch: {self.launch_config.mode.upper()}"
         mode_style = "warning" if self.launch_config.mode == "dangerous" else "success"
         self.add(0, 14, mode_text, self.style(mode_style, curses.A_BOLD))
-        count_text = f"{open_count} open · {len(items)} shown · {len(self.sessions)} indexed"
+        refresh_text = " · refreshing" if self.refresh is not None else ""
+        count_text = (
+            f"{open_count} open · {len(items)} shown · {len(self.sessions)} indexed{refresh_text}"
+        )
         self.add(0, max(1, width - len(count_text) - 2), count_text, self.style("muted"))
 
-        tool_text = "All tools" if self.tool == "all" else tool_label(self.tool)
+        tool_text = tool_filter_label(self.tools)
         dir_text = "All directories" if not self.directory else short_path(self.directory)
         filters = (
             f"{tool_text}  ·  {ORIGIN_LABELS[self.origin]}  ·  "
@@ -1856,11 +2103,16 @@ class Browser:
         self.add(3, 1, heading, self.style("muted", curses.A_BOLD), width - 2)
 
         if not items:
-            self.add(list_top + 1, 3, "No sessions match these filters.", self.style("warning"))
+            empty_text = (
+                "Loading sessions from installed tools…"
+                if self.refresh is not None and not self.sessions
+                else "No sessions match these filters."
+            )
+            self.add(list_top + 1, 3, empty_text, self.style("warning"))
             self.add(
                 list_top + 3,
                 3,
-                "Esc clears the search; Tab changes tools; d changes directory.",
+                "Esc clears the search; t chooses tools; d changes directory.",
                 self.style("muted"),
             )
         else:
@@ -1991,8 +2243,8 @@ class Browser:
                 )
 
         footer = self.message or (
-            "Enter focus/resume  Ctrl-F search  x select launch harness  p launch  o origin  v view  "
-            "s sort  r rename  h hide  q quit  ? help"
+            "Enter focus/resume  Ctrl-F search  t tools  x launch harness  p launch  o origin  "
+            "v view  s sort  r rename  h hide  q quit  ? help"
         )
         self.add(footer_row, 1, footer, self.style("accent", curses.A_BOLD), width - 2)
         if self.searching:
@@ -2015,11 +2267,84 @@ class Browser:
         index = order.index(self.tool) if self.tool in order else 0
         self.tool = order[(index + (-1 if backwards else 1)) % len(order)]
         if self.directory and not any(
-            item.cwd == self.directory and (self.tool == "all" or item.tool == self.tool)
-            for item in self.sessions
+            item.cwd == self.directory and item.tool in self.tools for item in self.sessions
         ):
             self.directory = ""
         self.keep_selection(previous)
+
+    def tool_picker(self) -> None:
+        adapters = list(REGISTRY.adapters())
+        if not adapters:
+            self.message = "No session tools are registered."
+            return
+        previous = self.selected_id()
+        pending = set(self.tools)
+        selected = 0
+        notice = ""
+        while True:
+            self.screen.erase()
+            height, width = self.screen.getmaxyx()
+            box_width = min(70, max(30, width - 4))
+            left = max(0, (width - box_width) // 2)
+            visible = max(1, height - 8)
+            offset = min(max(0, selected - visible + 1), max(0, len(adapters) - visible))
+            self.add(1, left, "TOOLS — CHOOSE WHAT TO SHOW", self.style("accent", curses.A_BOLD))
+            self.add(
+                3,
+                left,
+                "Space toggle · a all · Enter apply · Esc cancel",
+                self.style("muted"),
+                box_width,
+            )
+            for row, adapter in enumerate(adapters[offset : offset + visible]):
+                index = offset + row
+                checked = "x" if adapter.name in pending else " "
+                marker = "›" if index == selected else " "
+                self.add(
+                    5 + row,
+                    left,
+                    f"{marker} [{checked}] {adapter.label}",
+                    self.style(adapter.name, curses.A_BOLD, selected=index == selected),
+                    box_width,
+                )
+            summary = tool_filter_label(pending)
+            self.add(
+                min(height - 2, 5 + min(visible, len(adapters)) + 1),
+                left,
+                notice or f"Showing: {summary}",
+                self.style("warning" if notice else "muted"),
+                box_width,
+            )
+            self.screen.refresh()
+            key = self.screen.get_wch()
+            notice = ""
+            if key == "\x1b":
+                self.message = "Tool filter unchanged."
+                return
+            if key in (curses.KEY_UP, "k"):
+                selected = max(0, selected - 1)
+            elif key in (curses.KEY_DOWN, "j"):
+                selected = min(len(adapters) - 1, selected + 1)
+            elif key == " ":
+                name = adapters[selected].name
+                if name in pending:
+                    pending.remove(name)
+                else:
+                    pending.add(name)
+            elif key == "a":
+                pending = {adapter.name for adapter in adapters}
+            elif key in ("\n", "\r", curses.KEY_ENTER):
+                if not pending:
+                    notice = "Choose at least one tool; press a to restore all tools."
+                    continue
+                self.tools = pending
+                if self.directory and not any(
+                    item.cwd == self.directory and item.tool in self.tools for item in self.sessions
+                ):
+                    self.directory = ""
+                self.keep_selection(previous)
+                self.message = f"Showing {tool_filter_label(self.tools)}."
+                return
 
     def cycle_origin(self, backwards: bool = False) -> None:
         previous = self.selected_id()
@@ -2081,7 +2406,7 @@ class Browser:
         counts: dict[str, int] = {}
         eligible = filtered_sessions(
             self.sessions,
-            tool=self.tool,
+            tools=self.tools,
             origin=self.origin,
             visibility=self.visibility,
         )
@@ -2229,6 +2554,7 @@ class Browser:
                 value += key
 
     def rename_selected(self) -> None:
+        self.finish_refresh()
         items = self.current()
         if not items:
             return
@@ -2241,6 +2567,7 @@ class Browser:
         self.message = note or ("Name saved." if value else "Original name restored.")
 
     def toggle_hidden(self) -> None:
+        self.finish_refresh()
         items = self.current()
         if not items:
             return
@@ -2273,7 +2600,12 @@ class Browser:
             ("OPEN", "● running or Ⅱ paused in a live terminal"),
             ("Ctrl-F or /", "Enter search mode; command keys are then search text"),
             ("is:open", "Search syntax also supports tool:, dir:, name:, and origin:"),
-            ("Tab", "Cycle All → Codex → Claude"),
+            (
+                "Tab",
+                "Cycle single-tool presets: All → "
+                + " → ".join(adapter.short_label for adapter in REGISTRY.adapters()),
+            ),
+            ("t", "Choose any combination of tools to show"),
             ("o", "Cycle Human → Cross → Agent → All origins"),
             ("v", "Cycle Visible → Hidden → Visible + hidden"),
             ("A", "Show every session: all origins, visible and hidden"),
@@ -2326,9 +2658,17 @@ class Browser:
         return None
 
     def run(self) -> Session | None:
+        if self.refresh is not None:
+            self._set_input_timeout(100)
         while True:
+            self.apply_refresh()
             self.draw()
-            key = self.screen.get_wch()
+            try:
+                key = self.screen.get_wch()
+            except curses.error:
+                if self.refresh is not None:
+                    continue
+                raise
             self.message = ""
             items = self.current()
             page = max(1, self.screen.getmaxyx()[0] - 12)
@@ -2346,6 +2686,8 @@ class Browser:
             elif key == curses.KEY_END or (not self.searching and key == "G"):
                 self.selected = max(0, len(items) - 1)
             elif key in ("\n", "\r", curses.KEY_ENTER):
+                self.finish_refresh()
+                items = self.current()
                 if items:
                     chosen = items[self.selected]
                     if chosen.is_open:
@@ -2394,9 +2736,11 @@ class Browser:
             elif not self.searching and key == "q":
                 return None
             elif not self.searching and key == "?":
-                self.help()
+                self.run_modal(self.help)
+            elif not self.searching and key == "t":
+                self.run_modal(self.tool_picker)
             elif not self.searching and key == "d":
-                self.directory_picker()
+                self.run_modal(self.directory_picker)
             elif not self.searching and key == "s":
                 self.cycle_sort()
             elif not self.searching and key == "p":
@@ -2431,16 +2775,7 @@ class Browser:
                 self.origin = "all" if self.origin != "all" else "human"
                 self.keep_selection(previous)
             elif key == "\x12":  # Ctrl-R
-                previous = self.selected_id()
-                self.message = "Refreshing…"
-                self.draw()
-                self.sessions = load_sessions(
-                    use_cache=self.use_cache,
-                    state=self.state,
-                    config=self.launch_config,
-                )
-                self.message = "; ".join(load_warnings())
-                self.keep_selection(previous)
+                self.begin_refresh()
             elif key == "\x06" or (not self.searching and key == "/"):  # Ctrl-F or /
                 self.searching = True
             elif isinstance(key, str) and key.isprintable():
@@ -2791,7 +3126,9 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--sort", choices=tuple(SORT_LABELS), default="recent", help="sort order")
     parser.add_argument("--include-auxiliary", action="store_true", help=argparse.SUPPRESS)
     parser.add_argument(
-        "--no-cache", action="store_true", help="rebuild Claude metadata without using the cache"
+        "--no-cache",
+        action="store_true",
+        help="rebuild provider metadata without discovery caches",
     )
     parser.add_argument(
         "--resume", metavar="ID_OR_NAME", help="resume an exact session ID or named session"
@@ -2851,13 +3188,28 @@ def main(argv: list[str] | None = None) -> int:
         return 0
     if args.launch_mode:
         launch_config.mode = args.launch_mode
-    sessions = load_sessions(
-        use_cache=not args.no_cache,
-        state=state,
-        config=launch_config,
+    tui_mode = bool(
+        not (args.list or args.json or args.resume or args.rename or args.hide or args.unhide)
+        and sys.stdin.isatty()
+        and sys.stdout.isatty()
     )
-    for note in load_warnings():
-        print(f"sessions: {note}", file=sys.stderr)
+    background_refresh: SessionRefresh | None = None
+    if tui_mode:
+        sessions = [] if args.no_cache else load_session_catalog(state)
+        background_refresh = SessionRefresh(
+            use_cache=not args.no_cache,
+            state=state,
+            config=launch_config,
+        )
+    else:
+        sessions = load_sessions(
+            use_cache=not args.no_cache,
+            state=state,
+            config=launch_config,
+        )
+        save_session_catalog(sessions)
+        for note in load_warnings():
+            print(f"sessions: {note}", file=sys.stderr)
 
     def resolve(target: str) -> Session | None:
         exact = [
@@ -2954,6 +3306,7 @@ def main(argv: list[str] | None = None) -> int:
             state=state,
             launch_config=launch_config,
             use_cache=not args.no_cache,
+            refresh=background_refresh,
         )
         browser.tool = args.tool
         browser.origin = selected_origin

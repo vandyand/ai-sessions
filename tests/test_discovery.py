@@ -467,6 +467,24 @@ class GenericDiscoveryTests(unittest.TestCase):
         self.assertIn(token, calls)
         self.assertEqual(publisher.launch_targets["codex"], token)
 
+    def test_complete_native_index_answers_positive_and_negative_without_probes(self) -> None:
+        calls: list[str] = []
+        fake = replace(
+            REGISTRY.get("codex"),
+            name="native",
+            id_patterns=(re.compile(rb"native-[0-9]+"),),
+            resolve=lambda token: calls.append(token) or None,
+        )
+        publisher = Session("claude", "publisher", "", "", 0, 0, "", False, "source")
+        context = HarnessContext.create()
+        context.evidence[("claude", "publisher")] = (["native-1", "native-2"], False)
+        context.index_native("native", "native-1", "store")
+        context.complete_native_index("native")
+        with REGISTRY.temporary(fake):
+            reconcile_evidence([publisher], context)
+        self.assertEqual(calls, [])
+        self.assertEqual(publisher.launch_targets["native"], "native-1")
+
     def test_scratch_origin_is_declared_by_publisher_not_target(self) -> None:
         base = REGISTRY.get("codex")
         publisher_adapter = replace(

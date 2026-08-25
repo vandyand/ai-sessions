@@ -57,7 +57,7 @@ from ..registry import REGISTRY
 CODEX_CLI_VERSION = "0.147.0"
 CODEX_HOME = env_path("CODEX_HOME", HOME / ".codex")
 _RESULT_NOISE = re.compile(r"^Script completed\s*(Wall time[^\n]*)?\s*Output:\s*", re.I)
-DISCOVERY_CACHE_VERSION = 5
+DISCOVERY_CACHE_VERSION = 6
 DISCOVERY_CACHE_FILE = APP_CACHE_DIR / f"codex-discovery-v{DISCOVERY_CACHE_VERSION}.json"
 
 
@@ -462,16 +462,15 @@ class DiscoveryCache:
                     if not line:
                         break
                     offset = handle.tell()
-                    evidence.scan(line)
-                    response_user = bool(
+                    response_message = bool(
                         b"response_item" in line
-                        and (b'"role":"user"' in line or b'"role": "user"' in line)
+                        and (b'"type":"message"' in line or b'"type": "message"' in line)
                     )
                     user_event = b"event_msg" in line and b"user_message" in line
                     if source is SourceKind.SUBAGENT:
-                        if not response_user and not user_event:
+                        if not response_message and not user_event:
                             continue
-                    elif not user_event:
+                    elif not response_message and not user_event:
                         continue
                     try:
                         item = json.loads(line)
@@ -480,7 +479,18 @@ class DiscoveryCache:
                     payload = item.get("payload")
                     if not isinstance(payload, dict):
                         continue
+                    if (
+                        item.get("type") == "response_item"
+                        and payload.get("type") == "message"
+                        and payload.get("role") in ("user", "assistant")
+                    ):
+                        semantic_text = prompt_text(payload)
+                        if semantic_text:
+                            evidence.scan(semantic_text.encode("utf-8", "replace"))
                     if item.get("type") == "event_msg" and payload.get("type") == "user_message":
+                        raw_message = payload.get("message")
+                        if isinstance(raw_message, str) and raw_message:
+                            evidence.scan(raw_message.encode("utf-8", "replace"))
                         value = clean_prompt(payload.get("message"))
                         if value:
                             latest = value
@@ -848,6 +858,7 @@ ADAPTER = HarnessAdapter(
     resume_args=resume_args,
     publish_name=publish_name,
     inspect_liveness=inspect_liveness,
+    liveness_executables=frozenset(("codex", "codex.exe")),
     budget=BudgetPolicy(
         context_tokens=CODEX_BUDGET_CONTEXT_TOKENS,
         usable_fraction=DEFAULT_USABLE_FRACTION,

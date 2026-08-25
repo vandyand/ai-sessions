@@ -131,7 +131,14 @@ def opencode_home(path: Path):
     with opencode._DISCOVERY_CACHE_LOCK:
         cached_discovery = dict(opencode._DISCOVERY_CACHE)
         opencode._DISCOVERY_CACHE.clear()
-    with REGISTRY.temporary(replace(REGISTRY.get("opencode"), home=path)):
+    with (
+        REGISTRY.temporary(replace(REGISTRY.get("opencode"), home=path)),
+        patch.object(
+            opencode,
+            "OPENCODE_DISCOVERY_CACHE_FILE",
+            path / "ai-sessions-test-opencode-discovery.json",
+        ),
+    ):
         try:
             yield
         finally:
@@ -423,6 +430,51 @@ class OpenCodeDiscoveryTests(unittest.TestCase):
         self.assertEqual(first_context.evidence, second_context.evidence)
         self.assertEqual(first_warnings, second_warnings)
         self.assertEqual(reads.call_count, 0)
+
+    def test_discovery_cache_survives_process_memory_reset(self) -> None:
+        database = self.root / "persistent-cache.db"
+        self.populated_database(database)
+        cache_home = self.root / "fallback"
+
+        def context() -> HarnessContext:
+            return HarnessContext.create(
+                use_cache=True,
+                provider_commands={"opencode": db_path_command(database)},
+            )
+
+        with opencode_home(cache_home):
+            expected = opencode.discover(context(), use_cache=True)
+            # The first connection can create SQLite sidecars, so take one stable pass.
+            expected = opencode.discover(context(), use_cache=True)
+            self.assertTrue(opencode.OPENCODE_DISCOVERY_CACHE_FILE.is_file())
+            with opencode._DISCOVERY_CACHE_LOCK:
+                opencode._DISCOVERY_CACHE.clear()
+            restored_context = context()
+            with patch.object(opencode, "_read_data", wraps=opencode._read_data) as reads:
+                restored = opencode.discover(restored_context, use_cache=True)
+        self.assertEqual(restored, expected)
+        self.assertEqual(reads.call_count, 0)
+        self.assertIn(("opencode", expected[0].session_id), restored_context.evidence)
+        self.assertIn("opencode", restored_context.complete_native_indexes)
+
+    def test_invalid_persistent_discovery_cache_is_ignored(self) -> None:
+        database = self.root / "invalid-persistent-cache.db"
+        self.populated_database(database)
+        cache_home = self.root / "fallback"
+        cache_file = cache_home / "ai-sessions-test-opencode-discovery.json"
+        cache_home.mkdir(parents=True)
+        cache_file.write_text('{"version": 1, "fingerprint": "wrong"}', encoding="utf-8")
+        context = HarnessContext.create(
+            use_cache=True,
+            provider_commands={"opencode": db_path_command(database)},
+        )
+        with (
+            opencode_home(cache_home),
+            patch.object(opencode, "_read_data", wraps=opencode._read_data) as reads,
+        ):
+            rows = opencode.discover(context, use_cache=True)
+        self.assertEqual(len(rows), 2)
+        self.assertGreater(reads.call_count, 0)
 
     def test_registry_pattern_change_misses_discovery_cache(self) -> None:
         database = self.root / "pattern-cache.db"
@@ -980,6 +1032,31 @@ class OpenCodeDiscoveryTests(unittest.TestCase):
             opencode.discover(context, use_cache=False)
         tokens, truncated = context.evidence[("opencode", session_id)]
         self.assertEqual(tokens, [foreign_id])
+        self.assertFalse(truncated)
+
+    def test_cross_harness_evidence_ignores_non_text_part_metadata(self) -> None:
+        database = self.root / "semantic-evidence.db"
+        connection = create_database(database)
+        session_id = "ses_000000000001AAAAAAAAAAAAAA"
+        visible_id = "019abcde-1234-5678-9abc-0123456789ab"
+        metadata_id = "019abcde-aaaa-bbbb-cccc-0123456789ab"
+        add_session(connection, session_id)
+        add_message(
+            connection,
+            session_id,
+            "msg-semantic",
+            "assistant",
+            {"type": "tool", "metadata": {"session": metadata_id}},
+            {"type": "text", "text": f"continued from {visible_id}"},
+            created=1,
+        )
+        connection.commit()
+        connection.close()
+        context = self.context(database)
+        with opencode_home(self.root / "fallback"):
+            opencode.discover(context, use_cache=False)
+        tokens, truncated = context.evidence[("opencode", session_id)]
+        self.assertEqual(tokens, [visible_id])
         self.assertFalse(truncated)
 
     def test_cross_harness_id_spanning_blob_chunks_is_not_lost(self) -> None:

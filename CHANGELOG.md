@@ -1,5 +1,23 @@
 # Changelog
 
+## Unreleased
+
+### Added
+
+- A discoverable `t` tool picker can show any non-empty combination of registered harnesses while
+  keeping `Tab` as a fast single-tool preset cycle.
+- The interactive browser paints a persisted session catalog immediately and refreshes provider
+  discovery and liveness in the background.
+
+### Changed
+
+- Process discovery collects expensive start-time identity only for possible harness processes.
+- Codex, Claude Code, and OpenCode discovery extract cross-harness evidence from semantic messages
+  instead of regex-scanning every serialized log byte; OpenCode discovery is persisted by exact
+  database snapshot identity.
+- Native references discovered during a provider scan are reused during reconciliation instead of
+  repeatedly searching provider storage.
+
 ## 3.2.1 — 2026-08-25
 
 ### Fixed

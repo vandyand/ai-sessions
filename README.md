@@ -1,5 +1,7 @@
 # ai-sessions
 
+The terminal interaction contract is documented in [DESIGN.md](DESIGN.md).
+
 `ai-sessions` is a searchable terminal browser for local
 [Codex CLI](https://developers.openai.com/codex/cli/), Claude Code, and
 [OpenCode](https://opencode.ai/) conversations. It indexes each harness's existing native history.
@@ -63,7 +65,8 @@ Run `sessions`, navigate with the arrow keys or `j`/`k`, and press Enter to resu
 | Key | Action |
 | --- | --- |
 | `Ctrl-F` or `/` | Start search mode |
-| `Tab` | Cycle provider filter |
+| `Tab` | Cycle single-tool filter presets |
+| `t` | Choose any combination of tools to show |
 | `o` | Cycle Human, Cross, Agent, and All origins |
 | `v` | Cycle visible, hidden, and all sessions |
 | `d` | Choose a directory |
