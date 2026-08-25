@@ -598,6 +598,23 @@ def _process_start_matches(context: LivenessContext, process: ProcessInfo, expec
     return bool(expected and process.start_token == expected)
 
 
+def _claim_refreshed_at(record: dict[str, Any], path: Path) -> float:
+    """When a registry entry last showed evidence of being maintained, in ms.
+
+    A live Claude rewrites its entry as it works, so the refresh time is the
+    only thing separating a current claim from one a process left behind
+    after it moved to another session.
+    """
+    for key in ("updatedAt", "statusUpdatedAt", "startedAt"):
+        value = record.get(key)
+        if isinstance(value, (int, float)) and not isinstance(value, bool) and value > 0:
+            return float(value)
+    try:
+        return path.stat().st_mtime * 1000
+    except OSError:
+        return 0.0
+
+
 def inspect_liveness(
     context: LivenessContext, home: Path, sessions: Iterable[LivenessSession]
 ) -> dict[str, int]:
@@ -606,7 +623,7 @@ def inspect_liveness(
     if not eligible:
         return {}
     processes = {item.pid: item for item in context.process_snapshot}
-    result: dict[str, int] = {}
+    claims: dict[str, list[tuple[float, int]]] = {}
     try:
         registry_files = sorted((home / "sessions").glob("*.json"))
     except OSError:
@@ -628,7 +645,27 @@ def inspect_liveness(
             continue
         if not _process_start_matches(context, process, expected_start):
             continue
-        result[session_id] = pid
+        claims.setdefault(session_id, []).append((_claim_refreshed_at(record, path), pid))
+
+    result: dict[str, int] = {}
+    for session_id, entries in claims.items():
+        # One process per session is the normal case.  More than one means a
+        # process kept advertising a session it no longer runs, and whichever
+        # entry happened to sort last used to win -- which is how focusing a
+        # session could land in an unrelated terminal.  Prefer the entry still
+        # being refreshed, and say so, because the loser is evidence of a
+        # registry that has stopped describing reality.
+        entries.sort(key=lambda entry: (-entry[0], entry[1]))
+        chosen = entries[0][1]
+        if len(entries) > 1:
+            others = ", ".join(str(pid) for _, pid in entries[1:])
+            record_warning(
+                f"{len(entries)} live Claude processes claim session {session_id}; "
+                f"using the most recently refreshed (PID {chosen}, not {others}). "
+                "A process that changed sessions without updating its registry entry "
+                "will keep claiming the old one until it exits."
+            )
+        result[session_id] = chosen
     return result
 
 

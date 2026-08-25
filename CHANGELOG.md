@@ -1,5 +1,15 @@
 # Changelog
 
+## 3.2.1 — 2026-08-25
+
+### Fixed
+
+- Resolve duplicate Claude liveness claims by refresh time instead of filename order. A Claude
+  process that moves to another session without rewriting its registry entry keeps advertising
+  the old one for as long as it runs, so two live processes can claim one session id. The claim
+  still being refreshed now wins, and the collision is reported with the losing PID, because a
+  stale claim is why focusing a session could open an unrelated terminal.
+
 ## 3.2.0 — 2026-08-23
 
 ### Added
