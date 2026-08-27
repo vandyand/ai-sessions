@@ -1,5 +1,21 @@
 # Changelog
 
+## 3.4.3 — 2026-08-27
+
+### Changed
+
+- Duplicate titles are disambiguated only when needed with stable, minimally unique session-ID
+  suffixes in the interactive browser and plain list output.
+
+### Fixed
+
+- Tracked conversations now accept launch targets only from their recorded conversation members;
+  transcript-derived IDs cannot redirect preparation or the final resume command to an unrelated
+  existing session.
+- Arbitrary transcript ID mentions no longer cross-link two human or subagent sessions. Legacy
+  discovery remains available when at least one side is a writer-created bridge artifact.
+- Ambiguous name errors now point to the browser detail and JSON output for the exact session ID.
+
 ## 3.4.2 — 2026-08-27
 
 ### Fixed

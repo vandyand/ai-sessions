@@ -368,7 +368,7 @@ class GenericDiscoveryTests(unittest.TestCase):
         self.assertEqual(target.origin, "cross")
         self.assertIn("truncated", diagnostics.warnings()[0])
 
-    def test_interactive_target_keeps_human_origin_when_real_id_is_mentioned(self) -> None:
+    def test_interactive_target_is_not_linked_when_real_id_is_mentioned(self) -> None:
         context = HarnessContext.create()
         publisher = Session("claude", "publisher", "", "", 0, 0, "", False, "source")
         target_id = "019f59af-e300-7bd1-be75-e47599b5b593"
@@ -376,7 +376,60 @@ class GenericDiscoveryTests(unittest.TestCase):
         context.evidence[("claude", "publisher")] = ([target_id], False)
         reconcile_evidence([publisher, target], context)
         self.assertEqual(target.origin, "human")
+        self.assertNotIn("codex", publisher.launch_targets)
+
+    def test_subagent_does_not_link_human_parent_or_unrelated_id(self) -> None:
+        context = HarnessContext.create()
+        publisher = Session(
+            "codex",
+            "019f0000-0000-7000-8000-000000000001",
+            "",
+            "",
+            0,
+            0,
+            "",
+            False,
+            "source",
+            source=SourceKind.SUBAGENT,
+            parent_id="019f59af-e300-7bd1-be75-e47599b5b593",
+        )
+        target = Session(
+            "claude",
+            "019f59af-e300-7bd1-be75-e47599b5b593",
+            "",
+            "",
+            0,
+            0,
+            "",
+            False,
+            "human",
+        )
+        context.evidence[("codex", publisher.session_id)] = ([target.session_id], False)
+        reconcile_evidence([publisher, target], context)
+        self.assertEqual(target.origin, "human")
+        self.assertNotIn("claude", publisher.launch_targets)
+
+    def test_noninteractive_bridge_artifact_links_reciprocally(self) -> None:
+        context = HarnessContext.create()
+        publisher = Session(
+            "claude",
+            "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
+            "",
+            "",
+            0,
+            0,
+            "",
+            False,
+            "bridge",
+            source=SourceKind.NON_INTERACTIVE,
+        )
+        target_id = "019f59af-e300-7bd1-be75-e47599b5b593"
+        target = Session("codex", target_id, "", "", 0, 0, "", False, "human")
+        context.evidence[("claude", publisher.session_id)] = ([target_id], False)
+        reconcile_evidence([publisher, target], context)
         self.assertEqual(publisher.launch_targets["codex"], target_id)
+        self.assertEqual(target.launch_targets["claude"], publisher.session_id)
+        self.assertEqual(target.origin, "human")
 
     def test_unresolved_existence_probes_are_bounded_and_disclosed(self) -> None:
         diagnostics.clear_warnings()
@@ -413,8 +466,12 @@ class GenericDiscoveryTests(unittest.TestCase):
                 or (NativeRef(token, "native-store") if token == "native-0" else None)
             ),
         )
-        first = Session("claude", "first", "", "", 0, 0, "", False, "first")
-        second = Session("claude", "second", "", "", 0, 0, "", False, "second")
+        first = Session(
+            "claude", "first", "", "", 0, 0, "", False, "first", source=SourceKind.NON_INTERACTIVE
+        )
+        second = Session(
+            "claude", "second", "", "", 0, 0, "", False, "second", source=SourceKind.NON_INTERACTIVE
+        )
         context = HarnessContext.create()
         context.evidence[("claude", "first")] = (
             [f"native-{index}" for index in range(40)],
@@ -459,7 +516,18 @@ class GenericDiscoveryTests(unittest.TestCase):
             REGISTRY.get("codex"),
             resolve=lambda value: calls.append(value) or NativeRef(value, "native-store"),
         )
-        publisher = Session("claude", "publisher", "", "", 0, 0, "", False, "source")
+        publisher = Session(
+            "claude",
+            "publisher",
+            "",
+            "",
+            0,
+            0,
+            "",
+            False,
+            "source",
+            source=SourceKind.NON_INTERACTIVE,
+        )
         context = HarnessContext.create()
         context.evidence[("claude", "publisher")] = ([token], False)
         with REGISTRY.temporary(codex):
@@ -475,7 +543,18 @@ class GenericDiscoveryTests(unittest.TestCase):
             id_patterns=(re.compile(rb"native-[0-9]+"),),
             resolve=lambda token: calls.append(token) or None,
         )
-        publisher = Session("claude", "publisher", "", "", 0, 0, "", False, "source")
+        publisher = Session(
+            "claude",
+            "publisher",
+            "",
+            "",
+            0,
+            0,
+            "",
+            False,
+            "source",
+            source=SourceKind.NON_INTERACTIVE,
+        )
         context = HarnessContext.create()
         context.evidence[("claude", "publisher")] = (["native-1", "native-2"], False)
         context.index_native("native", "native-1", "store")

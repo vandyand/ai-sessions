@@ -246,9 +246,12 @@ class ThirdHarnessContractTests(unittest.TestCase):
         self.assertEqual(by_key[("claude", shared_id)].launch_targets, {"claude": shared_id})
         self.assertEqual(
             by_key[("fixture", shared_id)].launch_targets,
-            {"fixture": shared_id, "claude": referenced_id},
+            {"fixture": shared_id},
         )
-        self.assertEqual(by_key[("claude", referenced_id)].launch_targets["fixture"], shared_id)
+        self.assertEqual(
+            by_key[("claude", referenced_id)].launch_targets,
+            {"claude": referenced_id},
+        )
 
     def test_browser_initializes_the_late_adapter_color_pair(self) -> None:
         initialized: dict[int, tuple[int, int]] = {}

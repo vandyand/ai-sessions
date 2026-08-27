@@ -912,6 +912,37 @@ def display_list_title(session: Session) -> str:
     return agent_tag(session) + (title if session.named else f"*- {title}")
 
 
+def title_disambiguators(sessions: Iterable[Session]) -> dict[str, str]:
+    """Return collision-only, stable ID labels for a rendered result set."""
+    groups: dict[str, list[Session]] = {}
+    for item in sessions:
+        groups.setdefault(display_title(item).casefold(), []).append(item)
+
+    labels: dict[str, str] = {}
+    for group in groups.values():
+        if len(group) < 2:
+            continue
+        width = 8
+        maximum = max((len(item.session_id) for item in group), default=width)
+        while width < maximum:
+            prefixes = [item.session_id[:width] for item in group]
+            if len(set(prefixes)) == len(prefixes):
+                break
+            width += 1
+        prefixes = [item.session_id[:width] for item in group]
+        if len(set(prefixes)) == len(prefixes):
+            for item, prefix in zip(group, prefixes, strict=True):
+                labels[item.key] = f"[{prefix}]"
+            continue
+
+        # Native IDs are normally unique within a rendered title collision.
+        # If two harnesses reuse the exact same ID, retain the complete ID and
+        # add the harness name rather than producing two identical row labels.
+        for item in group:
+            labels[item.key] = f"[{item.tool}:{item.session_id}]"
+    return labels
+
+
 def conversation_status(session: Session) -> str:
     """A stable, non-title label for the session's conversation position."""
     if session.diverged:
@@ -1047,6 +1078,15 @@ def reconcile_evidence(sessions: list[Session], context: HarnessContext) -> None
                         for pattern in REGISTRY.get(item.tool).id_patterns
                     )
                 ]
+            # Transcript text is only a heuristic counterpart signal.  Keep
+            # legacy bridge discovery for writer-created/imported artifacts,
+            # but never let text alone join two human/agent sessions.
+            if (
+                discovered
+                and not (publisher is not None and publisher.source is SourceKind.NON_INTERACTIVE)
+                and not any(item.source is SourceKind.NON_INTERACTIVE for item in discovered)
+            ):
+                continue
             resolved: list[tuple[str, str, Session | None]] = [
                 (item.tool, item.session_id, item) for item in discovered
             ]
@@ -1084,6 +1124,14 @@ def reconcile_evidence(sessions: list[Session], context: HarnessContext) -> None
                     exists = locate_cache[cache_key]
                     if exists:
                         resolved.append((adapter.name, token, by_key.get((adapter.name, token))))
+            # An existence probe has no discovered target row to establish
+            # the bridge-artifact side, so only a non-interactive publisher
+            # may create this legacy mapping.
+            if not resolved or (
+                not discovered
+                and (publisher is None or publisher.source is not SourceKind.NON_INTERACTIVE)
+            ):
+                continue
             identities = {(tool, session_id) for tool, session_id, _ in resolved}
             if len(identities) != 1:
                 continue
@@ -1933,6 +1981,17 @@ def ellipsize(value: str, width: int) -> str:
     return value[: width - 1] + "…"
 
 
+def ellipsize_with_suffix(value: str, suffix: str, width: int) -> str:
+    """Clip a title while keeping its collision suffix visible when space permits."""
+    if not suffix:
+        return ellipsize(value, width)
+    if width <= len(suffix):
+        return ellipsize(suffix, width)
+    separator = " "
+    title_width = width - len(separator) - len(suffix)
+    return ellipsize(value, title_width) + separator + suffix
+
+
 class Browser:
     def __init__(
         self,
@@ -2180,6 +2239,7 @@ class Browser:
         self.screen.erase()
         height, width = self.screen.getmaxyx()
         items = self.current()
+        title_suffixes = title_disambiguators(items)
         if height < 12 or width < 65:
             self.add(0, 0, "Terminal too small", self.style("warning", curses.A_BOLD))
             self.add(2, 0, "Resize to at least 65 columns × 12 rows.")
@@ -2301,12 +2361,16 @@ class Browser:
                     segment(tag, item.origin, curses.A_BOLD)
                     remaining = max(0, remaining - len(tag))
                 if item.named:
-                    title = ellipsize(display_title(item), remaining)
+                    title = ellipsize_with_suffix(
+                        display_title(item), title_suffixes.get(item.key, ""), remaining
+                    )
                     segment(f"{title:<{remaining}}", "primary", curses.A_BOLD)
                 else:
                     prefix = "*- "
                     room = max(0, remaining - len(prefix))
-                    title = ellipsize(display_title(item), room)
+                    title = ellipsize_with_suffix(
+                        display_title(item), title_suffixes.get(item.key, ""), room
+                    )
                     segment(prefix, "warning", curses.A_BOLD)
                     segment(f"{title:<{room}}", "primary")
                 if show_directory:
@@ -2956,6 +3020,11 @@ def command_for(session: Session, config: LaunchConfig) -> list[str]:
     only when resuming there.  A bridged copy is an ordinary new session.
     """
     tool = active_launch_tool(session)
+    if session.conversation_id and tool != session.tool:
+        raise BridgeError(
+            f"{tool_label(tool)} cannot trust a heuristic counterpart for tracked conversation "
+            f"{session.conversation_id[:8]}; resolve and bridge the conversation first"
+        )
     if session_needs_bridge(session, tool):
         raise BridgeError(
             f"{tool_label(tool)} cannot resume a "
@@ -3006,7 +3075,7 @@ def prepare_launch(
     than spawning a new snapshot each time.
     """
     tool = active_launch_tool(session)
-    conversation_id = ""
+    conversation_id = session.conversation_id
     if state is not None:
         source, target, conversation_id = state.resolve_launch(session, tool)
         if target is not None:
@@ -3022,7 +3091,10 @@ def prepare_launch(
     if tool == session.tool:
         return session, ""
     stale = ""
-    recorded = session.launch_target(tool)
+    # Transcript-derived launch targets are only legacy counterpart hints. A
+    # tracked conversation's members are authoritative, so never let an
+    # unrelated hint override the head resolution above.
+    recorded = session.launch_target(tool) if not conversation_id else ""
     if recorded:
         if native_session_exists(tool, recorded):
             return session, ""
@@ -3206,6 +3278,7 @@ def list_output(items: list[Session], as_json: bool = False) -> None:
     tool_width = tool_column_width(8)
     run_width = tool_column_width(6)
     title_width = max(24, terminal_width - 112 - (tool_width - 8) - (run_width - 6))
+    title_suffixes = title_disambiguators(items)
     print(
         f"{'TOOL':<{tool_width}} {'RUN':<{run_width}} {'ORIGIN':<7} "
         f"{'OPEN':<5} {'MSGS':>5} {'STATE':<8} "
@@ -3215,6 +3288,9 @@ def list_output(items: list[Session], as_json: bool = False) -> None:
     for item in items:
         paused = item.is_open and process_state(item.open_pid) in ("T", "t")
         open_symbol = "Ⅱ" if paused else ("●" if item.is_open else "")
+        rendered_title = ellipsize_with_suffix(
+            display_list_title(item), title_suffixes.get(item.key, ""), title_width
+        )
         print(
             f"{tool_label(item.tool):<{tool_width}} "
             f"{tool_label(active_launch_tool(item)):<{run_width}} "
@@ -3222,7 +3298,8 @@ def list_output(items: list[Session], as_json: bool = False) -> None:
             f"{('hidden' if item.hidden else 'visible'):<8} "
             f"{conversation_status(item):<{conversation_width}} "
             f"{relative_time(item.created):<12} {relative_time(item.updated):<12} "
-            f"{ellipsize(display_list_title(item), title_width):<{title_width}} {short_path(item.cwd)}"
+            f"{rendered_title:<{title_width}} "
+            f"{short_path(item.cwd)}"
         )
 
 
@@ -3367,7 +3444,8 @@ def main(argv: list[str] | None = None) -> int:
             return None
         if len(exact) > 1:
             print(
-                f"sessions: {target!r} matches more than one record; use its displayed ID",
+                f"sessions: {target!r} matches more than one record; use the exact session ID "
+                "shown in the browser detail or by --json",
                 file=sys.stderr,
             )
             return None
