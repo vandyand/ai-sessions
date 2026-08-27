@@ -592,6 +592,7 @@ class UserState:
                 # The old schema did not store a byte frontier. Zero is a safe
                 # migration: it reports the source as advanced rather than stale.
                 source_member["cursor"] = 0
+                source_member.pop("checkpoint", None)
             for tool, entry in targets.items():
                 session_id = str(entry.get("session_id", ""))
                 if not session_id:
@@ -3090,6 +3091,7 @@ def prepare_launch(
         tool_calls=tool_calls,
         latest_window=latest_window,
         conversation_id=conversation_id,
+        allow_lossy=config.bridge_allow_lossy if config is not None else False,
     )
     if state is not None:
         state.set_bridge(

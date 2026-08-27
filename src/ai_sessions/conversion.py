@@ -1092,6 +1092,7 @@ def bridge(
     tool_calls: bool = True,
     latest_window: bool = True,
     conversation_id: str = "",
+    allow_lossy: bool = False,
 ) -> BridgeResult:
     """Materialise a conversation as a new native session in ``target_tool``."""
     target = harness(target_tool)
@@ -1139,6 +1140,23 @@ def bridge(
     flattened = flatten(turns)
     conversation_limit = applied_budget.chars - HANDOFF_NOTE_RESERVE_CHARS
     selected = select_messages(flattened, conversation_limit)
+    if not allow_lossy and (selected.dropped or selected.truncated):
+        projected_context_chars = selection_cost(flattened)
+        required_chars = projected_context_chars + HANDOFF_NOTE_RESERVE_CHARS
+        required_tokens = (
+            required_chars * applied_budget.tokens + applied_budget.chars - 1
+        ) // applied_budget.chars
+        raise BridgeError(
+            f"refusing lossy bridge from {harness(source_tool).label} to {target.label}: "
+            f"source message count {len(flattened):,}; projected context cost "
+            f"{projected_context_chars:,} characters ({required_chars:,} including the "
+            f"{HANDOFF_NOTE_RESERVE_CHARS:,}-character handoff reserve). The applied budget is "
+            f"{applied_budget.tokens:,} tokens / {applied_budget.chars:,} characters; "
+            f"selection would drop {selected.dropped:,} message(s) and truncate "
+            f"{selected.truncated:,} anchor message(s). Increase the bridge budget to at "
+            f"least {required_tokens:,} max_tokens (or {required_chars:,} max_chars), "
+            "or set bridge.allow_lossy = true to explicitly permit loss."
+        )
     kept = selected.turns
     assembled_count = sum(
         1 for index, turn in enumerate(kept) if index == 0 or turn.role != kept[index - 1].role

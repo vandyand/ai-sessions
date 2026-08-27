@@ -1,5 +1,14 @@
 # Changelog
 
+## 3.4.1 — 2026-08-27
+
+### Fixed
+
+- Bridges now refuse before the target writer when selection would drop messages or truncate an
+  anchor; explicit `allow_lossy = true` preserves the legacy behavior while reporting exact losses.
+- Moved legacy sources preserve conservative `advanced` status by removing the current checkpoint
+  that shadowed `cursor = 0`, preventing stale ancestor reuse or misclassification.
+
 ## 3.4.0 — 2026-08-26
 
 ### Added

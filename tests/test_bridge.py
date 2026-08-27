@@ -8,7 +8,7 @@ import unittest
 from contextlib import contextmanager, redirect_stderr, redirect_stdout
 from dataclasses import replace
 from pathlib import Path
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
 from ai_sessions import bridge, conversion
 from ai_sessions.app import (
@@ -957,6 +957,7 @@ class BridgeTests(unittest.TestCase):
                     storage=str(source),
                     cwd=directory,
                     budget=budget,
+                    allow_lossy=True,
                 )
             written = read_turns("claude", result.native)
         self.assertEqual((result.budget.tokens, result.budget.chars), (5_000, 10_000))
@@ -1002,6 +1003,73 @@ class BridgeTests(unittest.TestCase):
                     storage=str(source),
                     cwd=directory,
                 )
+
+    def test_default_bridge_refuses_dropped_history_before_writing(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            source = Path(directory) / "source.jsonl"
+            source.write_text(
+                "\n".join(
+                    codex_line("user" if index % 2 == 0 else "assistant", "x" * 2_000)
+                    for index in range(20)
+                )
+                + "\n",
+                encoding="utf-8",
+            )
+            before = source.read_bytes()
+            target_home = Path(directory) / "claude"
+            writer = Mock(side_effect=AssertionError("target writer must not be called"))
+            adapter = replace(REGISTRY.get("claude"), home=target_home, write=writer)
+            with REGISTRY.temporary(adapter):
+                with self.assertRaises(BridgeError) as raised:
+                    bridge.bridge(
+                        source_tool="codex",
+                        target_tool="claude",
+                        session_id="source-session",
+                        storage=str(source),
+                        cwd=directory,
+                        budget=resolve_budget("claude", max_tokens=5_000),
+                    )
+            error = str(raised.exception)
+            self.assertIn("Codex", error)
+            self.assertIn("Claude", error)
+            self.assertIn("source message count 20", error)
+            self.assertIn("projected context cost", error)
+            self.assertIn("applied budget", error)
+            self.assertIn("drop", error)
+            self.assertIn("truncate 0", error)
+            self.assertIn("max_tokens", error)
+            self.assertEqual(source.read_bytes(), before)
+            self.assertFalse(target_home.exists())
+            writer.assert_not_called()
+
+    def test_default_bridge_refuses_anchor_truncation_before_writing(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            source = Path(directory) / "source.jsonl"
+            source.write_text(
+                "\n".join([codex_line("user", "short"), codex_line("assistant", "x" * 20_000)])
+                + "\n",
+                encoding="utf-8",
+            )
+            before = source.read_bytes()
+            target_home = Path(directory) / "claude"
+            writer = Mock(side_effect=AssertionError("target writer must not be called"))
+            adapter = replace(REGISTRY.get("claude"), home=target_home, write=writer)
+            with REGISTRY.temporary(adapter):
+                with self.assertRaises(BridgeError) as raised:
+                    bridge.bridge(
+                        source_tool="codex",
+                        target_tool="claude",
+                        session_id="source-session",
+                        storage=str(source),
+                        cwd=directory,
+                        budget=resolve_budget("claude", max_tokens=4_096),
+                    )
+            error = str(raised.exception)
+            self.assertIn("selection would drop 0 message(s) and truncate 1 anchor", error)
+            self.assertIn("max_tokens", error)
+            self.assertEqual(source.read_bytes(), before)
+            self.assertFalse(target_home.exists())
+            writer.assert_not_called()
 
     def test_bridge_refuses_a_selected_payload_above_the_applied_ceiling(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -1056,6 +1124,7 @@ class BridgeTests(unittest.TestCase):
                     session_id="codex-source",
                     storage=str(codex_source),
                     cwd=directory,
+                    allow_lossy=True,
                 )
                 into_codex = bridge.bridge(
                     source_tool="claude",
@@ -1183,7 +1252,7 @@ class LaunchIntegrationTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             item, state, stdout, stderr = self.loaded_dry_run(
                 directory,
-                "version = 2\n[bridge]\nmax_tokens = 5000\n",
+                "version = 2\n[bridge]\nmax_tokens = 5000\nallow_lossy = true\n",
                 long_transcript=True,
             )
             target_path = Path(state.bridges[item.key]["claude"]["storage"])
@@ -1262,7 +1331,7 @@ class LaunchIntegrationTests(unittest.TestCase):
             ):
                 code = launch(
                     item,
-                    LaunchConfig(bridge_max_tokens=4_096),
+                    LaunchConfig(bridge_max_tokens=4_096, bridge_allow_lossy=True),
                     dry_run=True,
                     state=state,
                 )
@@ -1284,7 +1353,7 @@ class LaunchIntegrationTests(unittest.TestCase):
             with harness_home("claude", Path(directory) / "claude"):
                 prepared, notice = prepare_launch(
                     item,
-                    config=LaunchConfig(bridge_max_tokens=4_096),
+                    config=LaunchConfig(bridge_max_tokens=4_096, bridge_allow_lossy=True),
                 )
             handoff = read_turns("claude", native(prepared.storage, prepared.session_id))[0].text
         self.assertNotIn("dropped to fit", notice)
@@ -1825,6 +1894,39 @@ class LaunchIntegrationTests(unittest.TestCase):
                 prepared, _ = prepare_launch(source, state=state)
             self.assertNotEqual(prepared.session_id, source.session_id)
             self.assertIn("Later Claude work", Path(prepared.storage).read_text("utf-8"))
+
+    def test_moved_legacy_source_uses_conservative_cursor_after_migration(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            source = session(directory, updated=200.0)
+            state_path = Path(directory) / "state.json"
+            state_path.write_text(
+                json.dumps(
+                    {
+                        "version": 5,
+                        "names": {},
+                        "original_names": {},
+                        "hidden": [],
+                        "launch_tools": {},
+                        "bridges": {
+                            source.key: {
+                                "claude": {
+                                    "session_id": "missing-claude-copy",
+                                    "storage": str(Path(directory) / "missing.jsonl"),
+                                    "source_updated": 100.0,
+                                }
+                            }
+                        },
+                    }
+                ),
+                encoding="utf-8",
+            )
+            state = UserState(state_path)
+            state.apply([source])
+
+            member = state.conversations[state.conversation_id_for(source)]["members"][source.key]
+            self.assertEqual(member["cursor"], 0)
+            self.assertNotIn("checkpoint", member)
+            self.assertEqual(state._member_change_status(member), "changed")
 
     def test_bridge_writes_machine_readable_conversation_provenance(self) -> None:
         with tempfile.TemporaryDirectory() as directory:

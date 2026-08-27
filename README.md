@@ -188,6 +188,14 @@ counts. These target defaults intentionally replace the previous global 950,000-
 ceiling; they are smaller so an unknown target model is less likely to compact immediately
 on resume.
 
+The bridge refuses before calling the target writer if the selected context would drop messages or
+truncate an anchor. `max_tokens` and `max_chars` choose capacity; they do not authorize omission.
+The error reports projected source cost, the current budget, loss counts, and the minimum setting
+needed to fit. Set `allow_lossy = true` under `[bridge]` only to deliberately restore the old
+first-message-plus-newest-suffix behavior; this is dangerous and exact losses remain reported.
+Starting at the source's latest native compaction summary under `latest_window` is not budget loss,
+because that summary replaces earlier windows in the source context.
+
 Set `max_tokens` in `config.toml` for an explicit token-denominated ceiling, or
 `tool_calls = false` for a conversation-only copy. The deprecated `max_chars` remains an
 exact override. Version-1 files automatically written with `max_chars = 950000` migrate to
@@ -306,9 +314,14 @@ command = []
 
 [bridge]
 max_tokens = 150000
+allow_lossy = false
 tool_calls = true
 latest_window = true
 ```
+
+By default, a bridge refuses before writing if its selected context would drop or truncate content;
+increase `max_tokens`/`max_chars` to fit it. Set `allow_lossy = true` only as an explicit,
+dangerous authorization for those losses; exact dropped and truncated counts are still shown.
 
 Rename/hide state is kept alongside the configuration as `state.json`. Per-session
 launch-harness preferences, conversation ids, native members, equivalence frontiers, and
