@@ -94,6 +94,14 @@ decrease survivor count or increase dropped-message count. `BridgeResult` and bo
 distinguish selected source-message count, assembled target-message count, dropped messages,
 and marker-truncated anchors.
 
+By default, a bridge must refuse before calling the target writer when selection would drop a
+source message or truncate an anchor. `max_tokens` and `max_chars` select capacity but do not
+authorize loss. The refusal reports projected source cost, the applied budget, loss counts, and
+the minimum setting needed to fit. An explicit `allow_lossy = true` opts into the legacy
+first-message-plus-newest-suffix selection; exact dropped and truncated losses remain reported.
+Starting at the source's latest native compaction summary under `latest_window` is not budget loss,
+because that summary replaces earlier windows in the source context.
+
 ## Runtime ownership
 
 Provider-specific discovery, resume syntax, title publication, liveness evidence, transcript

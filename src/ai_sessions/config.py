@@ -44,6 +44,8 @@ class LaunchConfig:
     bridge_max_tokens: int | None = None
     bridge_max_chars: int | None = None
     bridge_max_chars_migrated: bool = False
+    # Refuse to create a copy when selection would lose conversation history.
+    bridge_allow_lossy: bool = False
     # Whether tool calls cross over as inline summaries.  They are usually
     # the most valuable context in an engineering session, and also the
     # bulkiest, so they can be dropped for a conversation-only copy.
@@ -112,6 +114,9 @@ class LaunchConfig:
             latest_window = bridge.get("latest_window")
             if isinstance(latest_window, bool):
                 result.bridge_latest_window = latest_window
+            allow_lossy = bridge.get("allow_lossy")
+            if isinstance(allow_lossy, bool):
+                result.bridge_allow_lossy = allow_lossy
         terminal = payload.get("terminal", {})
         if isinstance(terminal, dict):
             result.terminal_command = _string_list(terminal.get("command"), [])
@@ -235,6 +240,7 @@ class LaunchConfig:
             f"{provider_separator}"
             "[bridge]\n"
             f"{budget}"
+            f"allow_lossy = {str(self.bridge_allow_lossy).lower()}\n"
             f"tool_calls = {str(self.bridge_tool_calls).lower()}\n"
             f"latest_window = {str(self.bridge_latest_window).lower()}\n\n"
             "[terminal]\n"

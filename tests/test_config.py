@@ -14,6 +14,7 @@ class LaunchConfigTests(unittest.TestCase):
         with TemporaryDirectory() as directory:
             config = LaunchConfig.load(Path(directory) / "missing.toml")
         self.assertEqual(config.mode, "safe")
+        self.assertFalse(config.bridge_allow_lossy)
         self.assertEqual(config.provider_prefix("claude"), ["claude"])
         self.assertEqual(config.provider_prefix("codex"), ["codex"])
 
@@ -106,6 +107,17 @@ class LaunchConfigTests(unittest.TestCase):
         self.assertIsNone(loaded.bridge_max_chars)
         self.assertIn("max_tokens = 12345", text)
         self.assertNotIn("max_chars", text)
+
+    def test_allow_lossy_round_trips_and_defaults_to_false(self) -> None:
+        with TemporaryDirectory() as directory:
+            path = Path(directory) / "config.toml"
+            original = LaunchConfig(path=path, bridge_allow_lossy=True)
+            original.save()
+            loaded = LaunchConfig.load(path)
+            text = path.read_text(encoding="utf-8")
+        self.assertTrue(loaded.bridge_allow_lossy)
+        self.assertIn("allow_lossy = true", text)
+        self.assertFalse(LaunchConfig().bridge_allow_lossy)
 
     def test_loaded_token_budget_wins_when_both_legacy_keys_exist(self) -> None:
         with TemporaryDirectory() as directory:
