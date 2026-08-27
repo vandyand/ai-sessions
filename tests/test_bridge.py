@@ -1409,6 +1409,58 @@ class LaunchIntegrationTests(unittest.TestCase):
             self.assertEqual(note, "")
             self.assertEqual(command_for(prepared, LaunchConfig())[2], "real-claude-id")
 
+    def test_a_tracked_conversation_ignores_an_existing_foreign_launch_target(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            claude_home = Path(directory) / "claude"
+            counterpart = claude_home / "projects" / "-tmp"
+            counterpart.mkdir(parents=True)
+            (counterpart / "foreign-claude-id.jsonl").write_text("", encoding="utf-8")
+            item = session(
+                directory,
+                launch_targets={"codex": "019f-source", "claude": "foreign-claude-id"},
+                launch_tool="claude",
+            )
+            state = UserState(path=Path(directory) / "state.json")
+            state.conversation_id_for(item, create=True)
+            item.launch_tool = "claude"
+
+            with harness_home("claude", claude_home):
+                prepared, note = prepare_launch(item, state=state)
+
+            self.assertIn("Copied", note)
+            self.assertNotEqual(prepared.launch_target("claude"), "foreign-claude-id")
+
+    def test_a_tracked_row_without_loaded_state_ignores_a_foreign_launch_target(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            claude_home = Path(directory) / "claude"
+            counterpart = claude_home / "projects" / "-tmp"
+            counterpart.mkdir(parents=True)
+            (counterpart / "foreign-claude-id.jsonl").write_text("", encoding="utf-8")
+            item = session(
+                directory,
+                launch_targets={"codex": "019f-source", "claude": "foreign-claude-id"},
+                launch_tool="claude",
+            )
+            item.conversation_id = "tracked-conversation"
+
+            with harness_home("claude", claude_home):
+                prepared, note = prepare_launch(item)
+
+            self.assertIn("Copied", note)
+            self.assertNotEqual(prepared.launch_target("claude"), "foreign-claude-id")
+
+    def test_command_refuses_a_foreign_target_on_an_unresolved_tracked_row(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            item = session(
+                directory,
+                launch_targets={"codex": "019f-source", "claude": "foreign-claude-id"},
+                launch_tool="claude",
+            )
+            item.conversation_id = "tracked-conversation"
+
+            with self.assertRaisesRegex(BridgeError, "tracked conversation"):
+                command_for(item, LaunchConfig())
+
     def test_a_counterpart_that_does_not_exist_is_replaced_by_a_copy(self) -> None:
         # Cross-provider references are matched out of transcript text, so an
         # unrelated id of the same shape can be recorded as a counterpart.
