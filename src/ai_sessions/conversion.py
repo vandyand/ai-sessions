@@ -64,9 +64,10 @@ from .registry import REGISTRY
 
 # A bridged transcript is replayed into the target's context window in full,
 # so the ceiling is a context budget rather than a storage one.
-CLAUDE_BUDGET_CONTEXT_TOKENS = 200_000
-CODEX_BUDGET_CONTEXT_TOKENS = 256_000
+CLAUDE_BUDGET_CONTEXT_TOKENS = 1_000_000
+CODEX_BUDGET_CONTEXT_TOKENS = 1_000_000
 DEFAULT_USABLE_FRACTION = 0.75
+ONE_M_CONTEXT_USABLE_FRACTION = 0.95
 DEFAULT_CHARS_PER_TOKEN = 2.0
 REQUEST_CHARS = 300
 RESULT_CHARS = 500

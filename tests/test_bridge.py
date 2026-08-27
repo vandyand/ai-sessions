@@ -313,10 +313,10 @@ class ShapingTests(unittest.TestCase):
     def test_target_defaults_and_legacy_override_resolve_distinctly(self) -> None:
         claude = resolve_budget("claude")
         codex = resolve_budget("codex")
-        self.assertEqual((claude.tokens, claude.chars), (150_000, 300_000))
-        self.assertEqual((codex.tokens, codex.chars), (192_000, 384_000))
+        self.assertEqual((claude.tokens, claude.chars), (950_000, 1_900_000))
+        self.assertEqual((codex.tokens, codex.chars), (950_000, 1_900_000))
         self.assertEqual(resolve_budget("claude", max_chars=950_000).chars, 950_000)
-        self.assertTrue(resolve_budget("claude", max_chars=950_000).over_policy)
+        self.assertFalse(resolve_budget("claude", max_chars=950_000).over_policy)
         self.assertEqual(resolve_budget("claude", migrated=True).origin, "target-default-migrated")
 
     def test_token_budget_applies_ratio_and_precedence(self) -> None:
@@ -1093,7 +1093,7 @@ class BridgeTests(unittest.TestCase):
                     budget=resolve_budget("claude", max_chars=MIN_BRIDGE_CHARS),
                 )
 
-    def test_unset_target_policies_diverge_on_a_340k_transcript(self) -> None:
+    def test_unset_one_m_target_policies_keep_a_340k_transcript(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             codex_source = Path(directory) / "codex-source.jsonl"
             claude_source = Path(directory) / "claude-source.jsonl"
@@ -1133,7 +1133,8 @@ class BridgeTests(unittest.TestCase):
                     storage=str(claude_source),
                     cwd=directory,
                 )
-        self.assertGreater(into_claude.dropped, 0)
+        self.assertEqual(into_claude.dropped, 0)
+        self.assertEqual(into_claude.turns, len(messages))
         self.assertEqual(into_codex.dropped, 0)
         self.assertEqual(into_codex.turns, len(messages))
 
@@ -1273,7 +1274,7 @@ class LaunchIntegrationTests(unittest.TestCase):
             target_path = Path(state.bridges[item.key]["claude"]["storage"])
             written = read_turns("claude", native(target_path))
         self.assertNotIn("dropped to fit", stderr)
-        self.assertIn("150,000 tokens / 300,000 projected characters", stderr)
+        self.assertIn("950,000 tokens / 1,900,000 projected characters", stderr)
         self.assertIn("replaces the previous global 950,000-character ceiling", stderr)
         self.assertIn("replaces the previous global 950,000-character ceiling", written[0].text)
         self.assertIn("message-10:", "\n".join(turn.text for turn in written))
@@ -1289,8 +1290,8 @@ class LaunchIntegrationTests(unittest.TestCase):
             (
                 "version = 2\n[bridge]\nmax_chars = 950000\n",
                 "config.max_chars",
-                "legacy max_chars override exceeds target policy",
-                "legacy character override exceeds the target policy",
+                "",
+                "",
             ),
             (
                 "version = 2\n[bridge]\nmax_tokens = 1\n",
@@ -1305,9 +1306,11 @@ class LaunchIntegrationTests(unittest.TestCase):
                 target_path = Path(state.bridges[item.key]["claude"]["storage"])
                 handoff = read_turns("claude", native(target_path))[0].text
                 self.assertIn(f"({origin})", stderr)
-                self.assertIn(launch_explanation, stderr)
+                if launch_explanation:
+                    self.assertIn(launch_explanation, stderr)
                 self.assertIn(f"({origin})", handoff)
-                self.assertIn(handoff_explanation, handoff)
+                if handoff_explanation:
+                    self.assertIn(handoff_explanation, handoff)
 
     def test_launch_reports_truncated_anchor_without_claiming_a_drop(self) -> None:
         with tempfile.TemporaryDirectory() as directory:

@@ -16,7 +16,7 @@ from ..capabilities import HarnessAdapter
 from ..conversion import (
     CLAUDE_BUDGET_CONTEXT_TOKENS,
     DEFAULT_CHARS_PER_TOKEN,
-    DEFAULT_USABLE_FRACTION,
+    ONE_M_CONTEXT_USABLE_FRACTION,
     BridgeError,
     _block_text,
     _Conversation,
@@ -730,11 +730,8 @@ ADAPTER = HarnessAdapter(
     liveness_executables=frozenset(("claude", "claude.exe", "claude.cmd", "claude.ps1")),
     budget=BudgetPolicy(
         context_tokens=CLAUDE_BUDGET_CONTEXT_TOKENS,
-        usable_fraction=DEFAULT_USABLE_FRACTION,
+        usable_fraction=ONE_M_CONTEXT_USABLE_FRACTION,
         chars_per_token=DEFAULT_CHARS_PER_TOKEN,
-        source=(
-            "Claude 200k unknown-model floor from official context-window docs, "
-            "2026-08-23; Opus 5 context is larger"
-        ),
+        source=("Claude 1M operational context policy, 2026-08-27"),
     ),
 )

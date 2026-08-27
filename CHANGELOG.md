@@ -1,5 +1,13 @@
 # Changelog
 
+## 3.4.2 — 2026-08-27
+
+### Fixed
+
+- Claude Code and Codex bridges now use the configured 1M-context operating policy, reserving 5%
+  for target scaffolding instead of applying the obsolete 200k/256k compatibility floors. The
+  complete latest native compaction window passes through whenever it fits that policy.
+
 ## 3.4.1 — 2026-08-27
 
 ### Fixed
