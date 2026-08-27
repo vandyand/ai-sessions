@@ -1,5 +1,24 @@
 # Changelog
 
+## 3.4.0 — 2026-08-26
+
+### Added
+
+- Recover a live tmux session whose terminal died. When tmux reports no client on the session,
+  `sessions` opens one attached to the exact window and pane instead of reporting a dead end.
+  The terminal is resolved from `[terminal] command`, then `$TERMINAL`, then a probe list;
+  kitty is a fallback default rather than a dependency.
+
+### Fixed
+
+- Only trust a `tmux:<session>` window title as an exact match on the title field, and only
+  while a client really is on that session. Substring matching against the whole `wmctrl` line
+  let session `2` focus a window titled `tmux:21`, and the title is fixed at launch, so a client
+  that had since switched sessions could silently focus the wrong one.
+- Every focus failure now names its recovery, including the literal `tmux attach-session`
+  command. A session that is attached but unreachable explains why no second terminal was
+  opened, since two clients on one session leave both sized to the smaller window.
+
 ## 3.3.0 — 2026-08-25
 
 ### Added

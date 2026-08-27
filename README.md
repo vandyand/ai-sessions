@@ -297,6 +297,13 @@ bridge_model = "provider/model" # optional; must appear in `opencode models`
 claude_args = ["--permission-mode", "acceptEdits"]
 codex_args = ["--sandbox", "workspace-write", "--ask-for-approval", "on-request"]
 
+[terminal]
+# Opens a terminal on a tmux session whose own terminal died.
+# {session}, {window}, {pane} and {script} are substituted.
+# Empty means auto-detect: $TERMINAL, then kitty, wezterm, ghostty,
+# alacritty, gnome-terminal, konsole, xterm.
+command = []
+
 [bridge]
 max_tokens = 150000
 tool_calls = true
@@ -311,6 +318,22 @@ Linux and `%LOCALAPPDATA%\ai-sessions` on Windows. Environment overrides are ava
 through `AI_SESSIONS_CONFIG_FILE`, `AI_SESSIONS_STATE_FILE`, `CODEX_HOME`,
 `CLAUDE_CONFIG_DIR`, and `OPENCODE_DB`. Prefer the configured OpenCode command's authoritative
 `db path`; `OPENCODE_DB` is the explicit fallback override when that command cannot report one.
+
+## Recovering a session whose terminal died
+
+A tmux session outlives its terminal. When a window manager restart or a crash takes the
+terminal window but leaves the tmux server, the pane shells, and the harness process running,
+the session is still there — `sessions` just had no way back to it.
+
+Pressing Enter on such a session now opens a terminal attached to it, on the exact window and
+pane. This happens only when tmux reports **no client** on the session. A session that already
+has a client but whose window cannot be raised — different display, Wayland, remote — is not
+given a second one, because two clients share a session and tmux sizes both to the smaller
+window; the message explains that instead.
+
+The terminal is resolved from `[terminal] command`, then `$TERMINAL`, then the first of kitty,
+wezterm, ghostty, alacritty, gnome-terminal, konsole, xterm that is installed. With no display
+at all, nothing is spawned and the message carries the exact `tmux attach-session` command.
 
 ## How open-session detection works
 

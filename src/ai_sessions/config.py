@@ -52,6 +52,10 @@ class LaunchConfig:
     # rather than replayed from the beginning.  The summary is what the
     # source session itself resumes from.
     bridge_latest_window: bool = True
+    # Command that opens a terminal attached to a tmux session that has no
+    # client left.  Empty means auto-detect.  {session}, {window} and
+    # {pane} are substituted into each argument.
+    terminal_command: list[str] = field(default_factory=list)
 
     @classmethod
     def load(cls, path: Path = CONFIG_FILE) -> "LaunchConfig":
@@ -108,6 +112,9 @@ class LaunchConfig:
             latest_window = bridge.get("latest_window")
             if isinstance(latest_window, bool):
                 result.bridge_latest_window = latest_window
+        terminal = payload.get("terminal", {})
+        if isinstance(terminal, dict):
+            result.terminal_command = _string_list(terminal.get("command"), [])
         return result
 
     def set_mode(self, mode: str) -> None:
@@ -229,7 +236,9 @@ class LaunchConfig:
             "[bridge]\n"
             f"{budget}"
             f"tool_calls = {str(self.bridge_tool_calls).lower()}\n"
-            f"latest_window = {str(self.bridge_latest_window).lower()}\n"
+            f"latest_window = {str(self.bridge_latest_window).lower()}\n\n"
+            "[terminal]\n"
+            f"command = {_toml_array(self.terminal_command)}\n"
         )
 
 
