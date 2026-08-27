@@ -57,6 +57,7 @@ from .liveness import process_start_token
 from .model import Checkpoint, LivenessSession, NativeRef, NativeSession, Session, SourceKind
 from .paths import (
     APP_CACHE_DIR,
+    CONFIG_FILE,
     HOME,
     IS_WINDOWS,
     STATE_FILE,
@@ -1432,7 +1433,96 @@ def run_capture(
         return None
 
 
-def focus_open_session(item: Session) -> tuple[bool, str]:
+# Terminals that can run a command, in the order they are probed.  kitty is
+# first because the bundled launcher uses it, and its --class/--title shape is
+# what window-position restorers key off, so a respawned window lands where the
+# user left it.
+TERMINAL_PROBES: tuple[tuple[str, tuple[str, ...]], ...] = (
+    (
+        "kitty",
+        (
+            "--detach",
+            "--class",
+            "kitty-tmux-{session}",
+            "--title",
+            "tmux:{session}",
+            "--",
+            "bash",
+            "-lc",
+            "{script}",
+        ),
+    ),
+    ("wezterm", ("start", "--", "bash", "-lc", "{script}")),
+    ("ghostty", ("-e", "bash", "-lc", "{script}")),
+    ("alacritty", ("-T", "tmux:{session}", "-e", "bash", "-lc", "{script}")),
+    ("gnome-terminal", ("--title", "tmux:{session}", "--", "bash", "-lc", "{script}")),
+    ("konsole", ("-e", "bash", "-lc", "{script}")),
+    ("xterm", ("-T", "tmux:{session}", "-e", "bash", "-lc", "{script}")),
+)
+
+
+def tmux_attach_command(session: str, window_id: str, pane_id: str) -> str:
+    """A shell command attaching to a session with the right pane selected.
+
+    Selection travels with the attach rather than preceding it, so nothing
+    else can move the session between the two steps.
+    """
+    parts = ["tmux", "attach-session", "-t", shlex.quote(session)]
+    if window_id:
+        parts += ["\\;", "select-window", "-t", shlex.quote(window_id)]
+    if pane_id:
+        parts += ["\\;", "select-pane", "-t", shlex.quote(pane_id)]
+    return " ".join(parts)
+
+
+def terminal_argv(
+    config: LaunchConfig | None, session: str, window_id: str, pane_id: str
+) -> list[str]:
+    """Resolve the terminal to spawn: configured, then $TERMINAL, then probed."""
+    script = tmux_attach_command(session, window_id, pane_id)
+    fields = {"session": session, "window": window_id, "pane": pane_id, "script": script}
+
+    def expand(template: Iterable[str]) -> list[str]:
+        rendered: list[str] = []
+        for argument in template:
+            for key, value in fields.items():
+                argument = argument.replace("{" + key + "}", value)
+            rendered.append(argument)
+        return rendered
+
+    configured = list(config.terminal_command) if config and config.terminal_command else []
+    if configured:
+        # A configured command may name the session itself rather than take
+        # the prepared script, so only append one when it asked for neither.
+        if not any("{script}" in argument for argument in configured):
+            configured = configured + ["bash", "-lc", script]
+        return expand(configured)
+    preferred = os.environ.get("TERMINAL", "").strip()
+    if preferred and shutil.which(preferred):
+        return expand([preferred, "-e", "bash", "-lc", "{script}"])
+    for name, template in TERMINAL_PROBES:
+        if shutil.which(name):
+            return expand([name, *template])
+    return []
+
+
+def spawn_terminal(argv: list[str], env: dict[str, str]) -> bool:
+    """Start a terminal detached from this process and from the curses screen."""
+    try:
+        subprocess.Popen(  # noqa: S603
+            argv,
+            env=env,
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            start_new_session=True,
+        )
+    except (OSError, ValueError):
+        return False
+    return True
+
+
+def focus_open_session(item: Session, config: LaunchConfig | None = None) -> tuple[bool, str]:
     """Select an open session's tmux pane and raise its desktop terminal."""
     if IS_WINDOWS:
         from .platforms.windows import process_exists
@@ -1450,7 +1540,15 @@ def focus_open_session(item: Session) -> tuple[bool, str]:
     pane_id = process_env.get("TMUX_PANE", "")
     tmux_session = ""
     tmux_window = ""
+    window_id = ""
     roots: list[int] = []
+    # How many clients tmux reports on this session, and whether it answered
+    # at all.  Spawning a second client on a session that already has one
+    # leaves two windows fighting over one pane, and tmux sizes to the
+    # smallest, so the difference between "none attached" and "attached but
+    # unreachable" decides whether recovery is safe.
+    attached = 0
+    clients_known = False
 
     if pane_id:
         info = run_capture(
@@ -1484,9 +1582,11 @@ def focus_open_session(item: Session) -> tuple[bool, str]:
 
         clients = run_capture(["tmux", "list-clients", "-F", "#{client_session}\t#{client_pid}"])
         if clients and clients.returncode == 0:
+            clients_known = True
             for line in clients.stdout.splitlines():
                 parts = line.split("\t", 1)
                 if len(parts) == 2 and parts[0] == tmux_session:
+                    attached += 1
                     try:
                         roots.append(int(parts[1]))
                     except ValueError:
@@ -1522,22 +1622,28 @@ def focus_open_session(item: Session) -> tuple[bool, str]:
             parts = line.split(None, 8)
             if len(parts) < 3:
                 continue
-            window_id = parts[0]
             try:
                 owner_pid = int(parts[2])
             except ValueError:
                 continue
             if owner_pid in ancestors:
-                candidates.append(window_id)
-            elif tmux_session and f"tmux:{tmux_session}" in line:
-                title_fallback.append(window_id)
-        for window_id in candidates + title_fallback:
-            focused = run_capture(["wmctrl", "-i", "-a", window_id], env=desktop_env)
+                candidates.append(parts[0])
+            elif (
+                attached and tmux_session and len(parts) > 8 and parts[8] == f"tmux:{tmux_session}"
+            ):
+                # The title is a launcher convention, not a tmux fact: it is
+                # fixed at launch and survives switch-client, so it is only
+                # worth trusting as a last resort while a client really is on
+                # this session.  Equality on the title field keeps session 2
+                # from matching a window titled tmux:21.
+                title_fallback.append(parts[0])
+        for desktop_window in candidates + title_fallback:
+            focused = run_capture(["wmctrl", "-i", "-a", desktop_window], env=desktop_env)
             if focused and focused.returncode == 0:
                 # wmctrl activation is asynchronous under Mutter. xdotool's
                 # --sync makes Enter feel immediate when it is available.
                 run_capture(
-                    ["xdotool", "windowactivate", "--sync", window_id],
+                    ["xdotool", "windowactivate", "--sync", desktop_window],
                     env=desktop_env,
                 )
                 location = (
@@ -1560,11 +1666,47 @@ def focus_open_session(item: Session) -> tuple[bool, str]:
                 return True, f"Focused {location}."
 
     if tmux_session:
+        manual = f"tmux attach-session -t {shlex.quote(tmux_session)}"
+        if clients_known and not attached:
+            # Nothing is displaying this session: the terminal died while the
+            # server, the shells and the harness kept running.  This is the
+            # recoverable case, and the only one where opening a client is
+            # safe -- a second client on an already-attached session leaves
+            # two windows fighting over one pane.
+            display = displays[0] if displays else os.environ.get("DISPLAY", "")
+            if not display:
+                return False, (
+                    f"tmux {tmux_session}:{tmux_window} is alive with no terminal attached, "
+                    f"and there is no display to open one on. Run:  {manual}"
+                )
+            argv = terminal_argv(config, tmux_session, window_id, pane_id)
+            if not argv:
+                return False, (
+                    f"tmux {tmux_session}:{tmux_window} is alive with no terminal attached, "
+                    "and no terminal emulator was found to open one. Set [terminal] command "
+                    f"in {CONFIG_FILE}, or run:  {manual}"
+                )
+            desktop_env = dict(os.environ)
+            desktop_env["DISPLAY"] = display
+            if spawn_terminal(argv, desktop_env):
+                return True, (
+                    f"tmux {tmux_session}:{tmux_window} had no terminal attached; "
+                    f"opened {Path(argv[0]).name} on it."
+                )
+            return False, (
+                f"tmux {tmux_session}:{tmux_window} is alive with no terminal attached, "
+                f"and {Path(argv[0]).name} could not be started. Run:  {manual}"
+            )
         return (
             False,
-            f"Selected tmux {tmux_session}:{tmux_window} pane {pane_id}, but could not raise its desktop window.",
+            f"Selected tmux {tmux_session}:{tmux_window} pane {pane_id}. A terminal is attached "
+            f"to it but its window could not be raised, so no second one was opened — it may be "
+            f"on another display, on Wayland, or remote. Switch to it, or run:  {manual}",
         )
-    return False, "The session is open, but its desktop terminal window could not be identified."
+    return False, (
+        f"The session is open in terminal process {item.open_pid}, but its desktop window "
+        "could not be identified and it is not in tmux, so there is nothing to reattach to."
+    )
 
 
 def query_match(session: Session, query: str) -> tuple[bool, int]:
@@ -2691,7 +2833,7 @@ class Browser:
                 if items:
                     chosen = items[self.selected]
                     if chosen.is_open:
-                        focused, message = focus_open_session(chosen)
+                        focused, message = focus_open_session(chosen, self.launch_config)
                         if focused:
                             # The desktop focus moves away from this browser, but
                             # keep it alive so returning to its terminal preserves
