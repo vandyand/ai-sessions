@@ -176,9 +176,9 @@ deliberate safety correction to OpenCode 1.18.21's failed-attempt reorder behavi
 
 ### Budget
 
-Whatever survives the above is fitted to a target-owned token policy. The default is a
-conservative unknown-model allowance: about 150,000 tokens / 300,000 projected characters
-for Claude Code and 192,000 / 384,000 for Codex. OpenCode target preparation queries installed
+Whatever survives the above is fitted to a target-owned token policy. Claude Code and Codex use
+the 1M-context models configured for this deployment, reserving 5% for target scaffolding: about
+950,000 tokens / 1,900,000 projected characters. OpenCode target preparation queries installed
 models and uses the selected model's effective input limit; when verbose metadata is unavailable it
 warns and falls back to a 128,000-token compatibility floor. Selection happens at source-message
 boundaries before same-role messages are assembled for the target. The first message of the

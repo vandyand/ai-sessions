@@ -21,7 +21,7 @@ from ..conversion import (
     CODEX_BUDGET_CONTEXT_TOKENS,
     CODEX_CONTEXT_WINDOW,
     DEFAULT_CHARS_PER_TOKEN,
-    DEFAULT_USABLE_FRACTION,
+    ONE_M_CONTEXT_USABLE_FRACTION,
     BridgeError,
     _block_text,
     _Conversation,
@@ -861,11 +861,8 @@ ADAPTER = HarnessAdapter(
     liveness_executables=frozenset(("codex", "codex.exe")),
     budget=BudgetPolicy(
         context_tokens=CODEX_BUDGET_CONTEXT_TOKENS,
-        usable_fraction=DEFAULT_USABLE_FRACTION,
+        usable_fraction=ONE_M_CONTEXT_USABLE_FRACTION,
         chars_per_token=DEFAULT_CHARS_PER_TOKEN,
-        source=(
-            "declared Codex unknown-model compatibility floor, 2026-08-23; "
-            "current flagship model context is larger"
-        ),
+        source=("Codex 1M operational context policy, 2026-08-27"),
     ),
 )

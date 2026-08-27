@@ -115,8 +115,8 @@ Done when: the budget names its unit, is derived per target harness, explicit le
 - **Token estimation is policy, not tokenization.** A deterministic mixed engineering corpus
   measured 2.318 characters per token with `tiktoken` `o200k_base`. P3 rounds down to 2.0,
   keeps runtime dependency-free, and identifies the Claude estimate as a proxy. The defaults
-  are 150,000 estimated tokens / 300,000 projected characters for Claude and 192,000 /
-  384,000 for Codex.
+  reserve 5% of the configured 1M context: 950,000 estimated tokens / 1,900,000 projected
+  characters for both Claude and Codex.
 - **Migration needs schema context.** Version 1 wrote `max_chars = 950000` automatically, so
   that exact value was ambiguous. Schema 1 migrates it to target policy with a visible
   origin; schema 2 preserves it as an explicit override. Other positive character values
