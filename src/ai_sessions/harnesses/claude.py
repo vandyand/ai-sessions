@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import re
@@ -52,6 +53,44 @@ CLAUDE_VERSION = "2.1.227"
 CLAUDE_HOME = env_path("CLAUDE_CONFIG_DIR", HOME / ".claude")
 DISCOVERY_CACHE_VERSION = 7
 DISCOVERY_CACHE_FILE = APP_CACHE_DIR / f"claude-discovery-v{DISCOVERY_CACHE_VERSION}.json"
+_CACHE_SENTINEL_BYTES = 4096
+_CACHE_SENTINEL_COUNT = 8
+
+
+def _cached_prefix_identity(path: Path, end: int) -> str | None:
+    """Digest bounded samples of a cached JSONL prefix.
+
+    The beginning, boundary, and evenly spaced interior samples make an in-place
+    rewrite distinguishable from an append without rereading a large transcript.
+    """
+    if end < 0:
+        return None
+    starts = {0, max(0, end - _CACHE_SENTINEL_BYTES)}
+    if end > _CACHE_SENTINEL_BYTES:
+        max_start = end - _CACHE_SENTINEL_BYTES
+        for index in range(1, _CACHE_SENTINEL_COUNT - 1):
+            starts.add(max_start * index // (_CACHE_SENTINEL_COUNT - 2))
+    digest = hashlib.sha256(str(end).encode("ascii"))
+    try:
+        with path.open("rb") as handle:
+            for start in sorted(starts):
+                handle.seek(start)
+                sample = handle.read(min(_CACHE_SENTINEL_BYTES, end - start))
+                digest.update(start.to_bytes(8, "big"))
+                digest.update(len(sample).to_bytes(4, "big"))
+                digest.update(sample)
+    except (OSError, OverflowError):
+        return None
+    return digest.hexdigest()
+
+
+def _cached_prefix_matches(path: Path, cached: dict[str, Any]) -> bool:
+    identity = cached.get("prefix_identity")
+    try:
+        end = int(cached.get("offset", -1))
+    except (TypeError, ValueError):
+        return False
+    return isinstance(identity, str) and end >= 0 and identity == _cached_prefix_identity(path, end)
 
 
 def _claude_semantic_text(item: dict[str, Any]) -> str:
@@ -369,6 +408,7 @@ class DiscoveryCache:
                 or any(name not in cached for name in required_metrics)
             )
         )
+        prefix_matches = bool(cached and signature_matches and _cached_prefix_matches(path, cached))
         exact = bool(
             cached
             and signature_matches
@@ -377,6 +417,7 @@ class DiscoveryCache:
             and cached.get("size") == stat.st_size
             and cached.get("mtime_ns") == stat.st_mtime_ns
             and cached.get("ctime_ns", 0) == getattr(stat, "st_ctime_ns", 0)
+            and prefix_matches
             and "candidate_ids" in cached
             and "evidence_truncated" in cached
         )
@@ -391,6 +432,7 @@ class DiscoveryCache:
             and signature_matches
             and not needs_count
             and cached.get("inode") == stat.st_ino
+            and prefix_matches
             and 0 <= int(cached.get("offset", 0)) <= stat.st_size
             and int(cached.get("size", 0)) < stat.st_size
             and "candidate_ids" in cached
@@ -501,6 +543,7 @@ class DiscoveryCache:
             mtime_ns=read_stat.st_mtime_ns,
             ctime_ns=getattr(read_stat, "st_ctime_ns", 0),
             offset=offset,
+            prefix_identity=_cached_prefix_identity(path, offset) or "",
             candidate_ids=evidence.tokens,
             evidence_truncated=evidence.truncated,
             pattern_signature=self.context.pattern_signature,

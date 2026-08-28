@@ -6,6 +6,7 @@ import tempfile
 import unittest
 from pathlib import Path
 
+from ai_sessions.app import load_session_catalog, save_session_catalog
 from ai_sessions.discovery import HarnessContext
 from ai_sessions.harnesses import claude, codex, opencode
 from ai_sessions.model import NativeSession, Session, SourceKind
@@ -57,6 +58,36 @@ class ModelMetricCompatibilityTests(unittest.TestCase):
         self.assertEqual((old_session.prompt_count, old_session.message_count), (4, 4))
         self.assertEqual((new_native.prompt_count, new_native.message_count), (3, 3))
         self.assertEqual(old_session.activity, "0t 0c 4p")
+
+    def test_catalog_migrates_only_missing_activity_fields(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "catalog.json"
+            item = Session(
+                "claude",
+                "catalog-session",
+                "title",
+                "/work",
+                2,
+                1,
+                "preview",
+                False,
+                "storage",
+                message_count=4,
+            )
+            save_session_catalog([item], path)
+            document = json.loads(path.read_text(encoding="utf-8"))
+            legacy = document["sessions"][0]
+            for name in ("turn_count", "compaction_count", "prompt_count"):
+                legacy.pop(name)
+            path.write_text(json.dumps(document), encoding="utf-8")
+            loaded = load_session_catalog(path=path)
+            self.assertEqual(
+                (loaded[0].turn_count, loaded[0].compaction_count, loaded[0].prompt_count),
+                (4, 0, 4),
+            )
+            legacy["unexpected"] = True
+            path.write_text(json.dumps(document), encoding="utf-8")
+            self.assertEqual(load_session_catalog(path=path), [])
 
 
 class JsonlMetricTests(unittest.TestCase):
@@ -147,6 +178,50 @@ class JsonlMetricTests(unittest.TestCase):
                 else:
                     self.assertEqual(result[3], "two")
 
+    def test_jsonl_cache_rebuilds_larger_same_inode_rewrite(self) -> None:
+        for module, source, initial, replacement in (
+            (
+                claude,
+                None,
+                _claude_line("user", "one"),
+                _claude_line("user", "two") + _claude_line("assistant", "answer"),
+            ),
+            (
+                codex,
+                SourceKind.INTERACTIVE,
+                _json_line(
+                    {"type": "event_msg", "payload": {"type": "user_message", "message": "one"}}
+                ),
+                _json_line(
+                    {"type": "event_msg", "payload": {"type": "user_message", "message": "two"}}
+                )
+                + _json_line(_codex_message("assistant", "answer")),
+            ),
+        ):
+            with self.subTest(provider=module.__name__), tempfile.TemporaryDirectory() as directory:
+                path = Path(directory) / "transcript.jsonl"
+                path.write_bytes(initial)
+                context = HarnessContext.create(use_cache=False)
+                cache = module.DiscoveryCache(context)
+                if source is None:
+                    cache.scan(path, count_user_messages=True)
+                else:
+                    cache.scan(path, source)
+                original_mtime = path.stat().st_mtime_ns
+                path.write_bytes(replacement)
+                os.utime(path, ns=(original_mtime, original_mtime))
+                warm = module.DiscoveryCache(context)
+                warm.entries = cache.entries
+                if source is None:
+                    result, _ = warm.scan(path, count_user_messages=True)
+                    self.assertEqual(
+                        (result["turn_count"], result["prompt_count"], result["last_prompt"]),
+                        (2, 1, "two"),
+                    )
+                else:
+                    result = warm.scan(path, source)
+                    self.assertEqual((result[0], result[2], result[3]), (2, 1, "two"))
+
     def test_warm_claude_cache_does_not_reopen_transcript(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             path = Path(directory) / "claude.jsonl"
@@ -161,6 +236,49 @@ class JsonlMetricTests(unittest.TestCase):
 
 
 class OpenCodeMetricTests(unittest.TestCase):
+    def test_file_only_user_message_has_a_stable_preview_placeholder(self) -> None:
+        schema = """
+        CREATE TABLE session (id TEXT, parent_id TEXT, directory TEXT, title TEXT,
+            agent TEXT, time_created INTEGER, time_updated INTEGER, time_archived INTEGER,
+            revert TEXT);
+        CREATE TABLE message (id TEXT, session_id TEXT, time_created INTEGER, data TEXT);
+        CREATE TABLE part (id TEXT, message_id TEXT, session_id TEXT, time_created INTEGER, data TEXT);
+        """
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            database = root / "opencode.db"
+            connection = sqlite3.connect(database)
+            connection.executescript(schema)
+            session_id = "ses_000000000001AAAAAAAAAAAAAA"
+            connection.execute(
+                "INSERT INTO session VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                (session_id, None, "/work", "title", "", 1, 2, None, None),
+            )
+            connection.execute(
+                "INSERT INTO message VALUES (?, ?, ?, ?)",
+                ("m01", session_id, 1, json.dumps({"role": "user"})),
+            )
+            connection.execute(
+                "INSERT INTO part VALUES (?, ?, ?, ?, ?)",
+                (
+                    "p01",
+                    "m01",
+                    session_id,
+                    1,
+                    json.dumps({"type": "file", "mime": "image/png", "filename": "screen.png"}),
+                ),
+            )
+            connection.commit()
+            connection.close()
+            command = (sys.executable, "-c", f"print({str(database)!r})")
+            context = HarnessContext.create(
+                use_cache=False, provider_commands={"opencode": command}
+            )
+            rows = opencode.discover(context, use_cache=False)
+        self.assertEqual(len(rows), 1)
+        self.assertEqual(rows[0].prompt_count, 1)
+        self.assertEqual(rows[0].preview, "[Attached image/png: screen.png]")
+
     def test_active_semantic_messages_and_completed_compaction(self) -> None:
         schema = """
         CREATE TABLE session (id TEXT, parent_id TEXT, directory TEXT, title TEXT,

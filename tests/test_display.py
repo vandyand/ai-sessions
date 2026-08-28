@@ -108,6 +108,24 @@ class DisplayTests(unittest.TestCase):
         payload = json.loads(output.getvalue())
         self.assertEqual([item["title"] for item in payload], ["market-anomaly-analysis"] * 2)
 
+    def test_normal_agent_tag_uses_nickname_without_parent_id(self) -> None:
+        item = self.titled_session("child-id")
+        item.source = "subagent"
+        item.agent_nickname = "Bohr"
+        item.parent_id = "parent-native-id"
+        self.assertNotIn("parent-native-id", app.display_list_title(item))
+
+        output = io.StringIO()
+        with redirect_stdout(output):
+            app.list_output([item])
+        self.assertIn("[Bohr]", output.getvalue())
+        self.assertNotIn("parent-native-id", output.getvalue())
+
+        output = io.StringIO()
+        with redirect_stdout(output):
+            app.list_output([item], as_json=True)
+        self.assertEqual(json.loads(output.getvalue())[0]["parent_id"], "parent-native-id")
+
     def test_same_title_different_cwd_still_gets_suffixes(self) -> None:
         rows = [
             self.titled_session("081c1234567890", cwd="/one"),
@@ -349,6 +367,19 @@ class ConversationViewTests(unittest.TestCase):
         self.assertIs(rows[0].target, head)
         self.assertEqual(rows[0].all_members, (old, head))
 
+    def test_equivalent_current_heads_choose_a_deterministic_actionable_target(self) -> None:
+        first = self.item("first", conversation_id="conv", updated=2)
+        second = self.item("second", conversation_id="conv", updated=3)
+        rows = app.build_view_rows([first, second])
+        self.assertIs(rows[0].target, second)
+        self.assertTrue(rows[0].actionable)
+
+        first.diverged = True
+        second.diverged = True
+        rows = app.build_view_rows([first, second])
+        self.assertIsNone(rows[0].target)
+        self.assertFalse(rows[0].actionable)
+
     def test_independent_group_is_presentation_only_and_projects_do_not_merge(self) -> None:
         first = self.item("one", title=" Topic ", cwd="/one")
         second = self.item("two", title="topic", cwd="/one", updated=3)
@@ -360,6 +391,47 @@ class ConversationViewTests(unittest.TestCase):
         self.assertEqual([item.key for item in rows[0].members], [first.key, second.key])
         self.assertEqual(rows[1].status, "untracked")
         self.assertIs(rows[1].target, other)
+
+    def test_unknown_cwd_independent_threads_never_group(self) -> None:
+        first = self.item("first", cwd="")
+        second = self.item("second", cwd=" ")
+        rows = app.build_view_rows([first, second])
+        self.assertEqual(len(rows), 2)
+        self.assertEqual([row.status for row in rows], ["untracked", "untracked"])
+
+    def test_related_tracked_and_independent_threads_share_a_presentation_container(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory) / "nautilus-ema-backtest"
+            harness = root / "harness"
+            harness.mkdir(parents=True)
+            tracked = self.item("tracked", title="Nautilus", cwd=str(root), conversation_id="conv")
+            first = self.item("first", title="Nautilus", cwd=str(harness))
+            second = self.item("second", title="Nautilus", cwd=str(harness))
+
+            collapsed = app.build_view_rows([tracked, first, second])
+            self.assertEqual(len(collapsed), 1)
+            self.assertTrue(collapsed[0].row_id.startswith("project:"))
+            self.assertIsNone(collapsed[0].target)
+            self.assertEqual(collapsed[0].project, str(root))
+
+            expanded = app.build_view_rows([tracked, first, second], expanded={collapsed[0].row_id})
+            self.assertEqual(len(expanded), 4)
+            self.assertIsNone(expanded[0].target)
+            self.assertEqual([row.target for row in expanded[1:]], [tracked, first, second])
+            self.assertEqual(
+                [row.row_id for row in expanded[1:]],
+                [
+                    "conversation:conv",
+                    "session:claude:first",
+                    "session:claude:second",
+                ],
+            )
+
+    def test_unknown_project_container_cannot_be_created_by_same_title(self) -> None:
+        first = self.item("first", title="Nautilus", cwd="")
+        second = self.item("second", title="Nautilus", cwd="")
+        rows = app.build_view_rows([first, second])
+        self.assertFalse(any(row.row_id.startswith("project:") for row in rows))
 
     def test_normal_rows_have_human_collision_labels_but_no_native_ids(self) -> None:
         first = self.item("native-one", cwd="/one")
@@ -438,6 +510,22 @@ class ConversationViewTests(unittest.TestCase):
             self.assertEqual(browser.project_focus, "")
             self.assertEqual(len(browser.current()), 2)
 
+    def test_f_focuses_a_synthetic_project_group_at_its_common_root(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory) / "project"
+            child = root / "harness"
+            child.mkdir(parents=True)
+            tracked = self.item("tracked", title="Topic", cwd=str(root), conversation_id="conv")
+            independent = self.item("independent", title="Topic", cwd=str(child))
+            browser = self.browser([tracked, independent], directory)
+
+            self.assertIsNone(browser.view_rows()[0].target)
+            browser.focus_selected_project()
+            self.assertEqual(browser.project_focus, str(root))
+            self.assertEqual(
+                {item.key for item in browser.current()}, {tracked.key, independent.key}
+            )
+
     def test_disappearing_expanded_child_restores_parent_selection(self) -> None:
         old = self.item("old", conversation_id="conv", superseded=True)
         head = self.item("head", conversation_id="conv", updated=3)
@@ -455,6 +543,19 @@ class ConversationViewTests(unittest.TestCase):
             self.assertTrue(browser.apply_refresh())
             self.assertEqual(browser.selected_id(), parent_id)
             self.assertIs(browser.selected_target(), head)
+
+    def test_filtering_an_expanded_child_restores_its_parent_not_a_sibling(self) -> None:
+        old = self.item("old", conversation_id="conv", superseded=True)
+        head = self.item("head", conversation_id="conv", updated=3)
+        with tempfile.TemporaryDirectory() as directory:
+            browser = self.browser([old, head], directory)
+            parent_id = browser.view_rows()[0].row_id
+            browser.expanded.add(parent_id)
+            child_id = browser.view_rows()[1].row_id
+            browser.selected = 1
+            browser.query = "head"
+            browser.keep_selection(child_id)
+            self.assertEqual(browser.selected_id(), parent_id)
 
 
 class StripExtendedPrefixTests(unittest.TestCase):

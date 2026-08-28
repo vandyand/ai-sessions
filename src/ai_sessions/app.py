@@ -13,6 +13,7 @@ from __future__ import annotations
 import argparse
 import curses
 import datetime as dt
+import functools
 import json
 import locale
 import os
@@ -894,8 +895,9 @@ def agent_tag(session: Session) -> str:
     """Label agent threads that borrowed their opening message.
 
     Codex copies the parent's first user message into every subagent it
-    spawns, so a fan-out of five renders as five identical lines.  The
-    nickname identifies the sibling and the short parent id shows the lineage.
+    spawns, so a fan-out of five renders as five identical lines.  This legacy
+    helper retains the parent fragment for callers that explicitly request the
+    diagnostic tag; ordinary rows use ``_normal_agent_tag`` below.
     """
     if session.source == "subagent":
         nickname = session.agent_nickname or "sub"
@@ -906,10 +908,17 @@ def agent_tag(session: Session) -> str:
     return ""
 
 
+def _normal_agent_tag(session: Session) -> str:
+    """Return the human-facing agent tag without exposing a parent ID."""
+    if session.source == "subagent":
+        return f"[{session.agent_nickname or 'sub'}] "
+    return agent_tag(session)
+
+
 def display_list_title(session: Session) -> str:
     """Make generated/unnamed titles explicit without a separate flag column."""
     title = display_title(session)
-    return agent_tag(session) + (title if session.named else f"*- {title}")
+    return _normal_agent_tag(session) + (title if session.named else f"*- {title}")
 
 
 def title_disambiguators(sessions: Iterable[Session]) -> dict[str, str]:
@@ -954,6 +963,7 @@ def conversation_status(session: Session) -> str:
     return "untracked"
 
 
+@functools.lru_cache(maxsize=32_768)
 def project_identity(value: str) -> str:
     """Return the presentation identity for a project directory.
 
@@ -962,7 +972,7 @@ def project_identity(value: str) -> str:
     filesystem check is a bounded ``.git`` ancestor probe; it never mutates state
     and falls back to lexical normalization on any error.
     """
-    if not value:
+    if not normalize_space(value):
         return "(unknown project)"
     value = strip_extended_prefix(os.path.expanduser(value))
     lexical = os.path.normcase(os.path.abspath(os.path.normpath(value)))
@@ -976,6 +986,36 @@ def project_identity(value: str) -> str:
         return os.path.normcase(str(candidate))
     except (OSError, RuntimeError, ValueError):
         return lexical
+
+
+def _projects_related(left: str, right: str) -> bool:
+    """Whether two known project identities are equal or ancestor/descendant."""
+    if not left or not right or left == "(unknown project)" or right == "(unknown project)":
+        return False
+    try:
+        common = os.path.commonpath((left, right))
+    except (OSError, ValueError):
+        return False
+    return common == left or common == right
+
+
+def _common_project_path(projects: Iterable[str]) -> str:
+    """Return the deterministic common project root for a presentation group."""
+    known = sorted({project for project in projects if project and project != "(unknown project)"})
+    if not known:
+        return "(unknown project)"
+    try:
+        return os.path.commonpath(known)
+    except (OSError, ValueError):
+        return known[0]
+
+
+def _independent_group_key(item: Session) -> tuple[str, str]:
+    """Make unknown-cwd independent sessions permanently presentation-distinct."""
+    project = project_identity(item.cwd)
+    if project == "(unknown project)":
+        project = f"{project}:{item.key}"
+    return project, normalize_space(display_title(item)).casefold()
 
 
 def activity_counts(session: Session) -> tuple[int, int, int]:
@@ -1047,9 +1087,17 @@ def _view_representative(items: tuple[Session, ...]) -> Session:
 
 
 def _tracked_target(items: tuple[Session, ...]) -> Session | None:
-    """Return a native target only when the full catalog has one clear head."""
+    """Return a deterministic native representative for a validated head set.
+
+    Equivalent heads are safe to present as one actionable row: UserState still
+    performs the authoritative materialization and target validation at launch
+    time.  Divergence is different and must remain both non-actionable here and
+    refused by UserState.resolve_launch().
+    """
+    if any(item.diverged for item in items):
+        return None
     heads = tuple(item for item in items if not item.superseded and not item.diverged)
-    return heads[0] if len(heads) == 1 else None
+    return _view_representative(heads) if heads else None
 
 
 def _tracked_status(items: tuple[Session, ...], target: Session | None) -> str:
@@ -1069,9 +1117,10 @@ def build_view_rows(
 ) -> tuple[ViewRow, ...]:
     """Build stable conversation-centered rows without mutating any session.
 
-    Tracked members group only by their utility conversation id.  Sessions without
-    that id group only for presentation when both normalized project and title
-    match; the resulting group has no launch or lineage semantics.
+    Tracked members group only by their utility conversation id.  After those
+    logical rows are built, equal-title rows in the same project family may be
+    wrapped in a presentation-only container.  A family is formed only by
+    equal or ancestor/descendant project paths; it never creates lineage.
     """
     source = tuple(sessions)
     visible = None if visible_keys is None else frozenset(visible_keys)
@@ -1100,13 +1149,16 @@ def build_view_rows(
                 order.append(("tracked", item.conversation_id))
                 ordered_tracked.add(item.conversation_id)
             continue
-        group_key = (project_identity(item.cwd), normalize_space(display_title(item)).casefold())
+        group_key = _independent_group_key(item)
         if group_key not in independent:
             independent[group_key] = []
             order.append(("independent", group_key))
         independent[group_key].append(item)
 
-    rows: list[ViewRow] = []
+    # First build the real logical rows.  Presentation containers are applied
+    # below so a mixed tracked/untracked group can contain a tracked aggregate
+    # without changing that aggregate's conversation semantics.
+    logical_rows: list[ViewRow] = []
     for kind, key in order:
         if kind == "tracked":
             all_members = tuple(tracked[key])  # type: ignore[index]
@@ -1116,42 +1168,27 @@ def build_view_rows(
             row_id = _view_row_id(members, kind=kind, key=key)  # type: ignore[arg-type]
             representative = _view_representative(all_members)
             target = _tracked_target(all_members)
-            expanded_here = row_id in expanded_ids
-            parent = ViewRow(
-                row_id,
-                members,
-                all_members,
-                representative,
-                target,
-                _tracked_status(all_members, target),
-                display_title(representative),
-                project_identity(representative.cwd),
-                expandable=True,
-                expanded=expanded_here,
-                actionable=target is not None,
-            )
-            rows.append(parent)
-            if expanded_here:
-                rows.extend(
-                    ViewRow(
-                        f"{row_id}/member:{item.key}",
-                        (item,),
-                        (item,),
-                        item,
-                        item,
-                        conversation_status(item),
-                        display_title(item),
-                        project_identity(item.cwd),
-                    )
-                    for item in members
+            logical_rows.append(
+                ViewRow(
+                    row_id,
+                    members,
+                    all_members,
+                    representative,
+                    target,
+                    _tracked_status(all_members, target),
+                    display_title(representative),
+                    project_identity(representative.cwd),
+                    expandable=len(all_members) > 1,
+                    actionable=target is not None,
                 )
+            )
             continue
 
         members = tuple(independent[key])  # type: ignore[index]
         all_members = members
         if len(members) == 1:
             item = members[0]
-            rows.append(
+            logical_rows.append(
                 ViewRow(
                     _view_row_id(members, kind="single", key=""),
                     members,
@@ -1166,8 +1203,7 @@ def build_view_rows(
             continue
         group_key = "\x1f".join(key)  # type: ignore[arg-type]
         row_id = _view_row_id(members, kind="independent", key=group_key)
-        expanded_here = row_id in expanded_ids
-        rows.append(
+        logical_rows.append(
             ViewRow(
                 row_id,
                 members,
@@ -1178,24 +1214,115 @@ def build_view_rows(
                 display_title(members[0]),
                 project_identity(members[0].cwd),
                 expandable=True,
+                actionable=False,
+            )
+        )
+
+    def add_logical_row(rows: list[ViewRow], logical: ViewRow) -> None:
+        expanded_here = logical.expandable and logical.row_id in expanded_ids
+        rows.append(replace(logical, expanded=expanded_here))
+        if not expanded_here:
+            return
+        rows.extend(
+            ViewRow(
+                f"{logical.row_id}/member:{item.key}",
+                (item,),
+                (item,),
+                item,
+                item,
+                conversation_status(item)
+                if logical.status != "independent thread"
+                else "independent thread",
+                display_title(item),
+                project_identity(item.cwd),
+            )
+            for item in logical.members
+        )
+
+    # Find connected components within each title.  This permits a project root
+    # and a child such as ``root``/``root/harness`` to share one stable family,
+    # while sibling directories with no direct ancestor relation stay separate.
+    title_indexes: dict[str, list[int]] = {}
+    for index, row in enumerate(logical_rows):
+        title_indexes.setdefault(normalize_space(row.title).casefold(), []).append(index)
+
+    components: dict[int, tuple[int, ...]] = {}
+    for indexes in title_indexes.values():
+        remaining = set(indexes)
+        while remaining:
+            component = {remaining.pop()}
+            changed = True
+            while changed:
+                changed = False
+                for candidate in tuple(remaining):
+                    if any(
+                        _projects_related(
+                            logical_rows[candidate].project, logical_rows[index].project
+                        )
+                        for index in component
+                    ):
+                        component.add(candidate)
+                        remaining.remove(candidate)
+                        changed = True
+            if len(component) > 1:
+                ordered = tuple(sorted(component))
+                components[ordered[0]] = ordered
+
+    rows: list[ViewRow] = []
+    consumed: set[int] = set()
+    for index, logical in enumerate(logical_rows):
+        if index in consumed:
+            continue
+        component = components.get(index)
+        if component is None:
+            add_logical_row(rows, logical)
+            continue
+        consumed.update(component)
+        children = tuple(logical_rows[child] for child in component)
+        if any(any(member.conversation_id for member in child.members) for child in children):
+            flattened: list[ViewRow] = []
+            for child in children:
+                if child.status != "independent thread":
+                    flattened.append(child)
+                    continue
+                flattened.extend(
+                    ViewRow(
+                        _view_row_id((member,), kind="single", key=""),
+                        (member,),
+                        (member,),
+                        member,
+                        member,
+                        "untracked",
+                        display_title(member),
+                        project_identity(member.cwd),
+                    )
+                    for member in child.members
+                )
+            children = tuple(flattened)
+        native_members = tuple(member for child in children for member in child.members)
+        native_all_members = tuple(member for child in children for member in child.all_members)
+        project = _common_project_path(child.project for child in children)
+        title = display_title(_view_representative(native_members))
+        row_id = "project:" + "\x1f".join((project, normalize_space(title).casefold()))
+        expanded_here = row_id in expanded_ids
+        rows.append(
+            ViewRow(
+                row_id,
+                native_members,
+                native_all_members,
+                _view_representative(native_all_members),
+                None,
+                "independent thread",
+                title,
+                project,
+                expandable=True,
                 expanded=expanded_here,
                 actionable=False,
             )
         )
         if expanded_here:
-            rows.extend(
-                ViewRow(
-                    f"{row_id}/member:{item.key}",
-                    (item,),
-                    (item,),
-                    item,
-                    item,
-                    "independent thread",
-                    display_title(item),
-                    project_identity(item.cwd),
-                )
-                for item in members
-            )
+            for child in children:
+                add_logical_row(rows, child)
     labels = view_collision_labels(row for row in rows if "/member:" not in row.row_id)
     return tuple(replace(row, collision_label=labels.get(row.row_id, "")) for row in rows)
 
@@ -1572,10 +1699,25 @@ def load_session_catalog(
     ):
         return []
     field_names = {field.name for field in fields(Session)}
+    activity_fields = {"turn_count", "compaction_count", "prompt_count"}
     result: list[Session] = []
     for payload in document["sessions"][:100_000]:
-        if not isinstance(payload, dict) or set(payload) != field_names:
+        if not isinstance(payload, dict):
             continue
+        keys = set(payload)
+        missing = field_names - keys
+        if keys - field_names or missing - activity_fields:
+            continue
+        if missing:
+            message_count = payload.get("message_count")
+            if not isinstance(message_count, int) or isinstance(message_count, bool):
+                continue
+            defaults = {
+                "turn_count": message_count,
+                "compaction_count": 0,
+                "prompt_count": message_count,
+            }
+            payload = {**payload, **{name: defaults[name] for name in missing}}
         try:
             item = Session(**payload)
         except (TypeError, ValueError):
@@ -2501,7 +2643,7 @@ class Browser:
         )
         if self.project_focus:
             focus = project_identity(self.project_focus)
-            items = [item for item in items if project_identity(item.cwd) == focus]
+            items = [item for item in items if _projects_related(focus, project_identity(item.cwd))]
         return items
 
     def view_rows(self) -> tuple[ViewRow, ...]:
@@ -2515,22 +2657,31 @@ class Browser:
     def keep_selection(self, previous_id: str = "", *, fallback_id: str = "") -> None:
         items = self.view_rows()
         if previous_id:
+            member_parent = previous_id.split("/member:", 1)[0] if "/member:" in previous_id else ""
             for index, item in enumerate(items):
-                if item.row_id == previous_id or any(
-                    member.key == previous_id for member in item.members
-                ):
+                if item.row_id == previous_id:
                     self.selected = index
                     break
             else:
-                if fallback_id:
+                parent_id = fallback_id or member_parent
+                if parent_id:
                     for index, item in enumerate(items):
-                        if item.row_id == fallback_id:
+                        if item.row_id == parent_id:
                             self.selected = index
                             break
                     else:
                         self.selected = min(self.selected, max(0, len(items) - 1))
                 else:
-                    self.selected = min(self.selected, max(0, len(items) - 1))
+                    # Callers such as hide/unhide retain the stable native key,
+                    # while expanded rows retain the /member row id.  all_members
+                    # lets the former fall back to its surviving aggregate rather
+                    # than whatever sibling happens to occupy the old index.
+                    for index, item in enumerate(items):
+                        if any(member.key == previous_id for member in item.all_members):
+                            self.selected = index
+                            break
+                    else:
+                        self.selected = min(self.selected, max(0, len(items) - 1))
         else:
             self.selected = min(self.selected, max(0, len(items) - 1))
 
@@ -2699,7 +2850,7 @@ class Browser:
                     "warning" if status != "lineage head" else "success",
                     curses.A_BOLD,
                 )
-                title = view_row.title
+                title = _normal_agent_tag(item) + view_row.title
                 if view_row.status == "independent thread":
                     title += f" ({len(view_row.members)} threads)"
                 elif len(view_row.all_members) > 1:
@@ -3115,11 +3266,13 @@ class Browser:
             self.keep_selection(previous)
             self.message = "Showing all projects."
             return
-        if row.target is None:
-            self.message = "Expand this group and choose a native session first."
-            return
         previous = self.selected_id()
-        self.project_focus = row.target.cwd
+        self.project_focus = (
+            row.project if row.project != "(unknown project)" else row.representative.cwd
+        )
+        if not self.project_focus:
+            self.message = "This session has no known project directory."
+            return
         self.directory = ""
         self.keep_selection(previous)
         self.message = f"Focused project: {short_path(self.project_focus)}. Press f to reset."

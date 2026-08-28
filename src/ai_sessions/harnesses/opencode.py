@@ -44,6 +44,7 @@ from ..registry import REGISTRY
 from .opencode_semantics import (
     CHECKPOINT_SCHEME,
     StoredMessage,
+    _file_placeholder,
     normalize_revert,
     project_view,
     select_compacted_newest,
@@ -1317,6 +1318,12 @@ def discover(context: HarnessContext, *, use_cache: bool = True) -> list[NativeS
                         )
                 elif part_active and kind in ("file", "subtask", "agent"):
                     usable_part = True
+                    if kind == "file":
+                        current_preview_chars = _append_preview_part(
+                            current_parts,
+                            _file_placeholder(part),
+                            current_preview_chars,
+                        )
                 part_row = next(part_rows, None)
             if boundary_here and current_state is not None:
                 current_state.revert_seen = True
