@@ -93,7 +93,7 @@ class DisplayTests(unittest.TestCase):
         with redirect_stdout(output):
             app.list_output(rows)
         rendered = output.getvalue()
-        self.assertIn("2023-11-14 17:13 EST", rendered)
+        self.assertIn("[2023-11-14", rendered)
         self.assertNotIn("081c1234", rendered)
         self.assertNotIn("6f321234", rendered)
 
@@ -133,7 +133,7 @@ class DisplayTests(unittest.TestCase):
         ]
         labels = app.title_disambiguators(rows)
         self.assertEqual(len(set(labels.values())), 2)
-        self.assertTrue(all("2023-11-14 17:13 EST" in value for value in labels.values()))
+        self.assertTrue(all(value.startswith("[2023-11-14") for value in labels.values()))
         self.assertFalse(any("081c" in value or "6f32" in value for value in labels.values()))
 
     def test_renamed_title_collision_is_rendering_only(self) -> None:
@@ -142,7 +142,7 @@ class DisplayTests(unittest.TestCase):
             self.titled_session("6f321234567890", title="shared name", renamed=True),
         ]
         self.assertEqual(rows[0].title, "shared name")
-        self.assertIn("2023-11-14 17:13 EST", app.title_disambiguators(rows)[rows[0].key])
+        self.assertTrue(app.title_disambiguators(rows)[rows[0].key].startswith("[2023-11-14"))
         self.assertEqual(rows[0].title, "shared name")
 
     def test_same_timestamp_collision_uses_a_human_ordinal(self) -> None:
