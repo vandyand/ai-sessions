@@ -84,6 +84,12 @@ class DisplayTests(unittest.TestCase):
         self.assertEqual(app.title_disambiguators([item]), {})
         self.assertEqual(app.display_list_title(item), "market-anomaly-analysis")
 
+    def test_column_cells_are_always_exact_width_with_a_gutter(self) -> None:
+        self.assertEqual(app.column_cell("Codex", 9), "Codex    ")
+        self.assertEqual(app.column_cell("OpenCode", 9), "OpenCode ")
+        self.assertEqual(app.column_cell("18420t 337c 596p", 10), "18420t 3… ")
+        self.assertTrue(all(len(app.column_cell(value, 10)) == 10 for value in ("", "x", "x" * 40)))
+
     def test_same_title_same_cwd_keeps_native_ids_out_of_plain_list(self) -> None:
         rows = [
             self.titled_session("081c1234567890"),
