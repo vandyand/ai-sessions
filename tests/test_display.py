@@ -557,6 +557,17 @@ class ConversationViewTests(unittest.TestCase):
             browser.keep_selection(child_id)
             self.assertEqual(browser.selected_id(), parent_id)
 
+    def test_same_title_component_build_does_not_compare_every_row_pair(self) -> None:
+        rows = [
+            self.item(str(index), title="Same title", cwd=f"/unrelated/project-{index}")
+            for index in range(1_000)
+        ]
+        app.project_identity.cache_clear()
+        with patch.object(app, "_projects_related", wraps=app._projects_related) as related:
+            built = app.build_view_rows(rows)
+        self.assertEqual(len(built), len(rows))
+        self.assertLessEqual(related.call_count, len(rows))
+
 
 class StripExtendedPrefixTests(unittest.TestCase):
     def test_drive_prefix_removed(self) -> None:

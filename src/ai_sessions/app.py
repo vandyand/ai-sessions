@@ -1248,22 +1248,48 @@ def build_view_rows(
 
     components: dict[int, tuple[int, ...]] = {}
     for indexes in title_indexes.values():
-        remaining = set(indexes)
-        while remaining:
-            component = {remaining.pop()}
-            changed = True
-            while changed:
-                changed = False
-                for candidate in tuple(remaining):
-                    if any(
-                        _projects_related(
-                            logical_rows[candidate].project, logical_rows[index].project
-                        )
-                        for index in component
-                    ):
-                        component.add(candidate)
-                        remaining.remove(candidate)
-                        changed = True
+        # Union exact and ancestor paths through a path index. Walking parent
+        # chains is bounded by path depth, unlike comparing every same-title
+        # row with every other row.
+        parents = {index: index for index in indexes}
+
+        def find(index: int) -> int:
+            root = index
+            while parents[root] != root:
+                root = parents[root]
+            while parents[index] != index:
+                next_index = parents[index]
+                parents[index] = root
+                index = next_index
+            return root
+
+        def union(left: int, right: int) -> None:
+            left_root, right_root = find(left), find(right)
+            if left_root != right_root:
+                parents[max(left_root, right_root)] = min(left_root, right_root)
+
+        by_project: dict[str, int] = {}
+        for index in indexes:
+            project = logical_rows[index].project
+            if project == "(unknown project)":
+                continue
+            duplicate = by_project.get(project)
+            if duplicate is not None:
+                union(index, duplicate)
+            else:
+                by_project[project] = index
+
+        for project, index in by_project.items():
+            for ancestor in Path(project).parents:
+                ancestor_index = by_project.get(str(ancestor))
+                if ancestor_index is not None:
+                    union(index, ancestor_index)
+                    break
+
+        grouped: dict[int, list[int]] = {}
+        for index in indexes:
+            grouped.setdefault(find(index), []).append(index)
+        for component in grouped.values():
             if len(component) > 1:
                 ordered = tuple(sorted(component))
                 components[ordered[0]] = ordered

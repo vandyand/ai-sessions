@@ -508,6 +508,7 @@ class DiscoveryCache:
             and cached.get("mode") == source.value
             and cached.get("inode") == stat.st_ino
             and prefix_matches
+            and int(cached.get("mtime_ns", 0)) < stat.st_mtime_ns
             and 0 <= int(cached.get("offset", 0)) <= stat.st_size
             and int(cached.get("size", 0)) < stat.st_size
             and "user_messages" in cached

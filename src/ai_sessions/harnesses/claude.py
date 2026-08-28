@@ -433,6 +433,10 @@ class DiscoveryCache:
             and not needs_count
             and cached.get("inode") == stat.st_ino
             and prefix_matches
+            # A larger file with an unchanged/coarse timestamp may be an
+            # in-place rewrite plus growth. Rebuild instead of trusting sparse
+            # prefix sentinels in that ambiguous case.
+            and int(cached.get("mtime_ns", 0)) < stat.st_mtime_ns
             and 0 <= int(cached.get("offset", 0)) <= stat.st_size
             and int(cached.get("size", 0)) < stat.st_size
             and "candidate_ids" in cached
