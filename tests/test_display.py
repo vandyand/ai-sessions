@@ -93,7 +93,7 @@ class DisplayTests(unittest.TestCase):
         with redirect_stdout(output):
             app.list_output(rows)
         rendered = output.getvalue()
-        self.assertEqual(rendered.count("market-anomaly-analysis"), 2)
+        self.assertIn("2023-11-14 17:13 EST", rendered)
         self.assertNotIn("081c1234", rendered)
         self.assertNotIn("6f321234", rendered)
 
@@ -131,13 +131,10 @@ class DisplayTests(unittest.TestCase):
             self.titled_session("081c1234567890", cwd="/one"),
             self.titled_session("6f321234567890", title="MARKET-ANOMALY-ANALYSIS", cwd="/two"),
         ]
-        self.assertEqual(
-            app.title_disambiguators(rows),
-            {
-                "claude:081c1234567890": "[081c1234]",
-                "claude:6f321234567890": "[6f321234]",
-            },
-        )
+        labels = app.title_disambiguators(rows)
+        self.assertEqual(len(set(labels.values())), 2)
+        self.assertTrue(all("2023-11-14 17:13 EST" in value for value in labels.values()))
+        self.assertFalse(any("081c" in value or "6f32" in value for value in labels.values()))
 
     def test_renamed_title_collision_is_rendering_only(self) -> None:
         rows = [
@@ -145,31 +142,37 @@ class DisplayTests(unittest.TestCase):
             self.titled_session("6f321234567890", title="shared name", renamed=True),
         ]
         self.assertEqual(rows[0].title, "shared name")
-        self.assertEqual(app.title_disambiguators(rows)[rows[0].key], "[081c1234]")
+        self.assertIn("2023-11-14 17:13 EST", app.title_disambiguators(rows)[rows[0].key])
         self.assertEqual(rows[0].title, "shared name")
 
-    def test_shared_id_prefix_extends_only_until_unique(self) -> None:
+    def test_same_timestamp_collision_uses_a_human_ordinal(self) -> None:
         rows = [
             self.titled_session("12345678a-rest"),
             self.titled_session("12345678b-rest"),
         ]
         labels = app.title_disambiguators(rows)
-        self.assertEqual(labels[rows[0].key], "[12345678a]")
-        self.assertEqual(labels[rows[1].key], "[12345678b]")
+        self.assertEqual(len(set(labels.values())), 2)
+        self.assertTrue(any(" · 2]" in value for value in labels.values()))
+        self.assertFalse(any("12345678" in value for value in labels.values()))
 
-    def test_identical_ids_across_tools_fall_back_to_tool_qualified_ids(self) -> None:
+    def test_identical_ids_across_tools_still_use_human_labels(self) -> None:
         rows = [
             self.titled_session("shared-id", tool="claude"),
             self.titled_session("shared-id", tool="codex"),
         ]
         labels = app.title_disambiguators(rows)
-        self.assertEqual(labels[rows[0].key], "[claude:shared-id]")
-        self.assertEqual(labels[rows[1].key], "[codex:shared-id]")
+        self.assertEqual(len(set(labels.values())), 2)
+        self.assertFalse(any("shared-id" in value for value in labels.values()))
 
     def test_suffix_remains_visible_with_bounded_title_rendering(self) -> None:
         rendered = app.ellipsize_with_suffix("market-anomaly-analysis", "[081c1234]", 13)
         self.assertEqual(len(rendered), 13)
         self.assertTrue(rendered.endswith("[081c1234]"))
+
+    def test_narrow_human_suffix_preserves_its_collision_ordinal(self) -> None:
+        rendered = app.ellipsize_with_suffix("title", "[2026-08-27 22:00 EDT · 12]", 12)
+        self.assertEqual(len(rendered), 12)
+        self.assertTrue(rendered.endswith(" · 12]"))
 
     def test_tui_rows_disambiguate_current_title_collisions(self) -> None:
         rows = [
@@ -459,6 +462,14 @@ class ConversationViewTests(unittest.TestCase):
         self.assertEqual(app.conversation_status(branch), "diverged branch")
         self.assertEqual(app.conversation_status(self.item("free")), "untracked")
         self.assertEqual(app.activity_label(self.item("free")), "0t 0c 4p")
+
+    def test_blocked_lineage_is_not_presented_or_targeted_as_a_head(self) -> None:
+        item = self.item("blocked", conversation_id="conv")
+        item.conversation_blocker = "unavailable"
+        row = app.build_view_rows([item])[0]
+        self.assertEqual(row.status, "unavailable")
+        self.assertIsNone(row.target)
+        self.assertFalse(row.actionable)
 
     def test_details_show_full_native_identity_and_filtered_members(self) -> None:
         old = self.item("old-native", conversation_id="conv", superseded=True)

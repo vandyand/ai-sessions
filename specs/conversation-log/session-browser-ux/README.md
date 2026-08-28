@@ -77,7 +77,7 @@ same-title independent threads, same-title different projects, exact collisions,
 auxiliary members, active writers, compacted Claude/Codex/OpenCode histories, malformed tails,
 refresh/selection stability, narrow terminals, CLI compatibility, and bounded refresh cost.
 
-Release verification covers 541 unit/integration tests, exact real-data grouping of the three
+Release verification covers 543 unit/integration tests, exact real-data grouping of the three
 Nautilus threads, 3,416-session cold/warm discovery, a 10,000-row same-title stress case, and a
 400-compaction Codex scanner. Independent adversarial review found and closed equivalent-head,
 selection-transfer, cache-rewrite, legacy-catalog, ID-leakage, unknown-project, and quadratic

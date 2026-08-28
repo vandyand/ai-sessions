@@ -560,15 +560,20 @@ class UserState:
             item.conversation_id = ""
             item.superseded = False
             item.diverged = False
+            item.conversation_blocker = ""
         by_key = {item.key: item for item in sessions}
         for conversation_id, conversation in self.conversations.items():
             status = self._conversation_status(conversation_id)
+            blocker = next(
+                (name for name in ("unknown", "unstable", "unavailable") if status[name]), ""
+            )
             head_keys = {key for key, _ in status["heads"]}
             for key in conversation["members"]:
                 item = by_key.get(key)
                 if item is None:
                     continue
                 item.conversation_id = conversation_id
+                item.conversation_blocker = blocker
                 item.diverged = bool(status["conflict"] and key in head_keys)
                 item.superseded = key not in head_keys
 
@@ -922,7 +927,7 @@ def display_list_title(session: Session) -> str:
 
 
 def title_disambiguators(sessions: Iterable[Session]) -> dict[str, str]:
-    """Return collision-only, stable ID labels for a rendered result set."""
+    """Return collision-only human labels without exposing native IDs."""
     groups: dict[str, list[Session]] = {}
     for item in sessions:
         groups.setdefault(display_title(item).casefold(), []).append(item)
@@ -931,29 +936,20 @@ def title_disambiguators(sessions: Iterable[Session]) -> dict[str, str]:
     for group in groups.values():
         if len(group) < 2:
             continue
-        width = 8
-        maximum = max((len(item.session_id) for item in group), default=width)
-        while width < maximum:
-            prefixes = [item.session_id[:width] for item in group]
-            if len(set(prefixes)) == len(prefixes):
-                break
-            width += 1
-        prefixes = [item.session_id[:width] for item in group]
-        if len(set(prefixes)) == len(prefixes):
-            for item, prefix in zip(group, prefixes, strict=True):
-                labels[item.key] = f"[{prefix}]"
-            continue
-
-        # Native IDs are normally unique within a rendered title collision.
-        # If two harnesses reuse the exact same ID, retain the complete ID and
-        # add the harness name rather than producing two identical row labels.
-        for item in group:
-            labels[item.key] = f"[{item.tool}:{item.session_id}]"
+        ordered = sorted(group, key=lambda item: (item.created, item.updated, item.tool, item.key))
+        used: dict[str, int] = {}
+        for item in ordered:
+            stamp = exact_time(item.created)
+            ordinal = used.get(stamp, 0) + 1
+            used[stamp] = ordinal
+            labels[item.key] = f"[{stamp}{f' · {ordinal}' if ordinal > 1 else ''}]"
     return labels
 
 
 def conversation_status(session: Session) -> str:
     """A stable, non-title label for the session's conversation position."""
+    if session.conversation_blocker:
+        return session.conversation_blocker
     if session.diverged:
         return "diverged branch"
     if session.superseded:
@@ -1094,13 +1090,16 @@ def _tracked_target(items: tuple[Session, ...]) -> Session | None:
     time.  Divergence is different and must remain both non-actionable here and
     refused by UserState.resolve_launch().
     """
-    if any(item.diverged for item in items):
+    if any(item.diverged or item.conversation_blocker for item in items):
         return None
     heads = tuple(item for item in items if not item.superseded and not item.diverged)
     return _view_representative(heads) if heads else None
 
 
 def _tracked_status(items: tuple[Session, ...], target: Session | None) -> str:
+    blocker = next((item.conversation_blocker for item in items if item.conversation_blocker), "")
+    if blocker:
+        return blocker
     if any(item.diverged for item in items):
         return "diverged branch"
     if target is not None:
@@ -1229,12 +1228,13 @@ def build_view_rows(
                 (item,),
                 (item,),
                 item,
-                item,
+                None if item.conversation_blocker else item,
                 conversation_status(item)
                 if logical.status != "independent thread"
                 else "independent thread",
                 display_title(item),
                 project_identity(item.cwd),
+                actionable=not bool(item.conversation_blocker),
             )
             for item in logical.members
         )
@@ -1680,6 +1680,7 @@ def save_session_catalog(sessions: Iterable[Session], path: Path = CATALOG_CACHE
             conversation_id="",
             superseded=False,
             diverged=False,
+            conversation_blocker="",
             is_open=False,
             open_pid=0,
         )
@@ -1725,14 +1726,19 @@ def load_session_catalog(
     ):
         return []
     field_names = {field.name for field in fields(Session)}
-    activity_fields = {"turn_count", "compaction_count", "prompt_count"}
+    migratable_fields = {
+        "turn_count",
+        "compaction_count",
+        "prompt_count",
+        "conversation_blocker",
+    }
     result: list[Session] = []
     for payload in document["sessions"][:100_000]:
         if not isinstance(payload, dict):
             continue
         keys = set(payload)
         missing = field_names - keys
-        if keys - field_names or missing - activity_fields:
+        if keys - field_names or missing - migratable_fields:
             continue
         if missing:
             message_count = payload.get("message_count")
@@ -1742,6 +1748,7 @@ def load_session_catalog(
                 "turn_count": message_count,
                 "compaction_count": 0,
                 "prompt_count": message_count,
+                "conversation_blocker": "",
             }
             payload = {**payload, **{name: defaults[name] for name in missing}}
         try:
@@ -2430,7 +2437,11 @@ def ellipsize_with_suffix(value: str, suffix: str, width: int) -> str:
     if not suffix:
         return ellipsize(value, width)
     if width <= len(suffix):
-        return ellipsize(suffix, width)
+        if width <= 1:
+            return ellipsize(suffix, width)
+        # Collision ordinals live at the end; preserve that distinguishing
+        # portion when an exceptionally narrow row cannot show the full date.
+        return "…" + suffix[-(width - 1) :]
     separator = " "
     title_width = width - len(separator) - len(suffix)
     return ellipsize(value, title_width) + separator + suffix
@@ -3901,7 +3912,8 @@ def list_output(items: list[Session], as_json: bool = False) -> None:
     activity_width = 18
     tool_width = tool_column_width(8)
     run_width = tool_column_width(6)
-    title_width = max(24, terminal_width - 124 - (tool_width - 8) - (run_width - 6))
+    title_width = max(32, terminal_width - 124 - (tool_width - 8) - (run_width - 6))
+    title_suffixes = title_disambiguators(items)
     print(
         f"{'TOOL':<{tool_width}} {'RUN':<{run_width}} {'ORIGIN':<7} "
         f"{'OPEN':<5} {'ACTIVITY':<{activity_width}} {'STATE':<8} "
@@ -3911,7 +3923,9 @@ def list_output(items: list[Session], as_json: bool = False) -> None:
     for item in items:
         paused = item.is_open and process_state(item.open_pid) in ("T", "t")
         open_symbol = "Ⅱ" if paused else ("●" if item.is_open else "")
-        rendered_title = ellipsize(display_list_title(item), title_width)
+        rendered_title = ellipsize_with_suffix(
+            display_list_title(item), title_suffixes.get(item.key, ""), title_width
+        )
         print(
             f"{tool_label(item.tool):<{tool_width}} "
             f"{tool_label(active_launch_tool(item)):<{run_width}} "

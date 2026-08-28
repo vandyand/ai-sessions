@@ -228,6 +228,7 @@ class Session:
     turn_count: int = 0
     compaction_count: int = 0
     prompt_count: int = 0
+    conversation_blocker: str = ""
 
     def __post_init__(self) -> None:
         self.source = SourceKind(self.source)
