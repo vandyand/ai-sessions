@@ -15,9 +15,13 @@ context.
 ## Architecture direction
 
 - Keep `Session` as the native materialization model and add neutral activity metrics to it.
-- Build immutable browser view rows after native filtering. View rows own grouping, expansion,
-  human labels, representative selection, and stable identity; native sessions retain all launch,
-  rename, hide, and focus semantics.
+- Build immutable browser view rows in three ordered stages: (1) derive tracked membership, status,
+  and authoritative heads from the complete native/state snapshot; (2) project eligible native
+  children through display filters while retaining the full tracked aggregate and its true head
+  whenever any member matched; (3) presentation-group the resulting tracked rows and independent
+  rows. A filtered independent group with one remaining child renders as that child, not a
+  container. View rows own expansion, human labels, and stable identity; native sessions retain
+  all launch, rename, hide, and focus semantics.
 - Derive tracked groups only from `conversation_id`. Derive presentation-only independent groups
   from normalized project identity plus normalized display title.
 - Compute tracked groups and authoritative heads from the full discovered/state snapshot before
@@ -55,6 +59,22 @@ context.
 - Provider activity caches persist aggregate counters and offsets, not turns. Unchanged warm scans
   perform bounded metadata/checkpoint validation and no transcript re-projection; cold scans remain
   streaming with peak memory independent of transcript length.
+
+Provider classifiers share these fixture-level expectations:
+
+- Claude: non-meta mainline `user` and `assistant` records are turns; qualifying user records are
+  prompts; `isCompactSummary` increments compactions and is one assistant turn. Sidechains belong
+  only to their subagent session. Utility handoff/provenance records marked meta are excluded.
+- Codex: interactive `event_msg/user_message` is the prompt authority; ordinary semantic assistant
+  message records are turns; paired response-item/event encodings count once; `compacted` increments
+  compactions, while its replacement history is carry context and never lifetime activity.
+  Developer/system/internal-context and tool records are excluded.
+- OpenCode: active, non-reverted user/assistant messages with at least one non-ignored semantic part
+  are turns; qualifying user messages are prompts; completed compaction markers increment
+  compactions and their semantic assistant summary is one turn. Tool-only and ignored-only messages
+  are excluded.
+- `latest prompt` uses the newest prompt accepted by the same classifier. Every adapter fixture
+  asserts exact numeric `xt`, `yc`, and `zp` values plus that exact latest prompt.
 
 ## Compatibility risks
 

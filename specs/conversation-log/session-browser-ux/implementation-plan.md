@@ -4,6 +4,8 @@
 
 - [ ] Define `turn_count`, `compaction_count`, and `prompt_count`, including bridge provenance,
   compacted windows, tool results, summaries, malformed tails, and legacy `message_count`.
+- [ ] Add representative Claude, Codex, and OpenCode fixtures with exact activity triples and
+  latest-prompt assertions before implementation.
 - [ ] Define tracked-conversation, independent-thread-group, and native-child row identities.
 - [ ] Characterize filtered/hidden/missing/uncertain heads and prove filtering never promotes an
   older visible member or transfers launch intent between children.
@@ -24,6 +26,9 @@
 
 - [ ] Collapse tracked materializations by utility conversation ID and choose representative
   heads only through stored lineage state.
+- [ ] Enforce the ordered pipeline: full-snapshot lineage/head derivation, eligible-child filter
+  projection without head substitution, then presentation-only independent grouping. A filtered
+  independent singleton is a native row, not a synthetic container.
 - [ ] Group same-project/same-title independent sessions without asserting ancestry.
 - [ ] Add expansion/collapse, stable selection across refresh, date/time collision labels, and
   safe synthetic-row behavior.
