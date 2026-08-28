@@ -12,12 +12,13 @@ It runs as `sessions` on Linux and native Windows PowerShell.
 
 ## Features
 
-- One navigable list for Codex, Claude Code, and OpenCode sessions
+- One conversation-centered list for Codex, Claude Code, and OpenCode sessions
+- Expandable project/thread groups and collapsed cross-harness lineage copies
 - Search and filters for provider, directory, origin, open state, and visibility
 - Human, cross-provider, and subagent/automation origin labels
-- Started and updated timestamps plus user-message counts across compactions
+- Started/updated timestamps plus compact `turns / compactions / prompts` activity
 - Rename that carries through to all three harnesses, plus utility-local hiding
-- Nickname and parent labels that tell sibling subagent threads apart
+- Nickname labels that tell sibling subagent threads apart without exposing native IDs
 - Detection of currently open sessions on Linux and Windows
 - tmux pane and desktop-terminal focus on Linux when the environment exposes it
 - Cross-harness resume: continue any session in any of the three harnesses
@@ -61,6 +62,9 @@ On Windows, `py -m pip` can be used in place of `python -m pip`.
 ## Everyday use
 
 Run `sessions`, navigate with the arrow keys or `j`/`k`, and press Enter to resume the selected conversation.
+Tracked cross-harness copies collapse to their logical conversation. Same-title independent
+threads in one project collapse to a presentation-only container; press Enter, Space, or Right to
+expand it and then choose the exact thread. No title or directory grouping creates lineage.
 
 | Key | Action |
 | --- | --- |
@@ -70,6 +74,10 @@ Run `sessions`, navigate with the arrow keys or `j`/`k`, and press Enter to resu
 | `o` | Cycle Human, Cross, Agent, and All origins |
 | `v` | Cycle visible, hidden, and all sessions |
 | `d` | Choose a directory |
+| `Space` / `Right` | Expand the selected conversation or thread group |
+| `Left` | Collapse the selected conversation or thread group |
+| `i` | Show full session, lineage, related-thread, storage, and native-ID details |
+| `f` | Focus the selected project; press again to show all projects |
 | `s` | Cycle sort order |
 | `x` | Cycle launch harness for selected session (bridges a copy when needed) |
 | `p` | Cycle Safe, Dangerous, and Custom launch modes |
@@ -208,9 +216,11 @@ after that frontier. Timestamps are display data only and never decide which his
 
 Selecting an older row therefore does not resume an older history. `ai-sessions` follows
 the conversation head, reuses an equivalent copy in the requested harness when one exists,
-or creates a new native session from the head. Historical rows remain visible and are
-labelled `superseded`. If two materializations advance independently, both are labelled
-`diverged` and automatic resume stops instead of silently choosing one branch.
+or creates a new native session from the head. Historical materializations remain available under
+expansion and in details as `superseded copy`. The validated current materialization is a `lineage
+head`. If two materializations advance independently, both are `diverged branch` and automatic
+resume stops instead of silently choosing one branch. Same-title sessions without recorded lineage
+are `independent thread` or `untracked`; their visual grouping never changes launch routing.
 
 The conversation id is stored in `state.json` and included in new copies as a structured
 `[ai-sessions-provenance v1]` marker. State is authoritative today; the marker makes copies

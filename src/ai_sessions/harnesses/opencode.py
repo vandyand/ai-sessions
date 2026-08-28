@@ -18,7 +18,7 @@ import tempfile
 import threading
 import time
 import urllib.parse
-from dataclasses import asdict, dataclass, fields
+from dataclasses import asdict, dataclass, field, fields
 from pathlib import Path
 from typing import Any, Iterable, Iterator
 
@@ -44,6 +44,7 @@ from ..registry import REGISTRY
 from .opencode_semantics import (
     CHECKPOINT_SCHEME,
     StoredMessage,
+    _file_placeholder,
     normalize_revert,
     project_view,
     select_compacted_newest,
@@ -134,8 +135,16 @@ class _DiscoveryState:
     first_user: str = ""
     latest_user: str = ""
     user_messages: int = 0
+    turn_count: int = 0
+    compaction_count: int = 0
+    prompt_count: int = 0
     first_user_key: tuple[float, str] | None = None
     latest_user_key: tuple[float, str] | None = None
+    revert_message_id: str = ""
+    revert_part_id: str = ""
+    revert_seen: bool = False
+    compaction_ids: set[str] = field(default_factory=set)
+    completed_compaction_parents: set[str] = field(default_factory=set)
 
 
 @dataclass(frozen=True, slots=True)
@@ -152,7 +161,7 @@ _AUTHORITATIVE_BINDINGS: dict[tuple[tuple[str, ...], str], DatabaseBinding] = {}
 _DISCOVERY_CACHE_LOCK = threading.RLock()
 _DISCOVERY_CACHE: dict[tuple[str, str, tuple[Any, ...]], _CachedDiscovery] = {}
 _DISCOVERY_CACHE_SIZE = 8
-_DISCOVERY_CACHE_VERSION = 1
+_DISCOVERY_CACHE_VERSION = 2
 _DISCOVERY_CACHE_MAX_BYTES = 64 * 1024 * 1024
 OPENCODE_DISCOVERY_CACHE_FILE = APP_CACHE_DIR / "opencode-discovery-v1.json"
 
@@ -1070,7 +1079,6 @@ def _finish_user(
 ) -> None:
     if state is None:
         return
-    state.user_messages += 1
     text = clean_prompt(" ".join(parts))
     if not text:
         return
@@ -1147,10 +1155,12 @@ def discover(context: HarnessContext, *, use_cache: bool = True) -> list[NativeS
                 return cached
         agent_column = "agent" if "agent" in columns["session"] else "''"
         states: dict[bytes, _DiscoveryState] = {}
+        revert_column = "revert" if "revert" in columns["session"] else "NULL"
         for row in connection.execute(
             f"SELECT CAST(id AS BLOB), CAST(parent_id AS BLOB), directory, title, "
             f"{agent_column}, time_created, "
-            "time_updated, time_archived FROM session ORDER BY time_updated DESC, id DESC"
+            f"time_updated, time_archived, {revert_column} FROM session "
+            "ORDER BY time_updated DESC, id DESC"
         ):
             identity = _native_identifier(row[0])
             if identity is None:
@@ -1163,6 +1173,18 @@ def discover(context: HarnessContext, *, use_cache: bool = True) -> list[NativeS
             if raw_session_id in states:
                 malformed = True
                 continue
+            revert_message_id = ""
+            revert_part_id = ""
+            raw_revert = row[8]
+            if raw_revert not in (None, b"", ""):
+                try:
+                    boundary = normalize_revert(_strict_json_object(raw_revert, "session.revert"))
+                except BridgeError:
+                    malformed = True
+                    boundary = None
+                if boundary is not None:
+                    revert_message_id = boundary["messageID"]
+                    revert_part_id = str(boundary.get("partID") or "")
             states[raw_session_id] = _DiscoveryState(
                 session_id=session_id,
                 parent_id=parent[1] if parent is not None else "",
@@ -1173,6 +1195,8 @@ def discover(context: HarnessContext, *, use_cache: bool = True) -> list[NativeS
                 updated=timestamp(row[6]),
                 archived=row[7] is not None,
                 evidence=context.accumulator(max_bytes=OPENCODE_EVIDENCE_BYTES),
+                revert_message_id=revert_message_id,
+                revert_part_id=revert_part_id,
             )
         part_rows = iter(
             connection.execute(
@@ -1256,22 +1280,81 @@ def discover(context: HarnessContext, *, use_cache: bool = True) -> list[NativeS
                 malformed = True
             oversized = oversized or message_oversized
             role = str(message.get("role") or "") if message is not None else ""
+            boundary_here = (
+                current_state is not None
+                and current_state.revert_message_id == message_id
+                and not current_state.revert_seen
+            )
+            active_message = current_state is not None and not current_state.revert_seen
+            if boundary_here and not current_state.revert_part_id:
+                active_message = False
             current_parts: list[str] = []
             current_preview_chars = 0
+            part_boundary_hit = False
+            usable_part = False
+            compaction_part = False
             while part_row is not None and part_key(part_row) == key:
                 part = read_part(
                     part_row,
                     current_state,
-                    semantic=role in ("user", "assistant"),
+                    semantic=active_message and role in ("user", "assistant"),
                 )
-                if role == "user" and part is not None and part.get("type") == "text":
+                part_identity = _native_identifier(part_row[4])
+                part_id = part_identity[1] if part_identity is not None else ""
+                part_active = active_message and not part_boundary_hit
+                if boundary_here and current_state.revert_part_id == part_id:
+                    part_boundary_hit = True
+                    part_active = False
+                kind = part.get("type") if isinstance(part, dict) else None
+                if part_active and kind == "compaction":
+                    compaction_part = True
+                if part_active and kind == "text":
                     part_text = part.get("text")
-                    if isinstance(part_text, str):
+                    ignored = part.get("ignored") is True
+                    if isinstance(part_text, str) and part_text and not ignored:
+                        usable_part = True
                         current_preview_chars = _append_preview_part(
                             current_parts, part_text, current_preview_chars
                         )
+                elif part_active and kind in ("file", "subtask", "agent"):
+                    usable_part = True
+                    if kind == "file":
+                        current_preview_chars = _append_preview_part(
+                            current_parts,
+                            _file_placeholder(part),
+                            current_preview_chars,
+                        )
                 part_row = next(part_rows, None)
-            if role == "user":
+            if boundary_here and current_state is not None:
+                current_state.revert_seen = True
+            if active_message and current_state is not None and role in ("user", "assistant"):
+                message_info = message if isinstance(message, dict) else {}
+                summary = (
+                    role == "assistant"
+                    and message_info.get("summary") is True
+                    and isinstance(message_info.get("finish"), str)
+                    and bool(message_info["finish"])
+                    and message_info.get("error") is None
+                )
+                if compaction_part and message_id:
+                    if message_id in current_state.completed_compaction_parents:
+                        current_state.compaction_count += 1
+                        current_state.completed_compaction_parents.remove(message_id)
+                    else:
+                        current_state.compaction_ids.add(message_id)
+                if summary:
+                    parent_id = str(message_info.get("parentID") or "")
+                    if parent_id in current_state.compaction_ids:
+                        current_state.compaction_ids.remove(parent_id)
+                        current_state.compaction_count += 1
+                    elif parent_id:
+                        current_state.completed_compaction_parents.add(parent_id)
+                if usable_part and not compaction_part:
+                    current_state.turn_count += 1
+                    if role == "user":
+                        current_state.prompt_count += 1
+                        current_state.user_messages = current_state.prompt_count
+            if role == "user" and active_message and usable_part and not compaction_part:
                 _finish_user(
                     current_state,
                     current_parts,
@@ -1319,7 +1402,10 @@ def discover(context: HarnessContext, *, use_cache: bool = True) -> list[NativeS
             source=SourceKind.SUBAGENT if item.parent_id else SourceKind.INTERACTIVE,
             archived=item.archived,
             parent_id=item.parent_id,
-            message_count=item.user_messages,
+            message_count=item.prompt_count,
+            turn_count=item.turn_count,
+            compaction_count=item.compaction_count,
+            prompt_count=item.prompt_count,
             agent_nickname=item.agent,
         )
         result.append(native)
@@ -1807,6 +1893,23 @@ def _write_temporary_export(payload: dict[str, Any]) -> Path:
     return path
 
 
+def _remove_temporary_export(path: Path) -> OSError | None:
+    """Remove a sensitive import file, tolerating brief Windows lock release."""
+    attempts = 6 if IS_WINDOWS else 1
+    last_error: OSError | None = None
+    for attempt in range(attempts):
+        try:
+            path.unlink()
+            return None
+        except FileNotFoundError:
+            return None
+        except OSError as error:
+            last_error = error
+            if attempt + 1 < attempts:
+                time.sleep(0.05)
+    return last_error
+
+
 def _run_import_and_cleanup(
     command: tuple[str, ...], operation_cwd: str, temporary: Path
 ) -> MaintenanceResult:
@@ -1822,13 +1925,7 @@ def _run_import_and_cleanup(
         )
     except Exception as error:
         failure = error
-    cleanup_error: OSError | None = None
-    try:
-        temporary.unlink()
-    except FileNotFoundError:
-        pass
-    except OSError as error:
-        cleanup_error = error
+    cleanup_error = _remove_temporary_export(temporary)
     if failure is not None:
         if cleanup_error is not None:
             raise BridgeError(

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import datetime as dt
+import hashlib
 import json
 import os
 import re
@@ -36,7 +37,7 @@ from ..conversion import (
     scrub,
 )
 from ..diagnostics import record_warning
-from ..discovery import HarnessContext, clean_prompt, normalize_space, prompt_text, timestamp
+from ..discovery import HarnessContext, clean_prompt, normalize_space, timestamp
 from ..liveness import LivenessContext
 from ..model import (
     Availability,
@@ -57,8 +58,70 @@ from ..registry import REGISTRY
 CODEX_CLI_VERSION = "0.147.0"
 CODEX_HOME = env_path("CODEX_HOME", HOME / ".codex")
 _RESULT_NOISE = re.compile(r"^Script completed\s*(Wall time[^\n]*)?\s*Output:\s*", re.I)
-DISCOVERY_CACHE_VERSION = 6
+DISCOVERY_CACHE_VERSION = 7
 DISCOVERY_CACHE_FILE = APP_CACHE_DIR / f"codex-discovery-v{DISCOVERY_CACHE_VERSION}.json"
+_CACHE_SENTINEL_BYTES = 4096
+_CACHE_SENTINEL_COUNT = 8
+
+
+def _cached_prefix_identity(path: Path, end: int) -> str | None:
+    """Digest bounded samples of a cached JSONL prefix before resuming it."""
+    if end < 0:
+        return None
+    starts = {0, max(0, end - _CACHE_SENTINEL_BYTES)}
+    if end > _CACHE_SENTINEL_BYTES:
+        max_start = end - _CACHE_SENTINEL_BYTES
+        for index in range(1, _CACHE_SENTINEL_COUNT - 1):
+            starts.add(max_start * index // (_CACHE_SENTINEL_COUNT - 2))
+    digest = hashlib.sha256(str(end).encode("ascii"))
+    try:
+        with path.open("rb") as handle:
+            for start in sorted(starts):
+                handle.seek(start)
+                sample = handle.read(min(_CACHE_SENTINEL_BYTES, end - start))
+                digest.update(start.to_bytes(8, "big"))
+                digest.update(len(sample).to_bytes(4, "big"))
+                digest.update(sample)
+    except (OSError, OverflowError):
+        return None
+    return digest.hexdigest()
+
+
+def _cached_prefix_matches(path: Path, cached: dict[str, Any]) -> bool:
+    identity = cached.get("prefix_identity")
+    try:
+        end = int(cached.get("offset", -1))
+    except (TypeError, ValueError):
+        return False
+    return isinstance(identity, str) and end >= 0 and identity == _cached_prefix_identity(path, end)
+
+
+def _codex_activity_text(payload: dict[str, Any]) -> str:
+    """Return text from a semantic message, excluding Codex scaffolding."""
+    if payload.get("type") != "message" or payload.get("role") not in ("user", "assistant"):
+        return ""
+    text = scrub(_block_text(payload.get("content")))
+    lowered = text.casefold()
+    if lowered.startswith("<codex_internal_context") or lowered.startswith(
+        "[ai-sessions-provenance v1]"
+    ):
+        return ""
+    return text
+
+
+def _codex_event_text(payload: dict[str, Any]) -> str:
+    if payload.get("type") != "user_message":
+        return ""
+    value = payload.get("message")
+    if not isinstance(value, str):
+        return ""
+    text = scrub(value)
+    lowered = text.casefold()
+    if lowered.startswith("<codex_internal_context") or lowered.startswith(
+        "[ai-sessions-provenance v1]"
+    ):
+        return ""
+    return text
 
 
 def uuid7() -> str:
@@ -399,16 +462,17 @@ class DiscoveryCache:
             except (OSError, json.JSONDecodeError, AttributeError):
                 pass
 
-    def scan(self, path: Path, source: SourceKind) -> tuple[int, str, Any]:
+    def scan(self, path: Path, source: SourceKind) -> tuple[int, int, int, str, Any]:
         key = str(path)
         try:
             stat = path.stat()
         except OSError:
-            return 0, "", self.context.accumulator()
+            return 0, 0, 0, "", self.context.accumulator()
         cached = self.entries.get(key)
         signature_matches = bool(
             cached and cached.get("pattern_signature") == self.context.pattern_signature
         )
+        prefix_matches = bool(cached and signature_matches and _cached_prefix_matches(path, cached))
         exact = bool(
             cached
             and signature_matches
@@ -416,7 +480,12 @@ class DiscoveryCache:
             and cached.get("inode") == stat.st_ino
             and cached.get("size") == stat.st_size
             and cached.get("mtime_ns") == stat.st_mtime_ns
+            and cached.get("ctime_ns", 0) == getattr(stat, "st_ctime_ns", 0)
+            and prefix_matches
             and "user_messages" in cached
+            and "turn_count" in cached
+            and "compaction_count" in cached
+            and "prompt_count" in cached
             and "latest_user_message" in cached
             and "candidate_ids" in cached
             and "evidence_truncated" in cached
@@ -427,7 +496,9 @@ class DiscoveryCache:
                 truncated=bool(cached.get("evidence_truncated")),
             )
             return (
-                int(cached.get("user_messages", 0)),
+                int(cached.get("turn_count", 0)),
+                int(cached.get("compaction_count", 0)),
+                int(cached.get("prompt_count", cached.get("user_messages", 0))),
                 clean_prompt(cached.get("latest_user_message")),
                 evidence,
             )
@@ -436,6 +507,8 @@ class DiscoveryCache:
             and signature_matches
             and cached.get("mode") == source.value
             and cached.get("inode") == stat.st_ino
+            and prefix_matches
+            and int(cached.get("mtime_ns", 0)) < stat.st_mtime_ns
             and 0 <= int(cached.get("offset", 0)) <= stat.st_size
             and int(cached.get("size", 0)) < stat.st_size
             and "user_messages" in cached
@@ -443,7 +516,13 @@ class DiscoveryCache:
             and "candidate_ids" in cached
             and "evidence_truncated" in cached
         )
-        count = int(cached.get("user_messages", 0)) if can_continue and cached else 0
+        turn_count = int(cached.get("turn_count", 0)) if can_continue and cached else 0
+        compaction_count = int(cached.get("compaction_count", 0)) if can_continue and cached else 0
+        prompt_count = (
+            int(cached.get("prompt_count", cached.get("user_messages", 0)))
+            if can_continue and cached
+            else 0
+        )
         latest = clean_prompt(cached.get("latest_user_message")) if can_continue and cached else ""
         latest_from_event = (
             bool(cached.get("latest_from_event")) if can_continue and cached else False
@@ -454,6 +533,11 @@ class DiscoveryCache:
             truncated=bool(cached.get("evidence_truncated")) if can_continue and cached else False,
         )
         offset = start
+        last_kind = str(cached.get("last_activity_kind", "")) if can_continue and cached else ""
+        last_text = (
+            clean_prompt(cached.get("last_activity_text")) if can_continue and cached else ""
+        )
+        incomplete = False
         try:
             with path.open("rb") as handle:
                 handle.seek(start)
@@ -461,55 +545,73 @@ class DiscoveryCache:
                     line = handle.readline()
                     if not line:
                         break
+                    if not line.endswith(b"\n"):
+                        incomplete = True
+                        break
                     offset = handle.tell()
                     response_message = bool(
                         b"response_item" in line
                         and (b'"type":"message"' in line or b'"type": "message"' in line)
                     )
                     user_event = b"event_msg" in line and b"user_message" in line
+                    compacted_event = (
+                        b'"type":"compacted"' in line or b'"type": "compacted"' in line
+                    )
                     if source is SourceKind.SUBAGENT:
-                        if not response_message and not user_event:
+                        if not response_message and not compacted_event:
                             continue
-                    elif not response_message and not user_event:
+                    elif not response_message and not user_event and not compacted_event:
                         continue
                     try:
                         item = json.loads(line)
                     except (json.JSONDecodeError, UnicodeDecodeError):
                         continue
+                    if item.get("type") == "compacted":
+                        compaction_count += 1
+                        last_kind = "compacted"
+                        last_text = ""
+                        continue
                     payload = item.get("payload")
                     if not isinstance(payload, dict):
                         continue
-                    if (
-                        item.get("type") == "response_item"
-                        and payload.get("type") == "message"
-                        and payload.get("role") in ("user", "assistant")
-                    ):
-                        semantic_text = prompt_text(payload)
-                        if semantic_text:
-                            evidence.scan(semantic_text.encode("utf-8", "replace"))
-                    if item.get("type") == "event_msg" and payload.get("type") == "user_message":
-                        raw_message = payload.get("message")
-                        if isinstance(raw_message, str) and raw_message:
-                            evidence.scan(raw_message.encode("utf-8", "replace"))
-                        value = clean_prompt(payload.get("message"))
-                        if value:
-                            latest = value
-                            latest_from_event = True
-                        if source is not SourceKind.SUBAGENT:
-                            count += 1
-                    elif (
-                        source is SourceKind.SUBAGENT
-                        and item.get("type") == "response_item"
-                        and payload.get("type") == "message"
-                        and payload.get("role") == "user"
-                    ):
-                        count += 1
-                        if not latest_from_event:
-                            value = clean_prompt(prompt_text(payload))
-                            if value and not value.startswith("<codex_internal_context"):
-                                latest = value
+                    if item.get("type") == "response_item":
+                        semantic_text = _codex_activity_text(payload)
+                        if not semantic_text:
+                            last_kind = ""
+                            last_text = ""
+                            continue
+                        evidence.scan(semantic_text.encode("utf-8", "replace"))
+                        role = payload.get("role")
+                        if role == "assistant":
+                            turn_count += 1
+                            last_kind = "assistant"
+                            last_text = semantic_text
+                        elif role == "user":
+                            paired = last_kind == "event_user" and last_text == semantic_text
+                            if not paired:
+                                turn_count += 1
+                            if source is SourceKind.SUBAGENT:
+                                prompt_count += 1
+                                if not latest_from_event:
+                                    latest = clean_prompt(semantic_text)
+                            last_kind = "response_user"
+                            last_text = semantic_text
+                    elif item.get("type") == "event_msg":
+                        value = _codex_event_text(payload)
+                        if not value or source is SourceKind.SUBAGENT:
+                            last_kind = ""
+                            last_text = ""
+                            continue
+                        evidence.scan(value.encode("utf-8", "replace"))
+                        prompt_count += 1
+                        latest = clean_prompt(value)
+                        latest_from_event = True
+                        if not (last_kind == "response_user" and last_text == value):
+                            turn_count += 1
+                        last_kind = "event_user"
+                        last_text = value
         except OSError:
-            return count, latest, evidence
+            return turn_count, compaction_count, prompt_count, latest, evidence
         try:
             final_stat = path.stat()
         except OSError:
@@ -517,18 +619,27 @@ class DiscoveryCache:
         self.entries[key] = {
             "mode": source.value,
             "inode": final_stat.st_ino,
-            "size": final_stat.st_size,
+            # ``offset`` is the complete-record boundary.  A concurrent
+            # writer's partial final record must be replayed next time.
+            "size": offset,
             "mtime_ns": final_stat.st_mtime_ns,
+            "ctime_ns": getattr(final_stat, "st_ctime_ns", 0),
             "offset": offset,
-            "user_messages": count,
+            "prefix_identity": _cached_prefix_identity(path, offset) or "",
+            "user_messages": prompt_count,
+            "turn_count": turn_count,
+            "compaction_count": compaction_count,
+            "prompt_count": prompt_count,
             "latest_user_message": latest,
             "latest_from_event": latest_from_event,
+            "last_activity_kind": last_kind if not incomplete else last_kind,
+            "last_activity_text": last_text if not incomplete else last_text,
             "candidate_ids": evidence.tokens,
             "evidence_truncated": evidence.truncated,
             "pattern_signature": self.context.pattern_signature,
         }
         self.dirty = True
-        return count, latest, evidence
+        return turn_count, compaction_count, prompt_count, latest, evidence
 
     def save(self) -> None:
         if not self.context.use_cache or not self.dirty:
@@ -637,15 +748,22 @@ def discover(context: HarnessContext, *, use_cache: bool = True) -> list[NativeS
             rollout_path = str(field("rollout_path", "") or "")
             if rollout_path and not Path(rollout_path).is_file():
                 continue
-            count = 0
+            turn_count = 0
+            compaction_count = 0
+            prompt_count = 0
             latest = ""
             evidence = context.accumulator()
             if rollout_path:
-                count, latest, evidence = cache.scan(Path(rollout_path), source)
+                turn_count, compaction_count, prompt_count, latest, evidence = cache.scan(
+                    Path(rollout_path), source
+                )
                 context.publish("codex", session_id, evidence)
             if source is SourceKind.INTERACTIVE and session_id in history:
-                count = int(history[session_id].get("count", 0))
-                latest = clean_prompt(history[session_id].get("latest"))
+                if not rollout_path:
+                    prompt_count = int(history[session_id].get("count", 0))
+                    turn_count = prompt_count
+                if not latest:
+                    latest = clean_prompt(history[session_id].get("latest"))
             cwd = str(field("cwd", "") or "")
             result.append(
                 NativeSession(
@@ -664,7 +782,10 @@ def discover(context: HarnessContext, *, use_cache: bool = True) -> list[NativeS
                     if source is SourceKind.SUBAGENT and parent_id
                     else session_id,
                     parent_id=parent_id,
-                    message_count=count,
+                    message_count=prompt_count,
+                    turn_count=turn_count,
+                    compaction_count=compaction_count,
+                    prompt_count=prompt_count,
                     agent_nickname=nickname,
                 )
             )

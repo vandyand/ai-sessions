@@ -1,5 +1,34 @@
 # Changelog
 
+## 3.5.0 — 2026-08-27
+
+### Added
+
+- A conversation-centered browser collapses cross-harness materializations into one logical row
+  and groups same-title project threads into an expandable container without inferring lineage.
+- Press `i` for complete session, lineage, related-thread, storage, and native-ID details. Press
+  `f` to focus the selected project and again to return to all projects.
+- Activity is reported consistently as `xt yc zp`: semantic conversation turns, native
+  compactions, and direct user prompts. Claude, Codex, and OpenCode collect these metrics with
+  incremental, rewrite-safe caches.
+
+### Changed
+
+- Normal rows use human date/time collision labels and no longer expose native ID/hash fragments.
+- Conversation labels now say `lineage head`, `superseded copy`, `diverged branch`, `independent
+  thread`, or `untracked` instead of the ambiguous `current` shorthand.
+- Plain `--list` output uses the compact activity triple while JSON retains full native identity
+  and compatibility fields.
+
+### Fixed
+
+- Equivalent non-diverged cross-harness heads remain launchable, while divergent heads remain
+  blocked by authoritative lineage resolution.
+- Filtering, refresh, and child disappearance cannot transfer selection or launch intent to a
+  sibling session, and hidden/filtered older copies cannot replace an authoritative head.
+- Same-inode transcript rewrites invalidate aggregate activity caches; partial records remain
+  safely replayable, and pre-3.5 session catalogs migrate their missing activity fields.
+
 ## 3.4.3 — 2026-08-27
 
 ### Changed

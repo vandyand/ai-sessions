@@ -225,9 +225,20 @@ class Session:
     conversation_id: str = ""
     superseded: bool = False
     diverged: bool = False
+    turn_count: int = 0
+    compaction_count: int = 0
+    prompt_count: int = 0
+    conversation_blocker: str = ""
 
     def __post_init__(self) -> None:
         self.source = SourceKind(self.source)
+        # ``message_count`` predates the activity triple and remains the
+        # serialized/UI compatibility value.  Old callers therefore provide
+        # just it; new callers can provide prompt_count instead.
+        if self.prompt_count <= 0 and self.message_count > 0:
+            self.prompt_count = self.message_count
+        elif self.message_count <= 0 and self.prompt_count > 0:
+            self.message_count = self.prompt_count
         if not self.launch_targets:
             self.launch_targets = {self.tool: self.session_id}
         elif self.tool not in self.launch_targets:
@@ -243,6 +254,10 @@ class Session:
     @property
     def resume_target(self) -> str:
         return self.resume_id or self.session_id
+
+    @property
+    def activity(self) -> str:
+        return f"{self.turn_count}t {self.compaction_count}c {self.prompt_count}p"
 
 
 @dataclass(frozen=True, slots=True)
@@ -264,12 +279,23 @@ class NativeSession:
     parent_id: str = ""
     message_count: int = 0
     agent_nickname: str = ""
+    turn_count: int = 0
+    compaction_count: int = 0
+    prompt_count: int = 0
 
     def __post_init__(self) -> None:
         if not self.tool or not self.session_id:
             raise ValueError("native session tool and session_id must not be empty")
         if not isinstance(self.source, SourceKind):
             raise ValueError("native session source must be a SourceKind")
+        if self.prompt_count <= 0 and self.message_count > 0:
+            object.__setattr__(self, "prompt_count", self.message_count)
+        elif self.message_count <= 0 and self.prompt_count > 0:
+            object.__setattr__(self, "message_count", self.prompt_count)
+
+    @property
+    def activity(self) -> str:
+        return f"{self.turn_count}t {self.compaction_count}c {self.prompt_count}p"
 
 
 @dataclass(frozen=True, slots=True)
