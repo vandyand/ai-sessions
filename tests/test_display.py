@@ -84,7 +84,7 @@ class DisplayTests(unittest.TestCase):
         self.assertEqual(app.title_disambiguators([item]), {})
         self.assertEqual(app.display_list_title(item), "market-anomaly-analysis")
 
-    def test_same_title_same_cwd_gets_short_id_suffixes_in_plain_list(self) -> None:
+    def test_same_title_same_cwd_keeps_native_ids_out_of_plain_list(self) -> None:
         rows = [
             self.titled_session("081c1234567890"),
             self.titled_session("6f321234567890"),
@@ -93,8 +93,9 @@ class DisplayTests(unittest.TestCase):
         with redirect_stdout(output):
             app.list_output(rows)
         rendered = output.getvalue()
-        self.assertIn("market-anoma… [081c1234]", rendered)
-        self.assertIn("market-anoma… [6f321234]", rendered)
+        self.assertEqual(rendered.count("market-anomaly-analysis"), 2)
+        self.assertNotIn("081c1234", rendered)
+        self.assertNotIn("6f321234", rendered)
 
     def test_json_titles_do_not_receive_rendering_suffixes(self) -> None:
         rows = [
@@ -169,8 +170,11 @@ class DisplayTests(unittest.TestCase):
                     UserState(Path(directory) / "state.json"),
                     LaunchConfig(path=Path(directory) / "config.toml"),
                 ).draw()
-        self.assertIn("[081c1234]", screen.frames[-1])
-        self.assertIn("[6f321234]", screen.frames[-1])
+        # The conversation view groups same-project/same-title independent
+        # threads and never leaks native IDs into ordinary rows.
+        self.assertIn("independent", screen.frames[-1])
+        self.assertNotIn("081c1234567890", screen.frames[-1])
+        self.assertNotIn("6f321234567890", screen.frames[-1])
 
     def test_windows_extended_path_prefix_is_hidden(self) -> None:
         # short_path also abbreviates the home directory, so asserting on the
@@ -282,6 +286,175 @@ class DisplayTests(unittest.TestCase):
                 browser.draw()
         self.assertIn("Loading sessions from installed tools", screen.frames[-1])
         self.assertIn("refreshing", screen.frames[-1])
+
+
+class ConversationViewTests(unittest.TestCase):
+    @staticmethod
+    def item(
+        session_id: str,
+        *,
+        title: str = "Topic",
+        cwd: str = "/repo",
+        updated: float = 1_700_000_002,
+        conversation_id: str = "",
+        superseded: bool = False,
+        diverged: bool = False,
+        hidden: bool = False,
+    ) -> Session:
+        return Session(
+            "claude",
+            session_id,
+            title,
+            cwd,
+            updated,
+            1_700_000_001,
+            "latest prompt",
+            True,
+            "storage/" + session_id,
+            conversation_id=conversation_id,
+            superseded=superseded,
+            diverged=diverged,
+            hidden=hidden,
+            message_count=4,
+        )
+
+    def browser(self, sessions: list[Session], directory: str) -> Browser:
+        return Browser(
+            ScriptedScreen(),
+            sessions,
+            UserState(Path(directory) / "state.json"),
+            LaunchConfig(path=Path(directory) / "config.toml"),
+        )
+
+    def test_tracked_chain_has_one_parent_and_exact_expanded_children(self) -> None:
+        old = self.item("old", conversation_id="conv", superseded=True, updated=2)
+        head = self.item("head", conversation_id="conv", updated=3)
+        rows = app.build_view_rows([old, head])
+        self.assertEqual(len(rows), 1)
+        self.assertEqual(rows[0].status, "lineage head")
+        self.assertIs(rows[0].target, head)
+        expanded = app.build_view_rows([old, head], expanded={rows[0].row_id})
+        self.assertEqual([row.target for row in expanded], [head, old, head])
+        self.assertEqual(
+            [row.status for row in expanded],
+            ["lineage head", "superseded copy", "lineage head"],
+        )
+
+    def test_filtered_head_does_not_promote_an_older_visible_child(self) -> None:
+        old = self.item("old", conversation_id="conv", superseded=True, updated=2)
+        head = self.item("head", conversation_id="conv", updated=3)
+        rows = app.build_view_rows([old, head], visible_keys={old.key})
+        self.assertEqual(len(rows), 1)
+        self.assertEqual([item.key for item in rows[0].members], [old.key])
+        self.assertIs(rows[0].target, head)
+        self.assertEqual(rows[0].all_members, (old, head))
+
+    def test_independent_group_is_presentation_only_and_projects_do_not_merge(self) -> None:
+        first = self.item("one", title=" Topic ", cwd="/one")
+        second = self.item("two", title="topic", cwd="/one", updated=3)
+        other = self.item("three", title="TOPIC", cwd="/two")
+        rows = app.build_view_rows([first, second, other])
+        self.assertEqual(len(rows), 2)
+        self.assertEqual(rows[0].status, "independent thread")
+        self.assertIsNone(rows[0].target)
+        self.assertEqual([item.key for item in rows[0].members], [first.key, second.key])
+        self.assertEqual(rows[1].status, "untracked")
+        self.assertIs(rows[1].target, other)
+
+    def test_normal_rows_have_human_collision_labels_but_no_native_ids(self) -> None:
+        first = self.item("native-one", cwd="/one")
+        second = self.item("native-two", cwd="/two")
+        rows = app.build_view_rows([first, second])
+        self.assertTrue(all(row.collision_label.startswith("[") for row in rows))
+        self.assertNotIn("native-one", rows[0].collision_label)
+        with tempfile.TemporaryDirectory() as directory:
+            browser = self.browser([first, second], directory)
+            with (
+                patch.dict(os.environ, {"TERM": "dumb"}, clear=False),
+                patch.object(app.curses, "curs_set"),
+            ):
+                browser.draw()
+            frame = browser.screen.frames[-1]
+        self.assertNotIn("native-one", frame)
+        self.assertNotIn("native-two", frame)
+
+    def test_status_and_compatibility_activity_label_are_exact(self) -> None:
+        head = self.item("head", conversation_id="conv")
+        old = self.item("old", conversation_id="conv", superseded=True)
+        branch = self.item("branch", conversation_id="fork", diverged=True)
+        self.assertEqual(app.conversation_status(head), "lineage head")
+        self.assertEqual(app.conversation_status(old), "superseded copy")
+        self.assertEqual(app.conversation_status(branch), "diverged branch")
+        self.assertEqual(app.conversation_status(self.item("free")), "untracked")
+        self.assertEqual(app.activity_label(self.item("free")), "0t 0c 4p")
+
+    def test_details_show_full_native_identity_and_filtered_members(self) -> None:
+        old = self.item("old-native", conversation_id="conv", superseded=True)
+        head = self.item("head-native", conversation_id="conv")
+        with tempfile.TemporaryDirectory() as directory:
+            screen = ScriptedScreen("x")
+            browser = Browser(
+                screen,
+                [old, head],
+                UserState(Path(directory) / "state.json"),
+                LaunchConfig(path=Path(directory) / "config.toml"),
+            )
+            browser.query = "head-native"
+            with (
+                patch.dict(os.environ, {"TERM": "dumb"}, clear=False),
+                patch.object(app.curses, "curs_set"),
+            ):
+                browser.details()
+        details = screen.frames[-1]
+        self.assertIn("CONVERSATION DETAILS", details)
+        self.assertIn("Native ID head-native", details)
+        self.assertIn("Storage    storage/head-native", details)
+        self.assertIn("filtered/hidden", details)
+
+    def test_enter_on_independent_group_only_expands(self) -> None:
+        first = self.item("one")
+        second = self.item("two", updated=3)
+        with tempfile.TemporaryDirectory() as directory:
+            screen = ScriptedScreen("\n", "q")
+            browser = Browser(
+                screen,
+                [first, second],
+                UserState(Path(directory) / "state.json"),
+                LaunchConfig(path=Path(directory) / "config.toml"),
+            )
+            self.assertIsNone(browser.run())
+        self.assertEqual(len(browser.view_rows()), 3)
+        self.assertIsNone(browser.view_rows()[0].target)
+
+    def test_project_focus_toggles_back_to_all_projects(self) -> None:
+        first = self.item("one", cwd="/one")
+        second = self.item("two", cwd="/two")
+        with tempfile.TemporaryDirectory() as directory:
+            browser = self.browser([first, second], directory)
+            browser.focus_selected_project()
+            self.assertEqual(browser.project_focus, "/one")
+            self.assertEqual([item.key for item in browser.current()], [first.key])
+            browser.focus_selected_project()
+            self.assertEqual(browser.project_focus, "")
+            self.assertEqual(len(browser.current()), 2)
+
+    def test_disappearing_expanded_child_restores_parent_selection(self) -> None:
+        old = self.item("old", conversation_id="conv", superseded=True)
+        head = self.item("head", conversation_id="conv", updated=3)
+        with tempfile.TemporaryDirectory() as directory:
+            browser = self.browser([old, head], directory)
+            parent_id = browser.view_rows()[0].row_id
+            browser.expanded.add(parent_id)
+            browser.selected = 1
+
+            class Refresh:
+                def take(self, *, wait: bool = False):
+                    return [head], (), ""
+
+            browser.refresh = Refresh()
+            self.assertTrue(browser.apply_refresh())
+            self.assertEqual(browser.selected_id(), parent_id)
+            self.assertIs(browser.selected_target(), head)
 
 
 class StripExtendedPrefixTests(unittest.TestCase):

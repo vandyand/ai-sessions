@@ -30,7 +30,7 @@ from ..conversion import (
     scrub,
 )
 from ..diagnostics import record_warning
-from ..discovery import HarnessContext, clean_prompt, normalize_space, prompt_text, timestamp
+from ..discovery import HarnessContext, clean_prompt, normalize_space, timestamp
 from ..liveness import LivenessContext, ProcessInfo
 from ..model import (
     Availability,
@@ -50,8 +50,25 @@ from ..registry import REGISTRY
 
 CLAUDE_VERSION = "2.1.227"
 CLAUDE_HOME = env_path("CLAUDE_CONFIG_DIR", HOME / ".claude")
-DISCOVERY_CACHE_VERSION = 6
+DISCOVERY_CACHE_VERSION = 7
 DISCOVERY_CACHE_FILE = APP_CACHE_DIR / f"claude-discovery-v{DISCOVERY_CACHE_VERSION}.json"
+
+
+def _claude_semantic_text(item: dict[str, Any]) -> str:
+    """Return conversational text, with provider scaffolding removed."""
+    if item.get("type") not in ("user", "assistant") or item.get("isMeta"):
+        return ""
+    message = item.get("message")
+    if not isinstance(message, dict):
+        return ""
+    return scrub(_block_text(message.get("content")))
+
+
+def _claude_is_compaction(item: dict[str, Any]) -> bool:
+    return bool(item.get("isCompactSummary")) or item.get("type") in {
+        "compact_boundary",
+        "compaction",
+    }
 
 
 def claude_project_dir(cwd: str) -> Path:
@@ -272,12 +289,20 @@ class DiscoveryCache:
     INTERESTING = (
         b'"type":"user"',
         b'"type": "user"',
+        b'"type":"assistant"',
+        b'"type": "assistant"',
         b'"type":"custom-title"',
         b'"type": "custom-title"',
         b'"type":"ai-title"',
         b'"type": "ai-title"',
         b'"type":"last-prompt"',
         b'"type": "last-prompt"',
+        b'"isCompactSummary":true',
+        b'"isCompactSummary": true',
+        b'"type":"compact_boundary"',
+        b'"type": "compact_boundary"',
+        b'"type":"compaction"',
+        b'"type": "compaction"',
     )
 
     def __init__(self, context: HarnessContext) -> None:
@@ -315,6 +340,9 @@ class DiscoveryCache:
             "evidence_truncated": False,
             "pattern_signature": "",
             "user_messages": 0,
+            "turn_count": 0,
+            "compaction_count": 0,
+            "prompt_count": 0,
             "created": 0.0,
             "updated": 0.0,
         }
@@ -332,7 +360,15 @@ class DiscoveryCache:
         signature_matches = bool(
             cached and cached.get("pattern_signature") == self.context.pattern_signature
         )
-        needs_count = bool(count_user_messages and cached and "user_messages" not in cached)
+        required_metrics = ("turn_count", "compaction_count", "prompt_count")
+        needs_count = bool(
+            cached
+            and (
+                count_user_messages
+                and "user_messages" not in cached
+                or any(name not in cached for name in required_metrics)
+            )
+        )
         exact = bool(
             cached
             and signature_matches
@@ -340,6 +376,7 @@ class DiscoveryCache:
             and cached.get("inode") == stat.st_ino
             and cached.get("size") == stat.st_size
             and cached.get("mtime_ns") == stat.st_mtime_ns
+            and cached.get("ctime_ns", 0) == getattr(stat, "st_ctime_ns", 0)
             and "candidate_ids" in cached
             and "evidence_truncated" in cached
         )
@@ -392,10 +429,19 @@ class DiscoveryCache:
                     except (json.JSONDecodeError, UnicodeDecodeError):
                         continue
                     kind = item.get("type")
-                    if kind in ("user", "assistant") and not item.get("isMeta"):
-                        semantic_text = prompt_text(item.get("message"))
+                    active = allow_sidechain or not item.get("isSidechain")
+                    semantic_text = _claude_semantic_text(item) if active else ""
+                    if semantic_text:
+                        if kind in ("user", "assistant"):
+                            meta["turn_count"] = int(meta.get("turn_count", 0)) + 1
+                            if kind == "user" and not _claude_is_compaction(item):
+                                meta["prompt_count"] = int(meta.get("prompt_count", 0)) + 1
+                                if count_user_messages:
+                                    meta["user_messages"] = int(meta.get("user_messages", 0)) + 1
                         if semantic_text:
                             evidence.scan(semantic_text.encode("utf-8", "replace"))
+                    if active and not item.get("isMeta") and _claude_is_compaction(item):
+                        meta["compaction_count"] = int(meta.get("compaction_count", 0)) + 1
                     if allow_sidechain:
                         agent_id = item.get("agentId")
                         parent_id = item.get("sessionId")
@@ -429,10 +475,10 @@ class DiscoveryCache:
                             meta["entrypoint"] = entrypoint
                         if prompt_source and not meta.get("prompt_source"):
                             meta["prompt_source"] = prompt_source
-                        value = clean_prompt(prompt_text(item.get("message")))
+                        value = (
+                            clean_prompt(semantic_text) if not _claude_is_compaction(item) else ""
+                        )
                         if value:
-                            if count_user_messages:
-                                meta["user_messages"] = int(meta.get("user_messages", 0)) + 1
                             if not meta.get("first_prompt"):
                                 meta["first_prompt"] = value
                             meta["last_prompt"] = value
@@ -453,6 +499,7 @@ class DiscoveryCache:
             inode=read_stat.st_ino,
             size=offset,
             mtime_ns=read_stat.st_mtime_ns,
+            ctime_ns=getattr(read_stat, "st_ctime_ns", 0),
             offset=offset,
             candidate_ids=evidence.tokens,
             evidence_truncated=evidence.truncated,
@@ -511,7 +558,7 @@ def discover(context: HarnessContext, *, use_cache: bool = True) -> list[NativeS
         try:
             meta, evidence = cache.scan(
                 path,
-                count_user_messages=not bool(hist.get("message_count")),
+                count_user_messages=True,
             )
             stat = path.stat()
         except OSError:
@@ -529,7 +576,8 @@ def discover(context: HarnessContext, *, use_cache: bool = True) -> list[NativeS
             float(hist.get("updated") or 0),
             stat.st_mtime,
         )
-        message_count = int(hist.get("message_count") or meta.get("user_messages") or 0)
+        prompt_count = int(meta.get("prompt_count") or 0)
+        message_count = prompt_count
         programmatic = meta.get("entrypoint") == "sdk-cli" or meta.get("prompt_source") == "sdk"
         result.append(
             NativeSession(
@@ -545,6 +593,9 @@ def discover(context: HarnessContext, *, use_cache: bool = True) -> list[NativeS
                 source=SourceKind.SDK if programmatic else SourceKind.INTERACTIVE,
                 resume_id=session_id,
                 message_count=message_count,
+                turn_count=int(meta.get("turn_count") or 0),
+                compaction_count=int(meta.get("compaction_count") or 0),
+                prompt_count=prompt_count,
             )
         )
 
@@ -588,6 +639,9 @@ def discover(context: HarnessContext, *, use_cache: bool = True) -> list[NativeS
                 resume_id=parent_id,
                 parent_id=parent_id,
                 message_count=int(meta.get("user_messages") or 0),
+                turn_count=int(meta.get("turn_count") or 0),
+                compaction_count=int(meta.get("compaction_count") or 0),
+                prompt_count=int(meta.get("prompt_count") or 0),
             )
         )
     cache.save()

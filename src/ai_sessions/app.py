@@ -25,7 +25,7 @@ import textwrap
 import threading
 import uuid
 from collections.abc import Mapping
-from dataclasses import asdict, fields, replace
+from dataclasses import asdict, dataclass, fields, replace
 from pathlib import Path
 from typing import Any, Iterable
 
@@ -946,12 +946,285 @@ def title_disambiguators(sessions: Iterable[Session]) -> dict[str, str]:
 def conversation_status(session: Session) -> str:
     """A stable, non-title label for the session's conversation position."""
     if session.diverged:
-        return "diverged"
+        return "diverged branch"
     if session.superseded:
-        return "superseded"
+        return "superseded copy"
     if session.conversation_id:
-        return "current"
-    return ""
+        return "lineage head"
+    return "untracked"
+
+
+def project_identity(value: str) -> str:
+    """Return the presentation identity for a project directory.
+
+    This deliberately normalizes a path, rather than reducing it to its basename:
+    two repositories called ``project`` are still two different projects.  The only
+    filesystem check is a bounded ``.git`` ancestor probe; it never mutates state
+    and falls back to lexical normalization on any error.
+    """
+    if not value:
+        return "(unknown project)"
+    value = strip_extended_prefix(os.path.expanduser(value))
+    lexical = os.path.normcase(os.path.abspath(os.path.normpath(value)))
+    # A repository root is a better project identity than the current subdir,
+    # but probing is deliberately limited to ancestors and failure-safe.
+    try:
+        candidate = Path(lexical).resolve(strict=False)
+        for parent in (candidate, *candidate.parents):
+            if (parent / ".git").exists():
+                return os.path.normcase(str(parent))
+        return os.path.normcase(str(candidate))
+    except (OSError, RuntimeError, ValueError):
+        return lexical
+
+
+def activity_counts(session: Session) -> tuple[int, int, int]:
+    """Read the neutral activity metrics, retaining compatibility with old models."""
+    values: list[int] = []
+    for name, fallback in (
+        ("turn_count", getattr(session, "message_count", 0)),
+        ("compaction_count", 0),
+        ("prompt_count", getattr(session, "message_count", 0)),
+    ):
+        try:
+            values.append(max(0, int(getattr(session, name, fallback))))
+        except (TypeError, ValueError):
+            values.append(0)
+    return values[0], values[1], values[2]
+
+
+def activity_label(session: Session) -> str:
+    """Compact activity display: transcript turns, compactions, semantic prompts."""
+    turns, compactions, prompts = activity_counts(session)
+    return f"{turns}t {compactions}c {prompts}p"
+
+
+@dataclass(frozen=True, slots=True)
+class ViewRow:
+    """An immutable presentation row backed by one or more exact native sessions."""
+
+    row_id: str
+    members: tuple[Session, ...]
+    all_members: tuple[Session, ...]
+    representative: Session
+    target: Session | None
+    status: str
+    title: str
+    project: str
+    expandable: bool = False
+    expanded: bool = False
+    actionable: bool = True
+    collision_label: str = ""
+
+    @property
+    def is_group(self) -> bool:
+        return len(self.members) > 1 or self.expandable
+
+    @property
+    def session(self) -> Session:
+        """The exact native session used for an actionable collapsed row."""
+        if self.target is None:
+            raise ValueError("synthetic view rows have no native target")
+        return self.target
+
+
+def _view_row_id(items: tuple[Session, ...], *, kind: str, key: str) -> str:
+    if kind == "tracked":
+        return f"conversation:{key}"
+    if kind == "independent":
+        return f"threads:{key}"
+    return f"session:{items[0].key}"
+
+
+def _view_representative(items: tuple[Session, ...]) -> Session:
+    """Choose from state-provided lineage flags, never from title/path heuristics."""
+    heads = [item for item in items if not item.superseded and not item.diverged]
+    if not heads:
+        heads = [item for item in items if not item.superseded]
+    if not heads:
+        heads = list(items)
+    return sorted(heads, key=lambda item: (-item.updated, item.tool, item.session_id))[0]
+
+
+def _tracked_target(items: tuple[Session, ...]) -> Session | None:
+    """Return a native target only when the full catalog has one clear head."""
+    heads = tuple(item for item in items if not item.superseded and not item.diverged)
+    return heads[0] if len(heads) == 1 else None
+
+
+def _tracked_status(items: tuple[Session, ...], target: Session | None) -> str:
+    if any(item.diverged for item in items):
+        return "diverged branch"
+    if target is not None:
+        return "lineage head"
+    if items and all(item.superseded for item in items):
+        return "superseded copy"
+    return conversation_status(_view_representative(items))
+
+
+def build_view_rows(
+    sessions: Iterable[Session],
+    expanded: Iterable[str] = (),
+    visible_keys: Iterable[str] | None = None,
+) -> tuple[ViewRow, ...]:
+    """Build stable conversation-centered rows without mutating any session.
+
+    Tracked members group only by their utility conversation id.  Sessions without
+    that id group only for presentation when both normalized project and title
+    match; the resulting group has no launch or lineage semantics.
+    """
+    source = tuple(sessions)
+    visible = None if visible_keys is None else frozenset(visible_keys)
+    expanded_ids = frozenset(expanded)
+    tracked: dict[str, list[Session]] = {}
+    independent: dict[tuple[str, str], list[Session]] = {}
+    order: list[tuple[str, str | tuple[str, str] | Session]] = []
+    for item in source:
+        if item.conversation_id:
+            if item.conversation_id not in tracked:
+                tracked[item.conversation_id] = []
+            tracked[item.conversation_id].append(item)
+
+    eligible = source if visible is None else tuple(item for item in source if item.key in visible)
+    # Stage 2 projects eligible children without changing the full tracked
+    # membership or its authoritative head. Stage 3 groups only this result.
+    eligible_keys = {item.key for item in eligible}
+    eligible_tracked = {
+        conversation_id: tuple(item for item in members if item.key in eligible_keys)
+        for conversation_id, members in tracked.items()
+    }
+    ordered_tracked: set[str] = set()
+    for item in eligible:
+        if item.conversation_id:
+            if item.conversation_id not in ordered_tracked:
+                order.append(("tracked", item.conversation_id))
+                ordered_tracked.add(item.conversation_id)
+            continue
+        group_key = (project_identity(item.cwd), normalize_space(display_title(item)).casefold())
+        if group_key not in independent:
+            independent[group_key] = []
+            order.append(("independent", group_key))
+        independent[group_key].append(item)
+
+    rows: list[ViewRow] = []
+    for kind, key in order:
+        if kind == "tracked":
+            all_members = tuple(tracked[key])  # type: ignore[index]
+            members = eligible_tracked[key]  # type: ignore[index]
+            if not members:
+                continue
+            row_id = _view_row_id(members, kind=kind, key=key)  # type: ignore[arg-type]
+            representative = _view_representative(all_members)
+            target = _tracked_target(all_members)
+            expanded_here = row_id in expanded_ids
+            parent = ViewRow(
+                row_id,
+                members,
+                all_members,
+                representative,
+                target,
+                _tracked_status(all_members, target),
+                display_title(representative),
+                project_identity(representative.cwd),
+                expandable=True,
+                expanded=expanded_here,
+                actionable=target is not None,
+            )
+            rows.append(parent)
+            if expanded_here:
+                rows.extend(
+                    ViewRow(
+                        f"{row_id}/member:{item.key}",
+                        (item,),
+                        (item,),
+                        item,
+                        item,
+                        conversation_status(item),
+                        display_title(item),
+                        project_identity(item.cwd),
+                    )
+                    for item in members
+                )
+            continue
+
+        members = tuple(independent[key])  # type: ignore[index]
+        all_members = members
+        if len(members) == 1:
+            item = members[0]
+            rows.append(
+                ViewRow(
+                    _view_row_id(members, kind="single", key=""),
+                    members,
+                    all_members,
+                    item,
+                    item,
+                    "untracked",
+                    display_title(item),
+                    project_identity(item.cwd),
+                )
+            )
+            continue
+        group_key = "\x1f".join(key)  # type: ignore[arg-type]
+        row_id = _view_row_id(members, kind="independent", key=group_key)
+        expanded_here = row_id in expanded_ids
+        rows.append(
+            ViewRow(
+                row_id,
+                members,
+                all_members,
+                _view_representative(members),
+                None,
+                "independent thread",
+                display_title(members[0]),
+                project_identity(members[0].cwd),
+                expandable=True,
+                expanded=expanded_here,
+                actionable=False,
+            )
+        )
+        if expanded_here:
+            rows.extend(
+                ViewRow(
+                    f"{row_id}/member:{item.key}",
+                    (item,),
+                    (item,),
+                    item,
+                    item,
+                    "independent thread",
+                    display_title(item),
+                    project_identity(item.cwd),
+                )
+                for item in members
+            )
+    labels = view_collision_labels(row for row in rows if "/member:" not in row.row_id)
+    return tuple(replace(row, collision_label=labels.get(row.row_id, "")) for row in rows)
+
+
+def view_collision_labels(rows: Iterable[ViewRow]) -> dict[str, str]:
+    """Use human start times for duplicate titles; native IDs never enter this label."""
+    groups: dict[str, list[ViewRow]] = {}
+    for row in rows:
+        groups.setdefault(normalize_space(row.title).casefold(), []).append(row)
+    labels: dict[str, str] = {}
+    for group in groups.values():
+        if len(group) < 2:
+            continue
+        ordered = sorted(
+            group,
+            key=lambda row: (
+                row.representative.created,
+                row.representative.updated,
+                row.project,
+                row.row_id,
+            ),
+        )
+        used: dict[str, int] = {}
+        for row in ordered:
+            stamp = exact_time(row.representative.created)
+            ordinal = used.get(stamp, 0) + 1
+            used[stamp] = ordinal
+            labels[row.row_id] = f"[{stamp}{f' · {ordinal}' if ordinal > 1 else ''}]"
+    return labels
 
 
 def codex_resume_target(session_id: str, source: str, parent_id: str) -> str:
@@ -1015,6 +1288,9 @@ def session_from_native(item: NativeSession) -> Session:
         original_named=item.named,
         message_count=item.message_count,
         agent_nickname=item.agent_nickname,
+        turn_count=item.turn_count,
+        compaction_count=item.compaction_count,
+        prompt_count=item.prompt_count,
     )
 
 
@@ -2016,6 +2292,8 @@ class Browser:
         self.sort_mode = "recent"
         self.selected = 0
         self.offset = 0
+        self.expanded: set[str] = set()
+        self.project_focus = ""
         self.searching = False
         self.message = (
             "Loading sessions…"
@@ -2075,6 +2353,7 @@ class Browser:
         if sessions is None and not error:
             return False
         previous = self.selected_id()
+        previous_parent = previous.split("/member:", 1)[0] if "/member:" in previous else ""
         self.refresh = None
         self._set_input_timeout(-1)
         if error:
@@ -2082,7 +2361,11 @@ class Browser:
             return True
         assert sessions is not None
         self.sessions = sessions
-        self.keep_selection(previous)
+        # A disappeared child cannot retain launch intent or selection. Restore
+        # its aggregate only when that exact stable parent still exists.
+        self.keep_selection(previous, fallback_id=previous_parent)
+        live_ids = {row.row_id for row in self.view_rows()}
+        self.expanded.intersection_update(row_id for row_id in live_ids if "/member:" not in row_id)
         self.message = "; ".join(warnings) or "Sessions refreshed."
         return True
 
@@ -2207,7 +2490,7 @@ class Browser:
             pass
 
     def current(self) -> list[Session]:
-        return filtered_sessions(
+        items = filtered_sessions(
             self.sessions,
             tools=self.tools,
             directory=self.directory,
@@ -2216,30 +2499,70 @@ class Browser:
             visibility=self.visibility,
             sort_mode=self.sort_mode,
         )
+        if self.project_focus:
+            focus = project_identity(self.project_focus)
+            items = [item for item in items if project_identity(item.cwd) == focus]
+        return items
 
-    def keep_selection(self, previous_id: str = "") -> None:
-        items = self.current()
+    def view_rows(self) -> tuple[ViewRow, ...]:
+        eligible = self.current()
+        return build_view_rows(
+            self.sessions,
+            expanded=self.expanded,
+            visible_keys=(item.key for item in eligible),
+        )
+
+    def keep_selection(self, previous_id: str = "", *, fallback_id: str = "") -> None:
+        items = self.view_rows()
         if previous_id:
             for index, item in enumerate(items):
-                if item.key == previous_id:
+                if item.row_id == previous_id or any(
+                    member.key == previous_id for member in item.members
+                ):
                     self.selected = index
                     break
             else:
-                self.selected = min(self.selected, max(0, len(items) - 1))
+                if fallback_id:
+                    for index, item in enumerate(items):
+                        if item.row_id == fallback_id:
+                            self.selected = index
+                            break
+                    else:
+                        self.selected = min(self.selected, max(0, len(items) - 1))
+                else:
+                    self.selected = min(self.selected, max(0, len(items) - 1))
         else:
             self.selected = min(self.selected, max(0, len(items) - 1))
 
     def selected_id(self) -> str:
-        items = self.current()
+        items = self.view_rows()
         if items and 0 <= self.selected < len(items):
-            return items[self.selected].key
+            return items[self.selected].row_id
         return ""
+
+    def selected_row(self) -> ViewRow | None:
+        rows = self.view_rows()
+        return rows[self.selected] if rows and 0 <= self.selected < len(rows) else None
+
+    def selected_target(self) -> Session | None:
+        row = self.selected_row()
+        return row.target if row is not None and row.actionable else None
+
+    def toggle_expansion(self, *, collapse: bool = False) -> bool:
+        row = self.selected_row()
+        if row is None or not row.expandable:
+            return False
+        if collapse or row.row_id in self.expanded:
+            self.expanded.discard(row.row_id)
+        else:
+            self.expanded.add(row.row_id)
+        self.keep_selection(row.row_id)
+        return True
 
     def draw(self) -> None:
         self.screen.erase()
         height, width = self.screen.getmaxyx()
-        items = self.current()
-        title_suffixes = title_disambiguators(items)
+        rows = self.view_rows()
         if height < 12 or width < 65:
             self.add(0, 0, "Terminal too small", self.style("warning", curses.A_BOLD))
             self.add(2, 0, "Resize to at least 65 columns × 12 rows.")
@@ -2253,7 +2576,7 @@ class Browser:
         self.add(0, 14, mode_text, self.style(mode_style, curses.A_BOLD))
         refresh_text = " · refreshing" if self.refresh is not None else ""
         count_text = (
-            f"{open_count} open · {len(items)} shown · {len(self.sessions)} indexed{refresh_text}"
+            f"{open_count} open · {len(rows)} shown · {len(self.sessions)} indexed{refresh_text}"
         )
         self.add(0, max(1, width - len(count_text) - 2), count_text, self.style("muted"))
 
@@ -2265,6 +2588,15 @@ class Browser:
             f"{ellipsize(dir_text, max(10, width // 4))}  ·  {SORT_LABELS[self.sort_mode]}"
         )
         self.add(1, 1, filters, self.style("muted"), width - 2)
+        if self.project_focus:
+            focus = "PROJECT FOCUS " + short_path(self.project_focus)
+            self.add(
+                2,
+                max(1, width - len(focus) - 2),
+                focus,
+                self.style("success", curses.A_BOLD),
+                width - 2,
+            )
 
         prompt_style = self.style("accent" if self.searching else "primary", curses.A_BOLD)
         prompt = "Search › " + self.query
@@ -2277,16 +2609,16 @@ class Browser:
         footer_row = height - 1
         detail_top = height - detail_height - 1
         visible_rows = max(1, detail_top - list_top)
-        self.selected = min(self.selected, max(0, len(items) - 1))
+        self.selected = min(self.selected, max(0, len(rows) - 1))
         if self.selected < self.offset:
             self.offset = self.selected
         if self.selected >= self.offset + visible_rows:
             self.offset = self.selected - visible_rows + 1
-        self.offset = min(self.offset, max(0, len(items) - visible_rows))
+        self.offset = min(self.offset, max(0, len(rows) - visible_rows))
 
         show_directory = width >= 100
         tool_width = tool_column_width(8)
-        origin_width, open_width, messages_width, time_width = 7, 6, 6, 10
+        origin_width, open_width, activity_width, time_width, status_width = 7, 6, 10, 10, 18
         directory_width = min(34, max(16, width // 4)) if show_directory else 0
         title_width = (
             width
@@ -2294,18 +2626,20 @@ class Browser:
             - tool_width
             - origin_width
             - open_width
-            - messages_width
+            - activity_width
             - (time_width * 2)
+            - status_width
             - directory_width
         )
         heading = (
             f"  {'TOOL':<{tool_width}}{'ORIGIN':<{origin_width}}"
-            f"{'OPEN':<{open_width}}{'MSGS':<{messages_width}}"
-            f"{'STARTED':<{time_width}}{'UPDATED':<{time_width}}TITLE"
+            f"{'OPEN':<{open_width}}{'ACTIVITY':<{activity_width}}"
+            f"{'STARTED':<{time_width}}{'UPDATED':<{time_width}}"
+            f"{'STATUS':<{status_width}}TITLE"
         )
         self.add(3, 1, heading, self.style("muted", curses.A_BOLD), width - 2)
 
-        if not items:
+        if not rows:
             empty_text = (
                 "Loading sessions from installed tools…"
                 if self.refresh is not None and not self.sessions
@@ -2319,11 +2653,17 @@ class Browser:
                 self.style("muted"),
             )
         else:
-            for row, item in enumerate(items[self.offset : self.offset + visible_rows]):
+            for row, view_row in enumerate(rows[self.offset : self.offset + visible_rows]):
                 index = self.offset + row
                 y = list_top + row
                 selected = index == self.selected
-                marker = "›" if selected else ("⊘" if item.hidden else " ")
+                item = view_row.representative
+                marker = (
+                    "›"
+                    if selected
+                    else ("⊘" if any(member.hidden for member in view_row.members) else " ")
+                )
+                expander = "▾" if view_row.expanded else ("▸" if view_row.expandable else " ")
                 item_tool_label = tool_label(item.tool)
                 origin_label = ORIGIN_LABELS[item.origin]
                 directory = short_path(item.cwd)
@@ -2337,7 +2677,11 @@ class Browser:
                     x += len(value)
 
                 marker_color = "hidden" if item.hidden else "primary"
-                segment(f"{marker} ", marker_color, curses.A_BOLD if marker.strip() else 0)
+                segment(
+                    f"{marker}{expander} ",
+                    marker_color,
+                    curses.A_BOLD if marker.strip() else 0,
+                )
                 segment(f"{item_tool_label:<{tool_width}}", item.tool, curses.A_BOLD)
                 segment(f"{origin_label:<{origin_width}}", item.origin, curses.A_BOLD)
                 open_symbol = "Ⅱ" if paused else ("●" if item.is_open else "")
@@ -2346,40 +2690,34 @@ class Browser:
                     "warning" if paused else "success",
                     curses.A_BOLD,
                 )
-                segment(f"{item.message_count:<{messages_width}}", "messages")
+                segment(f"{activity_label(item):<{activity_width}}", "messages")
                 segment(f"{relative_time(item.created):<{time_width}}", "muted")
                 segment(f"{relative_time(item.updated):<{time_width}}", "timestamp")
-                status = conversation_status(item)
-                if status:
-                    badge = f"[{status}] "
-                    segment(badge, "warning" if status != "current" else "success", curses.A_BOLD)
-                tag = agent_tag(item)
-                remaining = title_width
-                if status:
-                    remaining = max(0, remaining - len(badge))
-                if tag:
-                    segment(tag, item.origin, curses.A_BOLD)
-                    remaining = max(0, remaining - len(tag))
-                if item.named:
-                    title = ellipsize_with_suffix(
-                        display_title(item), title_suffixes.get(item.key, ""), remaining
-                    )
-                    segment(f"{title:<{remaining}}", "primary", curses.A_BOLD)
-                else:
-                    prefix = "*- "
-                    room = max(0, remaining - len(prefix))
-                    title = ellipsize_with_suffix(
-                        display_title(item), title_suffixes.get(item.key, ""), room
-                    )
-                    segment(prefix, "warning", curses.A_BOLD)
-                    segment(f"{title:<{room}}", "primary")
+                status = view_row.status
+                segment(
+                    f"{status:<{status_width}}",
+                    "warning" if status != "lineage head" else "success",
+                    curses.A_BOLD,
+                )
+                title = view_row.title
+                if view_row.status == "independent thread":
+                    title += f" ({len(view_row.members)} threads)"
+                elif len(view_row.all_members) > 1:
+                    title += f" ({len(view_row.all_members) - 1} copies)"
+                if view_row.collision_label:
+                    title += " " + view_row.collision_label
+                if not item.named:
+                    title = "*- " + title
+                room = max(0, title_width)
+                segment(ellipsize(title, room).ljust(room), "primary", curses.A_BOLD)
                 if show_directory:
                     segment(ellipsize(directory, directory_width).ljust(directory_width), "muted")
 
         for x in range(1, width - 1):
             self.add(detail_top, x, "─", self.style("muted", curses.A_DIM))
-        if items:
-            item = items[self.selected]
+        if rows:
+            selected_row = rows[self.selected]
+            item = selected_row.representative
             missing = bool(item.cwd and not Path(item.cwd).is_dir())
             name_badge = " · utility name" if item.renamed else (" · named" if item.named else "")
             source_badge = f" · {item.source}" if item.source != "interactive" else ""
@@ -2394,8 +2732,9 @@ class Browser:
             self.add(
                 detail_top + 1,
                 2,
-                f"{tool_label(item.tool)} · {ORIGIN_LABELS[item.origin]} · launch via {launch_tool} · "
-                f"{item.message_count} user msgs{name_badge}{source_badge}{hidden_badge}{open_badge}",
+                f"{tool_label(item.tool)} · {ORIGIN_LABELS[item.origin]} · "
+                f"launch via {launch_tool} · "
+                f"{activity_label(item)}{name_badge}{source_badge}{hidden_badge}{open_badge}",
                 self.style(item.origin, curses.A_BOLD),
                 width - 4,
             )
@@ -2415,9 +2754,12 @@ class Browser:
                 path_style,
                 width - 4,
             )
-            identity = "Agent log " if item.parent_id else "Session   "
             self.add(
-                detail_top + 4, 2, identity + " " + item.session_id, self.style("muted"), width - 4
+                detail_top + 4,
+                2,
+                f"Status     {selected_row.status} · Activity {activity_label(item)}",
+                self.style("muted"),
+                width - 4,
             )
             latest_user_message = clean_prompt(item.preview)
             detail_row = detail_top + 5
@@ -2450,8 +2792,8 @@ class Browser:
                 )
 
         footer = self.message or (
-            "Enter focus/resume  Ctrl-F search  t tools  x launch harness  p launch  o origin  "
-            "v view  s sort  r rename  h hide  q quit  ? help"
+            "Enter open  t tools  i details  f focus  Space/Right expand  Left collapse  "
+            "Ctrl-F search  r rename  h hide  q quit  ? help"
         )
         self.add(footer_row, 1, footer, self.style("accent", curses.A_BOLD), width - 2)
         if self.searching:
@@ -2568,10 +2910,11 @@ class Browser:
         self.keep_selection(previous)
 
     def cycle_launch_tool(self) -> None:
-        items = self.current()
-        if not items:
+        item = self.selected_target()
+        if item is None:
+            if self.selected_row() is not None:
+                self.message = "Expand this group and choose a native session first."
             return
-        item = items[self.selected]
         before = active_launch_tool(item)
         cycle_session_launch_tool(item)
         selected = active_launch_tool(item)
@@ -2687,6 +3030,7 @@ class Browser:
                 if options:
                     previous = self.selected_id()
                     self.directory = options[selected]
+                    self.project_focus = ""
                     self.keep_selection(previous)
                 return
             if key in (curses.KEY_UP, "\x10"):
@@ -2760,12 +3104,81 @@ class Browser:
             elif isinstance(key, str) and key.isprintable() and len(value) < 200:
                 value += key
 
+    def focus_selected_project(self) -> None:
+        row = self.selected_row()
+        if row is None:
+            return
+        if self.project_focus:
+            previous = self.selected_id()
+            self.project_focus = ""
+            self.directory = ""
+            self.keep_selection(previous)
+            self.message = "Showing all projects."
+            return
+        if row.target is None:
+            self.message = "Expand this group and choose a native session first."
+            return
+        previous = self.selected_id()
+        self.project_focus = row.target.cwd
+        self.directory = ""
+        self.keep_selection(previous)
+        self.message = f"Focused project: {short_path(self.project_focus)}. Press f to reset."
+
+    def details(self) -> None:
+        """Show inspectable lineage and native identity without putting IDs in rows."""
+        row = self.selected_row()
+        if row is None:
+            return
+        eligible = {item.key for item in self.current()}
+        members = row.all_members
+        lines = [
+            "CONVERSATION DETAILS",
+            f"Project    {row.project}",
+            f"Thread     {row.title}",
+            f"Status     {row.status}",
+            f"Members    {len(members)} (shown {len(row.members)})",
+            "Lineage / related threads",
+            "",
+        ]
+        for item in members:
+            filtered = " · filtered/hidden" if item.key not in eligible else ""
+            prompt = ellipsize(clean_prompt(item.preview), max(1, self.screen.getmaxyx()[1] - 14))
+            lines.extend(
+                (
+                    f"{conversation_status(item)} · {tool_label(item.tool)} · "
+                    f"{exact_time(item.updated)}{filtered}",
+                    f"Harness    {item.tool} · Native ID {item.session_id}",
+                    f"Storage    {item.storage or '(unknown)'}",
+                    f"Dates      {exact_time(item.created)} → {exact_time(item.updated)}",
+                    f"Activity  {activity_label(item)}",
+                    f"Prompt    {prompt}",
+                    "",
+                )
+            )
+        self._set_input_timeout(-1)
+        try:
+            self.screen.erase()
+            height, width = self.screen.getmaxyx()
+            self.add(1, 2, lines[0], self.style("accent", curses.A_BOLD), width - 4)
+            for index, line in enumerate(lines[1 : max(1, height - 3)], 2):
+                line_style = (
+                    "muted" if line.startswith(("Harness", "Storage", "Dates")) else "primary"
+                )
+                self.add(index, 2, line, self.style(line_style), width - 4)
+            self.add(height - 2, 2, "Press any key to return", self.style("muted"), width - 4)
+            self.screen.refresh()
+            self.screen.get_wch()
+        finally:
+            if self.refresh is not None:
+                self._set_input_timeout(100)
+
     def rename_selected(self) -> None:
         self.finish_refresh()
-        items = self.current()
-        if not items:
+        item = self.selected_target()
+        if item is None:
+            if self.selected_row() is not None:
+                self.message = "Expand this group and choose a native session first."
             return
-        item = items[self.selected]
         value = self.name_prompt(item)
         if value is None:
             return
@@ -2775,10 +3188,11 @@ class Browser:
 
     def toggle_hidden(self) -> None:
         self.finish_refresh()
-        items = self.current()
-        if not items:
+        item = self.selected_target()
+        if item is None:
+            if self.selected_row() is not None:
+                self.message = "Expand this group and choose a native session first."
             return
-        item = items[self.selected]
         previous = item.key
         if item.hidden:
             self.state.set_hidden(item, False)
@@ -2800,9 +3214,13 @@ class Browser:
     def help(self) -> None:
         lines = [
             ("Enter", "Focus an open session; otherwise resume it"),
+            ("Space/Right", "Expand a conversation or independent thread group"),
+            ("Left", "Collapse the selected group"),
+            ("i", "Show project, status, activity, lineage, native IDs, and storage"),
+            ("f", "Focus the selected project; press again to show all projects"),
             ("↑/↓ or j/k", "Move through sessions"),
             ("PgUp/PgDn", "Move by a page; Home/End jump"),
-            ("MSGS", "User turns; compactions and tool/assistant chatter are excluded"),
+            ("ACTIVITY", "xt yc zp = turns, compactions, semantic user prompts"),
             ("STARTED", "When the session began; UPDATED is its latest activity"),
             ("OPEN", "● running or Ⅱ paused in a live terminal"),
             ("Ctrl-F or /", "Enter search mode; command keys are then search text"),
@@ -2818,7 +3236,7 @@ class Browser:
             ("A", "Show every session: all origins, visible and hidden"),
             ("H", "Show every hidden session across all origins"),
             ("r", "Rename; an empty name restores the vendor/original title"),
-            ("h", "Hide or unhide the selected session (never deletes it)"),
+            ("h", "Hide or unhide the selected native session (never deletes it)"),
             ("d", "Choose a directory from a searchable list"),
             ("s", "Sort by recent, title, directory, messages ↓, or open first"),
             ("p", "Cycle Safe → Dangerous → Custom launch mode"),
@@ -2877,26 +3295,46 @@ class Browser:
                     continue
                 raise
             self.message = ""
-            items = self.current()
+            rows = self.view_rows()
             page = max(1, self.screen.getmaxyx()[0] - 12)
 
             if key in (curses.KEY_UP, "\x10") or (not self.searching and key == "k"):
                 self.selected = max(0, self.selected - 1)
             elif key in (curses.KEY_DOWN, "\x0e") or (not self.searching and key == "j"):
-                self.selected = min(max(0, len(items) - 1), self.selected + 1)
+                self.selected = min(max(0, len(rows) - 1), self.selected + 1)
             elif key == curses.KEY_PPAGE:
                 self.selected = max(0, self.selected - page)
             elif key == curses.KEY_NPAGE:
-                self.selected = min(max(0, len(items) - 1), self.selected + page)
+                self.selected = min(max(0, len(rows) - 1), self.selected + page)
             elif key == curses.KEY_HOME or (not self.searching and key == "g"):
                 self.selected = 0
             elif key == curses.KEY_END or (not self.searching and key == "G"):
-                self.selected = max(0, len(items) - 1)
+                self.selected = max(0, len(rows) - 1)
+            elif not self.searching and key in (" ", curses.KEY_RIGHT):
+                if not self.toggle_expansion():
+                    self.message = "This row has no expandable members."
+            elif not self.searching and key == curses.KEY_LEFT:
+                row = self.selected_row()
+                if row is not None and "/member:" in row.row_id:
+                    parent_id = row.row_id.split("/member:", 1)[0]
+                    self.expanded.discard(parent_id)
+                    self.keep_selection(parent_id)
+                elif not self.toggle_expansion(collapse=True):
+                    self.message = "This row is not expanded."
             elif key in ("\n", "\r", curses.KEY_ENTER):
                 self.finish_refresh()
-                items = self.current()
-                if items:
-                    chosen = items[self.selected]
+                rows = self.view_rows()
+                if rows:
+                    chosen_row = rows[self.selected]
+                    chosen = chosen_row.target
+                    if chosen is None:
+                        if chosen_row.expandable:
+                            self.expanded.add(chosen_row.row_id)
+                            self.keep_selection(chosen_row.row_id)
+                            self.message = "Group expanded; choose a native session."
+                        else:
+                            self.message = "No native session is available for this row."
+                        continue
                     if chosen.is_open:
                         focused, message = focus_open_session(chosen, self.launch_config)
                         if focused:
@@ -2958,6 +3396,10 @@ class Browser:
                 self.cycle_visibility()
             elif not self.searching and key == "x":
                 self.cycle_launch_tool()
+            elif not self.searching and key == "i":
+                self.run_modal(self.details)
+            elif not self.searching and key == "f":
+                self.focus_selected_project()
             elif not self.searching and key == "r":
                 self.rename_selected()
             elif not self.searching and key == "h":
@@ -2967,6 +3409,7 @@ class Browser:
                 self.origin = "all"
                 self.visibility = "all"
                 self.directory = ""
+                self.project_focus = ""
                 self.query = ""
                 self.keep_selection()
             elif not self.searching and key == "H":
@@ -2974,6 +3417,7 @@ class Browser:
                 self.origin = "all"
                 self.visibility = "hidden"
                 self.directory = ""
+                self.project_focus = ""
                 self.query = ""
                 self.keep_selection()
             elif not self.searching and key == "a":
@@ -3274,27 +3718,26 @@ def list_output(items: list[Session], as_json: bool = False) -> None:
         terminal_width = os.get_terminal_size().columns if sys.stdout.isatty() else 120
     except OSError:
         terminal_width = 120
-    conversation_width = 11
+    conversation_width = 17
+    activity_width = 18
     tool_width = tool_column_width(8)
     run_width = tool_column_width(6)
-    title_width = max(24, terminal_width - 112 - (tool_width - 8) - (run_width - 6))
-    title_suffixes = title_disambiguators(items)
+    title_width = max(24, terminal_width - 124 - (tool_width - 8) - (run_width - 6))
     print(
         f"{'TOOL':<{tool_width}} {'RUN':<{run_width}} {'ORIGIN':<7} "
-        f"{'OPEN':<5} {'MSGS':>5} {'STATE':<8} "
-        f"{'HEAD':<{conversation_width}} {'STARTED':<12} {'UPDATED':<12} "
+        f"{'OPEN':<5} {'ACTIVITY':<{activity_width}} {'STATE':<8} "
+        f"{'HEAD / STATUS':<{conversation_width}} {'STARTED':<12} {'UPDATED':<12} "
         f"{'TITLE':<{title_width}} DIRECTORY"
     )
     for item in items:
         paused = item.is_open and process_state(item.open_pid) in ("T", "t")
         open_symbol = "Ⅱ" if paused else ("●" if item.is_open else "")
-        rendered_title = ellipsize_with_suffix(
-            display_list_title(item), title_suffixes.get(item.key, ""), title_width
-        )
+        rendered_title = ellipsize(display_list_title(item), title_width)
         print(
             f"{tool_label(item.tool):<{tool_width}} "
             f"{tool_label(active_launch_tool(item)):<{run_width}} "
-            f"{ORIGIN_LABELS[item.origin]:<7} {open_symbol:<5} {item.message_count:>5} "
+            f"{ORIGIN_LABELS[item.origin]:<7} {open_symbol:<5} "
+            f"{activity_label(item):<{activity_width}} "
             f"{('hidden' if item.hidden else 'visible'):<8} "
             f"{conversation_status(item):<{conversation_width}} "
             f"{relative_time(item.created):<12} {relative_time(item.updated):<12} "
