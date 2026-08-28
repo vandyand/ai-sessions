@@ -1,10 +1,13 @@
 ---
 title: "Conversation-Centered Session Browser"
-status: active
+status: completed
 date: 2026-08-27
 priority: 20
 ---
 # Conversation-centered session browser
+
+Status: complete on `feature/session-browser-ux` (`7edfb45`, implementation rooted at `d2e5357`
+and hardened through `ff4e91e`).
 
 Replace the provider-file-oriented browser with a conversation-oriented view that is easy to
 scan without weakening the native-session and lineage guarantees used for launch routing.
@@ -73,3 +76,9 @@ Generated fixtures cover tracked chains, equivalent heads, superseded copies, di
 same-title independent threads, same-title different projects, exact collisions, hidden and
 auxiliary members, active writers, compacted Claude/Codex/OpenCode histories, malformed tails,
 refresh/selection stability, narrow terminals, CLI compatibility, and bounded refresh cost.
+
+Release verification covers 541 unit/integration tests, exact real-data grouping of the three
+Nautilus threads, 3,416-session cold/warm discovery, a 10,000-row same-title stress case, and a
+400-compaction Codex scanner. Independent adversarial review found and closed equivalent-head,
+selection-transfer, cache-rewrite, legacy-catalog, ID-leakage, unknown-project, and quadratic
+grouping defects before release.

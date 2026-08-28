@@ -173,6 +173,33 @@ exact resume/semantic advancement, real compaction order, bridge-back, and head 
 touching user provider data. The full conversation-log provenance phase remains separate: this
 proof establishes storage- and harness-decoupling, not verbatim per-message carry-forward.
 
+### P5 — Conversation-centered session browser **(COMPLETE as of 7edfb45)**
+
+The browser now presents utility lineages and same-project independent threads as distinct logical
+objects instead of a flat provider-file list. Tracked materializations collapse behind their
+validated head; same-title project threads use a presentation-only expandable container that never
+creates ancestry. Full IDs live in `i` details and JSON rather than normal rows, project focus is a
+single key, and activity is the compact `turns / compactions / prompts` triple gathered by each
+adapter's incremental scanner.
+
+### P5 observations — what shipping conversation-centered browsing taught us
+
+- **Filtering must never become routing authority.** Lineage heads are derived from the complete
+  state/discovery snapshot before display filters. A visible historical member can reveal its
+  conversation but cannot replace a hidden, missing, or uncertain head.
+- **Presentation grouping needs a target type.** Every row carries one exact native target or no
+  target. Synthetic project containers only expand, which makes “newest thread wins” impossible.
+- **Project identity cannot depend only on `.git`.** The motivating Nautilus project has no marker;
+  ancestor/descendant working directories therefore form a project family while unrelated paths
+  with the same basename remain separate.
+- **Exact activity and fast activity pull in opposite directions.** Append caches retain aggregate
+  counters plus bounded prefix identity, rebuild on ambiguous coarse-timestamp growth, and exclude
+  partial records. A 400-compaction generated Codex log reads in 14 ms cold and 0.1 ms warm, while
+  real 3,416-session discovery measured 23.6 s cold and 3.6 s warm.
+- **Adversarial scale matters.** The first same-title component algorithm was quadratic and passed
+  ordinary fixtures. A 10,000-row adversarial case exposed it; path-indexed union reduced that case
+  to roughly 1.1 seconds with bounded path-depth work.
+
 ## Key decisions
 
 - **D1 — A concept enters the neutral model only when two or more harnesses need it.** Compaction qualifies: Codex marks `compacted`, Claude marks `isCompactSummary`. `replacement_history` does not — it is one harness's expression of a shared idea and stays inside `read_codex`. *Alternative rejected:* a canonical format that is lossless for every harness. That path ends in tracking every harness's quirks forever.
