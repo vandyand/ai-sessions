@@ -46,8 +46,26 @@ current head. A project can be focused directly from the selected row.
 - A synthetic group row never launches merely because it has a newest child; it expands first.
 - Refresh preserves selection by stable view identity where possible and cannot transfer launch
   intent between children.
+- Tracked membership and authoritative heads are computed from the complete discovered/state
+  snapshot before display filters. A matching historical child may make its conversation visible,
+  but can never replace a hidden, filtered, missing, or uncertain head as the launch target.
+- Every rendered row carries either one immutable native `Session` target or no target. Tracked
+  aggregates target an authoritative head; expanded member rows target that exact member;
+  independent-group containers have no target and only expand.
 - Active writers, partial JSONL records, missing members, unknown harnesses, and malformed legacy
   state fail conservatively and remain inspectable.
+
+## Deterministic normalization and precedence
+
+- Titles group by normalized whitespace followed by Unicode `casefold()`.
+- Project identity is the normalized resolved cwd's nearest existing repository root when a `.git`
+  ancestor exists, otherwise the normalized cwd itself. Windows extended prefixes are removed;
+  missing paths use lexical normalization without requiring filesystem access.
+- Divergence/unknown/unstable/unavailable launch blockers take precedence over presentation labels.
+  `lineage head` is used only for a validated single head; `superseded copy` only for a verified
+  non-head; `independent thread` for a child of a presentation-only group; `untracked` otherwise.
+- If refresh removes an exact selected child, selection falls back to its surviving parent row,
+  never to a sibling. Per-native launch-harness preferences remain keyed only by native identity.
 
 ## Acceptance evidence
 
@@ -55,4 +73,3 @@ Generated fixtures cover tracked chains, equivalent heads, superseded copies, di
 same-title independent threads, same-title different projects, exact collisions, hidden and
 auxiliary members, active writers, compacted Claude/Codex/OpenCode histories, malformed tails,
 refresh/selection stability, narrow terminals, CLI compatibility, and bounded refresh cost.
-
