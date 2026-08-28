@@ -426,7 +426,7 @@ class ConversationViewTests(unittest.TestCase):
             self.assertEqual(len(collapsed), 1)
             self.assertTrue(collapsed[0].row_id.startswith("project:"))
             self.assertIsNone(collapsed[0].target)
-            self.assertEqual(collapsed[0].project, str(root))
+            self.assertEqual(collapsed[0].project, app.project_identity(str(root)))
 
             expanded = app.build_view_rows([tracked, first, second], expanded={collapsed[0].row_id})
             self.assertEqual(len(expanded), 4)
@@ -526,7 +526,7 @@ class ConversationViewTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             browser = self.browser([first, second], directory)
             browser.focus_selected_project()
-            self.assertEqual(browser.project_focus, "/one")
+            self.assertEqual(browser.project_focus, app.project_identity("/one"))
             self.assertEqual([item.key for item in browser.current()], [first.key])
             browser.focus_selected_project()
             self.assertEqual(browser.project_focus, "")
@@ -543,7 +543,7 @@ class ConversationViewTests(unittest.TestCase):
 
             self.assertIsNone(browser.view_rows()[0].target)
             browser.focus_selected_project()
-            self.assertEqual(browser.project_focus, str(root))
+            self.assertEqual(browser.project_focus, app.project_identity(str(root)))
             self.assertEqual(
                 {item.key for item in browser.current()}, {tracked.key, independent.key}
             )

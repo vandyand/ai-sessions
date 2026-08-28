@@ -2418,7 +2418,10 @@ def relative_time(value: float) -> str:
 def exact_time(value: float) -> str:
     if not value:
         return "unknown"
-    return dt.datetime.fromtimestamp(value).astimezone().strftime("%Y-%m-%d %H:%M %Z")
+    # ``%Z`` is platform- and locale-dependent; Windows can emit a long name
+    # such as "Coordinated Universal Time".  A numeric offset stays compact
+    # and unambiguous on every supported platform.
+    return dt.datetime.fromtimestamp(value).astimezone().strftime("%Y-%m-%d %H:%M %z")
 
 
 def ellipsize(value: str, width: int) -> str:
