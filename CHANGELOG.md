@@ -1,5 +1,13 @@
 # Changelog
 
+## 3.5.1 — 2026-08-28
+
+### Fixed
+
+- Interactive browser columns now have exact widths and guaranteed gutters. Large activity
+  counts and full-width labels are ellipsized within their own cells instead of shifting every
+  column that follows them.
+
 ## 3.5.0 — 2026-08-27
 
 ### Added

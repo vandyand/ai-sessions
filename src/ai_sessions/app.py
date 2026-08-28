@@ -2435,6 +2435,13 @@ def ellipsize(value: str, width: int) -> str:
     return value[: width - 1] + "…"
 
 
+def column_cell(value: str, width: int) -> str:
+    """Render one exact-width table cell with a visible trailing gutter."""
+    if width <= 0:
+        return ""
+    return ellipsize(value, max(0, width - 1)).ljust(width)
+
+
 def ellipsize_with_suffix(value: str, suffix: str, width: int) -> str:
     """Clip a title while keeping its collision suffix visible when space permits."""
     if not suffix:
@@ -2812,8 +2819,8 @@ class Browser:
         self.offset = min(self.offset, max(0, len(rows) - visible_rows))
 
         show_directory = width >= 100
-        tool_width = tool_column_width(8)
-        origin_width, open_width, activity_width, time_width, status_width = 7, 6, 10, 10, 18
+        tool_width = tool_column_width(8) + 1
+        origin_width, open_width, activity_width, time_width, status_width = 7, 6, 18, 10, 19
         directory_width = min(34, max(16, width // 4)) if show_directory else 0
         title_width = (
             width
@@ -2877,20 +2884,20 @@ class Browser:
                     marker_color,
                     curses.A_BOLD if marker.strip() else 0,
                 )
-                segment(f"{item_tool_label:<{tool_width}}", item.tool, curses.A_BOLD)
-                segment(f"{origin_label:<{origin_width}}", item.origin, curses.A_BOLD)
+                segment(column_cell(item_tool_label, tool_width), item.tool, curses.A_BOLD)
+                segment(column_cell(origin_label, origin_width), item.origin, curses.A_BOLD)
                 open_symbol = "Ⅱ" if paused else ("●" if item.is_open else "")
                 segment(
-                    f"{open_symbol:<{open_width}}",
+                    column_cell(open_symbol, open_width),
                     "warning" if paused else "success",
                     curses.A_BOLD,
                 )
-                segment(f"{activity_label(item):<{activity_width}}", "messages")
-                segment(f"{relative_time(item.created):<{time_width}}", "muted")
-                segment(f"{relative_time(item.updated):<{time_width}}", "timestamp")
+                segment(column_cell(activity_label(item), activity_width), "messages")
+                segment(column_cell(relative_time(item.created), time_width), "muted")
+                segment(column_cell(relative_time(item.updated), time_width), "timestamp")
                 status = view_row.status
                 segment(
-                    f"{status:<{status_width}}",
+                    column_cell(status, status_width),
                     "warning" if status != "lineage head" else "success",
                     curses.A_BOLD,
                 )
@@ -2904,7 +2911,7 @@ class Browser:
                 if not item.named:
                     title = "*- " + title
                 room = max(0, title_width)
-                segment(ellipsize(title, room).ljust(room), "primary", curses.A_BOLD)
+                segment(column_cell(title, room), "primary", curses.A_BOLD)
                 if show_directory:
                     segment(ellipsize(directory, directory_width).ljust(directory_width), "muted")
 
