@@ -1893,6 +1893,23 @@ def _write_temporary_export(payload: dict[str, Any]) -> Path:
     return path
 
 
+def _remove_temporary_export(path: Path) -> OSError | None:
+    """Remove a sensitive import file, tolerating brief Windows lock release."""
+    attempts = 6 if IS_WINDOWS else 1
+    last_error: OSError | None = None
+    for attempt in range(attempts):
+        try:
+            path.unlink()
+            return None
+        except FileNotFoundError:
+            return None
+        except OSError as error:
+            last_error = error
+            if attempt + 1 < attempts:
+                time.sleep(0.05)
+    return last_error
+
+
 def _run_import_and_cleanup(
     command: tuple[str, ...], operation_cwd: str, temporary: Path
 ) -> MaintenanceResult:
@@ -1908,13 +1925,7 @@ def _run_import_and_cleanup(
         )
     except Exception as error:
         failure = error
-    cleanup_error: OSError | None = None
-    try:
-        temporary.unlink()
-    except FileNotFoundError:
-        pass
-    except OSError as error:
-        cleanup_error = error
+    cleanup_error = _remove_temporary_export(temporary)
     if failure is not None:
         if cleanup_error is not None:
             raise BridgeError(

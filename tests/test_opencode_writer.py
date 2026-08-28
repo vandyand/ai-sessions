@@ -396,6 +396,29 @@ class OpenCodeWriterIntegrationTests(unittest.TestCase):
 
         self.assertTrue(temporary.exists())
 
+    def test_windows_cleanup_retries_a_transient_file_lock(self) -> None:
+        temporary = self.root / "transiently-locked-import.json"
+        temporary.write_text("sensitive transcript", encoding="utf-8")
+        real_unlink = Path.unlink
+        attempts = 0
+
+        def transient_unlink(path: Path) -> None:
+            nonlocal attempts
+            attempts += 1
+            if attempts == 1:
+                raise PermissionError("file is still closing")
+            real_unlink(path)
+
+        with (
+            patch.object(opencode, "IS_WINDOWS", True),
+            patch.object(Path, "unlink", autospec=True, side_effect=transient_unlink),
+            patch.object(opencode.time, "sleep"),
+        ):
+            self.assertIsNone(opencode._remove_temporary_export(temporary))
+
+        self.assertEqual(attempts, 2)
+        self.assertFalse(temporary.exists())
+
     def test_import_failure_propagates_after_successful_cleanup(self) -> None:
         temporary = self.root / "ordinary-failed-import.json"
         temporary.write_text("sensitive transcript", encoding="utf-8")
