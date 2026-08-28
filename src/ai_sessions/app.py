@@ -2592,10 +2592,14 @@ class Browser:
         except curses.error:
             pass
         self.screen.keypad(True)
+        try:
+            terminal_has_colors = curses.has_colors()
+        except curses.error:
+            terminal_has_colors = False
         self.colors_enabled = bool(
             not os.environ.get("NO_COLOR")
             and os.environ.get("TERM", "") != "dumb"
-            and curses.has_colors()
+            and terminal_has_colors
         )
         self.initialized_pairs: set[int] = set()
         if not self.colors_enabled:

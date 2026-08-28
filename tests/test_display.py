@@ -273,6 +273,17 @@ class DisplayTests(unittest.TestCase):
         detect.assert_not_called()
         self.assertIn("t tools", screen.frames[-1])
 
+    def test_browser_initializes_without_an_active_curses_screen(self) -> None:
+        screen = ScriptedScreen()
+        with patch.object(app.curses, "has_colors", side_effect=app.curses.error):
+            browser = Browser(
+                screen,
+                [self.titled_session("headless")],
+                UserState(Path(tempfile.gettempdir()) / "missing-state.json"),
+                LaunchConfig(path=Path(tempfile.gettempdir()) / "missing-config.toml"),
+            )
+        self.assertFalse(browser.colors_enabled)
+
     def test_minimum_supported_size_keeps_tool_filter_discoverable(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             screen = ScriptedScreen(size=(12, 65))
