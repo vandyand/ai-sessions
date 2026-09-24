@@ -5,7 +5,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from pathlib import Path
 from re import Pattern
-from typing import Any, Iterable, Mapping, Protocol
+from typing import Any, Callable, Iterable, Mapping, Protocol
 
 from .liveness import LivenessContext
 from .model import (
@@ -81,6 +81,17 @@ class PublishNameHook(Protocol):
     def __call__(self, session: Any, name: str) -> str: ...
 
 
+class UpgradeStorageHook(Protocol):
+    def __call__(
+        self,
+        *,
+        session_id: str,
+        storage: str,
+        command: tuple[str, ...],
+        report: Callable[[str], None],
+    ) -> tuple[str, ...]: ...
+
+
 class LivenessHook(Protocol):
     def __call__(
         self, context: LivenessContext, home: Path, sessions: Iterable[LivenessSession]
@@ -119,6 +130,9 @@ class HarnessAdapter:
     inspect_liveness: LivenessHook | Unsupported = Unsupported("liveness is not installed")
     prepare_target: PrepareTargetHook | Unsupported = Unsupported(
         "dynamic target preparation is not installed"
+    )
+    upgrade_storage: UpgradeStorageHook | Unsupported = Unsupported(
+        "stored sessions need no upgrade before resuming"
     )
 
     def __post_init__(self) -> None:
@@ -183,6 +197,7 @@ class HarnessAdapter:
             self.publish_name,
             self.inspect_liveness,
             self.prepare_target,
+            self.upgrade_storage,
         )
         if not all(callable(hook) or isinstance(hook, Unsupported) for hook in required + optional):
             raise ValueError("harness capabilities must be callable or Unsupported")

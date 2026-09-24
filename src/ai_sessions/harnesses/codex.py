@@ -8,14 +8,16 @@ import json
 import os
 import re
 import secrets
+import shutil
 import sqlite3
 import stat
+import subprocess
 import time
 import uuid
 from contextlib import closing
 from dataclasses import replace
 from pathlib import Path
-from typing import Any, Iterable
+from typing import Any, Callable, Iterable
 
 from ..capabilities import HarnessAdapter
 from ..conversion import (
@@ -922,6 +924,83 @@ def inspect_liveness(
     return result
 
 
+PAGINATED_HISTORY_MODE = "paginated"
+MIGRATE_TIMEOUT_SECONDS = 300.0
+MAX_META_LINE_BYTES = 1 << 20
+
+
+def _history_mode(storage: str) -> str | None:
+    """Read the recorded history mode without loading a multi-gigabyte rollout.
+
+    Returns None when the rollout cannot be inspected at all, which is
+    different from a rollout that simply predates the field.
+    """
+    if not storage:
+        return None
+    try:
+        with Path(storage).open("r", encoding="utf-8", errors="replace") as handle:
+            first = handle.readline(MAX_META_LINE_BYTES)
+    except OSError:
+        return None
+    try:
+        payload = json.loads(first).get("payload")
+    except (json.JSONDecodeError, AttributeError, TypeError):
+        return None
+    if not isinstance(payload, dict):
+        return None
+    mode = payload.get("history_mode")
+    return mode if isinstance(mode, str) else ""
+
+
+def upgrade_storage(
+    *,
+    session_id: str,
+    storage: str,
+    command: tuple[str, ...],
+    report: Callable[[str], None],
+) -> tuple[str, ...]:
+    """Migrate a legacy rollout to paginated history before it is resumed.
+
+    Codex rejects `thread/revert` on a legacy rollout, so a conversation
+    recorded before paginated thread history cannot be rewound or have a
+    prompt edited until it is migrated.  Migration is Codex's own supported
+    operation, and it refuses a thread another process is writing, so a
+    session open elsewhere is reported rather than forced.
+    """
+    if not session_id or not command:
+        return ()
+    mode = _history_mode(storage)
+    if mode is None or mode == PAGINATED_HISTORY_MODE:
+        return ()
+    executable = shutil.which(command[0])
+    if executable is None:
+        return ()
+    report(f"updating Codex storage for {session_id} so it can be rewound")
+    argv = [executable, *command[1:], "migrate-rollouts", "--apply", "--thread", session_id]
+    try:
+        completed = subprocess.run(
+            argv,
+            capture_output=True,
+            text=True,
+            timeout=MIGRATE_TIMEOUT_SECONDS,
+            check=False,
+        )
+    except (OSError, subprocess.SubprocessError) as error:
+        return (f"could not update Codex storage for {session_id}: {error}",)
+    if _history_mode(storage) == PAGINATED_HISTORY_MODE:
+        return (f"Updated {session_id} to Codex paginated history; it can be rewound now.",)
+    output = " ".join(part for part in (completed.stdout, completed.stderr) if part)
+    if "active writer" in output:
+        return (
+            f"{session_id} is open in another Codex process, so it stays on the legacy "
+            "format and cannot be rewound until that one is closed.",
+        )
+    return (
+        f"Codex did not migrate {session_id} to paginated history, so rewinding it "
+        "stays unavailable.",
+    )
+
+
 def publish_name(session: Any, name: str) -> str:
     stamp = dt.datetime.now(dt.timezone.utc).isoformat().replace("+00:00", "Z")
     append_jsonl(
@@ -978,6 +1057,7 @@ ADAPTER = HarnessAdapter(
     discover=discover,
     resume_args=resume_args,
     publish_name=publish_name,
+    upgrade_storage=upgrade_storage,
     inspect_liveness=inspect_liveness,
     liveness_executables=frozenset(("codex", "codex.exe")),
     budget=BudgetPolicy(

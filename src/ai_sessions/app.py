@@ -1767,6 +1767,40 @@ def load_session_catalog(
     return result
 
 
+def upgrade_native_storage(session: Session, config: LaunchConfig) -> tuple[str, ...]:
+    """Let a harness bring its own stored session up to date before resuming it.
+
+    A harness can change how it stores a conversation, leaving older sessions
+    readable but missing newer abilities.  Only the recording harness knows
+    that, so this asks it, and only when the resume is native: a copy opened
+    elsewhere is that harness's own new session.
+    """
+    tool = active_launch_tool(session)
+    if tool != session.tool:
+        return ()
+    try:
+        adapter = REGISTRY.get(tool)
+    except KeyError:
+        return ()
+    hook = adapter.upgrade_storage
+    if isinstance(hook, Unsupported):
+        return ()
+
+    def report(message: str) -> None:
+        print(f"sessions: {message}…", file=sys.stderr, flush=True)
+
+    try:
+        notices = hook(
+            session_id=session.resume_target,
+            storage=session.storage,
+            command=tuple(config.provider_command(tool)),
+            report=report,
+        )
+    except (BridgeError, OSError, ValueError) as error:
+        return (f"could not update {adapter.label} storage: {error}",)
+    return tuple(str(notice) for notice in notices if str(notice).strip())
+
+
 def record_launch(
     session: Session,
     argv: Iterable[str],
@@ -3963,6 +3997,9 @@ def launch(
         return 2
     if note:
         print(f"sessions: {note}", file=sys.stderr)
+    if not dry_run:
+        for notice in upgrade_native_storage(session, config):
+            print(f"sessions: {notice}", file=sys.stderr)
     argv = command_for(session, config)
     cwd = strip_extended_prefix(session.cwd) or str(HOME)
     if config.custom_args_missing(active_launch_tool(session)):
