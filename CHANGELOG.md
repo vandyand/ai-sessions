@@ -1,5 +1,13 @@
 # Changelog
 
+## Unreleased
+
+### Added
+
+- Every resume records the harness, the selected session, the id actually requested, and the
+  command that ran. `sessions --launch-log` prints that history, so a harness that opens a
+  different conversation than the row that was picked can be told apart from a wrong id.
+
 ## 3.5.1 — 2026-08-28
 
 ### Fixed

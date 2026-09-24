@@ -1,7 +1,10 @@
 import io
+import json
+import tempfile
 import unittest
 from contextlib import redirect_stderr, redirect_stdout
 from dataclasses import replace
+from pathlib import Path
 from unittest.mock import patch
 
 from ai_sessions import app
@@ -153,7 +156,9 @@ class WindowsShimResolutionTests(unittest.TestCase):
     def test_windows_launch_resolves_the_shim_before_calling(self) -> None:
         calls: list[list[str]] = []
         with (
+            tempfile.TemporaryDirectory() as root,
             patch.object(app, "IS_WINDOWS", True),
+            patch.object(app, "LAUNCH_LOG_FILE", Path(root) / "launch-log.jsonl"),
             patch.object(app.os, "chdir", lambda _: None),
             patch.object(app.shutil, "which", lambda name: rf"C:\npm\{name}.CMD"),
             patch.object(app.subprocess, "call", lambda argv: calls.append(argv) or 0),
@@ -164,6 +169,8 @@ class WindowsShimResolutionTests(unittest.TestCase):
     def test_missing_command_reports_instead_of_raising(self) -> None:
         errors = io.StringIO()
         with (
+            tempfile.TemporaryDirectory() as root,
+            patch.object(app, "LAUNCH_LOG_FILE", Path(root) / "launch-log.jsonl"),
             patch.object(app, "IS_WINDOWS", True),
             patch.object(app.os, "chdir", lambda _: None),
             patch.object(app.shutil, "which", lambda _: None),
@@ -219,6 +226,102 @@ class CustomModeNoticeTests(unittest.TestCase):
         ):
             launch(session("other"), LaunchConfig(mode="custom"), dry_run=True)
         self.assertIn("[launch.providers.other] custom_args", errors.getvalue())
+
+
+class LaunchLogTests(unittest.TestCase):
+    """A resume that opens the wrong conversation needs a record of what it asked for."""
+
+    def test_launch_records_the_command_and_requested_id(self) -> None:
+        with tempfile.TemporaryDirectory() as root:
+            log = Path(root) / "launch-log.jsonl"
+            with (
+                patch.object(app, "IS_WINDOWS", True),
+                patch.object(app, "LAUNCH_LOG_FILE", log),
+                patch.object(app.os, "chdir", lambda _: None),
+                patch.object(app.shutil, "which", lambda name: f"/opt/bin/{name}"),
+                patch.object(app.subprocess, "call", lambda argv: 0),
+            ):
+                launch(session("codex", title="Reports"), LaunchConfig())
+            entries = app.read_launch_log(path=log)
+        self.assertEqual(len(entries), 1)
+        self.assertEqual(entries[0]["tool"], "codex")
+        self.assertEqual(entries[0]["selected_id"], "session-id")
+        self.assertEqual(entries[0]["argv"], ["codex", "resume", "session-id"])
+        self.assertEqual(entries[0]["executable"], "/opt/bin/codex")
+
+    def test_subagent_redirect_is_recorded_so_the_parent_is_visible(self) -> None:
+        with tempfile.TemporaryDirectory() as root:
+            log = Path(root) / "launch-log.jsonl"
+            item = session("codex", "subagent", resume_id="parent-id", parent_id="parent-id")
+            app.record_launch(item, command_for(item, LaunchConfig()), path=log)
+            entries = app.read_launch_log(path=log)
+        self.assertEqual(entries[0]["selected_id"], "session-id")
+        self.assertEqual(entries[0]["resume_target"], "parent-id")
+        self.assertEqual(entries[0]["argv"][-1], "parent-id")
+
+    def test_a_dry_run_records_nothing(self) -> None:
+        with tempfile.TemporaryDirectory() as root:
+            log = Path(root) / "launch-log.jsonl"
+            with patch.object(app, "LAUNCH_LOG_FILE", log), redirect_stdout(io.StringIO()):
+                launch(session("codex"), LaunchConfig(), dry_run=True)
+            self.assertFalse(log.exists())
+            self.assertEqual(app.read_launch_log(path=log), [])
+
+    def test_history_is_bounded_and_keeps_the_newest_entries(self) -> None:
+        with tempfile.TemporaryDirectory() as root:
+            log = Path(root) / "launch-log.jsonl"
+            with patch.object(app, "LAUNCH_LOG_ENTRIES", 3):
+                for index in range(5):
+                    app.record_launch(
+                        session("codex", session_id=f"id-{index}"), ["codex"], path=log
+                    )
+            entries = app.read_launch_log(path=log)
+        self.assertEqual([entry["selected_id"] for entry in entries], ["id-2", "id-3", "id-4"])
+
+    def test_damaged_lines_are_skipped_rather_than_losing_the_history(self) -> None:
+        with tempfile.TemporaryDirectory() as root:
+            log = Path(root) / "launch-log.jsonl"
+            good = json.dumps({"selected_id": "kept"})
+            log.write_text("not json\n" + good + "\n", encoding="utf-8")
+            self.assertEqual(app.read_launch_log(path=log), [{"selected_id": "kept"}])
+
+    def test_an_unwritable_log_never_fails_the_launch(self) -> None:
+        with tempfile.TemporaryDirectory() as root:
+            blocked = Path(root) / "missing-dir"
+            blocked.write_text("not a directory", encoding="utf-8")
+            with (
+                patch.object(app, "IS_WINDOWS", True),
+                patch.object(app, "LAUNCH_LOG_FILE", blocked / "launch-log.jsonl"),
+                patch.object(app.os, "chdir", lambda _: None),
+                patch.object(app.shutil, "which", lambda name: name),
+                patch.object(app.subprocess, "call", lambda argv: 0),
+            ):
+                self.assertEqual(launch(session("codex"), LaunchConfig()), 0)
+
+    def test_output_names_the_redirect_and_the_command(self) -> None:
+        buffer = io.StringIO()
+        entries = [
+            {
+                "at": "2026-09-23T17:00:00Z",
+                "tool": "codex",
+                "selected_id": "child",
+                "resume_target": "parent",
+                "title": "Worker",
+                "cwd": "/project",
+                "argv": ["codex", "resume", "parent"],
+            }
+        ]
+        with redirect_stdout(buffer):
+            app.launch_log_output(entries)
+        printed = buffer.getvalue()
+        self.assertIn("child → parent", printed)
+        self.assertIn("codex resume parent", printed)
+
+    def test_empty_history_explains_where_it_would_be(self) -> None:
+        buffer = io.StringIO()
+        with redirect_stdout(buffer):
+            app.launch_log_output([])
+        self.assertIn("no launches recorded", buffer.getvalue())
 
 
 if __name__ == "__main__":
