@@ -88,6 +88,8 @@ CODEX_ID_PATTERN = re.compile(
 _UNSET_CHECKPOINT = object()
 CATALOG_CACHE_VERSION = 1
 CATALOG_CACHE_FILE = APP_CACHE_DIR / f"session-catalog-v{CATALOG_CACHE_VERSION}.json"
+LAUNCH_LOG_FILE = APP_CACHE_DIR / "launch-log.jsonl"
+LAUNCH_LOG_ENTRIES = 200
 
 
 def tool_label(name: str, *, short: bool = True) -> str:
@@ -1763,6 +1765,87 @@ def load_session_catalog(
     if state is not None:
         state.apply(result)
     return result
+
+
+def record_launch(
+    session: Session,
+    argv: Iterable[str],
+    executable: str = "",
+    *,
+    path: Path | None = None,
+) -> None:
+    """Append what this launch asked a harness to reopen.
+
+    Every harness resolves the id it is handed through its own index, so when
+    the wrong conversation appears there is otherwise nothing that records
+    which one was requested.  Logging is best effort: a launch never fails
+    because its own audit trail could not be written.
+    """
+    path = LAUNCH_LOG_FILE if path is None else path
+    tool = active_launch_tool(session)
+    entry = {
+        "at": dt.datetime.now(dt.timezone.utc).isoformat().replace("+00:00", "Z"),
+        "tool": tool,
+        "selected_id": session.session_id,
+        "resume_target": session.resume_target,
+        "title": display_title(session),
+        "cwd": strip_extended_prefix(session.cwd),
+        "storage": strip_extended_prefix(session.storage),
+        "executable": executable,
+        "argv": list(argv),
+    }
+    line = json.dumps(entry, ensure_ascii=False, separators=(",", ":"))
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        try:
+            kept = [row for row in path.read_text(encoding="utf-8").splitlines() if row.strip()]
+        except (OSError, UnicodeError):
+            kept = []
+        kept = kept[-(LAUNCH_LOG_ENTRIES - 1) :] if LAUNCH_LOG_ENTRIES > 1 else []
+        path.write_text("\n".join([*kept, line]) + "\n", encoding="utf-8")
+        try:
+            path.chmod(0o600)
+        except OSError:
+            pass
+    except (OSError, UnicodeError):
+        pass
+
+
+def read_launch_log(limit: int = 20, path: Path | None = None) -> list[dict[str, Any]]:
+    """Return the most recent launch records, newest last, ignoring damaged lines."""
+    path = LAUNCH_LOG_FILE if path is None else path
+    try:
+        lines = path.read_text(encoding="utf-8").splitlines()
+    except (OSError, UnicodeError):
+        return []
+    entries: list[dict[str, Any]] = []
+    for row in lines:
+        if not row.strip():
+            continue
+        try:
+            parsed = json.loads(row)
+        except json.JSONDecodeError:
+            continue
+        if isinstance(parsed, dict):
+            entries.append(parsed)
+    return entries[-limit:] if limit > 0 else entries
+
+
+def launch_log_output(entries: list[dict[str, Any]]) -> None:
+    """Print the launch history that shows which id each resume actually asked for."""
+    if not entries:
+        print(f"sessions: no launches recorded yet in {LAUNCH_LOG_FILE}")
+        return
+    for entry in entries:
+        selected = str(entry.get("selected_id", ""))
+        target = str(entry.get("resume_target", ""))
+        redirect = f" → {target}" if target and target != selected else ""
+        print(f"{entry.get('at', '')}  {tool_label(str(entry.get('tool', '')))}")
+        print(f"  chose     {selected}{redirect}  {entry.get('title', '')}")
+        print(f"  directory {entry.get('cwd', '')}")
+        argv = entry.get("argv")
+        if isinstance(argv, list):
+            print(f"  ran       {subprocess.list2cmdline([str(part) for part in argv])}")
 
 
 class SessionRefresh:
@@ -3903,7 +3986,9 @@ def launch(
             if executable is None:
                 print(f"sessions: {argv[0]!r} is not on PATH", file=sys.stderr)
                 return 127
+            record_launch(session, argv, executable)
             return subprocess.call([executable, *argv[1:]])
+        record_launch(session, argv, shutil.which(argv[0]) or "")
         os.execvp(argv[0], argv)
     except OSError as error:
         print(f"sessions: could not launch {argv[0]!r}: {error}", file=sys.stderr)
@@ -4018,6 +4103,14 @@ def build_parser() -> argparse.ArgumentParser:
         metavar=("ID_OR_NAME", "NEW_NAME"),
         help="rename a session in Claude Code or Codex too; empty name resets it",
     )
+    parser.add_argument(
+        "--launch-log",
+        nargs="?",
+        type=int,
+        const=20,
+        metavar="COUNT",
+        help="print the last resumes with the exact id and command sent to the harness",
+    )
     parser.add_argument("--hide", metavar="ID_OR_NAME", help="hide a session from the normal view")
     parser.add_argument("--unhide", metavar="ID_OR_NAME", help="restore a hidden session")
     parser.add_argument(
@@ -4049,6 +4142,9 @@ def main(argv: list[str] | None = None) -> int:
     except locale.Error:
         pass
     args = build_parser().parse_args(argv)
+    if args.launch_log is not None:
+        launch_log_output(read_launch_log(args.launch_log))
+        return 0
     state = UserState()
     launch_config = LaunchConfig.load()
     if args.set_launch_mode:

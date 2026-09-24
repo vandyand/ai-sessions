@@ -97,7 +97,12 @@ sessions --resume SESSION_ID --launch-tool claude
 sessions --resume SESSION_ID --launch-tool codex
 sessions --resume SESSION_ID --launch-tool opencode
 sessions --resume SESSION_ID --dry-run
+sessions --launch-log
 ```
+
+Each resume records the exact id and command handed to the harness. If a harness ever opens a
+different conversation than the row you picked, `sessions --launch-log` shows what was actually
+requested, which separates a wrong id from a harness resolving the right id to the wrong session.
 
 ## What is written, and when
 
