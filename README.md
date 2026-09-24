@@ -106,17 +106,22 @@ requested, which separates a wrong id from a harness resolving the right id to t
 
 ## What is written, and when
 
-Resuming a session in the harness that recorded it is a pure read: `sessions` runs
-`codex resume ID`, `claude --resume ID`, or `opencode --session ID` against the original ID and
-touches nothing.
-Sessions at rest are never rewritten, and no transcript is ever edited in place.
+Resuming a session in the harness that recorded it is a read: `sessions` runs
+`codex resume ID`, `claude --resume ID`, or `opencode --session ID` against the original ID.
+Sessions at rest are never rewritten by `sessions`, and no transcript is ever edited in place.
 
-Only two actions write to provider storage:
+Only three actions write to provider storage:
 
 - **Rename** (`r`) appends a `custom-title` record for Claude or a `thread_name` record for Codex.
   OpenCode has no rename command, so its adapter performs one bounded, transactional update of the
   exact existing session title and verifies the row afterward; semantic checkpoints exclude this
   metadata-only change.
+- **Upgrading stored sessions** lets the recording harness modernize its own storage before a
+  native resume, and only when that harness asks for it. Codex rejects rewind and prompt editing
+  on a session recorded before its paginated thread history, so resuming one first runs Codex's
+  own `migrate-rollouts --apply` for that single session and reports what happened. A session
+  another process is writing is reported and left alone, never forced, and a failed upgrade never
+  blocks the resume.
 - **Bridging** creates a *new* native target session. Claude and Codex receive new session files;
   OpenCode receives export JSON through its official `import` command. The source remains read-only.
 

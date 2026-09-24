@@ -324,5 +324,89 @@ class LaunchLogTests(unittest.TestCase):
         self.assertIn("no launches recorded", buffer.getvalue())
 
 
+class StorageUpgradeTests(unittest.TestCase):
+    """A harness that changed how it stores sessions gets to update its own."""
+
+    def adapter_with_hook(self, hook: object) -> object:
+        return replace(REGISTRY.get("codex"), upgrade_storage=hook)
+
+    def test_native_resume_asks_the_recording_harness_first(self) -> None:
+        seen: list[dict] = []
+
+        def hook(**values: object) -> tuple[str, ...]:
+            seen.append(values)
+            return ("updated the stored session",)
+
+        item = session("codex", storage="/sessions/one.jsonl")
+        with REGISTRY.temporary(self.adapter_with_hook(hook)):
+            notices = app.upgrade_native_storage(item, LaunchConfig())
+        self.assertEqual(notices, ("updated the stored session",))
+        self.assertEqual(seen[0]["session_id"], "session-id")
+        self.assertEqual(seen[0]["storage"], "/sessions/one.jsonl")
+        self.assertEqual(seen[0]["command"], ("codex",))
+
+    def test_subagent_upgrades_the_session_that_is_actually_resumed(self) -> None:
+        seen: list[str] = []
+
+        def hook(*, session_id: str, **_: object) -> tuple[str, ...]:
+            seen.append(session_id)
+            return ()
+
+        item = session("codex", "subagent", resume_id="parent-id", parent_id="parent-id")
+        with REGISTRY.temporary(self.adapter_with_hook(hook)):
+            app.upgrade_native_storage(item, LaunchConfig())
+        self.assertEqual(seen, ["parent-id"])
+
+    def test_a_copy_opened_elsewhere_is_left_to_that_harness(self) -> None:
+        def hook(**_: object) -> tuple[str, ...]:
+            raise AssertionError("a cross-harness launch must not upgrade the source")
+
+        item = session(
+            "codex",
+            launch_targets={"codex": "x-2", "claude": "c-1"},
+            launch_tool="claude",
+        )
+        with REGISTRY.temporary(self.adapter_with_hook(hook)):
+            self.assertEqual(app.upgrade_native_storage(item, LaunchConfig()), ())
+
+    def test_a_harness_without_the_capability_is_skipped(self) -> None:
+        self.assertEqual(app.upgrade_native_storage(session("claude"), LaunchConfig()), ())
+
+    def test_a_failing_upgrade_reports_but_never_blocks_the_resume(self) -> None:
+        def hook(**_: object) -> tuple[str, ...]:
+            raise OSError("storage is read-only")
+
+        with REGISTRY.temporary(self.adapter_with_hook(hook)):
+            notices = app.upgrade_native_storage(session("codex"), LaunchConfig())
+        self.assertEqual(len(notices), 1)
+        self.assertIn("storage is read-only", notices[0])
+
+    def test_launch_reports_the_upgrade_before_running_the_harness(self) -> None:
+        errors = io.StringIO()
+        with tempfile.TemporaryDirectory() as root:
+            hook = lambda **_: ("Updated session-id to paginated history.",)  # noqa: E731
+            with (
+                REGISTRY.temporary(self.adapter_with_hook(hook)),
+                patch.object(app, "IS_WINDOWS", True),
+                patch.object(app, "LAUNCH_LOG_FILE", Path(root) / "launch-log.jsonl"),
+                patch.object(app.os, "chdir", lambda _: None),
+                patch.object(app.shutil, "which", lambda name: f"/opt/bin/{name}"),
+                patch.object(app.subprocess, "call", lambda argv: 0),
+                redirect_stderr(errors),
+            ):
+                self.assertEqual(launch(session("codex"), LaunchConfig()), 0)
+        self.assertIn("Updated session-id to paginated history.", errors.getvalue())
+
+    def test_a_dry_run_changes_no_stored_session(self) -> None:
+        def hook(**_: object) -> tuple[str, ...]:
+            raise AssertionError("a dry run must not touch stored sessions")
+
+        with (
+            REGISTRY.temporary(self.adapter_with_hook(hook)),
+            redirect_stdout(io.StringIO()),
+        ):
+            self.assertEqual(launch(session("codex"), LaunchConfig(), dry_run=True), 0)
+
+
 if __name__ == "__main__":
     unittest.main()

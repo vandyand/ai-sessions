@@ -1,5 +1,15 @@
 # Changelog
 
+## Unreleased
+
+### Added
+
+- Harnesses can declare an `upgrade_storage` capability, letting a provider modernize its own
+  stored session before a native resume.
+- Codex sessions recorded before paginated thread history are migrated on resume, so rewinding
+  and prompt editing work instead of failing with `thread/revert only supports paginated
+  threads`. A session open in another Codex process is reported and left untouched.
+
 ## 3.6.0 — 2026-09-24
 
 ### Added
