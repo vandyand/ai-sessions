@@ -1767,16 +1767,24 @@ def load_session_catalog(
     return result
 
 
-def upgrade_native_storage(session: Session, config: LaunchConfig) -> tuple[str, ...]:
+def upgrade_native_storage(
+    session: Session,
+    config: LaunchConfig,
+    state: UserState | None = None,
+) -> tuple[str, ...]:
     """Let a harness bring its own stored session up to date before resuming it.
 
     A harness can change how it stores a conversation, leaving older sessions
     readable but missing newer abilities.  Only the recording harness knows
     that, so this asks it, and only when the resume is native: a copy opened
-    elsewhere is that harness's own new session.
+    elsewhere is that harness's own new session.  Upgrading can rewrite the
+    stored history, so every conversation position recorded against this
+    session is handed over and replaced by the harness's translation.
     """
     tool = active_launch_tool(session)
-    if tool != session.tool:
+    if tool != session.tool or session.resume_target != session.session_id:
+        # A row resumed through another thread (a subagent's parent) is not
+        # the storage this row describes; that thread upgrades when opened.
         return ()
     try:
         adapter = REGISTRY.get(tool)
@@ -1785,20 +1793,39 @@ def upgrade_native_storage(session: Session, config: LaunchConfig) -> tuple[str,
     hook = adapter.upgrade_storage
     if isinstance(hook, Unsupported):
         return ()
+    tracked: dict[str, dict[str, Any]] = {}
+    if state is not None:
+        for conversation_id, conversation in state.conversations.items():
+            member = conversation.get("members", {}).get(session.key)
+            if isinstance(member, dict):
+                tracked[conversation_id] = member
 
     def report(message: str) -> None:
         print(f"sessions: {message}…", file=sys.stderr, flush=True)
 
     try:
-        notices = hook(
-            session_id=session.resume_target,
+        result = hook(
+            session_id=session.session_id,
             storage=session.storage,
             command=tuple(config.provider_command(tool)),
             report=report,
+            checkpoints={
+                conversation_id: member.get("checkpoint", member.get("cursor"))
+                for conversation_id, member in tracked.items()
+            },
         )
     except (BridgeError, OSError, ValueError) as error:
         return (f"could not update {adapter.label} storage: {error}",)
-    return tuple(str(notice) for notice in notices if str(notice).strip())
+    relocated = False
+    for conversation_id, checkpoint in result.checkpoints.items():
+        member = tracked.get(conversation_id)
+        if member is not None:
+            member["checkpoint"] = checkpoint
+            member["cursor"] = checkpoint
+            relocated = True
+    if relocated and state is not None:
+        state.save()
+    return tuple(str(notice) for notice in result.notices if str(notice).strip())
 
 
 def record_launch(
@@ -3998,7 +4025,7 @@ def launch(
     if note:
         print(f"sessions: {note}", file=sys.stderr)
     if not dry_run:
-        for notice in upgrade_native_storage(session, config):
+        for notice in upgrade_native_storage(session, config, state):
             print(f"sessions: {notice}", file=sys.stderr)
     argv = command_for(session, config)
     cwd = strip_extended_prefix(session.cwd) or str(HOME)

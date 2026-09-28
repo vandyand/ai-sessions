@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from re import Pattern
 from typing import Any, Callable, Iterable, Mapping, Protocol
@@ -81,6 +81,19 @@ class PublishNameHook(Protocol):
     def __call__(self, session: Any, name: str) -> str: ...
 
 
+@dataclass(frozen=True, slots=True)
+class StorageUpgrade:
+    """What a storage upgrade did, and where each tracked checkpoint now lies.
+
+    Rewriting stored history can move every checkpoint recorded against it.
+    ``checkpoints`` maps each caller label to its translated checkpoint; a
+    label that is absent was not translated and must not be trusted.
+    """
+
+    notices: tuple[str, ...] = ()
+    checkpoints: Mapping[str, Checkpoint] = field(default_factory=dict)
+
+
 class UpgradeStorageHook(Protocol):
     def __call__(
         self,
@@ -89,7 +102,8 @@ class UpgradeStorageHook(Protocol):
         storage: str,
         command: tuple[str, ...],
         report: Callable[[str], None],
-    ) -> tuple[str, ...]: ...
+        checkpoints: Mapping[str, Checkpoint],
+    ) -> StorageUpgrade: ...
 
 
 class LivenessHook(Protocol):

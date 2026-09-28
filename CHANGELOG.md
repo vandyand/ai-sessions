@@ -1,5 +1,18 @@
 # Changelog
 
+## 3.7.1 — 2026-09-28
+
+### Fixed
+
+- Upgrading a Codex session no longer breaks the conversation that tracks it. Migration rewrites
+  the rollout in place, which left every tracked byte position pointing into different content,
+  so the conversation read as unstable and refused to launch in any harness ("No native session
+  is available for this row"). Each tracked position is now anchored to its record before the
+  upgrade and relocated after the same record afterwards, keeping its classification. A session
+  whose tracking is not settled, or cannot be anchored, is left on the legacy format instead.
+- A subagent row resumed through its parent no longer passes the subagent's own file to the
+  parent's storage upgrade.
+
 ## Unreleased
 
 ### Added

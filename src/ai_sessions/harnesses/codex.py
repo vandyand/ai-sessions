@@ -17,9 +17,9 @@ import uuid
 from contextlib import closing
 from dataclasses import replace
 from pathlib import Path
-from typing import Any, Callable, Iterable
+from typing import Any, Callable, Iterable, Mapping
 
-from ..capabilities import HarnessAdapter
+from ..capabilities import HarnessAdapter, StorageUpgrade
 from ..conversion import (
     CODEX_BUDGET_CONTEXT_TOKENS,
     CODEX_CONTEXT_WINDOW,
@@ -44,6 +44,7 @@ from ..liveness import LivenessContext
 from ..model import (
     Availability,
     BudgetPolicy,
+    Checkpoint,
     LivenessSession,
     NativeRef,
     NativeSession,
@@ -927,6 +928,7 @@ def inspect_liveness(
 PAGINATED_HISTORY_MODE = "paginated"
 MIGRATE_TIMEOUT_SECONDS = 300.0
 MAX_META_LINE_BYTES = 1 << 20
+MAX_ANCHOR_RECORD_BYTES = 64 << 20
 
 
 def _history_mode(storage: str) -> str | None:
@@ -952,29 +954,146 @@ def _history_mode(storage: str) -> str | None:
     return mode if isinstance(mode, str) else ""
 
 
+def _record_identity(raw: bytes) -> tuple[Any, ...] | None:
+    """Identify a record by fields a history migration does not rewrite.
+
+    Migration re-serializes records and may add fields such as ``ordinal``,
+    so identity uses only the timestamp and structural kind of the record.
+    """
+    try:
+        record = json.loads(raw)
+    except (ValueError, UnicodeDecodeError):
+        return None
+    if not isinstance(record, dict) or not isinstance(record.get("timestamp"), str):
+        return None
+    payload = record.get("payload")
+    payload = payload if isinstance(payload, dict) else {}
+    return (
+        record["timestamp"],
+        record.get("type"),
+        payload.get("type"),
+        payload.get("role"),
+        payload.get("call_id"),
+    )
+
+
+def _anchor_before(path: Path, checkpoint: int) -> tuple[Any, ...] | None:
+    """Return the identity of the complete record that ends exactly at a checkpoint."""
+    if checkpoint <= 0:
+        return None
+    start = max(0, checkpoint - MAX_ANCHOR_RECORD_BYTES)
+    try:
+        with path.open("rb") as handle:
+            handle.seek(start)
+            chunk = handle.read(checkpoint - start)
+    except OSError:
+        return None
+    if len(chunk) != checkpoint - start or not chunk.endswith(b"\n"):
+        return None
+    body = chunk[:-1]
+    cut = body.rfind(b"\n")
+    if cut < 0 and start > 0:
+        return None
+    return _record_identity(body[cut + 1 :].rstrip(b"\r"))
+
+
+def _offset_after(path: Path, anchor: tuple[Any, ...]) -> int | None:
+    """Locate the one record with this identity and return the offset after it."""
+    needle = str(anchor[0]).encode("utf-8")
+    found: int | None = None
+    offset = 0
+    try:
+        with path.open("rb") as handle:
+            for line in handle:
+                offset += len(line)
+                if needle not in line or _record_identity(line.rstrip(b"\r\n")) != anchor:
+                    continue
+                if found is not None:
+                    return None
+                found = offset
+    except OSError:
+        return None
+    return found
+
+
+def _first_record_end(path: Path) -> int | None:
+    try:
+        with path.open("rb") as handle:
+            first = handle.readline(MAX_META_LINE_BYTES)
+    except OSError:
+        return None
+    return len(first) if first.endswith(b"\n") else None
+
+
+def _translate_checkpoint(
+    ref: NativeRef, anchor: tuple[Any, ...] | None, before: str
+) -> int | None:
+    """Find a post-migration checkpoint that keeps the pre-migration classification.
+
+    The same record is the exact translation.  When migration dropped it, the
+    classification is still what the conversation relies on: the end of the
+    file keeps a settled member settled, and the end of the session header
+    keeps a member that has moved on reported as moved on.
+    """
+    path = Path(ref.storage)
+    candidates: list[int | None] = []
+    if anchor is not None:
+        candidates.append(_offset_after(path, anchor))
+    if before == "unchanged":
+        candidates.append(_codex_checkpoint(ref))
+    elif before == "changed":
+        candidates.append(_first_record_end(path))
+    for candidate in candidates:
+        if candidate is not None and _codex_change_status(ref, candidate) == before:
+            return candidate
+    return None
+
+
+def _left_legacy(session_id: str, reason: str) -> tuple[str, ...]:
+    return (
+        f"Left {session_id} on the legacy Codex format because {reason}; rewind stays unavailable.",
+    )
+
+
 def upgrade_storage(
     *,
     session_id: str,
     storage: str,
     command: tuple[str, ...],
     report: Callable[[str], None],
-) -> tuple[str, ...]:
+    checkpoints: Mapping[str, Checkpoint],
+) -> StorageUpgrade:
     """Migrate a legacy rollout to paginated history before it is resumed.
 
     Codex rejects `thread/revert` on a legacy rollout, so a conversation
     recorded before paginated thread history cannot be rewound or have a
-    prompt edited until it is migrated.  Migration is Codex's own supported
-    operation, and it refuses a thread another process is writing, so a
-    session open elsewhere is reported rather than forced.
+    prompt edited until it is migrated.  Migration rewrites the file in place,
+    which moves every byte checkpoint recorded against it, so each one is
+    anchored to a record first and relocated afterwards.  A session whose
+    tracking is not settled is left on the legacy format rather than risk
+    losing track of its conversation.
     """
     if not session_id or not command:
-        return ()
+        return StorageUpgrade()
     mode = _history_mode(storage)
     if mode is None or mode == PAGINATED_HISTORY_MODE:
-        return ()
+        return StorageUpgrade()
+    ref = NativeRef(session_id, storage)
+    plan: dict[str, tuple[tuple[Any, ...] | None, str]] = {}
+    for label, checkpoint in checkpoints.items():
+        if not isinstance(checkpoint, int) or isinstance(checkpoint, bool):
+            return StorageUpgrade(
+                _left_legacy(session_id, "its tracked position is not a byte offset")
+            )
+        before = _codex_change_status(ref, checkpoint)
+        if before not in ("unchanged", "changed"):
+            return StorageUpgrade(
+                _left_legacy(session_id, "a conversation tracking it is not in a settled state")
+            )
+        plan[label] = (_anchor_before(Path(storage), checkpoint), before)
     executable = shutil.which(command[0])
     if executable is None:
-        return ()
+        return StorageUpgrade()
     report(f"updating Codex storage for {session_id} so it can be rewound")
     argv = [executable, *command[1:], "migrate-rollouts", "--apply", "--thread", session_id]
     try:
@@ -986,19 +1105,35 @@ def upgrade_storage(
             check=False,
         )
     except (OSError, subprocess.SubprocessError) as error:
-        return (f"could not update Codex storage for {session_id}: {error}",)
-    if _history_mode(storage) == PAGINATED_HISTORY_MODE:
-        return (f"Updated {session_id} to Codex paginated history; it can be rewound now.",)
-    output = " ".join(part for part in (completed.stdout, completed.stderr) if part)
-    if "active writer" in output:
-        return (
-            f"{session_id} is open in another Codex process, so it stays on the legacy "
-            "format and cannot be rewound until that one is closed.",
+        return StorageUpgrade((f"could not update Codex storage for {session_id}: {error}",))
+    if _history_mode(storage) != PAGINATED_HISTORY_MODE:
+        output = " ".join(part for part in (completed.stdout, completed.stderr) if part)
+        if "active writer" in output:
+            return StorageUpgrade(
+                (
+                    f"{session_id} is open in another Codex process, so it stays on the "
+                    "legacy format and cannot be rewound until that one is closed.",
+                )
+            )
+        return StorageUpgrade(
+            (
+                f"Codex did not migrate {session_id} to paginated history, so rewinding it "
+                "stays unavailable.",
+            )
         )
-    return (
-        f"Codex did not migrate {session_id} to paginated history, so rewinding it "
-        "stays unavailable.",
-    )
+    translated: dict[str, Checkpoint] = {}
+    for label, (anchor, before) in plan.items():
+        moved = _translate_checkpoint(ref, anchor, before)
+        if moved is not None:
+            translated[label] = moved
+    notices = [f"Updated {session_id} to Codex paginated history; it can be rewound now."]
+    lost = len(set(plan) - set(translated))
+    if lost:
+        notices.append(
+            f"Could not relocate where {lost} tracked conversation(s) stand in {session_id} "
+            "after migrating it."
+        )
+    return StorageUpgrade(tuple(notices), translated)
 
 
 def publish_name(session: Any, name: str) -> str:
