@@ -9,6 +9,7 @@ from unittest.mock import patch
 
 from ai_sessions import app
 from ai_sessions.app import Session, codex_resume_target, command_for, launch
+from ai_sessions.capabilities import StorageUpgrade
 from ai_sessions.config import LaunchConfig
 from ai_sessions.registry import REGISTRY
 
@@ -330,12 +331,27 @@ class StorageUpgradeTests(unittest.TestCase):
     def adapter_with_hook(self, hook: object) -> object:
         return replace(REGISTRY.get("codex"), upgrade_storage=hook)
 
+    def state_tracking(self, root: str, item: Session, checkpoint: object) -> app.UserState:
+        state = app.UserState(Path(root) / "state.json")
+        state.conversations["conv-1"] = {
+            "members": {
+                item.key: {
+                    "tool": item.tool,
+                    "session_id": item.session_id,
+                    "storage": item.storage,
+                    "checkpoint": checkpoint,
+                    "cursor": checkpoint,
+                }
+            }
+        }
+        return state
+
     def test_native_resume_asks_the_recording_harness_first(self) -> None:
         seen: list[dict] = []
 
-        def hook(**values: object) -> tuple[str, ...]:
+        def hook(**values: object) -> StorageUpgrade:
             seen.append(values)
-            return ("updated the stored session",)
+            return StorageUpgrade(("updated the stored session",))
 
         item = session("codex", storage="/sessions/one.jsonl")
         with REGISTRY.temporary(self.adapter_with_hook(hook)):
@@ -344,21 +360,50 @@ class StorageUpgradeTests(unittest.TestCase):
         self.assertEqual(seen[0]["session_id"], "session-id")
         self.assertEqual(seen[0]["storage"], "/sessions/one.jsonl")
         self.assertEqual(seen[0]["command"], ("codex",))
+        self.assertEqual(seen[0]["checkpoints"], {})
 
-    def test_subagent_upgrades_the_session_that_is_actually_resumed(self) -> None:
-        seen: list[str] = []
+    def test_tracked_positions_are_handed_over_and_replaced(self) -> None:
+        seen: list[dict] = []
 
-        def hook(*, session_id: str, **_: object) -> tuple[str, ...]:
-            seen.append(session_id)
-            return ()
+        def hook(*, checkpoints: dict, **_: object) -> StorageUpgrade:
+            seen.append(dict(checkpoints))
+            return StorageUpgrade(("migrated",), {"conv-1": 421})
+
+        item = session("codex", storage="/sessions/one.jsonl")
+        with tempfile.TemporaryDirectory() as root:
+            state = self.state_tracking(root, item, 968292)
+            with REGISTRY.temporary(self.adapter_with_hook(hook)):
+                app.upgrade_native_storage(item, LaunchConfig(), state)
+            member = state.conversations["conv-1"]["members"][item.key]
+            saved = json.loads((Path(root) / "state.json").read_text(encoding="utf-8"))
+        self.assertEqual(seen, [{"conv-1": 968292}])
+        self.assertEqual((member["checkpoint"], member["cursor"]), (421, 421))
+        saved_member = saved["conversations"]["conv-1"]["members"][item.key]
+        self.assertEqual(saved_member["checkpoint"], 421)
+
+    def test_an_untranslated_position_is_left_exactly_as_it_was(self) -> None:
+        def hook(**_: object) -> StorageUpgrade:
+            return StorageUpgrade(("left on the legacy format",))
+
+        item = session("codex", storage="/sessions/one.jsonl")
+        with tempfile.TemporaryDirectory() as root:
+            state = self.state_tracking(root, item, 968292)
+            with REGISTRY.temporary(self.adapter_with_hook(hook)):
+                app.upgrade_native_storage(item, LaunchConfig(), state)
+            member = state.conversations["conv-1"]["members"][item.key]
+            self.assertFalse((Path(root) / "state.json").exists())
+        self.assertEqual(member["checkpoint"], 968292)
+
+    def test_a_row_resumed_through_its_parent_does_not_upgrade_the_wrong_file(self) -> None:
+        def hook(**_: object) -> StorageUpgrade:
+            raise AssertionError("the parent thread must not be upgraded from a child's storage")
 
         item = session("codex", "subagent", resume_id="parent-id", parent_id="parent-id")
         with REGISTRY.temporary(self.adapter_with_hook(hook)):
-            app.upgrade_native_storage(item, LaunchConfig())
-        self.assertEqual(seen, ["parent-id"])
+            self.assertEqual(app.upgrade_native_storage(item, LaunchConfig()), ())
 
     def test_a_copy_opened_elsewhere_is_left_to_that_harness(self) -> None:
-        def hook(**_: object) -> tuple[str, ...]:
+        def hook(**_: object) -> StorageUpgrade:
             raise AssertionError("a cross-harness launch must not upgrade the source")
 
         item = session(
@@ -373,7 +418,7 @@ class StorageUpgradeTests(unittest.TestCase):
         self.assertEqual(app.upgrade_native_storage(session("claude"), LaunchConfig()), ())
 
     def test_a_failing_upgrade_reports_but_never_blocks_the_resume(self) -> None:
-        def hook(**_: object) -> tuple[str, ...]:
+        def hook(**_: object) -> StorageUpgrade:
             raise OSError("storage is read-only")
 
         with REGISTRY.temporary(self.adapter_with_hook(hook)):
@@ -384,7 +429,10 @@ class StorageUpgradeTests(unittest.TestCase):
     def test_launch_reports_the_upgrade_before_running_the_harness(self) -> None:
         errors = io.StringIO()
         with tempfile.TemporaryDirectory() as root:
-            hook = lambda **_: ("Updated session-id to paginated history.",)  # noqa: E731
+
+            def hook(**_: object) -> StorageUpgrade:
+                return StorageUpgrade(("Updated session-id to paginated history.",))
+
             with (
                 REGISTRY.temporary(self.adapter_with_hook(hook)),
                 patch.object(app, "IS_WINDOWS", True),
@@ -398,7 +446,7 @@ class StorageUpgradeTests(unittest.TestCase):
         self.assertIn("Updated session-id to paginated history.", errors.getvalue())
 
     def test_a_dry_run_changes_no_stored_session(self) -> None:
-        def hook(**_: object) -> tuple[str, ...]:
+        def hook(**_: object) -> StorageUpgrade:
             raise AssertionError("a dry run must not touch stored sessions")
 
         with (
