@@ -1919,7 +1919,9 @@ class SessionRefresh:
         state: UserState,
         config: LaunchConfig,
         catalog_path: Path = CATALOG_CACHE_FILE,
+        stop_detached: bool = False,
     ) -> None:
+        self._stop_detached = stop_detached
         self._use_cache = use_cache
         self._state = state
         self._config = config
@@ -1943,9 +1945,15 @@ class SessionRefresh:
                 state=self._state,
                 config=self._config,
             )
+            notes = list(load_warnings())
+            if self._stop_detached:
+                from .detached import cleanup_note, stop_detached
+
+                if note := cleanup_note(*stop_detached(sessions)):
+                    notes.insert(0, note)
             save_session_catalog(sessions, self._catalog_path)
             self._sessions = sessions
-            self._warnings = tuple(load_warnings())
+            self._warnings = tuple(notes)
         except Exception as error:
             self._error = f"refresh failed: {error}"
         finally:
@@ -3630,6 +3638,46 @@ class Browser:
             return replace(item, cwd=str(HOME))
         return None
 
+    def confirm_take_over(self, item: Session) -> Session | None:
+        """Stop the process running ``item`` elsewhere so it can resume here."""
+        from .detached import is_busy
+        from .platforms.windows import is_detached, process_started, stop_process_tree
+
+        pid = item.open_pid
+        started = process_started(pid)
+        if not started:
+            return item
+        since = dt.datetime.fromtimestamp(started).strftime("%b %d %H:%M")
+        detached = is_detached(pid)
+        # A detached copy that is between turns has nothing left to lose.
+        if not detached or is_busy(item):
+            where = (
+                "lost its terminal but is still working"
+                if detached
+                else "is already running in another terminal"
+            )
+            self.message = (
+                f"This session {where} (PID {pid}, since {since}). "
+                "Press y to stop it and resume here, or any other key to cancel."
+            )
+            self.draw()
+            while True:
+                try:
+                    key = self.screen.get_wch()
+                    break
+                except curses.error:
+                    continue
+            if not (isinstance(key, str) and key.casefold() == "y"):
+                self.message = "Left the running session alone."
+                return None
+        self.message = f"Stopping PID {pid}..."
+        self.draw()
+        problem = stop_process_tree(pid, started)
+        if problem:
+            self.message = problem
+            return None
+        return replace(item, is_open=False, open_pid=0)
+
     def run(self) -> Session | None:
         if self.refresh is not None:
             self._set_input_timeout(100)
@@ -3683,7 +3731,15 @@ class Browser:
                         else:
                             self.message = "No native session is available for this row."
                         continue
-                    if chosen.is_open:
+                    if chosen.is_open and IS_WINDOWS:
+                        # Windows Terminal cannot be asked to raise one tab, so
+                        # resume here instead, once the running copy has stopped:
+                        # two writers on one session interleave its history.
+                        chosen = self.confirm_take_over(chosen)
+                        detect_open_sessions(self.sessions)
+                        if chosen is None:
+                            continue
+                    elif chosen.is_open:
                         focused, message = focus_open_session(chosen, self.launch_config)
                         if focused:
                             # The desktop focus moves away from this browser, but
@@ -4002,12 +4058,101 @@ def prepare_launch(
     return attach(result.session_id, result.storage), note
 
 
+def ask(question: str) -> bool:
+    try:
+        return input(f"sessions: {question} [y/N] ").strip().casefold() in ("y", "yes")
+    except (EOFError, OSError):
+        return False
+
+
+def make_room(session: Session, others: Iterable[Session]) -> bool:
+    """Stop what would share this terminal or this session with the new launch.
+
+    A harness left detached in this tab garbles the next one's input, and a
+    second copy of ``session`` elsewhere would interleave its history.  Both
+    are stopped quietly when idle; anything working, or still attached to
+    another terminal, is only stopped if the user says so.
+    """
+    from .detached import detached_sessions, is_busy
+    from .platforms.windows import console_pids, is_detached, process_started, stop_process_tree
+
+    candidates = [item for item in others if item.key != session.key]
+    candidates.append(session)
+    detect_open_sessions(candidates)
+    here = set(console_pids())
+    targets = [item for item in detached_sessions(candidates) if item.open_pid in here]
+    if session.is_open and all(item.open_pid != session.open_pid for item in targets):
+        targets.append(session)
+    for item in targets:
+        title = display_title(item)
+        detached = is_detached(item.open_pid)
+        if not detached and not ask(
+            f"{title!r} is open in another terminal (PID {item.open_pid}). Stop it and resume here?"
+        ):
+            print("sessions: left the running session alone.", file=sys.stderr)
+            return False
+        if (
+            detached
+            and is_busy(item)
+            and not ask(
+                f"{title!r} lost its terminal but is still working (PID {item.open_pid}). Stop it?"
+            )
+        ):
+            print("sessions: left it running; try again once it is idle.", file=sys.stderr)
+            return False
+        started = process_started(item.open_pid)
+        problem = stop_process_tree(item.open_pid, started) if started else ""
+        if problem:
+            print(f"sessions: {problem}", file=sys.stderr)
+            return False
+        if detached:
+            print(f"sessions: stopped {title!r}, which had lost its terminal.", file=sys.stderr)
+        item.is_open = False
+        item.open_pid = 0
+    return True
+
+
+def run_harness(session: Session, command: list[str]) -> int:
+    """Run the harness here and remember that this tab runs ``session``.
+
+    A harness that declares ``contain_launch`` runs inside a kill-on-close
+    job so it cannot outlive this launcher; one that may start a daemon
+    other windows share is left out, since that daemon must outlive it.
+    """
+    from .detached import forget, remember
+    from .platforms.windows import KillOnCloseJob, process_started
+
+    tool = active_launch_tool(session)
+    if REGISTRY.get(tool).contain_launch:
+        process, job = KillOnCloseJob.start(command)
+    else:
+        process, job = subprocess.Popen(command), None  # noqa: S603
+    remember(session, tool, process.pid, process_started(process.pid))
+    try:
+        while True:
+            try:
+                code = process.wait()
+                break
+            except KeyboardInterrupt:
+                # Ctrl-C reaches the harness through the shared console;
+                # it decides what that means.
+                continue
+    finally:
+        if job is not None:
+            job.release()
+    forget(process.pid)
+    return code
+
+
 def launch(
     session: Session,
     config: LaunchConfig,
     dry_run: bool = False,
     state: UserState | None = None,
+    others: Iterable[Session] = (),
 ) -> int:
+    if IS_WINDOWS and not dry_run and not make_room(session, others):
+        return 1
     # A dry run still bridges, because the point of printing the command is
     # that it can be pasted and run, and it cannot name a copy that does not
     # exist yet.  Writing the copy is inert until something resumes it.
@@ -4051,13 +4196,65 @@ def launch(
                 print(f"sessions: {argv[0]!r} is not on PATH", file=sys.stderr)
                 return 127
             record_launch(session, argv, executable)
-            return subprocess.call([executable, *argv[1:]])
+            return run_harness(session, [executable, *argv[1:]])
         record_launch(session, argv, shutil.which(argv[0]) or "")
         os.execvp(argv[0], argv)
     except OSError as error:
         print(f"sessions: could not launch {argv[0]!r}: {error}", file=sys.stderr)
         return 127
     return 127
+
+
+def choose_reattach(sessions: list[Session]) -> Session | None:
+    """The session this terminal lost, or one the user picks from those that lost theirs.
+
+    In order: a harness still detached in this very tab; the session this
+    tab last ran, if its harness has since gone; otherwise every session
+    that lost its terminal, newest first.
+    """
+    from .detached import detached_sessions, interrupted, terminal_id
+    from .platforms.windows import console_pids
+
+    detached = detached_sessions(sessions)
+    here = set(console_pids())
+    for item in detached:
+        if item.open_pid in here:
+            return item
+    by_id = {item.session_id: item for item in sessions}
+    detached_ids = {item.session_id for item in detached}
+
+    def available(session_id: str) -> Session | None:
+        item = by_id.get(session_id)
+        # Something resumed it elsewhere since; that copy is not lost.
+        if item is None or (item.is_open and session_id not in detached_ids):
+            return None
+        return item
+
+    lost = interrupted()
+    terminal = terminal_id()
+    if terminal and terminal in lost and (item := available(lost[terminal]["session_id"])):
+        return item
+    choices: list[Session] = list(detached)
+    for entry in sorted(lost.values(), key=lambda entry: -float(entry.get("at", 0) or 0)):
+        item = available(str(entry.get("session_id", "")))
+        if item is not None and item not in choices:
+            choices.append(item)
+    if not choices:
+        print("sessions: no session has lost its terminal; nothing to reattach.", file=sys.stderr)
+        return None
+    if len(choices) == 1:
+        return choices[0]
+    print("Sessions that lost their terminal:")
+    for index, item in enumerate(choices, 1):
+        state = "detached, still running" if item.session_id in detached_ids else "interrupted"
+        print(f"  {index}. {display_title(item)}  [{tool_label(item.tool)}, {state}]")
+        print(f"     {short_path(item.cwd)}")
+    try:
+        answer = input("Reattach which? [1] ").strip() or "1"
+        return choices[int(answer) - 1]
+    except (EOFError, OSError, ValueError, IndexError):
+        print("sessions: nothing reattached.", file=sys.stderr)
+        return None
 
 
 def list_output(items: list[Session], as_json: bool = False) -> None:
@@ -4154,6 +4351,14 @@ def build_parser() -> argparse.ArgumentParser:
         "--resume", metavar="ID_OR_NAME", help="resume an exact session ID or named session"
     )
     parser.add_argument(
+        "--reattach",
+        action="store_true",
+        help=(
+            "Windows: resume the session this terminal lost (or pick one that lost its "
+            "terminal), stopping any copy left running detached"
+        ),
+    )
+    parser.add_argument(
         "--launch-tool",
         choices=REGISTRY.names(),
         help=(
@@ -4220,7 +4425,15 @@ def main(argv: list[str] | None = None) -> int:
     if args.launch_mode:
         launch_config.mode = args.launch_mode
     tui_mode = bool(
-        not (args.list or args.json or args.resume or args.rename or args.hide or args.unhide)
+        not (
+            args.list
+            or args.json
+            or args.resume
+            or args.reattach
+            or args.rename
+            or args.hide
+            or args.unhide
+        )
         and sys.stdin.isatty()
         and sys.stdout.isatty()
     )
@@ -4231,6 +4444,7 @@ def main(argv: list[str] | None = None) -> int:
             use_cache=not args.no_cache,
             state=state,
             config=launch_config,
+            stop_detached=IS_WINDOWS,
         )
     else:
         sessions = load_sessions(
@@ -4322,7 +4536,20 @@ def main(argv: list[str] | None = None) -> int:
             return 2
         if args.launch_tool:
             item = replace(item, launch_tool=args.launch_tool)
-        return launch(item, launch_config, dry_run=args.dry_run, state=state)
+        return launch(item, launch_config, dry_run=args.dry_run, state=state, others=sessions)
+
+    if args.reattach:
+        if not IS_WINDOWS:
+            print(
+                "sessions: --reattach is for Windows; elsewhere sessions hands the terminal "
+                "to the harness, so nothing is left running detached.",
+                file=sys.stderr,
+            )
+            return 2
+        item = choose_reattach(sessions)
+        if item is None:
+            return 1
+        return launch(item, launch_config, dry_run=args.dry_run, state=state, others=sessions)
 
     if args.list or args.json or not (sys.stdin.isatty() and sys.stdout.isatty()):
         try:
@@ -4331,7 +4558,10 @@ def main(argv: list[str] | None = None) -> int:
             return 0
         return 0
 
+    loaded: list[Session] = sessions
+
     def wrapped(screen: Any) -> Session | None:
+        nonlocal loaded
         browser = Browser(
             screen,
             sessions,
@@ -4349,11 +4579,14 @@ def main(argv: list[str] | None = None) -> int:
         # stderr is unusable once curses owns the screen, so the same notes
         # ride in on the status line instead of vanishing.
         browser.message = "; ".join(load_warnings())
-        return browser.run()
+        try:
+            return browser.run()
+        finally:
+            loaded = browser.sessions
 
     selected = curses.wrapper(wrapped)
     if selected:
-        return launch(selected, launch_config, dry_run=args.dry_run, state=state)
+        return launch(selected, launch_config, dry_run=args.dry_run, state=state, others=loaded)
     return 0
 
 

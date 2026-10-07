@@ -162,7 +162,8 @@ class WindowsShimResolutionTests(unittest.TestCase):
             patch.object(app, "LAUNCH_LOG_FILE", Path(root) / "launch-log.jsonl"),
             patch.object(app.os, "chdir", lambda _: None),
             patch.object(app.shutil, "which", lambda name: rf"C:\npm\{name}.CMD"),
-            patch.object(app.subprocess, "call", lambda argv: calls.append(argv) or 0),
+            patch.object(app, "make_room", lambda *_: True),
+            patch.object(app, "run_harness", lambda _, argv: calls.append(argv) or 0),
         ):
             self.assertEqual(launch(session("claude"), LaunchConfig()), 0)
         self.assertEqual(calls, [[r"C:\npm\claude.CMD", "--resume", "session-id"]])
@@ -240,7 +241,8 @@ class LaunchLogTests(unittest.TestCase):
                 patch.object(app, "LAUNCH_LOG_FILE", log),
                 patch.object(app.os, "chdir", lambda _: None),
                 patch.object(app.shutil, "which", lambda name: f"/opt/bin/{name}"),
-                patch.object(app.subprocess, "call", lambda argv: 0),
+                patch.object(app, "make_room", lambda *_: True),
+                patch.object(app, "run_harness", lambda *_: 0),
             ):
                 launch(session("codex", title="Reports"), LaunchConfig())
             entries = app.read_launch_log(path=log)
@@ -295,7 +297,8 @@ class LaunchLogTests(unittest.TestCase):
                 patch.object(app, "LAUNCH_LOG_FILE", blocked / "launch-log.jsonl"),
                 patch.object(app.os, "chdir", lambda _: None),
                 patch.object(app.shutil, "which", lambda name: name),
-                patch.object(app.subprocess, "call", lambda argv: 0),
+                patch.object(app, "make_room", lambda *_: True),
+                patch.object(app, "run_harness", lambda *_: 0),
             ):
                 self.assertEqual(launch(session("codex"), LaunchConfig()), 0)
 
@@ -439,7 +442,8 @@ class StorageUpgradeTests(unittest.TestCase):
                 patch.object(app, "LAUNCH_LOG_FILE", Path(root) / "launch-log.jsonl"),
                 patch.object(app.os, "chdir", lambda _: None),
                 patch.object(app.shutil, "which", lambda name: f"/opt/bin/{name}"),
-                patch.object(app.subprocess, "call", lambda argv: 0),
+                patch.object(app, "make_room", lambda *_: True),
+                patch.object(app, "run_harness", lambda *_: 0),
                 redirect_stderr(errors),
             ):
                 self.assertEqual(launch(session("codex"), LaunchConfig()), 0)

@@ -112,6 +112,17 @@ class LivenessHook(Protocol):
     ) -> Mapping[str, int]: ...
 
 
+class TurnStateHook(Protocol):
+    """Report what a running harness process is doing.
+
+    Returns ``"working"`` mid-turn, ``"idle"`` between turns, ``"headless"``
+    for a run no terminal drives (a script's batch job or a shared daemon),
+    or ``""`` when it cannot tell.
+    """
+
+    def __call__(self, *, pid: int, home: Path, storage: str, command: tuple[str, ...]) -> str: ...
+
+
 @dataclass(frozen=True, slots=True)
 class Unsupported:
     reason: str
@@ -148,6 +159,11 @@ class HarnessAdapter:
     upgrade_storage: UpgradeStorageHook | Unsupported = Unsupported(
         "stored sessions need no upgrade before resuming"
     )
+    turn_state: TurnStateHook | Unsupported = Unsupported("turn state is not reported")
+    # Whether everything the harness starts may be stopped along with its
+    # launcher.  False for a harness that can start a daemon other windows
+    # share, which must outlive the window that happened to start it.
+    contain_launch: bool = False
 
     def __post_init__(self) -> None:
         if not self.label.strip() or not self.short_label.strip():

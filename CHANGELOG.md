@@ -1,5 +1,26 @@
 # Changelog
 
+## 3.7.2 — 2026-10-07
+
+### Added
+
+- `sessions --reattach` (Windows) resumes the session the current Windows Terminal tab lost,
+  stopping a copy still running detached in that tab first; in a fresh tab it lists every session
+  that lost its terminal.
+
+### Fixed
+
+- Opening an open session on Windows no longer stops at "Already open in Windows Terminal …;
+  exact tab focusing is not supported." It offers to stop the running copy and resume it in the
+  current terminal, and does so without asking when that copy has lost its terminal and is idle.
+- Codex's shared app-server daemon is no longer mistaken for a terminal holding the last thread
+  it served, which marked unrelated Codex sessions as open.
+- Killing `sessions` no longer leaves Claude Code running in the tab, sharing keystrokes with the
+  shell: the harness runs in a kill-on-close job tied to the launcher. Codex is excluded because a
+  Codex window can start the shared daemon other windows depend on.
+- Harnesses already left detached that way are stopped when `sessions` starts, once they are
+  between turns, and starting a session in a tab stops one detached there.
+
 ## 3.7.1 — 2026-09-28
 
 ### Fixed

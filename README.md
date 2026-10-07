@@ -25,7 +25,15 @@ It runs as `sessions` on Linux and native Windows PowerShell.
 - Safe, dangerous, and custom launch profiles
 - Native paths and argument handling on both operating systems
 
-Windows Terminal does not expose a stable session-ID-to-tab interface. On Windows, open sessions are identified, but exact tab focusing is intentionally not attempted.
+Windows Terminal does not expose a stable session-ID-to-tab interface. On Windows, open sessions are identified, but exact tab focusing is intentionally not attempted. Pressing Enter on an open session instead offers to stop the running copy and resume it in the current terminal, so two processes never write to one session.
+
+On Windows `sessions` stays running underneath the harness it launches. Claude Code now runs in a job tied to that launcher, so if `sessions` is killed the harness stops with it instead of lingering in the tab and fighting the shell for keystrokes; the conversation is already saved and resumes normally. A harness left in that state by an older version — "detached" — is stopped automatically when `sessions` next starts, unless it is in the middle of a turn, in which case it is left to finish. Each Windows Terminal tab also remembers the session `sessions` launched in it, so after an interruption run:
+
+```powershell
+sessions --reattach
+```
+
+It resumes whatever that tab lost (stopping a detached copy still sitting in it first), or, in a fresh tab, lists the sessions that lost their terminal to pick from.
 
 ## Requirements
 

@@ -779,6 +779,16 @@ def inspect_liveness(
     return result
 
 
+def turn_state(*, pid: int, home: Path, storage: str, command: tuple[str, ...]) -> str:
+    """Claude Code keeps its own idle/busy flag in its per-process registry entry."""
+    try:
+        record = json.loads((home / "sessions" / f"{pid}.json").read_text(encoding="utf-8"))
+    except (OSError, UnicodeError, json.JSONDecodeError):
+        return ""
+    status = record.get("status") if isinstance(record, dict) else None
+    return {"busy": "working", "idle": "idle"}.get(str(status), "")
+
+
 def publish_name(session: Any, name: str) -> str:
     transcript = Path(session.storage)
     if not transcript.is_file():
@@ -829,6 +839,8 @@ ADAPTER = HarnessAdapter(
     publish_name=publish_name,
     inspect_liveness=inspect_liveness,
     liveness_executables=frozenset(("claude", "claude.exe", "claude.cmd", "claude.ps1")),
+    turn_state=turn_state,
+    contain_launch=True,
     budget=BudgetPolicy(
         context_tokens=CLAUDE_BUDGET_CONTEXT_TOKENS,
         usable_fraction=ONE_M_CONTEXT_USABLE_FRACTION,
