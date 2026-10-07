@@ -40,7 +40,7 @@ from ..conversion import (
 )
 from ..diagnostics import record_warning
 from ..discovery import HarnessContext, clean_prompt, normalize_space, timestamp
-from ..liveness import LivenessContext
+from ..liveness import LivenessContext, ProcessInfo
 from ..model import (
     Availability,
     BudgetPolicy,
@@ -835,6 +835,50 @@ def _spawn_parents(home: Path) -> dict[str, str]:
         return {}
 
 
+TURN_TAIL_BYTES = 256 * 1024
+
+
+def turn_state(*, pid: int, home: Path, storage: str, command: tuple[str, ...]) -> str:
+    """Working between a turn's task_started and its completion event.
+
+    ``exec`` runs belong to the script that started them and the app-server
+    daemon serves every window, so neither is a terminal's session.
+    """
+    arguments = {argument.casefold() for argument in command[1:]}
+    if arguments & {"exec", "app-server"}:
+        return "headless"
+    try:
+        with Path(storage).open("rb") as handle:
+            handle.seek(0, os.SEEK_END)
+            handle.seek(max(0, handle.tell() - TURN_TAIL_BYTES))
+            lines = handle.read().decode("utf-8", errors="replace").splitlines()
+    except (OSError, ValueError):
+        return ""
+    for line in reversed(lines):
+        if '"event_msg"' not in line:
+            continue
+        try:
+            payload = json.loads(line).get("payload")
+        except (json.JSONDecodeError, AttributeError):
+            continue
+        kind = payload.get("type") if isinstance(payload, dict) else None
+        if kind == "task_started":
+            return "working"
+        if kind in ("task_complete", "turn_aborted"):
+            return "idle"
+    return ""
+
+
+def _is_app_server(process: ProcessInfo) -> bool:
+    """A shared app-server daemon logs every thread its clients touch.
+
+    Its most recent thread says nothing about which session a terminal has
+    open, and it outlives the clients that used it, so attributing that thread
+    to it reports sessions as open long after they were closed.
+    """
+    return any(argument.casefold() == "app-server" for argument in process.command[1:])
+
+
 def _windows_liveness(context: LivenessContext, home: Path, eligible: set[str]) -> dict[str, int]:
     candidates = [
         process
@@ -843,6 +887,7 @@ def _windows_liveness(context: LivenessContext, home: Path, eligible: set[str]) 
             process.name.casefold() in ("codex.exe", "codex")
             or "codex.exe" in " ".join(process.command).casefold()
         )
+        and not _is_app_server(process)
     ]
     if any(process.started_at <= 0 for process in candidates):
         record_warning("could not verify the start time of a live Codex process")
@@ -1195,6 +1240,7 @@ ADAPTER = HarnessAdapter(
     upgrade_storage=upgrade_storage,
     inspect_liveness=inspect_liveness,
     liveness_executables=frozenset(("codex", "codex.exe")),
+    turn_state=turn_state,
     budget=BudgetPolicy(
         context_tokens=CODEX_BUDGET_CONTEXT_TOKENS,
         usable_fraction=ONE_M_CONTEXT_USABLE_FRACTION,
