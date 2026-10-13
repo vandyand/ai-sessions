@@ -33,8 +33,8 @@ from ..conversion import (
     _iso,
     _jsonl_change_status,
     _records,
-    _records_after,
     append_jsonl,
+    classify_appended,
     complete_jsonl_cursor,
     scrub,
 )
@@ -389,34 +389,28 @@ def _write_codex(
     return NativeWrite(ref, _codex_checkpoint(ref))
 
 
+def _is_codex_work(record: dict[str, Any]) -> bool:
+    if record.get("type") != "response_item":
+        return False
+    payload = record.get("payload")
+    if not isinstance(payload, dict):
+        return False
+    kind = payload.get("type")
+    if kind == "message":
+        return payload.get("role") in ("user", "assistant")
+    return kind in (
+        "function_call",
+        "custom_tool_call",
+        "function_call_output",
+        "custom_tool_call_output",
+    )
+
+
 def _classify_codex_tail(ref: NativeRef, checkpoint: int | str, end: int) -> str:
     """Ignore UI metadata while treating messages and tool traffic as work."""
     if not isinstance(checkpoint, int) or isinstance(checkpoint, bool):
         return "unstable"
-    changed = False
-    for record in _records_after(Path(ref.storage), checkpoint, end=end):
-        if record.get("type") in (
-            "ai_sessions_replaced",
-            "ai_sessions_missing",
-            "ai_sessions_incomplete",
-        ):
-            return "unstable"
-        if record.get("type") != "response_item":
-            continue
-        payload = record.get("payload")
-        if not isinstance(payload, dict):
-            continue
-        kind = payload.get("type")
-        if kind == "message" and payload.get("role") in ("user", "assistant"):
-            changed = True
-        if kind in (
-            "function_call",
-            "custom_tool_call",
-            "function_call_output",
-            "custom_tool_call_output",
-        ):
-            changed = True
-    return "changed" if changed else "unchanged"
+    return classify_appended(ref, checkpoint, end, _is_codex_work)
 
 
 def _codex_change_status(ref: NativeRef, checkpoint: int | str) -> str:

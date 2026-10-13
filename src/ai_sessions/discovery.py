@@ -19,10 +19,19 @@ MAX_EVIDENCE_OVERLAP = 255
 MAX_EXISTENCE_PROBES_PER_PASS = 64
 
 
+_SCAFFOLDING = re.compile(
+    r"<environment_context>.*?</environment_context>"
+    r"|<permissions instructions>.*?</permissions instructions>",
+    re.I | re.S,
+)
+
+
 def normalize_space(value: Any) -> str:
     if not isinstance(value, str):
         return ""
-    return re.sub(r"\s+", " ", value).strip()
+    # str.split() splits on exactly what ``\s`` matches, several times faster
+    # than a regex over the long pasted prompts discovery sees thousands of.
+    return " ".join(value.split())
 
 
 def clean_prompt(value: Any) -> str:
@@ -30,11 +39,8 @@ def clean_prompt(value: Any) -> str:
     text = normalize_space(value)
     if not text:
         return ""
-    text = re.sub(r"<environment_context>.*?</environment_context>", " ", text, flags=re.I | re.S)
-    text = re.sub(
-        r"<permissions instructions>.*?</permissions instructions>", " ", text, flags=re.I | re.S
-    )
-    text = normalize_space(text)
+    if "<" in text:
+        text = normalize_space(_SCAFFOLDING.sub(" ", text))
     for prefix in ("<user>", "Human:", "User:"):
         if text.startswith(prefix):
             text = text[len(prefix) :].lstrip()

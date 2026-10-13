@@ -1,5 +1,21 @@
 # Changelog
 
+## 3.7.3 — 2026-10-13
+
+### Fixed
+
+- A session refresh on Windows took about 50 seconds because the Claude discovery cache never
+  matched: it recorded each transcript's ctime from the open file, which on Windows is the last
+  metadata change, but compared it with the path's ctime, which is creation time. Every
+  transcript was reread in full on every refresh; a warm refresh now takes about 5 seconds, and
+  pressing Enter no longer waits on the slow refresh.
+- Startup re-parsed every record after each conversation's checkpoint to decide whether it had
+  changed (about 60,000 records here). Validated progress is now remembered on disk, so only
+  records appended since the last look are parsed; malformed records and in-place rewrites are
+  still reported as unstable. Loading the session list at startup dropped from about 2.5 to 0.3
+  seconds.
+- Collapsing whitespace in titles and prompts no longer uses a regular expression.
+
 ## 3.7.2 — 2026-10-07
 
 ### Added
