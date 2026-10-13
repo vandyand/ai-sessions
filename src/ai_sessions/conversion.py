@@ -23,10 +23,12 @@ from __future__ import annotations
 
 import datetime as dt
 import functools
+import hashlib
 import json
 import math
 import os
 import re
+import threading
 from dataclasses import replace
 from pathlib import Path
 from typing import Any, Callable, Iterable, Iterator, Mapping
@@ -60,6 +62,7 @@ from .model import (
 from .model import (
     BudgetPolicy as BudgetPolicy,
 )
+from .paths import APP_CACHE_DIR
 from .registry import REGISTRY
 
 # A bridged transcript is replayed into the target's context window in full,
@@ -771,6 +774,119 @@ def _records_after(path: Path, offset: int, *, end: int | None = None) -> Iterat
                     yield item
     except OSError:
         yield {"type": "ai_sessions_missing"}
+
+
+TAIL_PROGRESS_FILE = APP_CACHE_DIR / "tail-progress-v1.json"
+_TAIL_DIGEST_BYTES = 4096
+_TAIL_PROGRESS_ENTRIES = 512
+_tail_progress: dict[str, dict[str, Any]] | None = None
+_tail_lock = threading.Lock()
+
+
+def _tail_digest(path: Path, offset: int) -> str:
+    """Digest the bytes just before ``offset`` so a rewrite is not mistaken for an append."""
+    try:
+        with path.open("rb") as handle:
+            start = max(0, offset - _TAIL_DIGEST_BYTES)
+            handle.seek(start)
+            sample = handle.read(offset - start)
+    except OSError:
+        return ""
+    return hashlib.sha256(offset.to_bytes(8, "big") + sample).hexdigest()
+
+
+def _load_tail_progress() -> dict[str, dict[str, Any]]:
+    global _tail_progress
+    if _tail_progress is None:
+        try:
+            document = json.loads(TAIL_PROGRESS_FILE.read_text(encoding="utf-8"))
+        except (OSError, UnicodeError, json.JSONDecodeError):
+            document = {}
+        _tail_progress = document if isinstance(document, dict) else {}
+    return _tail_progress
+
+
+def _save_tail_progress(key: str, entry: dict[str, Any]) -> None:
+    with _tail_lock:
+        progress = _load_tail_progress()
+        progress.pop(key, None)
+        progress[key] = entry
+        while len(progress) > _TAIL_PROGRESS_ENTRIES:
+            progress.pop(next(iter(progress)))
+        try:
+            TAIL_PROGRESS_FILE.parent.mkdir(parents=True, exist_ok=True)
+            temporary = TAIL_PROGRESS_FILE.with_suffix(f".tmp-{os.getpid()}")
+            temporary.write_text(json.dumps(progress), encoding="utf-8")
+            temporary.replace(TAIL_PROGRESS_FILE)
+        except OSError:
+            pass
+
+
+def classify_appended(
+    ref: NativeRef, offset: int, end: int, is_work: Callable[[dict[str, Any]], bool]
+) -> str:
+    """Classify the JSONL records between byte ``offset`` and ``end``.
+
+    For adapters whose resume frontier is a byte offset, like
+    ``_records_after``.  "changed" when any record is work, "unchanged" when
+    none is, and "unstable" when the file shrank or any record in range is
+    incomplete or malformed.  Records already validated are remembered on
+    disk, so a long-running conversation only parses what was appended since
+    the last look instead of everything after its frontier.
+    """
+    path = Path(ref.storage)
+    # A different adapter generation or classifier may judge records
+    # differently, so neither reuses the other's progress.
+    owner = f"{getattr(is_work, '__module__', '')}.{getattr(is_work, '__qualname__', '')}"
+    key = f"{REGISTRY.generation}\0{owner}\0{ref.storage}\0{offset}"
+    try:
+        stat = path.stat()
+    except OSError:
+        return "unstable"
+    if offset < 0 or end < offset or stat.st_size < end:
+        return "unstable"
+    start, changed = offset, False
+    with _tail_lock:
+        known = _load_tail_progress().get(key)
+    if (
+        isinstance(known, dict)
+        and known.get("inode") == stat.st_ino
+        and isinstance(known.get("offset"), int)
+        and offset <= known["offset"] <= end
+        and known.get("digest") == _tail_digest(path, known["offset"])
+    ):
+        start, changed = known["offset"], bool(known.get("changed"))
+    validated = start
+    status = ""
+    try:
+        with path.open("rb") as handle:
+            handle.seek(start)
+            while handle.tell() < end:
+                raw = handle.readline(end - handle.tell())
+                if not raw.endswith(b"\n"):
+                    status = "unstable"
+                    break
+                try:
+                    item = json.loads(raw)
+                except (json.JSONDecodeError, UnicodeDecodeError):
+                    status = "unstable"
+                    break
+                validated = handle.tell()
+                if isinstance(item, dict) and not changed and is_work(item):
+                    changed = True
+    except OSError:
+        return "unstable"
+    if validated > start:
+        _save_tail_progress(
+            key,
+            {
+                "inode": stat.st_ino,
+                "offset": validated,
+                "changed": changed,
+                "digest": _tail_digest(path, validated),
+            },
+        )
+    return status or ("changed" if changed else "unchanged")
 
 
 class _UnstableJsonlSnapshot(RuntimeError):

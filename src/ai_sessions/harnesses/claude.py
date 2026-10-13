@@ -25,8 +25,8 @@ from ..conversion import (
     _iso,
     _jsonl_change_status,
     _records,
-    _records_after,
     append_jsonl,
+    classify_appended,
     complete_jsonl_cursor,
     scrub,
 )
@@ -253,24 +253,18 @@ def _write_claude(
     return NativeWrite(ref, _claude_checkpoint(ref))
 
 
+def _is_claude_work(record: dict[str, Any]) -> bool:
+    if record.get("type") not in ("user", "assistant") or record.get("isMeta"):
+        return False
+    message = record.get("message")
+    return isinstance(message, dict) and message.get("content") not in (None, "", [])
+
+
 def _classify_claude_tail(ref: NativeRef, checkpoint: int | str, end: int) -> str:
     """Ignore title/metadata appends and classify only semantic messages."""
     if not isinstance(checkpoint, int) or isinstance(checkpoint, bool):
         return "unstable"
-    changed = False
-    for record in _records_after(Path(ref.storage), checkpoint, end=end):
-        if record.get("type") in (
-            "ai_sessions_replaced",
-            "ai_sessions_missing",
-            "ai_sessions_incomplete",
-        ):
-            return "unstable"
-        if record.get("type") not in ("user", "assistant") or record.get("isMeta"):
-            continue
-        message = record.get("message")
-        if isinstance(message, dict) and message.get("content") not in (None, "", []):
-            changed = True
-    return "changed" if changed else "unchanged"
+    return classify_appended(ref, checkpoint, end, _is_claude_work)
 
 
 def _claude_change_status(ref: NativeRef, checkpoint: int | str) -> str:
@@ -541,11 +535,19 @@ class DiscoveryCache:
             incomplete_evidence = self.context.accumulator(tokens=evidence.tokens, truncated=True)
             return meta, incomplete_evidence
         offset = int(meta.get("offset", start))
+        # The cache is checked against ``path.stat()``, so record ctime the
+        # same way: on Windows fstat's st_ctime is the last metadata change
+        # while stat's is creation time, and mixing them meant no transcript
+        # ever matched, so every refresh reread all of them.
+        try:
+            ctime_ns = getattr(path.stat(), "st_ctime_ns", 0)
+        except OSError:
+            ctime_ns = getattr(read_stat, "st_ctime_ns", 0)
         meta.update(
             inode=read_stat.st_ino,
             size=offset,
             mtime_ns=read_stat.st_mtime_ns,
-            ctime_ns=getattr(read_stat, "st_ctime_ns", 0),
+            ctime_ns=ctime_ns,
             offset=offset,
             prefix_identity=_cached_prefix_identity(path, offset) or "",
             candidate_ids=evidence.tokens,

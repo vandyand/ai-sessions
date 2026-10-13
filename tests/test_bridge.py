@@ -2019,5 +2019,74 @@ class LaunchIntegrationTests(unittest.TestCase):
             self.assertNotIn("parent-id", argv)
 
 
+class IncrementalTailTests(unittest.TestCase):
+    """A long conversation should only parse what was appended since the last look."""
+
+    def setUp(self) -> None:
+        directory = tempfile.TemporaryDirectory()
+        self.addCleanup(directory.cleanup)
+        self.root = Path(directory.name)
+        self.path = self.root / "codex.jsonl"
+        for patcher in (
+            patch.object(conversion, "TAIL_PROGRESS_FILE", self.root / "progress.json"),
+            patch.object(conversion, "_tail_progress", None),
+        ):
+            patcher.start()
+            self.addCleanup(patcher.stop)
+
+    def classify(self) -> tuple[str, int]:
+        end = self.path.stat().st_size
+        with patch.object(conversion.json, "loads", wraps=json.loads) as loads:
+            status = conversion.classify_appended(
+                native(self.path), self.cursor, end, codex_harness._is_codex_work
+            )
+        return status, loads.call_count
+
+    def write(self, *lines: str) -> None:
+        with self.path.open("a", encoding="utf-8") as handle:
+            handle.writelines(line + "\n" for line in lines)
+
+    def test_only_appended_records_are_parsed_again(self) -> None:
+        self.path.write_text(codex_line("user", "Earlier") + "\n", encoding="utf-8")
+        self.cursor = self.path.stat().st_size
+        self.write(*(json.dumps({"type": "metadata", "index": index}) for index in range(50)))
+        self.assertEqual(self.classify(), ("unchanged", 50))
+        self.write(codex_line("assistant", "New work"))
+        self.assertEqual(self.classify(), ("changed", 1))
+        self.assertEqual(self.classify(), ("changed", 0))
+
+    def test_progress_survives_a_new_process(self) -> None:
+        self.path.write_text(codex_line("user", "Earlier") + "\n", encoding="utf-8")
+        self.cursor = self.path.stat().st_size
+        self.write(
+            codex_line("user", "Changed"), *(json.dumps({"n": index}) for index in range(20))
+        )
+        self.assertEqual(self.classify(), ("changed", 21))
+        conversion._tail_progress = None  # what a fresh process starts with
+        conversion._load_tail_progress()
+        self.assertEqual(self.classify(), ("changed", 0))
+
+    def test_a_malformed_record_after_validated_work_stays_unstable(self) -> None:
+        self.path.write_text(codex_line("user", "Earlier") + "\n", encoding="utf-8")
+        self.cursor = self.path.stat().st_size
+        self.write(codex_line("user", "Changed"))
+        self.assertEqual(self.classify()[0], "changed")
+        self.write('{"type":"malformed"')
+        self.assertEqual(self.classify()[0], "unstable")
+        self.assertEqual(self.classify()[0], "unstable")
+
+    def test_a_rewrite_of_validated_records_is_not_trusted(self) -> None:
+        self.path.write_text(codex_line("user", "Earlier") + "\n", encoding="utf-8")
+        self.cursor = self.path.stat().st_size
+        self.write(codex_line("user", "Changed"))
+        self.assertEqual(self.classify()[0], "changed")
+        text = self.path.read_text(encoding="utf-8")
+        # Same size, now malformed: trusting the remembered progress would
+        # still say "changed" without ever reading the damage.
+        same_size = text.replace('"Changed"', '"Chang"d')
+        self.path.write_text(same_size, encoding="utf-8")
+        self.assertEqual(self.classify()[0], "unstable")
+
+
 if __name__ == "__main__":
     unittest.main()
