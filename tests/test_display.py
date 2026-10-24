@@ -4,6 +4,7 @@ import os
 import tempfile
 import unittest
 from contextlib import redirect_stdout
+from dataclasses import replace
 from pathlib import Path
 from unittest.mock import patch
 
@@ -369,13 +370,13 @@ class ConversationViewTests(unittest.TestCase):
         head = self.item("head", conversation_id="conv", updated=3)
         rows = app.build_view_rows([old, head])
         self.assertEqual(len(rows), 1)
-        self.assertEqual(rows[0].status, "lineage head")
+        self.assertEqual(rows[0].status, "latest copy")
         self.assertIs(rows[0].target, head)
         expanded = app.build_view_rows([old, head], expanded={rows[0].row_id})
         self.assertEqual([row.target for row in expanded], [head, old, head])
         self.assertEqual(
             [row.status for row in expanded],
-            ["lineage head", "superseded copy", "lineage head"],
+            ["latest copy", "superseded copy", "latest copy"],
         )
 
     def test_filtered_head_does_not_promote_an_older_visible_child(self) -> None:
@@ -409,7 +410,7 @@ class ConversationViewTests(unittest.TestCase):
         self.assertEqual(rows[0].status, "independent thread")
         self.assertIsNone(rows[0].target)
         self.assertEqual([item.key for item in rows[0].members], [first.key, second.key])
-        self.assertEqual(rows[1].status, "untracked")
+        self.assertEqual(rows[1].status, "standalone")
         self.assertIs(rows[1].target, other)
 
     def test_unknown_cwd_independent_threads_never_group(self) -> None:
@@ -417,7 +418,7 @@ class ConversationViewTests(unittest.TestCase):
         second = self.item("second", cwd=" ")
         rows = app.build_view_rows([first, second])
         self.assertEqual(len(rows), 2)
-        self.assertEqual([row.status for row in rows], ["untracked", "untracked"])
+        self.assertEqual([row.status for row in rows], ["standalone", "standalone"])
 
     def test_related_tracked_and_independent_threads_share_a_presentation_container(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -474,10 +475,10 @@ class ConversationViewTests(unittest.TestCase):
         head = self.item("head", conversation_id="conv")
         old = self.item("old", conversation_id="conv", superseded=True)
         branch = self.item("branch", conversation_id="fork", diverged=True)
-        self.assertEqual(app.conversation_status(head), "lineage head")
+        self.assertEqual(app.conversation_status(head), "latest copy")
         self.assertEqual(app.conversation_status(old), "superseded copy")
         self.assertEqual(app.conversation_status(branch), "diverged branch")
-        self.assertEqual(app.conversation_status(self.item("free")), "untracked")
+        self.assertEqual(app.conversation_status(self.item("free")), "standalone")
         self.assertEqual(app.activity_label(self.item("free")), "0t 0c 4p")
 
     def test_blocked_lineage_is_not_presented_or_targeted_as_a_head(self) -> None:
@@ -571,6 +572,43 @@ class ConversationViewTests(unittest.TestCase):
             self.assertTrue(browser.apply_refresh())
             self.assertEqual(browser.selected_id(), parent_id)
             self.assertIs(browser.selected_target(), head)
+
+    def test_connection_and_copy_status_are_separate(self) -> None:
+        standalone = self.item("standalone")
+        linked = self.item("linked", conversation_id="conversation")
+        self.assertEqual(app.connection_label(standalone), "standalone")
+        self.assertEqual(app.copy_status(app.conversation_status(standalone)), "")
+        self.assertEqual(app.connection_label(linked), "linked")
+        self.assertEqual(app.copy_status(app.conversation_status(linked)), "latest")
+        linked.superseded = True
+        self.assertEqual(app.copy_status(app.conversation_status(linked)), "superseded")
+        linked.diverged = True
+        self.assertEqual(app.copy_status(app.conversation_status(linked)), "diverged")
+        linked.conversation_blocker = "unstable"
+        self.assertEqual(app.copy_status(app.conversation_status(linked)), "unstable")
+
+    def test_choices_made_while_a_refresh_runs_survive_it(self) -> None:
+        # The refresh copied saved choices onto its rows before the user acted.
+        selected, renamed = self.item("selected"), self.item("renamed", title="Other")
+        with tempfile.TemporaryDirectory() as directory:
+            browser = self.browser([selected, renamed], directory)
+            refreshed = [replace(selected), replace(renamed)]
+            browser.keep_selection(browser.view_rows()[0].row_id)
+            target = browser.selected_target()
+            browser.cycle_launch_tool()
+            chosen = app.active_launch_tool(target)
+            self.assertNotEqual(chosen, target.tool)
+            browser.state.set_name(renamed, "Renamed while refreshing")
+
+            class Refresh:
+                def take(self, *, wait: bool = False):
+                    return refreshed, (), ""
+
+            browser.refresh = Refresh()
+            self.assertTrue(browser.apply_refresh())
+            by_id = {item.session_id: item for item in browser.sessions}
+            self.assertEqual(app.active_launch_tool(by_id[target.session_id]), chosen)
+            self.assertEqual(by_id["renamed"].title, "Renamed while refreshing")
 
     def test_filtering_an_expanded_child_restores_its_parent_not_a_sibling(self) -> None:
         old = self.item("old", conversation_id="conv", superseded=True)

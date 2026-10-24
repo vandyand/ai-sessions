@@ -1550,7 +1550,8 @@ class LaunchIntegrationTests(unittest.TestCase):
             output = io.StringIO()
             with redirect_stdout(output):
                 list_output([original_row, copy])
-            self.assertIn("HEAD", output.getvalue().splitlines()[0])
+            self.assertIn("CONNECTION", output.getvalue().splitlines()[0])
+            self.assertIn("STATUS", output.getvalue().splitlines()[0])
             self.assertIn("superseded", output.getvalue().splitlines()[1])
 
             with harness_home("codex", codex_home):

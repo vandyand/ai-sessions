@@ -1,5 +1,19 @@
 # Changelog
 
+## 3.7.4 — 2026-10-24
+
+### Fixed
+
+- Launch-harness choices, renames, and visibility changes made during a background refresh
+  now survive its completion. Selecting Claude no longer silently falls back to Codex when
+  Enter applies rows loaded before the selection changed.
+
+### Changed
+
+- Session lists show `standalone` or `linked` in a separate CONNECTION column. STATUS shows
+  `latest`, `superseded`, `diverged`, or validation problems independently; standalone sessions
+  have no copy status and no warning color.
+
 ## 3.7.3 — 2026-10-13
 
 ### Fixed

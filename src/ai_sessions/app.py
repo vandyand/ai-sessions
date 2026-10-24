@@ -627,7 +627,12 @@ class UserState:
         items = list(sessions)
         self._sessions_by_key = {item.key: item for item in items}
         self._migrate_legacy_bridges(items)
-        for item in items:
+        self.apply_choices(items)
+        self._apply_conversation_status(items)
+
+    def apply_choices(self, sessions: Iterable[Session]) -> None:
+        """Apply the user's names, hidden flags and launch harnesses to ``sessions``."""
+        for item in sessions:
             remembered = self.original_names.get(item.key)
             if remembered is not None:
                 item.original_title = str(remembered["title"])
@@ -647,7 +652,6 @@ class UserState:
                 item.named = True
                 item.renamed = True
             item.hidden = item.key in self.hidden
-        self._apply_conversation_status(items)
 
     def save(self) -> None:
         self.path.parent.mkdir(parents=True, exist_ok=True)
@@ -957,8 +961,22 @@ def conversation_status(session: Session) -> str:
     if session.superseded:
         return "superseded copy"
     if session.conversation_id:
-        return "lineage head"
-    return "untracked"
+        return "latest copy"
+    return "standalone"
+
+
+def connection_label(session: Session) -> str:
+    return "linked" if session.conversation_id else "standalone"
+
+
+def copy_status(status: str) -> str:
+    return {
+        "standalone": "",
+        "independent thread": "",
+        "latest copy": "latest",
+        "superseded copy": "superseded",
+        "diverged branch": "diverged",
+    }.get(status, status)
 
 
 @functools.lru_cache(maxsize=32_768)
@@ -1105,7 +1123,7 @@ def _tracked_status(items: tuple[Session, ...], target: Session | None) -> str:
     if any(item.diverged for item in items):
         return "diverged branch"
     if target is not None:
-        return "lineage head"
+        return "latest copy"
     if items and all(item.superseded for item in items):
         return "superseded copy"
     return conversation_status(_view_representative(items))
@@ -1196,7 +1214,7 @@ def build_view_rows(
                     all_members,
                     item,
                     item,
-                    "untracked",
+                    "standalone",
                     display_title(item),
                     project_identity(item.cwd),
                 )
@@ -1320,7 +1338,7 @@ def build_view_rows(
                         (member,),
                         member,
                         member,
-                        "untracked",
+                        "standalone",
                         display_title(member),
                         project_identity(member.cwd),
                     )
@@ -2701,6 +2719,10 @@ class Browser:
             self.message = error + "; press Ctrl-R to retry"
             return True
         assert sessions is not None
+        # The refresh applied saved choices when it started.  Anything chosen
+        # since -- a launch harness picked with x, a rename, a hide -- would
+        # otherwise vanish here, and Enter would resume the native harness.
+        self.state.apply_choices(sessions)
         self.sessions = sessions
         # A disappeared child cannot retain launch intent or selection. Restore
         # its aggregate only when that exact stable parent still exists.
@@ -2973,6 +2995,7 @@ class Browser:
         show_directory = width >= 100
         tool_width = tool_column_width(8) + 1
         origin_width, open_width, activity_width, time_width, status_width = 7, 6, 18, 10, 19
+        connection_width = 11
         directory_width = min(34, max(16, width // 4)) if show_directory else 0
         title_width = (
             width
@@ -2983,13 +3006,14 @@ class Browser:
             - activity_width
             - (time_width * 2)
             - status_width
+            - connection_width
             - directory_width
         )
         heading = (
             f"  {'TOOL':<{tool_width}}{'ORIGIN':<{origin_width}}"
             f"{'OPEN':<{open_width}}{'ACTIVITY':<{activity_width}}"
             f"{'STARTED':<{time_width}}{'UPDATED':<{time_width}}"
-            f"{'STATUS':<{status_width}}TITLE"
+            f"{'CONNECTION':<{connection_width}}{'STATUS':<{status_width}}TITLE"
         )
         self.add(3, 1, heading, self.style("muted", curses.A_BOLD), width - 2)
 
@@ -3048,9 +3072,12 @@ class Browser:
                 segment(column_cell(relative_time(item.created), time_width), "muted")
                 segment(column_cell(relative_time(item.updated), time_width), "timestamp")
                 status = view_row.status
+                segment(column_cell(connection_label(item), connection_width), "muted")
                 segment(
-                    column_cell(status, status_width),
-                    "warning" if status != "lineage head" else "success",
+                    column_cell(copy_status(status), status_width),
+                    "muted"
+                    if status == "standalone"
+                    else ("success" if status == "latest copy" else "warning"),
                     curses.A_BOLD,
                 )
                 title = _normal_agent_tag(item) + view_row.title
@@ -3501,7 +3528,7 @@ class Browser:
             prompt = ellipsize(clean_prompt(item.preview), max(1, self.screen.getmaxyx()[1] - 14))
             lines.extend(
                 (
-                    f"{conversation_status(item)} · {tool_label(item.tool)} · "
+                    f"{connection_label(item)} {copy_status(conversation_status(item))} · {tool_label(item.tool)} · "
                     f"{exact_time(item.updated)}{filtered}",
                     f"Harness    {item.tool} · Native ID {item.session_id}",
                     f"Storage    {item.storage or '(unknown)'}",
@@ -4272,12 +4299,12 @@ def list_output(items: list[Session], as_json: bool = False) -> None:
     activity_width = 18
     tool_width = tool_column_width(8)
     run_width = tool_column_width(6)
-    title_width = max(32, terminal_width - 124 - (tool_width - 8) - (run_width - 6))
+    title_width = max(32, terminal_width - 136 - (tool_width - 8) - (run_width - 6))
     title_suffixes = title_disambiguators(items)
     print(
         f"{'TOOL':<{tool_width}} {'RUN':<{run_width}} {'ORIGIN':<7} "
         f"{'OPEN':<5} {'ACTIVITY':<{activity_width}} {'STATE':<8} "
-        f"{'HEAD / STATUS':<{conversation_width}} {'STARTED':<12} {'UPDATED':<12} "
+        f"{'CONNECTION':<11} {'STATUS':<{conversation_width}} {'STARTED':<12} {'UPDATED':<12} "
         f"{'TITLE':<{title_width}} DIRECTORY"
     )
     for item in items:
@@ -4292,7 +4319,7 @@ def list_output(items: list[Session], as_json: bool = False) -> None:
             f"{ORIGIN_LABELS[item.origin]:<7} {open_symbol:<5} "
             f"{activity_label(item):<{activity_width}} "
             f"{('hidden' if item.hidden else 'visible'):<8} "
-            f"{conversation_status(item):<{conversation_width}} "
+            f"{connection_label(item):<11} {copy_status(conversation_status(item)):<{conversation_width}} "
             f"{relative_time(item.created):<12} {relative_time(item.updated):<12} "
             f"{rendered_title:<{title_width}} "
             f"{short_path(item.cwd)}"

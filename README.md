@@ -235,10 +235,13 @@ after that frontier. Timestamps are display data only and never decide which his
 Selecting an older row therefore does not resume an older history. `ai-sessions` follows
 the conversation head, reuses an equivalent copy in the requested harness when one exists,
 or creates a new native session from the head. Historical materializations remain available under
-expansion and in details as `superseded copy`. The validated current materialization is a `lineage
-head`. If two materializations advance independently, both are `diverged branch` and automatic
+expansion and in details as `superseded`. The validated current copy is labeled `latest`.
+If two copies advance independently, both are `diverged` and automatic
 resume stops instead of silently choosing one branch. Same-title sessions without recorded lineage
-are `independent thread` or `untracked`; their visual grouping never changes launch routing.
+are `independent thread` or `standalone`; their visual grouping never changes launch routing.
+
+The CONNECTION column shows `standalone` or `linked`. STATUS separately shows
+`latest`, `superseded`, `diverged`, or a validation problem. Standalone sessions have no copy status.
 
 The conversation id is stored in `state.json` and included in new copies as a structured
 `[ai-sessions-provenance v1]` marker. State is authoritative today; the marker makes copies
