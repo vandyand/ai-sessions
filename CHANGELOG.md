@@ -1,5 +1,40 @@
 # Changelog
 
+## 3.7.5 — 2026-10-30
+
+### Fixed
+
+- Start in about 0.7 s instead of 6 s or more. Checking a linked conversation's bookmarks
+  reread every copy from its first record on each launch, a cost that grew with every
+  message. Where each bookmark was found is now remembered across launches and trusted
+  while the file has only been appended to; a check that failed is not repeated until
+  the file changes.
+- Bookmarks taken before semantic fingerprints no longer break when Codex 0.165 merges a
+  resume's AGENTS.md instructions and environment context into one message and rewrites
+  the compactions that embed it. Every message and tool record must still match exactly
+  and in order.
+- Preserve conversation-record fingerprints alongside new linked-session bookmarks so
+  formatting and instruction-metadata rewrites do not strand valid histories. Actual
+  conversation edits or missing records still block automatic routing.
+- Separate standard Codex instruction envelopes and compaction bookkeeping from conversation
+  fingerprints, retaining checks on real messages, tool traffic and summary content.
+- Count legacy Codex response-only prompts and paginated user events, deduplicating
+  paired representations. Refresh the discovery cache once for corrected metrics.
+
+### Added
+
+- Persistent in-app recovery for an exact native copy in a blocked group. Enter asks
+  before making it the continuing history, backs up utility state, and preserves other
+  copies separately; `x` remains available to choose the destination harness.
+
+### Changed
+
+- Find a Codex rollout from the creation date in its id instead of walking every session
+  folder for each lookup, trimming the background refresh by about 1.5 s.
+- Show Updated ages in days, hours, and minutes.
+- Explain validation blocks on native rows instead of claiming the session is missing
+  or telling the user to expand a row that cannot expand.
+
 ## 3.7.4 — 2026-10-24
 
 ### Fixed
@@ -64,7 +99,7 @@
 - A subagent row resumed through its parent no longer passes the subagent's own file to the
   parent's storage upgrade.
 
-## Unreleased
+## 3.7.0 — 2026-09-24
 
 ### Added
 

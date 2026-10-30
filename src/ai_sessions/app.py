@@ -240,6 +240,10 @@ class UserState:
                         }
                         if members:
                             self.conversations[str(conversation_id)] = {"members": members}
+                            if isinstance(value.get("recovery"), dict):
+                                self.conversations[str(conversation_id)]["recovery"] = value[
+                                    "recovery"
+                                ]
                 if isinstance(session_conversations, dict):
                     self.session_conversations = {
                         self.stable_key(str(key)): str(value)
@@ -313,6 +317,11 @@ class UserState:
         }
         resolved = self._checkpoint(item) if checkpoint is _UNSET_CHECKPOINT else checkpoint
         if resolved is not None:
+            protector = REGISTRY.get(item.tool).protect_checkpoint
+            if not isinstance(protector, Unsupported):
+                protected = protector(NativeRef(item.session_id, item.storage), resolved)
+                if protected is not None:
+                    result["protected_checkpoint"] = protected
             result["checkpoint"] = resolved
             if isinstance(resolved, int) and not isinstance(resolved, bool):
                 result["cursor"] = resolved
@@ -345,6 +354,59 @@ class UserState:
             return conversation_id
         return self._ensure_conversation(item)[0]
 
+    def recover_session(self, item: Session) -> Session:
+        """Persist the user's explicit choice of an exact native history, without merging."""
+        ref = NativeRef(item.session_id, item.storage)
+        if native_session_availability(item.tool, ref) != "available":
+            raise BridgeError("The selected transcript is unavailable; recovery made no changes.")
+        checkpoint = self._checkpoint(item)
+        if (
+            checkpoint is None
+            or conversation_change_status(item.tool, ref, checkpoint) != "unchanged"
+        ):
+            raise BridgeError(
+                "The selected transcript is still being written or is incomplete; retry when idle."
+            )
+        cid = str(uuid.uuid4())
+        member = self._member_from_session(
+            item, generation=0, frontier=str(uuid.uuid4()), checkpoint=checkpoint
+        )
+        protector = REGISTRY.get(item.tool).protect_checkpoint
+        if isinstance(protector, Unsupported) or not member.get("protected_checkpoint"):
+            raise BridgeError(
+                "The selected transcript could not be fully validated; recovery made no changes."
+            )
+        old_id = self.conversation_id_for(item)
+        old = self.conversations.get(old_id)
+        previous = dict(old["members"].get(item.key, {})) if old else {}
+        # Back up utility state before changing any relationship. Native history is never edited.
+        if self.path.exists():
+            backup = self.path.with_name("state.before-recovery-" + uuid.uuid4().hex + ".json")
+            with backup.open("xb") as handle:
+                handle.write(self.path.read_bytes())
+        if old:
+            old["members"].pop(item.key, None)
+            if not old["members"]:
+                del self.conversations[old_id]
+        self.conversations[cid] = {
+            "members": {item.key: member},
+            "recovery": {
+                "previous_conversation": old_id,
+                "previous_member": previous,
+                "chosen_at": dt.datetime.now(dt.timezone.utc).isoformat(),
+            },
+        }
+        self.session_conversations[item.key] = cid
+        self.save()
+        return replace(
+            item,
+            conversation_id=cid,
+            conversation_blocker="",
+            superseded=False,
+            diverged=False,
+            launch_targets={item.tool: item.session_id},
+        )
+
     def _member_changed(self, member: dict[str, Any]) -> bool:
         return self._member_change_status(member) != "unchanged"
 
@@ -354,7 +416,9 @@ class UserState:
         storage = str(member.get("storage", ""))
         if not tool or not session_id or not storage:
             return "unknown"
-        checkpoint = member.get("checkpoint", member.get("cursor"))
+        checkpoint = member.get(
+            "protected_checkpoint", member.get("checkpoint", member.get("cursor"))
+        )
         if isinstance(checkpoint, bool) or not isinstance(checkpoint, (int, str)):
             return "unstable"
         return conversation_change_status(
@@ -601,6 +665,7 @@ class UserState:
                 # migration: it reports the source as advanced rather than stale.
                 source_member["cursor"] = 0
                 source_member.pop("checkpoint", None)
+                source_member.pop("protected_checkpoint", None)
             for tool, entry in targets.items():
                 session_id = str(entry.get("session_id", ""))
                 if not session_id:
@@ -1828,7 +1893,9 @@ def upgrade_native_storage(
             command=tuple(config.provider_command(tool)),
             report=report,
             checkpoints={
-                conversation_id: member.get("checkpoint", member.get("cursor"))
+                conversation_id: member.get(
+                    "protected_checkpoint", member.get("checkpoint", member.get("cursor"))
+                )
                 for conversation_id, member in tracked.items()
             },
         )
@@ -2585,6 +2652,36 @@ def relative_time(value: float) -> str:
     return date.strftime("%Y-%m-%d")
 
 
+def updated_age(value: float, *, now: float | None = None) -> str:
+    """Show enough precision to distinguish updates on the same day."""
+    if not value:
+        return "unknown"
+    minutes = int(max(0, (dt.datetime.now().timestamp() if now is None else now) - value) // 60)
+    if not minutes:
+        return "just now"
+    days, remainder = divmod(minutes, 1440)
+    hours, minutes = divmod(remainder, 60)
+    if days:
+        return f"{days}d {hours}h {minutes}m"
+    if hours:
+        return f"{hours}h {minutes}m"
+    return f"{minutes}m"
+
+
+def blocked_row_message(row: ViewRow) -> str:
+    problem = row.representative.conversation_blocker
+    if problem:
+        return (
+            f"Linked history validation blocked ({problem}); the transcript exists, "
+            "but its latest copy cannot be verified. Enter to recover this copy; i for details."
+        )
+    if row.representative.diverged:
+        return (
+            "Linked copies diverged; their separate changes need review. Press i for copy details."
+        )
+    return "Expand this group and choose a native session first."
+
+
 def exact_time(value: float) -> str:
     if not value:
         return "unknown"
@@ -2996,6 +3093,7 @@ class Browser:
         tool_width = tool_column_width(8) + 1
         origin_width, open_width, activity_width, time_width, status_width = 7, 6, 18, 10, 19
         connection_width = 11
+        updated_width = 17
         directory_width = min(34, max(16, width // 4)) if show_directory else 0
         title_width = (
             width
@@ -3004,7 +3102,8 @@ class Browser:
             - origin_width
             - open_width
             - activity_width
-            - (time_width * 2)
+            - time_width
+            - updated_width
             - status_width
             - connection_width
             - directory_width
@@ -3012,7 +3111,7 @@ class Browser:
         heading = (
             f"  {'TOOL':<{tool_width}}{'ORIGIN':<{origin_width}}"
             f"{'OPEN':<{open_width}}{'ACTIVITY':<{activity_width}}"
-            f"{'STARTED':<{time_width}}{'UPDATED':<{time_width}}"
+            f"{'STARTED':<{time_width}}{'UPDATED':<{updated_width}}"
             f"{'CONNECTION':<{connection_width}}{'STATUS':<{status_width}}TITLE"
         )
         self.add(3, 1, heading, self.style("muted", curses.A_BOLD), width - 2)
@@ -3070,7 +3169,7 @@ class Browser:
                 )
                 segment(column_cell(activity_label(item), activity_width), "messages")
                 segment(column_cell(relative_time(item.created), time_width), "muted")
-                segment(column_cell(relative_time(item.updated), time_width), "timestamp")
+                segment(column_cell(updated_age(item.updated), updated_width), "timestamp")
                 status = view_row.status
                 segment(column_cell(connection_label(item), connection_width), "muted")
                 segment(
@@ -3292,9 +3391,12 @@ class Browser:
 
     def cycle_launch_tool(self) -> None:
         item = self.selected_target()
+        row = self.selected_row()
+        if item is None and row is not None and not row.expandable and len(row.members) == 1:
+            item = row.representative
         if item is None:
             if self.selected_row() is not None:
-                self.message = "Expand this group and choose a native session first."
+                self.message = blocked_row_message(self.selected_row())
             return
         before = active_launch_tool(item)
         cycle_session_launch_tool(item)
@@ -3560,7 +3662,7 @@ class Browser:
         item = self.selected_target()
         if item is None:
             if self.selected_row() is not None:
-                self.message = "Expand this group and choose a native session first."
+                self.message = blocked_row_message(self.selected_row())
             return
         value = self.name_prompt(item)
         if value is None:
@@ -3574,7 +3676,7 @@ class Browser:
         item = self.selected_target()
         if item is None:
             if self.selected_row() is not None:
-                self.message = "Expand this group and choose a native session first."
+                self.message = blocked_row_message(self.selected_row())
             return
         previous = item.key
         if item.hidden:
@@ -3665,6 +3767,32 @@ class Browser:
             return replace(item, cwd=str(HOME))
         return None
 
+    def confirm_recovery(self, row: ViewRow) -> Session | None:
+        item = row.representative
+        self.message = (
+            f"Recover selected {tool_label(item.tool)} copy in {tool_label(active_launch_tool(item))}? "
+            "y=yes; other key=cancel. Other copies kept."
+        )
+        self.draw()
+        while True:
+            try:
+                key = self.screen.get_wch()
+                break
+            except curses.error:
+                continue
+        if not isinstance(key, str) or key.casefold() != "y":
+            self.message = "Recovery cancelled; nothing changed."
+            return None
+        try:
+            chosen = self.state.recover_session(item)
+        except (BridgeError, OSError) as error:
+            self.message = str(error)
+            return None
+        self.sessions = [chosen if member.key == chosen.key else member for member in self.sessions]
+        self.state.apply(self.sessions)
+        self.message = "Recovered this copy; other histories were preserved separately."
+        return chosen
+
     def confirm_take_over(self, item: Session) -> Session | None:
         """Stop the process running ``item`` elsewhere so it can resume here."""
         from .detached import is_busy
@@ -3735,7 +3863,12 @@ class Browser:
                 self.selected = max(0, len(rows) - 1)
             elif not self.searching and key in (" ", curses.KEY_RIGHT):
                 if not self.toggle_expansion():
-                    self.message = "This row has no expandable members."
+                    self.message = (
+                        blocked_row_message(self.selected_row())
+                        if self.selected_row()
+                        and self.selected_row().representative.conversation_blocker
+                        else "This row has no expandable members."
+                    )
             elif not self.searching and key == curses.KEY_LEFT:
                 row = self.selected_row()
                 if row is not None and "/member:" in row.row_id:
@@ -3755,9 +3888,17 @@ class Browser:
                             self.expanded.add(chosen_row.row_id)
                             self.keep_selection(chosen_row.row_id)
                             self.message = "Group expanded; choose a native session."
+                            continue
+                        elif (
+                            chosen_row.representative.conversation_blocker
+                            or chosen_row.representative.diverged
+                        ) and len(chosen_row.members) == 1:
+                            chosen = self.confirm_recovery(chosen_row)
+                            if chosen is None:
+                                continue
                         else:
-                            self.message = "No native session is available for this row."
-                        continue
+                            self.message = blocked_row_message(chosen_row)
+                            continue
                     if chosen.is_open and IS_WINDOWS:
                         # Windows Terminal cannot be asked to raise one tab, so
                         # resume here instead, once the running copy has stopped:
@@ -4299,12 +4440,12 @@ def list_output(items: list[Session], as_json: bool = False) -> None:
     activity_width = 18
     tool_width = tool_column_width(8)
     run_width = tool_column_width(6)
-    title_width = max(32, terminal_width - 136 - (tool_width - 8) - (run_width - 6))
+    title_width = max(32, terminal_width - 141 - (tool_width - 8) - (run_width - 6))
     title_suffixes = title_disambiguators(items)
     print(
         f"{'TOOL':<{tool_width}} {'RUN':<{run_width}} {'ORIGIN':<7} "
         f"{'OPEN':<5} {'ACTIVITY':<{activity_width}} {'STATE':<8} "
-        f"{'CONNECTION':<11} {'STATUS':<{conversation_width}} {'STARTED':<12} {'UPDATED':<12} "
+        f"{'CONNECTION':<11} {'STATUS':<{conversation_width}} {'STARTED':<12} {'UPDATED':<17} "
         f"{'TITLE':<{title_width}} DIRECTORY"
     )
     for item in items:
@@ -4320,7 +4461,7 @@ def list_output(items: list[Session], as_json: bool = False) -> None:
             f"{activity_label(item):<{activity_width}} "
             f"{('hidden' if item.hidden else 'visible'):<8} "
             f"{connection_label(item):<11} {copy_status(conversation_status(item)):<{conversation_width}} "
-            f"{relative_time(item.created):<12} {relative_time(item.updated):<12} "
+            f"{relative_time(item.created):<12} {updated_age(item.updated):<17} "
             f"{rendered_title:<{title_width}} "
             f"{short_path(item.cwd)}"
         )

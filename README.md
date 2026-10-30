@@ -112,6 +112,16 @@ Each resume records the exact id and command handed to the harness. If a harness
 different conversation than the row you picked, `sessions --launch-log` shows what was actually
 requested, which separates a wrong id from a harness resolving the right id to the wrong session.
 
+Updated ages include days, hours, and minutes (for example, `4d 7h 23m`); the detail pane
+retains exact timestamps. Activity counts are transcript messages (`t`), compactions (`c`),
+and user prompts (`p`). One agent response can generate several transcript messages.
+
+If linked-history validation blocks an exact native row, choose the desired harness with `x`
+and press Enter. Recovery asks before using that selected copy as a new tracked starting point.
+Other copies remain separate; the previous relationship and utility state are backed up.
+Malformed or actively changing transcripts cannot be recovered this way. Recovery never rewrites
+native transcript content or silently merges competing histories.
+
 ## What is written, and when
 
 Resuming a session in the harness that recorded it is a read: `sessions` runs
@@ -229,8 +239,11 @@ the target default; add `version = 2` or use `max_tokens` to make an override ex
 
 Every first bridge creates a utility-owned conversation id. The original and each native
 copy are materializations of that conversation. Equivalent copies share a frontier; byte
-cursors on their append-only transcripts reveal which materialization received real work
-after that frontier. Timestamps are display data only and never decide which history wins.
+bookmarks on their transcripts reveal which copy received real work after that frontier.
+New bookmarks retain ordered fingerprints of conversation records as well as a byte position.
+Formatting and instruction-metadata rewrites can therefore relocate the position without
+losing its meaning; edits or missing conversation records still block automatic routing.
+Timestamps are display data only and never decide which history wins.
 
 Selecting an older row therefore does not resume an older history. `ai-sessions` follows
 the conversation head, reuses an equivalent copy in the requested harness when one exists,

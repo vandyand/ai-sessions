@@ -364,3 +364,53 @@ class OpenCodeMetricTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class CodexPromptFallbackTests(unittest.TestCase):
+    def test_response_only_users_count_and_paired_events_are_not_counted_twice(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "codex.jsonl"
+            path.write_bytes(
+                b"".join(
+                    _json_line(r)
+                    for r in [
+                        _codex_message("user", "legacy prompt"),
+                        _codex_message("assistant", "answer"),
+                        {
+                            "type": "event_msg",
+                            "payload": {"type": "user_message", "message": "paired"},
+                        },
+                        _codex_message("user", "paired"),
+                    ]
+                )
+            )
+            result = codex.DiscoveryCache(HarnessContext.create(use_cache=False)).scan(
+                path, SourceKind.INTERACTIVE
+            )
+            self.assertEqual(result[2], 2)
+
+    def test_paginated_user_events_count_without_duplicate_response(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "codex.jsonl"
+            event = {
+                "type": "event_msg",
+                "payload": {
+                    "type": "item_completed",
+                    "item": {
+                        "type": "UserMessage",
+                        "id": "u1",
+                        "content": [{"type": "text", "text": "question"}],
+                    },
+                },
+            }
+            for records in (
+                [event],
+                [_codex_message("user", "question"), event],
+                [event, _codex_message("user", "question")],
+            ):
+                with self.subTest(records=len(records)):
+                    path.write_bytes(b"".join(_json_line(r) for r in records))
+                    result = codex.DiscoveryCache(HarnessContext.create(use_cache=False)).scan(
+                        path, SourceKind.INTERACTIVE
+                    )
+                    self.assertEqual(result[2], 1)

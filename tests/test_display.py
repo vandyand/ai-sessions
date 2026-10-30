@@ -573,6 +573,59 @@ class ConversationViewTests(unittest.TestCase):
             self.assertEqual(browser.selected_id(), parent_id)
             self.assertIs(browser.selected_target(), head)
 
+    def test_blocked_native_row_explains_validation_instead_of_expansion(self) -> None:
+        item = self.item("blocked", conversation_id="conv")
+        item.conversation_blocker = "unstable"
+        with tempfile.TemporaryDirectory() as directory:
+            browser = self.browser([item], directory)
+            before = app.active_launch_tool(item)
+            browser.cycle_launch_tool()
+            self.assertNotEqual(app.active_launch_tool(item), before)
+            self.assertNotIn("Expand", browser.message)
+
+    def test_enter_and_expand_on_blocked_native_row_explain_validation(self) -> None:
+        for key in ("\n", " "):
+            with self.subTest(key=key), tempfile.TemporaryDirectory() as directory:
+                item = self.item("blocked", conversation_id="conv")
+                item.conversation_blocker = "unstable"
+                browser = self.browser([item], directory)
+                browser.screen = ScriptedScreen(key, *(("n", "q") if key == "\n" else ("q",)))
+                self.assertIsNone(browser.run())
+                frames = "\n".join(browser.screen.frames)
+                self.assertIn("recover" if key == "\n" else "validation", frames.lower())
+                self.assertNotIn("No native session", frames)
+
+    def test_enter_recovery_returns_a_persistently_unblocked_native_copy(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "history.jsonl"
+            path.write_text(
+                json.dumps({"type": "user", "message": {"role": "user", "content": "hello"}})
+                + "\n",
+                encoding="utf-8",
+            )
+            item = replace(
+                self.item("blocked", conversation_id="old"), cwd=directory, storage=str(path)
+            )
+            item.conversation_blocker = "unstable"
+            browser = self.browser([item], directory)
+            browser.screen = ScriptedScreen("\n", "y")
+            chosen = browser.run()
+            self.assertIsNotNone(chosen)
+            self.assertFalse(chosen.conversation_blocker)
+            self.assertNotEqual(chosen.conversation_id, "old")
+            loaded = UserState(browser.state.path)
+            loaded.apply([chosen])
+            self.assertFalse(chosen.conversation_blocker)
+
+    def test_detailed_age_keeps_days_hours_and_minutes(self) -> None:
+        now = app.dt.datetime.now().timestamp()
+        self.assertEqual(
+            app.updated_age(now - 4 * 86400 - 7 * 3600 - 23 * 60, now=now), "4d 7h 23m"
+        )
+        self.assertEqual(app.updated_age(now - 125, now=now), "2m")
+        self.assertEqual(app.updated_age(0, now=now), "unknown")
+        self.assertEqual(app.updated_age(now + 10, now=now), "just now")
+
     def test_connection_and_copy_status_are_separate(self) -> None:
         standalone = self.item("standalone")
         linked = self.item("linked", conversation_id="conversation")
