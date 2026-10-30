@@ -40,6 +40,7 @@ from ..conversion import (
 )
 from ..diagnostics import record_warning
 from ..discovery import HarnessContext, clean_prompt, normalize_space, timestamp
+from ..jsonl_tracking import PREFIX, locate_checkpoint, protect_checkpoint
 from ..liveness import LivenessContext, ProcessInfo
 from ..model import (
     Availability,
@@ -61,7 +62,7 @@ from ..registry import REGISTRY
 CODEX_CLI_VERSION = "0.147.0"
 CODEX_HOME = env_path("CODEX_HOME", HOME / ".codex")
 _RESULT_NOISE = re.compile(r"^Script completed\s*(Wall time[^\n]*)?\s*Output:\s*", re.I)
-DISCOVERY_CACHE_VERSION = 7
+DISCOVERY_CACHE_VERSION = 8
 DISCOVERY_CACHE_FILE = APP_CACHE_DIR / f"codex-discovery-v{DISCOVERY_CACHE_VERSION}.json"
 _CACHE_SENTINEL_BYTES = 4096
 _CACHE_SENTINEL_COUNT = 8
@@ -113,9 +114,15 @@ def _codex_activity_text(payload: dict[str, Any]) -> str:
 
 
 def _codex_event_text(payload: dict[str, Any]) -> str:
-    if payload.get("type") != "user_message":
+    if payload.get("type") == "user_message":
+        value = payload.get("message")
+    elif payload.get("type") == "item_completed":
+        item = payload.get("item")
+        if not isinstance(item, dict) or item.get("type") not in ("UserMessage", "userMessage"):
+            return ""
+        value = _block_text(item.get("content"), ("text", "input_text", "Text"))
+    else:
         return ""
-    value = payload.get("message")
     if not isinstance(value, str):
         return ""
     text = scrub(value)
@@ -339,15 +346,64 @@ def write_codex_session(
     return session_id, path
 
 
+_ROLLOUT_INDEX_SECONDS = 10.0
+_rollout_index: tuple[float, Path, dict[str, list[Path]]] | None = None
+
+
+def _dated_rollouts(root: Path, session_id: str) -> list[Path]:
+    """Look only in the day folders a UUIDv7 id was created in.
+
+    Codex files each rollout under sessions/YYYY/MM/DD for its local creation
+    date, which the id's leading 48 bits record.  The neighbouring days cover
+    a timezone change between writing the file and reading it.
+    """
+    compact = session_id.replace("-", "")
+    if len(compact) != 32 or compact[12] != "7":
+        return []
+    try:
+        created = dt.datetime.fromtimestamp(int(compact[:12], 16) / 1000)
+    except (ValueError, OverflowError, OSError):
+        return []
+    found: list[Path] = []
+    for shift in (0, -1, 1):
+        day = created + dt.timedelta(days=shift)
+        found += (root / f"{day:%Y}" / f"{day:%m}" / f"{day:%d}").glob(
+            f"rollout-*-{session_id}.jsonl"
+        )
+    return found
+
+
+def _indexed_rollouts(root: Path, session_id: str) -> list[Path]:
+    """Find a rollout anywhere, sharing one recent walk between lookups."""
+    global _rollout_index
+    now = time.monotonic()
+    if (
+        _rollout_index is None
+        or _rollout_index[1] != root
+        or now - _rollout_index[0] > _ROLLOUT_INDEX_SECONDS
+    ):
+        index: dict[str, list[Path]] = {}
+        for path in root.rglob("rollout-*.jsonl"):
+            index.setdefault(path.stem[-36:], []).append(path)
+        _rollout_index = (now, root, index)
+    return list(_rollout_index[2].get(session_id, ()))
+
+
+def _codex_rollouts(session_id: str) -> list[Path]:
+    root = REGISTRY.get("codex").home / "sessions"
+    return sorted(_dated_rollouts(root, session_id) or _indexed_rollouts(root, session_id))
+
+
 def _codex_exists(session_id: str) -> bool:
-    return any((REGISTRY.get("codex").home / "sessions").rglob(f"rollout-*-{session_id}.jsonl"))
+    try:
+        return bool(_codex_rollouts(session_id))
+    except OSError:
+        return False
 
 
 def _codex_resolve(session_id: str) -> NativeRef | None:
     try:
-        paths = sorted(
-            (REGISTRY.get("codex").home / "sessions").rglob(f"rollout-*-{session_id}.jsonl")
-        )
+        paths = _codex_rollouts(session_id)
     except OSError:
         return None
     return NativeRef(session_id, str(paths[0])) if paths else None
@@ -406,11 +462,93 @@ def _is_codex_work(record: dict[str, Any]) -> bool:
     )
 
 
+def _codex_record_identity(record: dict[str, Any]) -> Any:
+    if record.get("type") == "compacted":
+        return {"compacted": record.get("payload")}
+    if not _is_codex_work(record):
+        return None
+    payload = record["payload"]
+    # Transport IDs, metadata and pagination wrappers may change during migration.
+    fields = ("type", "role", "content", "name", "arguments", "call_id", "output")
+    return {key: payload[key] for key in fields if key in payload}
+
+
+def _codex_semantic_identity(record: dict[str, Any]) -> Any:
+    payload = record.get("payload")
+    if not isinstance(payload, dict):
+        return None
+    if record.get("type") == "compacted":
+        history = payload.get("replacement_history")
+        normalized = None
+        if isinstance(history, list):
+            normalized = []
+            for entry in history:
+                if not isinstance(entry, dict):
+                    normalized.append(entry)
+                elif entry.get("type") == "message":
+                    value = _codex_semantic_identity({"type": "response_item", "payload": entry})
+                    if value is not None:
+                        normalized.append(value)
+                else:
+                    normalized.append(entry)
+        # Window IDs, usage totals and resume metadata are bookkeeping, not conversation content.
+        return {"compacted": {"message": payload.get("message"), "replacement_history": normalized}}
+    if payload.get("type") == "message" and payload.get("role") == "user":
+        text = _block_text(payload.get("content")).lstrip()
+        if (
+            text.startswith("# AGENTS.md instructions") and "<INSTRUCTIONS>" in text[:100]
+        ) or text.startswith("<environment_context>"):
+            return None
+    return _codex_record_identity(record)
+
+
+def _codex_checkpoint_identity(checkpoint: str) -> Callable[[dict[str, Any]], Any]:
+    try:
+        version = json.loads(checkpoint.removeprefix(PREFIX)).get("identity", 1)
+    except (ValueError, AttributeError):
+        version = 1
+    return _codex_semantic_identity if version == 2 else _codex_record_identity
+
+
+def _codex_context_rewrite(record: dict[str, Any]) -> bool:
+    """Records Codex rewrites in place without any conversation work changing.
+
+    Codex 0.165 merged each resume's AGENTS.md and environment context into
+    one message with provenance metadata, and so changed every compaction
+    that embeds a copy of it.  Bookmarks taken before the semantic identity
+    fingerprinted those records byte for byte; every message and tool record
+    around them still has to match exactly and in order.
+    """
+    if record.get("type") == "compacted":
+        return True
+    return _codex_record_identity(record) is not None and _codex_semantic_identity(record) is None
+
+
+def _is_codex_semantic_work(record: dict[str, Any]) -> bool:
+    return _codex_semantic_identity(record) is not None
+
+
+def _protect_codex_checkpoint(ref: NativeRef, checkpoint: int | str) -> str | None:
+    return protect_checkpoint(ref, checkpoint, _codex_semantic_identity, identity_version=2)
+
+
 def _classify_codex_tail(ref: NativeRef, checkpoint: int | str, end: int) -> str:
     """Ignore UI metadata while treating messages and tool traffic as work."""
+    classifier = _is_codex_work
+    if isinstance(checkpoint, str):
+        identity = _codex_checkpoint_identity(checkpoint)
+        tolerate = None
+        if identity is _codex_semantic_identity:
+            classifier = _is_codex_semantic_work
+        else:
+            tolerate = _codex_context_rewrite
+        relocated = locate_checkpoint(ref, checkpoint, identity, tolerate)
+        if relocated is None:
+            return "unstable"
+        checkpoint = relocated
     if not isinstance(checkpoint, int) or isinstance(checkpoint, bool):
         return "unstable"
-    return classify_appended(ref, checkpoint, end, _is_codex_work)
+    return classify_appended(ref, checkpoint, end, classifier)
 
 
 def _codex_change_status(ref: NativeRef, checkpoint: int | str) -> str:
@@ -550,7 +688,10 @@ class DiscoveryCache:
                         b"response_item" in line
                         and (b'"type":"message"' in line or b'"type": "message"' in line)
                     )
-                    user_event = b"event_msg" in line and b"user_message" in line
+                    user_event = b"event_msg" in line and any(
+                        marker in line
+                        for marker in (b"user_message", b"UserMessage", b"userMessage")
+                    )
                     compacted_event = (
                         b'"type":"compacted"' in line or b'"type": "compacted"' in line
                     )
@@ -587,10 +728,11 @@ class DiscoveryCache:
                             paired = last_kind == "event_user" and last_text == semantic_text
                             if not paired:
                                 turn_count += 1
-                            if source is SourceKind.SUBAGENT:
+                            if not paired:
                                 prompt_count += 1
-                                if not latest_from_event:
-                                    latest = clean_prompt(semantic_text)
+                            if not paired:
+                                latest = clean_prompt(semantic_text)
+                                latest_from_event = False
                             last_kind = "response_user"
                             last_text = semantic_text
                     elif item.get("type") == "event_msg":
@@ -600,7 +742,8 @@ class DiscoveryCache:
                             last_text = ""
                             continue
                         evidence.scan(value.encode("utf-8", "replace"))
-                        prompt_count += 1
+                        if not (last_kind == "response_user" and last_text == value):
+                            prompt_count += 1
                         latest = clean_prompt(value)
                         latest_from_event = True
                         if not (last_kind == "response_user" and last_text == value):
@@ -1120,6 +1263,8 @@ def upgrade_storage(
     ref = NativeRef(session_id, storage)
     plan: dict[str, tuple[tuple[Any, ...] | None, str]] = {}
     for label, checkpoint in checkpoints.items():
+        if isinstance(checkpoint, str):
+            checkpoint = locate_checkpoint(ref, checkpoint, _codex_checkpoint_identity(checkpoint))
         if not isinstance(checkpoint, int) or isinstance(checkpoint, bool):
             return StorageUpgrade(
                 _left_legacy(session_id, "its tracked position is not a byte offset")
@@ -1228,6 +1373,7 @@ ADAPTER = HarnessAdapter(
     availability=_codex_availability,
     checkpoint=_codex_checkpoint,
     change_status=_codex_change_status,
+    protect_checkpoint=_protect_codex_checkpoint,
     discover=discover,
     resume_args=resume_args,
     publish_name=publish_name,

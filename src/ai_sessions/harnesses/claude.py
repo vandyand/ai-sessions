@@ -32,6 +32,7 @@ from ..conversion import (
 )
 from ..diagnostics import record_warning
 from ..discovery import HarnessContext, clean_prompt, normalize_space, timestamp
+from ..jsonl_tracking import locate_checkpoint, protect_checkpoint
 from ..liveness import LivenessContext, ProcessInfo
 from ..model import (
     Availability,
@@ -260,8 +261,28 @@ def _is_claude_work(record: dict[str, Any]) -> bool:
     return isinstance(message, dict) and message.get("content") not in (None, "", [])
 
 
+def _claude_record_identity(record: dict[str, Any]) -> Any:
+    if not _is_claude_work(record):
+        return None
+    message = record["message"]
+    return {
+        "type": record["type"],
+        "content": message.get("content"),
+        "compaction": _claude_is_compaction(record),
+    }
+
+
+def _protect_claude_checkpoint(ref: NativeRef, checkpoint: int | str) -> str | None:
+    return protect_checkpoint(ref, checkpoint, _claude_record_identity)
+
+
 def _classify_claude_tail(ref: NativeRef, checkpoint: int | str, end: int) -> str:
     """Ignore title/metadata appends and classify only semantic messages."""
+    if isinstance(checkpoint, str):
+        relocated = locate_checkpoint(ref, checkpoint, _claude_record_identity)
+        if relocated is None:
+            return "unstable"
+        checkpoint = relocated
     if not isinstance(checkpoint, int) or isinstance(checkpoint, bool):
         return "unstable"
     return classify_appended(ref, checkpoint, end, _is_claude_work)
@@ -836,6 +857,7 @@ ADAPTER = HarnessAdapter(
     availability=_claude_availability,
     checkpoint=_claude_checkpoint,
     change_status=_claude_change_status,
+    protect_checkpoint=_protect_claude_checkpoint,
     discover=discover,
     resume_args=resume_args,
     publish_name=publish_name,

@@ -106,6 +106,10 @@ class UpgradeStorageHook(Protocol):
     ) -> StorageUpgrade: ...
 
 
+class ProtectCheckpointHook(Protocol):
+    def __call__(self, ref: NativeRef, checkpoint: Checkpoint) -> Checkpoint | None: ...
+
+
 class LivenessHook(Protocol):
     def __call__(
         self, context: LivenessContext, home: Path, sessions: Iterable[LivenessSession]
@@ -158,6 +162,9 @@ class HarnessAdapter:
     )
     upgrade_storage: UpgradeStorageHook | Unsupported = Unsupported(
         "stored sessions need no upgrade before resuming"
+    )
+    protect_checkpoint: ProtectCheckpointHook | Unsupported = Unsupported(
+        "checkpoint protection is not supported"
     )
     turn_state: TurnStateHook | Unsupported = Unsupported("turn state is not reported")
     # Whether everything the harness starts may be stopped along with its
