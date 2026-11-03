@@ -722,7 +722,7 @@ class OpenCodeMatrixTests(unittest.TestCase):
             target_checkpoint=target_written.checkpoint,
         )
         payload = json.loads(state_path.read_text(encoding="utf-8"))
-        self.assertEqual(payload["version"], 6)
+        self.assertEqual(payload["version"], 7)
 
         restored = UserState(state_path)
         conversation_id = restored.conversation_id_for(source)

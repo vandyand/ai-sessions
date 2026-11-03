@@ -35,6 +35,7 @@ class Availability(StrEnum):
     AVAILABLE = "available"
     UNAVAILABLE = "unavailable"
     UNKNOWN = "unknown"
+    COMPRESSED = "compressed"
 
 
 @dataclass(frozen=True, slots=True)
@@ -56,6 +57,7 @@ class ToolCall:
     name: str
     request: str
     result: str = ""
+    failed: bool = False
 
 
 @dataclass(frozen=True, slots=True)
@@ -229,6 +231,9 @@ class Session:
     compaction_count: int = 0
     prompt_count: int = 0
     conversation_blocker: str = ""
+    supervises: str = ""
+    supervised_by: str = ""
+    compressed: bool = False
 
     def __post_init__(self) -> None:
         self.source = SourceKind(self.source)
@@ -282,6 +287,7 @@ class NativeSession:
     turn_count: int = 0
     compaction_count: int = 0
     prompt_count: int = 0
+    compressed: bool = False
 
     def __post_init__(self) -> None:
         if not self.tool or not self.session_id:

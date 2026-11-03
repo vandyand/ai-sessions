@@ -67,6 +67,21 @@ tokens:
 - **Recovery / exit:** `Esc` cancels; `a` restores all tools; an empty selection cannot be applied.
 - **Evidence:** Multi-select and empty-recovery tests in `tests/test_display.py`.
 
+### Supervise A Session
+
+- **Entry:** Select a session and press `S`.
+- **Actions and decisions:** The first time, choose the supervisor's harness from a short list
+  that starts on the sensible default; Enter accepts it. Later, `S` goes straight to the
+  existing supervisor. On a supervisor row, `S` moves to its target instead.
+- **System feedback:** The supervisor opens in this terminal. A supervised session carries `◉`,
+  and `i` says "supervised by" / "supervises". An open target is never offered for stopping:
+  the status line says to switch tabs with Ctrl+Tab.
+- **Completion and next action:** The user asks the supervisor about the target; `S` on the
+  supervisor returns to the target.
+- **Recovery / exit:** `Esc` cancels the harness choice; `R` then `y` in `i` resets a supervisor
+  so the next `S` starts fresh.
+- **Evidence:** `tests/test_supervisor_browser.py`.
+
 ## Information Architecture And Language
 
 - **Navigation model:** One session list, one detail region, and short modal pickers for filters or
@@ -126,3 +141,17 @@ tokens:
   loading status, and refreshed completion status.
 - **Known research gaps:** Keyboard behavior is deterministically tested, but recognition and
   preference for `t` versus Tab require human use rather than agent inference.
+
+## Retention
+
+A compressed transcript is `<name>.jsonl.zst` beside where the plain file was, the form Codex writes
+and reads. `compression.py` holds the file operations: the original is removed only after the copy is
+read back and matches, and only while nothing else has it open: on Windows it holds the file with no
+sharing, because an ordinary delete succeeds under a process that is appending. An existing `.zst` is
+replaced only by a file that contains all of it, so a short file cannot destroy a full history; the
+two are kept and reported instead. `retention.py` works on sessions:
+harnesses name their files through `transcript_files`, and it decides what is idle, treating a
+session and its subagents as one unit so that reopening a parent also protects its logs. A compressed
+session's `storage` is the `.zst`, and `Availability.COMPRESSED` keeps it distinct from a missing
+file, so a compressed copy can never be mistaken for no copy and bridged again. Requirements are in
+`openspec/specs/session-compression/spec.md`.

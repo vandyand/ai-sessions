@@ -1,5 +1,46 @@
 # Changelog
 
+## 3.8.0 — 2026-11-02
+
+### Added
+
+- Supervisor sessions. Press `S` on a session to open a second agent session that watches it
+  and answers questions about what it is doing, or `sessions --supervise ID` from the command
+  line. The first `S` asks which harness to use; later presses resume the same supervisor.
+  On a supervisor, `S` jumps to its target and never offers to stop an open one. A session
+  with a supervisor shows `◉`, and its supervisor is listed directly under it as
+  `◎ Supervisor: <title>` with the `Super` origin. The details pane names each row
+  `MAIN SESSION` or `SUPERVISOR`, `i` shows "supervised by" and
+  "supervises", and `R` in `i` resets a supervisor so the next `S` starts a fresh one.
+- `sessions --target-log ID` prints what a supervisor sees of its target, and
+  `sessions --install-hooks` / `--uninstall-hooks` add and remove the Claude Code and Codex
+  hooks that feed it. Codex asks to re-trust its hooks after an install.
+- Compressed sessions are listed. Codex rollouts stored as `.jsonl.zst` no longer disappear, nor do
+  rollouts missing from Codex's database. `z` or `--compression` chooses uncompressed (the
+  default), compressed or both, and the header counts matches the filter is excluding.
+  The first refresh indexes existing compressed sessions once, in the background.
+- Sessions idle for 30 days are compressed automatically, hidden ones included. `Z`, `--compress`,
+  `--decompress` and `--compress-idle` do it by hand, `[retention] compress_after_days` sets the
+  days, and opening a compressed session decompresses it after asking. Only uncompressed sessions
+  can be bridged or get a new supervisor.
+
+### Fixed
+
+- A supervisor's name now reaches its harness, so its terminal tab reads `Supervisor: <title>`
+  instead of a title the harness generated from the first question. A new Claude Code
+  supervisor starts with `--name`; a new Codex supervisor is stored already named and resumed,
+  because Codex cannot name a session it starts. Existing supervisors are named the next time
+  they are opened.
+- Renaming a Codex session now reaches Codex. Codex reads a paginated thread's name only from
+  its database, so renames appended to `session_index.jsonl` were ignored for every session on
+  the current format; renames now go through Codex's own `thread/name/set`, and the list shows
+  the name Codex shows.
+- A rename applies to every copy of a conversation, so whichever harness opens it next shows
+  the same name. Claude Code renames now also set the name shown in its prompt box and tab.
+- Bridging no longer stacks a `(from …)` suffix on every round trip. A copy names only the
+  harness it came from, and a copy that older versions named
+  `elevate-futures (from Codex) (from Claude) (from Codex)` is tidied when it is next opened.
+
 ## 3.7.5 — 2026-10-30
 
 ### Fixed

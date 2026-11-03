@@ -13,7 +13,16 @@ import uuid
 from pathlib import Path
 from typing import Any, Iterable
 
+import zstandard
+
 from ..capabilities import HarnessAdapter
+from ..compression import (
+    ZST_SUFFIX,
+    is_compressed_path,
+    open_for_scan,
+    plain_path,
+    resolve_storage,
+)
 from ..conversion import (
     CLAUDE_BUDGET_CONTEXT_TOKENS,
     DEFAULT_CHARS_PER_TOKEN,
@@ -117,11 +126,13 @@ def claude_project_dir(cwd: str) -> Path:
     return REGISTRY.get("claude").home / "projects" / slug
 
 
-def read_claude(path: Path, *, latest_window: bool = True, end: int | None = None) -> Transcript:
+def read_claude(
+    path: Path, *, latest_window: bool = True, start: int = 0, end: int | None = None
+) -> Transcript:
     """Read mainline Claude messages, using sidechain only for an agent-only file."""
     main = _Conversation()
     sidechain = _Conversation()
-    for record in _records(path, end=end):
+    for record in _records(path, start=start, end=end):
         role = record.get("type")
         if role not in ("user", "assistant") or record.get("isMeta"):
             continue
@@ -149,6 +160,7 @@ def read_claude(path: Path, *, latest_window: bool = True, end: int | None = Non
                 conversation.result(
                     str(block.get("tool_use_id", "")),
                     body if isinstance(body, str) else _block_text(body),
+                    failed=bool(block.get("is_error")),
                 )
     del latest_window
     return Transcript(main.finish() or sidechain.finish(), main.opaque_compactions)
@@ -206,27 +218,39 @@ def write_claude_session(
     return session_id, path
 
 
+def _claude_session_files(session_id: str) -> list[Path]:
+    """Every file holding this session, plain files before compressed ones."""
+    projects = REGISTRY.get("claude").home / "projects"
+    return sorted(projects.rglob(f"{session_id}.jsonl")) + sorted(
+        projects.rglob(f"{session_id}.jsonl{ZST_SUFFIX}")
+    )
+
+
 def _claude_exists(session_id: str) -> bool:
-    return any((REGISTRY.get("claude").home / "projects").rglob(f"{session_id}.jsonl"))
+    return bool(_claude_session_files(session_id))
 
 
 def _claude_resolve(session_id: str) -> NativeRef | None:
     try:
-        paths = sorted((REGISTRY.get("claude").home / "projects").rglob(f"{session_id}.jsonl"))
+        paths = _claude_session_files(session_id)
     except OSError:
         return None
     return NativeRef(session_id, str(paths[0])) if paths else None
 
 
 def _claude_availability(ref: NativeRef) -> Availability:
-    path = Path(ref.storage)
     try:
+        path = resolve_storage(Path(ref.storage))
+        if path is None:
+            return Availability.UNAVAILABLE
         metadata = path.stat()
     except FileNotFoundError:
         return Availability.UNAVAILABLE
     except OSError:
         return Availability.UNKNOWN
-    return Availability.AVAILABLE if stat.S_ISREG(metadata.st_mode) else Availability.UNAVAILABLE
+    if not stat.S_ISREG(metadata.st_mode):
+        return Availability.UNAVAILABLE
+    return Availability.COMPRESSED if is_compressed_path(path) else Availability.AVAILABLE
 
 
 def _claude_checkpoint(ref: NativeRef) -> int:
@@ -238,6 +262,62 @@ def _read_claude_snapshot(ref: NativeRef, *, latest_window: bool = True) -> Read
     return ReadSnapshot(
         read_claude(Path(ref.storage), latest_window=latest_window, end=checkpoint), checkpoint
     )
+
+
+def _read_claude_since(ref: NativeRef, checkpoint: int | str) -> ReadSnapshot | None:
+    if isinstance(checkpoint, str):
+        located = locate_checkpoint(ref, checkpoint, _claude_record_identity)
+        if located is None:
+            return None
+        checkpoint = located
+    if not isinstance(checkpoint, int) or isinstance(checkpoint, bool):
+        return None
+    cursor = _claude_checkpoint(ref)
+    if checkpoint > cursor:
+        return None
+    return ReadSnapshot(
+        read_claude(Path(ref.storage), latest_window=False, start=checkpoint, end=cursor), cursor
+    )
+
+
+def claude_pastes(session_id: str, home: Path) -> list[str]:
+    """Return every paste recorded for a session in Claude Code's history.jsonl.
+
+    Inline ``content`` is used as is; a ``contentHash`` is read from ``paste-cache``, and a
+    missing cached file is skipped.
+    """
+    found: list[str] = []
+    try:
+        lines = (home / "history.jsonl").read_text(encoding="utf-8").splitlines()
+    except OSError:
+        return found
+    for line in lines:
+        try:
+            entry = json.loads(line)
+        except ValueError:
+            continue
+        if not isinstance(entry, dict) or entry.get("sessionId") != session_id:
+            continue
+        contents = entry.get("pastedContents")
+        if not isinstance(contents, dict):
+            continue
+        for item in contents.values():
+            if not isinstance(item, dict):
+                continue
+            content = item.get("content")
+            if not isinstance(content, str) and item.get("contentHash"):
+                name = f"{item['contentHash']}.txt"
+                try:
+                    content = (home / "paste-cache" / name).read_text(encoding="utf-8")
+                except OSError:
+                    content = None
+            if isinstance(content, str) and content:
+                found.append(content)
+    return found
+
+
+def _claude_pasted_contents(ref: NativeRef) -> list[str]:
+    return claude_pastes(ref.session_id, REGISTRY.get("claude").home)
 
 
 def _write_claude(
@@ -401,6 +481,25 @@ class DiscoveryCache:
             "updated": 0.0,
         }
 
+    def _carried_over(self, path: Path, stat: os.stat_result) -> dict[str, Any] | None:
+        """The plain file's entry, when compression has kept its modification time."""
+        plain = self.entries.get(str(plain_path(path)))
+        if (
+            not plain
+            or plain.get("mtime_ns") != stat.st_mtime_ns
+            or plain.get("pattern_signature") != self.context.pattern_signature
+            or "candidate_ids" not in plain
+            or "evidence_truncated" not in plain
+        ):
+            return None
+        return dict(
+            plain,
+            inode=stat.st_ino,
+            size=stat.st_size,
+            ctime_ns=getattr(stat, "st_ctime_ns", 0),
+            prefix_identity="",
+        )
+
     def scan(
         self,
         path: Path,
@@ -411,6 +510,8 @@ class DiscoveryCache:
         key = str(path)
         stat = path.stat()
         cached = self.entries.get(key)
+        if cached is None and is_compressed_path(path):
+            cached = self._carried_over(path, stat)
         signature_matches = bool(
             cached and cached.get("pattern_signature") == self.context.pattern_signature
         )
@@ -423,7 +524,12 @@ class DiscoveryCache:
                 or any(name not in cached for name in required_metrics)
             )
         )
-        prefix_matches = bool(cached and signature_matches and _cached_prefix_matches(path, cached))
+        # A compressed file is read once, whole: its bytes are not the transcript's, so there is
+        # nothing to sample and nothing to continue from.
+        compressed = is_compressed_path(path)
+        prefix_matches = compressed or bool(
+            cached and signature_matches and _cached_prefix_matches(path, cached)
+        )
         exact = bool(
             cached
             and signature_matches
@@ -437,6 +543,10 @@ class DiscoveryCache:
             and "evidence_truncated" in cached
         )
         if exact:
+            assert cached is not None
+            if key not in self.entries:
+                self.entries[key] = cached
+                self.dirty = True
             evidence = self.context.accumulator(
                 tokens=list(cached.get("candidate_ids", [])),
                 truncated=bool(cached.get("evidence_truncated")),
@@ -444,6 +554,7 @@ class DiscoveryCache:
             return cached, evidence
         can_continue = bool(
             cached
+            and not compressed
             and signature_matches
             and not needs_count
             and cached.get("inode") == stat.st_ino
@@ -466,8 +577,8 @@ class DiscoveryCache:
         read_stat = stat
         incomplete = False
         try:
-            with path.open("rb") as handle:
-                opened_stat = os.fstat(handle.fileno())
+            with open_for_scan(path) as handle:
+                opened_stat = stat if compressed else os.fstat(handle.fileno())
                 if can_continue and (
                     opened_stat.st_ino != stat.st_ino or opened_stat.st_size < start
                 ):
@@ -551,8 +662,10 @@ class DiscoveryCache:
                             if not meta.get("created"):
                                 meta["created"] = event_time
                             meta["updated"] = max(float(meta.get("updated", 0)), event_time)
-                read_stat = os.fstat(handle.fileno())
-        except OSError:
+                read_stat = stat if compressed else os.fstat(handle.fileno())
+        except (OSError, zstandard.ZstdError):
+            # Unreadable or corrupt: report what was read, but cache nothing, so a
+            # repaired file is scanned again.
             incomplete_evidence = self.context.accumulator(tokens=evidence.tokens, truncated=True)
             return meta, incomplete_evidence
         offset = int(meta.get("offset", start))
@@ -566,11 +679,11 @@ class DiscoveryCache:
             ctime_ns = getattr(read_stat, "st_ctime_ns", 0)
         meta.update(
             inode=read_stat.st_ino,
-            size=offset,
+            size=read_stat.st_size if compressed else offset,
             mtime_ns=read_stat.st_mtime_ns,
             ctime_ns=ctime_ns,
             offset=offset,
-            prefix_identity=_cached_prefix_identity(path, offset) or "",
+            prefix_identity="" if compressed else _cached_prefix_identity(path, offset) or "",
             candidate_ids=evidence.tokens,
             evidence_truncated=evidence.truncated,
             pattern_signature=self.context.pattern_signature,
@@ -609,19 +722,23 @@ def discover(context: HarnessContext, *, use_cache: bool = True) -> list[NativeS
     cache = DiscoveryCache(context)
     result: list[NativeSession] = []
     try:
-        all_files = sorted(projects.rglob("*.jsonl"))
+        found = sorted({*projects.rglob("*.jsonl"), *projects.rglob(f"*.jsonl{ZST_SUFFIX}")})
+        # One file per session: the plain one when both exist.
+        all_files = [
+            path for path in found if not is_compressed_path(path) or plain_path(path) not in found
+        ]
     except OSError:
         all_files = []
         index_complete = False
     else:
         index_complete = True
     for path in all_files:
-        context.index_native("claude", path.stem, str(path))
+        context.index_native("claude", plain_path(path).stem, str(path))
     if index_complete:
         context.complete_native_index("claude")
     files = [path for path in all_files if len(path.relative_to(projects).parts) == 2]
     for path in files:
-        session_id = path.stem
+        session_id = plain_path(path).stem
         if not re.fullmatch(r"[0-9a-fA-F-]{32,36}", session_id):
             continue
         hist = history.get(session_id, {})
@@ -660,6 +777,7 @@ def discover(context: HarnessContext, *, use_cache: bool = True) -> list[NativeS
                 preview=last or first,
                 named=bool(custom),
                 storage=str(path),
+                compressed=is_compressed_path(path),
                 source=SourceKind.SDK if programmatic else SourceKind.INTERACTIVE,
                 resume_id=session_id,
                 message_count=message_count,
@@ -673,7 +791,7 @@ def discover(context: HarnessContext, *, use_cache: bool = True) -> list[NativeS
         path for path in all_files if path.name.startswith("agent-") and "subagents" in path.parts
     ]
     for path in agent_files:
-        fallback_agent_id = path.stem.removeprefix("agent-")
+        fallback_agent_id = plain_path(path).stem.removeprefix("agent-")
         try:
             fallback_parent_id = path.relative_to(projects).parts[1]
         except (ValueError, IndexError):
@@ -705,6 +823,7 @@ def discover(context: HarnessContext, *, use_cache: bool = True) -> list[NativeS
                 preview=last or first,
                 named=False,
                 storage=str(path),
+                compressed=is_compressed_path(path),
                 source=SourceKind.SUBAGENT,
                 resume_id=parent_id,
                 parent_id=parent_id,
@@ -814,12 +933,23 @@ def turn_state(*, pid: int, home: Path, storage: str, command: tuple[str, ...]) 
 
 def publish_name(session: Any, name: str) -> str:
     transcript = Path(session.storage)
-    if not transcript.is_file():
+    if is_compressed_path(transcript):
+        return f"transcript for {session.session_id} is compressed; name kept local only"
+    try:
+        # The same pair of records `claude --name` writes: the title, and the
+        # name shown in the prompt box and the terminal tab.
+        append_jsonl(
+            transcript,
+            {"type": "custom-title", "customTitle": name, "sessionId": session.session_id},
+            create=False,
+        )
+        append_jsonl(
+            transcript,
+            {"type": "agent-name", "agentName": name, "sessionId": session.session_id},
+            create=False,
+        )
+    except FileNotFoundError:
         return f"transcript for {session.session_id} is missing; name kept local only"
-    append_jsonl(
-        transcript,
-        {"type": "custom-title", "customTitle": name, "sessionId": session.session_id},
-    )
     return ""
 
 
@@ -833,6 +963,28 @@ def resume_args(
 ) -> list[str]:
     del source, resume_id, parent_id, native
     return ["--resume", session_id]
+
+
+def transcript_files(ref: NativeRef) -> tuple[Path, ...]:
+    """The main transcript and the subagent logs Claude Code keeps in a folder of its name."""
+    main = plain_path(Path(ref.storage))
+    folder = main.with_suffix("") / "subagents"
+    children = {
+        plain_path(path)
+        for pattern in ("*.jsonl", f"*.jsonl{ZST_SUFFIX}")
+        for path in folder.rglob(pattern)
+    }
+    return (*sorted(children), main)
+
+
+def new_session_args(*, session_id: str | None, name: str = "") -> list[str]:
+    # --name is what Claude Code shows in its prompt box, /resume picker and tab title.
+    return (["--session-id", session_id] if session_id else []) + (["--name", name] if name else [])
+
+
+def extra_dir_args(directory: str) -> list[str]:
+    # The joined form keeps a variadic option from swallowing the arguments after it.
+    return [f"--add-dir={directory}"]
 
 
 ADAPTER = HarnessAdapter(
@@ -857,9 +1009,14 @@ ADAPTER = HarnessAdapter(
     availability=_claude_availability,
     checkpoint=_claude_checkpoint,
     change_status=_claude_change_status,
+    read_since=_read_claude_since,
+    pasted_contents=_claude_pasted_contents,
     protect_checkpoint=_protect_claude_checkpoint,
     discover=discover,
     resume_args=resume_args,
+    new_session_args=new_session_args,
+    extra_dir_args=extra_dir_args,
+    transcript_files=transcript_files,
     publish_name=publish_name,
     inspect_liveness=inspect_liveness,
     liveness_executables=frozenset(("claude", "claude.exe", "claude.cmd", "claude.ps1")),

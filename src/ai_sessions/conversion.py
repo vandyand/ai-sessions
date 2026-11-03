@@ -34,6 +34,7 @@ from pathlib import Path
 from typing import Any, Callable, Iterable, Iterator, Mapping
 
 from .capabilities import HarnessAdapter, Unsupported
+from .compression import is_compressed_path, plain_path, resolve_storage
 from .model import (
     DEFAULT_MAX_CHARS,
     HANDOFF_NOTE_RESERVE_CHARS,
@@ -115,7 +116,7 @@ class BridgeError(RuntimeError):
     """A session could not be carried into another harness."""
 
 
-def append_jsonl(path: Path, payload: dict[str, Any]) -> None:
+def append_jsonl(path: Path, payload: dict[str, Any], *, create: bool = True) -> None:
     """Append one compact JSON line, repairing a missing final newline first.
 
     Both providers append to these files while they run, so the line is
@@ -131,6 +132,12 @@ def append_jsonl(path: Path, payload: dict[str, Any]) -> None:
                     prefix = b"\n"
     except OSError:
         pass
+    if not create:
+        # A transcript compressed a moment ago must not come back as a file holding one line.
+        flags = os.O_WRONLY | os.O_APPEND | getattr(os, "O_BINARY", 0)
+        with os.fdopen(os.open(path, flags), "wb") as handle:
+            handle.write(prefix + line + b"\n")
+        return
     path.parent.mkdir(parents=True, exist_ok=True)
     with path.open("ab") as handle:
         handle.write(prefix + line + b"\n")
@@ -255,12 +262,14 @@ def flatten(turns: Iterable[Turn]) -> list[Turn]:
     return result
 
 
-def _records(path: Path, *, end: int | None = None) -> Iterator[dict[str, Any]]:
+def _records(path: Path, *, start: int = 0, end: int | None = None) -> Iterator[dict[str, Any]]:
     try:
         handle = path.open("rb")
     except OSError as error:
         raise BridgeError(f"could not read {path}: {error}") from error
     with handle:
+        if start:
+            handle.seek(start)
         while end is None or handle.tell() < end:
             line = handle.readline() if end is None else handle.readline(end - handle.tell())
             if not line:
@@ -348,14 +357,19 @@ class _Conversation:
         if call_id:
             self._pending[call_id] = (len(self.turns) - 1, len(calls) - 1)
 
-    def result(self, call_id: str, text: str) -> None:
+    def result(self, call_id: str, text: str, failed: bool = False) -> None:
+        """Attach a result to its call by id.
+
+        A result whose call is not in this read, such as one that precedes the
+        start of an incremental read, is dropped.
+        """
         location = self._pending.pop(call_id, None)
-        if location is None or not text:
+        if location is None or not (text or failed):
             return
         index, position = location
         turn = self.turns[index]
         calls = list(turn.calls)
-        calls[position] = replace(calls[position], result=_clip(text, RESULT_CHARS))
+        calls[position] = replace(calls[position], result=_clip(text, RESULT_CHARS), failed=failed)
         self.turns[index] = replace(turn, calls=tuple(calls))
 
     def finish(self) -> list[Turn]:
@@ -382,6 +396,15 @@ def read_transcript(
     ).transcript
 
 
+def _compressed_message(label: str) -> str:
+    return f"the {label} source session is compressed; decompress it first"
+
+
+def _plain_ref(ref: NativeRef) -> NativeRef:
+    """A reference to an available session names its plain file even if stored as ``.zst``."""
+    return replace(ref, storage=str(plain_path(Path(ref.storage))))
+
+
 def read_snapshot(
     tool: str,
     native: NativeRef,
@@ -403,11 +426,14 @@ def read_snapshot(
         raise BridgeError(
             f"the {adapter.label} source session is unavailable, so there is nothing to carry over"
         )
+    if availability == "compressed":
+        raise BridgeError(_compressed_message(adapter.label))
     if availability != "available":
         raise BridgeError(
             f"the {adapter.label} source session could not be verified safely; "
             "restore storage access or retry"
         )
+    native = _plain_ref(native)
     reader = adapter.read
     if isinstance(reader, Unsupported):
         raise BridgeError(f"{adapter.label} cannot read native transcripts: {reader.reason}")
@@ -435,6 +461,46 @@ def read_snapshot(
         ),
         result.checkpoint,
     )
+
+
+def read_since(tool: str, ref: NativeRef, checkpoint: Checkpoint) -> ReadSnapshot | None:
+    """Read the turns after ``checkpoint`` and the new checkpoint.
+
+    None means the checkpoint cannot be located.  Raises BridgeError when the
+    session is unavailable or the adapter cannot read incrementally.
+    """
+    adapter = harness(tool)
+    if not isinstance(ref, NativeRef):
+        raise TypeError("native session reads require an explicit NativeRef")
+    reader = adapter.read_since
+    if isinstance(reader, Unsupported):
+        raise BridgeError(f"{adapter.label} cannot read incrementally: {reader.reason}")
+    availability = native_session_availability(tool, ref)
+    if availability == "unavailable":
+        raise BridgeError(f"the {adapter.label} source session is unavailable")
+    if availability == "compressed":
+        raise BridgeError(_compressed_message(adapter.label))
+    if availability != "available":
+        raise BridgeError(
+            f"the {adapter.label} source session could not be verified safely; "
+            "restore storage access or retry"
+        )
+    if not is_checkpoint(checkpoint):
+        return None
+    ref = _plain_ref(ref)
+    try:
+        result = reader(ref, checkpoint)
+    except OSError as error:
+        raise BridgeError(f"could not read the {adapter.label} source session: {error}") from error
+    if result is None:
+        return None
+    if (
+        not isinstance(result, ReadSnapshot)
+        or not isinstance(result.transcript, Transcript)
+        or not is_checkpoint(result.checkpoint)
+    ):
+        raise BridgeError(f"{adapter.label} returned an invalid native read checkpoint")
+    return result
 
 
 def read_turns(tool: str, native: NativeRef, *, tool_calls: bool = True) -> list[Turn]:
@@ -1085,7 +1151,7 @@ def native_session_exists(tool: str, session_id: str, storage: str = "") -> bool
 
 
 def native_session_availability(tool: str, ref: NativeRef) -> str:
-    """Return available, unavailable, or unknown for one exact native ref."""
+    """Return available, compressed, unavailable, or unknown for one exact native ref."""
     if tool not in REGISTRY:
         return "unknown"
     probe = REGISTRY.get(tool).availability
@@ -1124,6 +1190,10 @@ def conversation_change_status(
     """Classify semantic activity, instability, or unavailable harness support."""
     if tool not in REGISTRY:
         return "unknown"
+    if is_compressed_path(native.storage):
+        found = resolve_storage(Path(native.storage))
+        if found is not None:
+            native = NativeRef(native.session_id, str(found))
     if not is_checkpoint(checkpoint):
         return "unstable"
     resolved_availability = (
@@ -1162,10 +1232,29 @@ def conversation_changed_since(
     return conversation_change_status(tool, native, checkpoint) != "unchanged"
 
 
+def base_title(title: str) -> str:
+    """``title`` without the ``(from …)`` suffixes earlier bridges added to it."""
+    labels = "|".join(re.escape(adapter.short_label) for adapter in REGISTRY.adapters())
+    return re.sub(rf"(?:\s*\(from (?:{labels})\))+\s*$", "", title or "").strip()
+
+
+def tidy_title(title: str) -> str:
+    """Collapse a stack of ``(from …)`` suffixes to the last one, which names the source."""
+    base = base_title(title)
+    suffixes = re.findall(r"\(from [^()]+\)", title[len(base) :])
+    if len(suffixes) < 2:
+        return title
+    return f"{base} {suffixes[-1]}"
+
+
 def bridged_title(title: str, source_tool: str) -> str:
-    """Name the copy so the list never shows two identical rows."""
+    """Name the copy so the list never shows two identical rows.
+
+    One suffix names the harness it came from; a round trip replaces the
+    earlier suffix instead of stacking another on it.
+    """
     source = harness(source_tool).short_label
-    base = (title or "untitled session").strip()
+    base = base_title(title) or "untitled session"
     suffix = f" (from {source})"
     return base[: 200 - len(suffix)] + suffix
 

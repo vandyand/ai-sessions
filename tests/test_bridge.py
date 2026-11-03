@@ -48,6 +48,7 @@ from ai_sessions.bridge import (
     resolve_budget,
     select_messages,
     selection_cost,
+    tidy_title,
     write_claude_session,
     write_codex_session,
 )
@@ -638,6 +639,27 @@ class ShapingTests(unittest.TestCase):
             bridged_title("ai-sessions-cli-util", "codex"), "ai-sessions-cli-util (from Codex)"
         )
         self.assertEqual(bridged_title("", "claude"), "untitled session (from Claude)")
+
+    def test_round_trips_replace_the_suffix_instead_of_stacking_it(self) -> None:
+        self.assertEqual(
+            bridged_title("minecraft-mods (from Claude)", "codex"), "minecraft-mods (from Codex)"
+        )
+        self.assertEqual(
+            bridged_title("elevate-futures (from Codex) (from Claude)", "claude"),
+            "elevate-futures (from Claude)",
+        )
+        # Parentheses that are not a bridge suffix are part of the name.
+        self.assertEqual(
+            bridged_title("fix (from scratch)", "codex"), "fix (from scratch) (from Codex)"
+        )
+
+    def test_tidy_title_keeps_only_the_last_suffix(self) -> None:
+        self.assertEqual(
+            tidy_title("TOP-Assistant (from Codex) (from Claude) (from Codex)"),
+            "TOP-Assistant (from Codex)",
+        )
+        self.assertEqual(tidy_title("open-phone (from Claude)"), "open-phone (from Claude)")
+        self.assertEqual(tidy_title("plain"), "plain")
 
 
 class CompactionTests(unittest.TestCase):
