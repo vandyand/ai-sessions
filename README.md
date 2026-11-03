@@ -79,7 +79,7 @@ expand it and then choose the exact thread. No title or directory grouping creat
 | `Ctrl-F` or `/` | Start search mode |
 | `Tab` | Cycle single-tool filter presets |
 | `t` | Choose any combination of tools to show |
-| `o` | Cycle Human, Cross, Agent, and All origins |
+| `o` | Cycle Human, Cross, Agent, Supervisor, and All origins |
 | `v` | Cycle visible, hidden, and all sessions |
 | `d` | Choose a directory |
 | `Space` / `Right` | Expand the selected conversation or thread group |
@@ -91,6 +91,7 @@ expand it and then choose the exact thread. No title or directory grouping creat
 | `p` | Cycle Safe, Dangerous, and Custom launch modes |
 | `r` | Rename in the utility and provider |
 | `h` | Hide or restore locally |
+| `S` | Open or create the supervisor of the selected session; on a supervisor, go to its target |
 | `Ctrl-R` | Refresh |
 | `?` | Show complete help |
 
@@ -121,6 +122,46 @@ and press Enter. Recovery asks before using that selected copy as a new tracked 
 Other copies remain separate; the previous relationship and utility state are backed up.
 Malformed or actively changing transcripts cannot be recovered this way. Recovery never rewrites
 native transcript content or silently merges competing histories.
+
+## Supervisor sessions
+
+A supervisor is a second agent session that watches one of your sessions (the target) and answers
+your questions about it. It never writes to the target and never sends it messages; you read its
+answers and decide what to do.
+
+- **Start or resume one:** press `S` on a session. The first time, you pick the supervisor's
+  harness (the other harness than the target's, unless `[supervisor] default_tool` is set in
+  `config.toml`); after that, `S` resumes the same supervisor. The supervisor opens in the
+  current terminal, like Enter. Keep the target in one terminal tab and `sessions` in another,
+  and switch between them with Ctrl+Tab on Windows Terminal.
+- **From the command line:** `sessions --supervise ID [--launch-tool claude|codex]` does the
+  same as `S`.
+- **On a supervisor row:** `S` moves the selection to the target. If the target is open in
+  another tab it says so and does nothing else; it never offers to stop that session. If the
+  target is closed, `S` resumes it as Enter would.
+- **How they look:** there are three states.
+  - `◉ <title>`: this session has a supervisor.
+  - No mark: this session has no supervisor.
+  - `◎ Supervisor: <title>`: this row is the supervisor. It sits directly under its main session
+    in every view that shows that session, in its own colour, with `Super` in the ORIGIN column.
+
+  The details pane names the selected row as `MAIN SESSION` or `SUPERVISOR of '<title>'`, and `o`
+  still cycles to a view of supervisors alone. The title does not follow later renames of the
+  target, and `r` renames it freely.
+- **Reset:** in `i` on either row, `R` then `y` archives the supervisor and hides its session.
+  The next `S` starts a fresh one. The old ledger stays on disk.
+- **What the supervisor sees:** on your first question it is sent a brief (a digest of the
+  target's conversation, with long pastes shortened, tool calls cleaned to one line each, and the
+  most recent exchanges in full). On each later question it is sent only what the target did
+  since. It can read more with `sessions --target-log SUPERVISOR_OR_TARGET_ID [--tail N]`, which
+  prints the target's cleaned exchanges without moving the supervisor's place.
+- **The ledger:** each supervisor keeps a notes file, `supervisors/<record id>/ledger.md` inside
+  the ai-sessions config folder, next to its other working files. The supervisor edits it, and it
+  is sent again with every brief, so it survives the supervisor's own compaction.
+- **Hooks:** supervisors need hooks in Claude Code and Codex. `sessions --install-hooks` adds
+  them (keeping any hooks you already have) and `sessions --uninstall-hooks` removes them. Codex
+  asks you to trust a changed hook, so the first Codex session after an install asks once.
+- Supervisors run with your current launch mode (`p`). Nothing makes them read-only.
 
 ## What is written, and when
 

@@ -44,9 +44,15 @@ path = "src/ai_sessions/__init__.py"
 [tool.hatch.build.targets.wheel]
 packages = ["src/ai_sessions"]
 
+# The supervisor hook's stdlib-only fast entry, outside the package so ordinary
+# sessions never import it.
+[tool.hatch.build.targets.wheel.force-include]
+"src/ai_sessions_hook.py" = "ai_sessions_hook.py"
+
 [tool.hatch.build.targets.sdist]
 include = [
     "src/ai_sessions",
+    "src/ai_sessions_hook.py",
     "tests",
     "tools",
     "README.md",

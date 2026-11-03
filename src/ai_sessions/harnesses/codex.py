@@ -61,6 +61,7 @@ from ..registry import REGISTRY
 
 CODEX_CLI_VERSION = "0.147.0"
 CODEX_HOME = env_path("CODEX_HOME", HOME / ".codex")
+_RESULT_FAILED = re.compile(r"^Script failed|timed out", re.I)
 _RESULT_NOISE = re.compile(r"^Script completed\s*(Wall time[^\n]*)?\s*Output:\s*", re.I)
 DISCOVERY_CACHE_VERSION = 8
 DISCOVERY_CACHE_FILE = APP_CACHE_DIR / f"codex-discovery-v{DISCOVERY_CACHE_VERSION}.json"
@@ -168,14 +169,16 @@ def _codex_window_turns(payload: dict[str, Any]) -> tuple[list[Turn], bool] | No
     return [replace(carried[0], compaction=True), *carried[1:]], sealed
 
 
-def read_codex(path: Path, *, latest_window: bool = True, end: int | None = None) -> Transcript:
+def read_codex(
+    path: Path, *, latest_window: bool = True, start: int = 0, end: int | None = None
+) -> Transcript:
     """Read Codex response items and honor replacement-history window semantics.
 
     With ``latest_window`` the newest carried context replaces superseded history;
     without it each window is appended as a marked boundary for whole-log replay.
     """
     conversation = _Conversation()
-    for record in _records(path, end=end):
+    for record in _records(path, start=start, end=end):
         if record.get("type") == "compacted":
             payload = record.get("payload")
             window = _codex_window_turns(payload) if isinstance(payload, dict) else None
@@ -208,8 +211,11 @@ def read_codex(path: Path, *, latest_window: bool = True, end: int | None = None
         elif kind in ("function_call_output", "custom_tool_call_output"):
             output = payload.get("output")
             text = output if isinstance(output, str) else _block_text(output)
+            raw = text.strip()
             conversation.result(
-                str(payload.get("call_id", "")), _RESULT_NOISE.sub("", text.strip())
+                str(payload.get("call_id", "")),
+                _RESULT_NOISE.sub("", raw),
+                failed=bool(_RESULT_FAILED.search(raw.split("\n", 1)[0])),
             )
     return Transcript(
         conversation.finish(),
@@ -431,6 +437,24 @@ def _read_codex_snapshot(ref: NativeRef, *, latest_window: bool = True) -> ReadS
     )
 
 
+def _read_codex_since(ref: NativeRef, checkpoint: int | str) -> ReadSnapshot | None:
+    if isinstance(checkpoint, str):
+        identity = _codex_checkpoint_identity(checkpoint)
+        tolerate = None if identity is _codex_semantic_identity else _codex_context_rewrite
+        located = locate_checkpoint(ref, checkpoint, identity, tolerate)
+        if located is None:
+            return None
+        checkpoint = located
+    if not isinstance(checkpoint, int) or isinstance(checkpoint, bool):
+        return None
+    cursor = _codex_checkpoint(ref)
+    if checkpoint > cursor:
+        return None
+    return ReadSnapshot(
+        read_codex(Path(ref.storage), latest_window=False, start=checkpoint, end=cursor), cursor
+    )
+
+
 def _write_codex(
     *,
     cwd: str,
@@ -500,6 +524,19 @@ def _codex_semantic_identity(record: dict[str, Any]) -> Any:
         ) or text.startswith("<environment_context>"):
             return None
     return _codex_record_identity(record)
+
+
+def _codex_injected_prompt(text: str) -> bool:
+    """The AGENTS.md and environment context Codex sends as user-role messages.
+
+    The AGENTS.md header names the working directory, so a deep path pushes the
+    ``<INSTRUCTIONS>`` tag well past the first hundred characters.
+    """
+    text = text.lstrip()
+    if text.startswith("# AGENTS.md instructions"):
+        head = text.split("\n", 3)
+        return any(line.strip() == "<INSTRUCTIONS>" for line in head)
+    return text.startswith("<environment_context>")
 
 
 def _codex_checkpoint_identity(checkpoint: str) -> Callable[[dict[str, Any]], Any]:
@@ -1349,6 +1386,16 @@ def resume_args(
     return result
 
 
+def new_session_args(*, session_id: str | None) -> list[str]:
+    del session_id
+    return []
+
+
+def extra_dir_args(directory: str) -> list[str]:
+    # The joined form keeps a variadic option from swallowing the arguments after it.
+    return [f"--add-dir={directory}"]
+
+
 ADAPTER = HarnessAdapter(
     name="codex",
     label="Codex",
@@ -1373,9 +1420,12 @@ ADAPTER = HarnessAdapter(
     availability=_codex_availability,
     checkpoint=_codex_checkpoint,
     change_status=_codex_change_status,
+    read_since=_read_codex_since,
     protect_checkpoint=_protect_codex_checkpoint,
     discover=discover,
     resume_args=resume_args,
+    new_session_args=new_session_args,
+    extra_dir_args=extra_dir_args,
     publish_name=publish_name,
     upgrade_storage=upgrade_storage,
     inspect_liveness=inspect_liveness,
@@ -1387,4 +1437,5 @@ ADAPTER = HarnessAdapter(
         chars_per_token=DEFAULT_CHARS_PER_TOKEN,
         source=("Codex 1M operational context policy, 2026-08-27"),
     ),
+    injected_prompt=_codex_injected_prompt,
 )

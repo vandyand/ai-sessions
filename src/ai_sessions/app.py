@@ -14,6 +14,7 @@ import argparse
 import curses
 import datetime as dt
 import functools
+import io
 import json
 import locale
 import os
@@ -26,6 +27,7 @@ import textwrap
 import threading
 import uuid
 from collections.abc import Mapping
+from contextlib import redirect_stderr
 from dataclasses import asdict, dataclass, fields, replace
 from pathlib import Path
 from typing import Any, Iterable
@@ -65,13 +67,17 @@ from .paths import (
 )
 from .registry import REGISTRY
 
-ORIGIN_ORDER = ("human", "cross", "agent", "all")
+ORIGIN_ORDER = ("human", "cross", "agent", "supervisor", "all")
 ORIGIN_LABELS = {
     "human": "Human",
     "cross": "Cross",
     "agent": "Agent",
+    "supervisor": "Super",
     "all": "All origins",
 }
+SUPERVISED_GLYPH = "◉"
+SUPERVISOR_GLYPH = "◎"
+SUPERVISOR_TITLE_PREFIX = "Supervisor: "
 VISIBILITY_ORDER = ("visible", "hidden", "all")
 VISIBILITY_LABELS = {"visible": "Visible", "hidden": "Hidden", "all": "Visible + hidden"}
 SORT_LABELS = {
@@ -199,10 +205,11 @@ class UserState:
         self.bridges: dict[str, dict[str, dict[str, Any]]] = {}
         self.conversations: dict[str, dict[str, Any]] = {}
         self.session_conversations: dict[str, str] = {}
+        self.supervisors: dict[str, dict[str, Any]] = {}
         self._sessions_by_key: dict[str, Session] = {}
         try:
             payload = json.loads(path.read_text(encoding="utf-8"))
-            if payload.get("version") in (1, 2, 3, 4, 5, 6):
+            if payload.get("version") in (1, 2, 3, 4, 5, 6, 7):
                 names = payload.get("names", {})
                 original_names = payload.get("original_names", {})
                 hidden = payload.get("hidden", [])
@@ -210,6 +217,13 @@ class UserState:
                 bridges = payload.get("bridges", {})
                 conversations = payload.get("conversations", {})
                 session_conversations = payload.get("session_conversations", {})
+                supervisors = payload.get("supervisors", {})
+                if isinstance(supervisors, dict):
+                    self.supervisors = {
+                        str(key): dict(value)
+                        for key, value in supervisors.items()
+                        if isinstance(value, dict)
+                    }
                 if isinstance(bridges, dict):
                     for key, value in bridges.items():
                         if not isinstance(value, dict):
@@ -538,6 +552,32 @@ class UserState:
             "unknown": [],
         }
 
+    def supervisor_for_conversation(self, conversation_id: str) -> str | None:
+        """Return the record id of the live supervisor bound to a conversation."""
+        for record_id, record in self.supervisors.items():
+            if record.get("target_conversation") == conversation_id and not record.get("archived"):
+                return record_id
+        return None
+
+    def conversation_head(
+        self, conversation_id: str
+    ) -> tuple[str, list[tuple[str, dict[str, Any]]]]:
+        """Report a conversation's head state without mutating anything.
+
+        Returns ``("ok" | "diverged" | "unavailable" | "unknown", heads)``.
+        """
+        if conversation_id not in self.conversations:
+            return "unknown", []
+        status = self._conversation_status(conversation_id)
+        heads: list[tuple[str, dict[str, Any]]] = list(status["heads"])
+        if status["unknown"]:
+            return "unknown", heads
+        if status["unavailable"] or status["unstable"]:
+            return "unavailable", heads
+        if status["conflict"]:
+            return "diverged", heads
+        return "ok", heads
+
     def _session_for_member(self, member: dict[str, Any], template: Session) -> Session:
         key = self._member_key(str(member["tool"]), str(member["session_id"]))
         actual = self._sessions_by_key.get(key)
@@ -694,6 +734,44 @@ class UserState:
         self._migrate_legacy_bridges(items)
         self.apply_choices(items)
         self._apply_conversation_status(items)
+        self._apply_supervisors(items)
+
+    def _apply_supervisors(self, items: list[Session]) -> None:
+        """Mark supervised targets and the supervisor sessions that watch them."""
+        from .supervisor.store import TITLE_SUFFIX, load_hook_state
+
+        for item in items:
+            item.supervises = ""
+            item.supervised_by = ""
+        if not self.supervisors:
+            return
+        by_conversation: dict[str, list[Session]] = {}
+        for item in items:
+            if item.conversation_id:
+                by_conversation.setdefault(item.conversation_id, []).append(item)
+        by_native = {(item.tool, item.session_id): item for item in items}
+        for record_id, record in self.supervisors.items():
+            archived = bool(record.get("archived"))
+            if not archived:
+                for member in by_conversation.get(str(record.get("target_conversation", "")), ()):
+                    member.supervised_by = record_id
+            hook_state = load_hook_state(record_id)
+            native = hook_state.native_session_id if hook_state else ""
+            supervisor = by_native.get((str(record.get("tool", "")), native)) if native else None
+            if supervisor is None:
+                continue
+            supervisor.origin = "supervisor"
+            supervisor.supervises = record_id
+            title = str(record.get("title", ""))
+            if title:
+                title = SUPERVISOR_TITLE_PREFIX + title.removesuffix(TITLE_SUFFIX)
+                supervisor.original_title = title
+                supervisor.original_named = True
+                if not supervisor.renamed:
+                    supervisor.title = title
+                    supervisor.named = True
+            if archived:
+                supervisor.hidden = True
 
     def apply_choices(self, sessions: Iterable[Session]) -> None:
         """Apply the user's names, hidden flags and launch harnesses to ``sessions``."""
@@ -724,7 +802,7 @@ class UserState:
         temp.write_text(
             json.dumps(
                 {
-                    "version": 6,
+                    "version": 7,
                     "names": self.names,
                     "original_names": self.original_names,
                     "hidden": sorted(self.hidden),
@@ -732,6 +810,7 @@ class UserState:
                     "bridges": self.bridges,
                     "conversations": self.conversations,
                     "session_conversations": self.session_conversations,
+                    "supervisors": self.supervisors,
                 },
                 indent=2,
                 ensure_ascii=False,
@@ -1436,6 +1515,44 @@ def build_view_rows(
                 add_logical_row(rows, child)
     labels = view_collision_labels(row for row in rows if "/member:" not in row.row_id)
     return tuple(replace(row, collision_label=labels.get(row.row_id, "")) for row in rows)
+
+
+def pair_supervisor_rows(rows: tuple[ViewRow, ...]) -> tuple[ViewRow, ...]:
+    """Move each supervisor row, with its expanded copies, directly under its target."""
+    blocks: list[list[ViewRow]] = []
+    for row in rows:
+        if blocks and row.row_id.startswith(blocks[-1][0].row_id + "/member:"):
+            blocks[-1].append(row)
+        else:
+            blocks.append([row])
+    targets = {
+        member.supervised_by
+        for block in blocks
+        for member in block[0].all_members
+        if member.supervised_by
+    }
+    moved: dict[str, list[ViewRow]] = {}
+    kept: list[list[ViewRow]] = []
+    for block in blocks:
+        record_id = next((m.supervises for m in block[0].all_members if m.supervises), "")
+        if record_id in targets:
+            moved[record_id] = block
+        else:
+            kept.append(block)
+    if not moved:
+        return rows
+    last_target_block: dict[str, int] = {}
+    for index, block in enumerate(kept):
+        for member in block[0].all_members:
+            if member.supervised_by:
+                last_target_block[member.supervised_by] = index
+    paired: list[ViewRow] = []
+    for index, block in enumerate(kept):
+        paired.extend(block)
+        for record_id, target_index in last_target_block.items():
+            if target_index == index:
+                paired.extend(moved.get(record_id, ()))
+    return tuple(paired)
 
 
 def view_collision_labels(rows: Iterable[ViewRow]) -> dict[str, str]:
@@ -2864,6 +2981,7 @@ class Browser:
             "hidden",
             "timestamp",
             "messages",
+            "supervisor",
         ]
         return {name: number for number, name in enumerate(names, 1)}
 
@@ -2897,7 +3015,7 @@ class Browser:
             colors.extend(
                 provider_palette[index % len(provider_palette)] for index in range(provider_count)
             )
-            colors.extend((-1, -1, 214, 82, 245, 114, 215, 141, 245, 110, 223))
+            colors.extend((-1, -1, 214, 82, 245, 114, 215, 141, 245, 110, 223, 213))
             backgrounds = [-1] * len(colors)
             backgrounds[self.pairs["selected"] - 1] = 45
             colors[self.pairs["selected"] - 1] = 16
@@ -2920,6 +3038,7 @@ class Browser:
                     curses.COLOR_WHITE,
                     curses.COLOR_CYAN,
                     curses.COLOR_YELLOW,
+                    curses.COLOR_MAGENTA,
                 )
             )
             backgrounds = [-1] * len(colors)
@@ -2970,10 +3089,14 @@ class Browser:
 
     def view_rows(self) -> tuple[ViewRow, ...]:
         eligible = self.current()
-        return build_view_rows(
-            self.sessions,
-            expanded=self.expanded,
-            visible_keys=(item.key for item in eligible),
+        keys = [item.key for item in eligible]
+        records = {item.supervised_by for item in eligible if item.supervised_by}
+        if records and self.visibility != "hidden":
+            keys.extend(
+                item.key for item in self.sessions if item.supervises in records and not item.hidden
+            )
+        return pair_supervisor_rows(
+            build_view_rows(self.sessions, expanded=self.expanded, visible_keys=keys)
         )
 
     def keep_selection(self, previous_id: str = "", *, fallback_id: str = "") -> None:
@@ -3180,6 +3303,14 @@ class Browser:
                     curses.A_BOLD,
                 )
                 title = _normal_agent_tag(item) + view_row.title
+                is_supervisor = any(member.supervises for member in view_row.all_members)
+                if is_supervisor:
+                    title = f"{SUPERVISOR_GLYPH} {title}"
+                elif any(
+                    member.supervised_by and not member.superseded
+                    for member in view_row.all_members
+                ):
+                    title = f"{SUPERVISED_GLYPH} {title}"
                 if view_row.status == "independent thread":
                     title += f" ({len(view_row.members)} threads)"
                 elif len(view_row.all_members) > 1:
@@ -3189,7 +3320,8 @@ class Browser:
                 if not item.named:
                     title = "*- " + title
                 room = max(0, title_width)
-                segment(column_cell(title, room), "primary", curses.A_BOLD)
+                title_color = "supervisor" if is_supervisor else "primary"
+                segment(column_cell(title, room), title_color, curses.A_BOLD)
                 if show_directory:
                     segment(ellipsize(directory, directory_width).ljust(directory_width), "muted")
 
@@ -3212,8 +3344,8 @@ class Browser:
             self.add(
                 detail_top + 1,
                 2,
-                f"{tool_label(item.tool)} · {ORIGIN_LABELS[item.origin]} · "
-                f"launch via {launch_tool} · "
+                f"{tool_label(item.tool)} · {ORIGIN_LABELS[item.origin]}"
+                f"{self.supervision_role(item)} · launch via {launch_tool} · "
                 f"{activity_label(item)}{name_badge}{source_badge}{hidden_badge}{open_badge}",
                 self.style(item.origin, curses.A_BOLD),
                 width - 4,
@@ -3637,9 +3769,19 @@ class Browser:
                     f"Dates      {exact_time(item.created)} → {exact_time(item.updated)}",
                     f"Activity  {activity_label(item)}",
                     f"Prompt    {prompt}",
+                    *self.supervision_lines(item),
                     "",
                 )
             )
+        reset_id = next(
+            (
+                record_id
+                for item in members
+                for record_id in (item.supervised_by or item.supervises,)
+                if record_id and not self.state.supervisors.get(record_id, {}).get("archived")
+            ),
+            "",
+        )
         self._set_input_timeout(-1)
         try:
             self.screen.erase()
@@ -3650,12 +3792,215 @@ class Browser:
                     "muted" if line.startswith(("Harness", "Storage", "Dates")) else "primary"
                 )
                 self.add(index, 2, line, self.style(line_style), width - 4)
-            self.add(height - 2, 2, "Press any key to return", self.style("muted"), width - 4)
+            prompt_line = (
+                "R resets this supervisor · any other key returns"
+                if reset_id
+                else "Press any key to return"
+            )
+            self.add(height - 2, 2, prompt_line, self.style("muted"), width - 4)
             self.screen.refresh()
-            self.screen.get_wch()
+            key = self.screen.get_wch()
+            if reset_id and key == "R":
+                confirm = (
+                    "Reset archives this supervisor and its ledger; the next S starts a new "
+                    "one. Press y to confirm."
+                )
+                self.add(height - 2, 2, confirm.ljust(max(0, width - 4)), self.style("warning"))
+                self.screen.refresh()
+                if self.screen.get_wch() == "y":
+                    self.reset_supervisor(reset_id)
+                else:
+                    self.message = "Reset cancelled."
         finally:
             if self.refresh is not None:
                 self._set_input_timeout(100)
+
+    def supervised_target_name(self, supervisor: Session) -> str:
+        """The current title of the session that ``supervisor`` watches."""
+        record = self.state.supervisors.get(supervisor.supervises, {})
+        conversation = str(record.get("target_conversation", ""))
+        target = next(
+            (
+                other
+                for other in self.sessions
+                if conversation and other.conversation_id == conversation and not other.superseded
+            ),
+            None,
+        )
+        return display_title(target) if target is not None else "(session not found)"
+
+    def supervision_role(self, item: Session) -> str:
+        """The details-pane words that say which side of a pair ``item`` is."""
+        if item.supervises:
+            return f" · SUPERVISOR of {self.supervised_target_name(item)!r}"
+        if item.supervised_by and not item.superseded:
+            return " · MAIN SESSION (has a supervisor)"
+        return ""
+
+    def supervision_lines(self, item: Session) -> tuple[str, ...]:
+        """The details lines that say who supervises ``item`` or what it supervises."""
+        lines: list[str] = []
+        if item.supervised_by:
+            record = self.state.supervisors.get(item.supervised_by, {})
+            lines.append(
+                f"Oversight  supervised by a {tool_label(str(record.get('tool', '')))} "
+                f"supervisor (record {item.supervised_by[:8]})"
+            )
+        if item.supervises:
+            record = self.state.supervisors.get(item.supervises, {})
+            name = self.supervised_target_name(item)
+            retired = " (reset)" if record.get("archived") else ""
+            lines.append(f"Oversight  supervises {name!r}{retired}")
+        return tuple(lines)
+
+    def reset_supervisor(self, record_id: str) -> None:
+        """Archive a supervisor: the next ``S`` on its target creates a fresh one."""
+        from .supervisor.store import load_hook_state, save_hook_state
+
+        record = self.state.supervisors.get(record_id)
+        if record is None:
+            return
+        record["archived"] = True
+        hook_state = load_hook_state(record_id)
+        if hook_state is not None:
+            hook_state.reset = True
+            save_hook_state(hook_state)
+        self.state.save()
+        self.state.apply(self.sessions)
+        self.message = "Supervisor reset. Press S on the session to start a new one."
+
+    def supervisor_picker(
+        self, adapters: list[HarnessAdapter], default: str, target: Session
+    ) -> str:
+        """Choose the harness for a new supervisor; empty when cancelled."""
+        if not adapters:
+            return ""
+        selected = next((i for i, adapter in enumerate(adapters) if adapter.name == default), 0)
+        while True:
+            self.screen.erase()
+            _height, width = self.screen.getmaxyx()
+            box_width = min(70, max(30, width - 4))
+            left = max(0, (width - box_width) // 2)
+            heading = "SUPERVISOR — CHOOSE A HARNESS"
+            self.add(1, left, heading, self.style("accent", curses.A_BOLD))
+            self.add(
+                3,
+                left,
+                f"Supervising {ellipsize(display_title(target), max(10, box_width - 12))}",
+                self.style("muted"),
+                box_width,
+            )
+            hint = "↑/↓ choose · Enter create and open · Esc cancel"
+            self.add(4, left, hint, self.style("muted"))
+            for row, adapter in enumerate(adapters):
+                marker = "›" if row == selected else " "
+                suffix = " (default)" if adapter.name == default else ""
+                self.add(
+                    6 + row,
+                    left,
+                    f"{marker} {adapter.label}{suffix}",
+                    self.style(adapter.name, curses.A_BOLD, selected=row == selected),
+                    box_width,
+                )
+            self.screen.refresh()
+            key = self.screen.get_wch()
+            if key == "\x1b":
+                return ""
+            if key in (curses.KEY_UP, "k"):
+                selected = max(0, selected - 1)
+            elif key in (curses.KEY_DOWN, "j"):
+                selected = min(len(adapters) - 1, selected + 1)
+            elif key in ("\n", "\r", curses.KEY_ENTER):
+                return adapters[selected].name
+
+    def supervise_selected(self) -> tuple[str, Session] | None:
+        """Handle ``S``; return a ``(action, session)`` for the caller to carry out."""
+        from .supervisor.create import (
+            SupervisorError,
+            can_supervise,
+            create_supervisor,
+            default_supervisor_tool,
+            supports_supervising,
+        )
+
+        self.finish_refresh()
+        row = self.selected_row()
+        if row is None:
+            return None
+        item = row.representative
+        if item.supervises:
+            return self.go_to_supervised_target(item)
+        target = self.selected_target()
+        if target is None:
+            self.message = blocked_row_message(row)
+            return None
+        conversation = target.conversation_id
+        if target.supervised_by or (
+            conversation and self.state.supervisor_for_conversation(conversation)
+        ):
+            return ("supervise", target)
+        if not supports_supervising(target.tool):
+            self.message = f"{tool_label(target.tool)} sessions cannot be supervised yet."
+            return None
+        adapters = [adapter for adapter in REGISTRY.adapters() if can_supervise(adapter.name)]
+        default = default_supervisor_tool(target.tool, self.launch_config)
+        chosen: list[str] = []
+        self.run_modal(lambda: chosen.append(self.supervisor_picker(adapters, default, target)))
+        if not chosen[0]:
+            self.message = "Supervisor cancelled."
+            return None
+        try:
+            with redirect_stderr(io.StringIO()):
+                create_supervisor(self.state, target, chosen[0])
+        except SupervisorError as error:
+            self.message = str(error)
+            return None
+        self.state.apply(self.sessions)
+        return ("supervise", target)
+
+    def go_to_supervised_target(self, supervisor: Session) -> tuple[str, Session] | None:
+        """``S`` on a supervisor row: select its target, and launch it only when closed."""
+        record = self.state.supervisors.get(supervisor.supervises, {})
+        conversation = str(record.get("target_conversation", ""))
+        keys = {
+            other.key
+            for other in self.sessions
+            if conversation and other.conversation_id == conversation
+        }
+        if not keys:
+            self.message = "The supervised session is not in the list."
+            return None
+        for attempt in range(2):
+            rows = self.view_rows()
+            index = next(
+                (i for i, r in enumerate(rows) if any(m.key in keys for m in r.members)), None
+            )
+            if index is not None:
+                break
+            if attempt == 0:
+                self.origin = "all"
+                self.visibility = "all"
+                self.tools = set(REGISTRY.names())
+                self.directory = ""
+                self.project_focus = ""
+                self.query = ""
+        else:
+            self.message = "The supervised session is not in the list."
+            return None
+        self.selected = index
+        row = rows[index]
+        target = row.target
+        if target is None:
+            self.message = blocked_row_message(row)
+            return None
+        if target.is_open:
+            self.message = "Target is open in another tab; switch with Ctrl+Tab."
+            return None
+        if target.cwd and not Path(target.cwd).is_dir():
+            target = self.confirm_missing(target)
+            if target is None:
+                return None
+        return ("launch", target)
 
     def rename_selected(self) -> None:
         self.finish_refresh()
@@ -3716,7 +4061,12 @@ class Browser:
                 + " → ".join(adapter.short_label for adapter in REGISTRY.adapters()),
             ),
             ("t", "Choose any combination of tools to show"),
-            ("o", "Cycle Human → Cross → Agent → All origins"),
+            ("o", "Cycle Human → Cross → Agent → Super(visor) → All origins"),
+            (
+                "S",
+                "Open or create the supervisor of the selected session; "
+                "on a supervisor, go to its target",
+            ),
             ("v", "Cycle Visible → Hidden → Visible + hidden"),
             ("A", "Show every session: all origins, visible and hidden"),
             ("H", "Show every hidden session across all origins"),
@@ -3970,6 +4320,10 @@ class Browser:
                 self.cycle_launch_tool()
             elif not self.searching and key == "i":
                 self.run_modal(self.details)
+            elif not self.searching and key == "S":
+                outcome = self.supervise_selected()
+                if outcome is not None:
+                    return outcome
             elif not self.searching and key == "f":
                 self.focus_selected_project()
             elif not self.searching and key == "r":
@@ -4373,6 +4727,132 @@ def launch(
     return 127
 
 
+def supervisor_hook_files() -> tuple[Path, Path]:
+    """The real Claude settings file and Codex hooks file the supervisor hooks live in."""
+    from .harnesses import claude as claude_harness
+    from .harnesses import codex as codex_harness
+
+    return (
+        claude_harness.ADAPTER.home / "settings.json",
+        codex_harness.ADAPTER.home / "hooks.json",
+    )
+
+
+def _native_session_stored(adapter: HarnessAdapter, session_id: str) -> bool:
+    if not session_id:
+        return False
+    if isinstance(adapter.resolve, Unsupported):
+        return True
+    return adapter.resolve(session_id) is not None
+
+
+def supervise_session(
+    item: Session,
+    config: LaunchConfig,
+    state: UserState,
+    tool: str | None = None,
+    dry_run: bool = False,
+) -> int:
+    """Open the supervisor of ``item``, creating it (on ``tool`` or the default) if needed."""
+    from .supervisor.create import SupervisorError, create_supervisor, default_supervisor_tool
+
+    conversation_id = state.conversation_id_for(item)
+    record_id = state.supervisor_for_conversation(conversation_id) if conversation_id else None
+    if record_id is None:
+        try:
+            record_id = create_supervisor(
+                state, item, tool or default_supervisor_tool(item.tool, config)
+            )
+        except SupervisorError as error:
+            print(f"sessions: {error}", file=sys.stderr)
+            return 2
+    return launch_supervisor(record_id, config, state, dry_run)
+
+
+def launch_supervisor(
+    record_id: str,
+    config: LaunchConfig,
+    state: UserState,
+    dry_run: bool = False,
+    root: Path | None = None,
+) -> int:
+    """Start a new supervisor session, or resume an existing one by its native id."""
+    from .supervisor.context import supervisor_dir as supervisor_folder
+    from .supervisor.create import ENV_VAR
+    from .supervisor.store import load_hook_state, save_hook_state
+
+    record = state.supervisors.get(record_id)
+    hook_state = load_hook_state(record_id, root)
+    if record is None or hook_state is None:
+        print(f"sessions: no supervisor record {record_id!r}", file=sys.stderr)
+        return 2
+    tool = str(record.get("tool", ""))
+    if tool not in REGISTRY:
+        print(f"sessions: unknown supervisor harness {tool!r}", file=sys.stderr)
+        return 2
+    adapter = REGISTRY.get(tool)
+    cwd = strip_extended_prefix(str(record.get("cwd", ""))) or str(HOME)
+    title = str(record.get("title", "")) or "supervisor"
+    # Resume only a native session the harness actually stored; one that was started and quit
+    # before its first prompt has nothing to resume, so it starts again under the same id.
+    fresh = not _native_session_stored(adapter, hook_state.native_session_id)
+    session = Session(
+        tool=tool,
+        session_id=hook_state.native_session_id or f"supervisor-{record_id}",
+        title=title,
+        cwd=cwd,
+        updated=0,
+        created=float(record.get("created", 0) or 0),
+        preview="",
+        named=True,
+        storage="",
+        origin="supervisor",
+    )
+    if fresh:
+        hook = adapter.new_session_args
+        if isinstance(hook, Unsupported):
+            print(f"sessions: {adapter.label} cannot start supervisors", file=sys.stderr)
+            return 2
+        chosen = hook_state.native_session_id or None
+        args = hook(session_id=chosen)
+        if chosen and chosen not in args and not dry_run:
+            # The harness picks its own id, so the hook must bind the new session afresh.
+            save_hook_state(replace(hook_state, native_session_id=""), root)
+        argv = config.provider_prefix(tool) + args
+    else:
+        try:
+            argv = command_for(session, config)
+        except BridgeError as error:
+            print(f"sessions: {error}", file=sys.stderr)
+            return 2
+    if not isinstance(adapter.extra_dir_args, Unsupported):
+        # The supervisor reads its brief files and keeps its ledger in its own folder.
+        argv += adapter.extra_dir_args(str(supervisor_folder(record_id, root)))
+    if config.custom_args_missing(tool):
+        print(custom_mode_notice(config, tool), file=sys.stderr)
+    if dry_run:
+        if IS_WINDOWS:
+            rendered = subprocess.list2cmdline(argv)
+            print(f"Set-Location -LiteralPath {subprocess.list2cmdline([cwd])}; {rendered}")
+        else:
+            print(f"cd -- {shlex.quote(cwd)} && " + shlex.join(argv))
+        return 0
+    os.environ[ENV_VAR] = record_id
+    try:
+        os.chdir(cwd)
+        executable = shutil.which(argv[0])
+        if executable is None:
+            print(f"sessions: {argv[0]!r} is not on PATH", file=sys.stderr)
+            return 127
+        record_launch(session, argv, executable)
+        if IS_WINDOWS:
+            return run_harness(session, [executable, *argv[1:]])
+        os.execvp(argv[0], argv)
+    except OSError as error:
+        print(f"sessions: could not launch {argv[0]!r}: {error}", file=sys.stderr)
+    return 127
+
+
 def choose_reattach(sessions: list[Session]) -> Session | None:
     """The session this terminal lost, or one the user picks from those that lost theirs.
 
@@ -4535,6 +5015,37 @@ def build_parser() -> argparse.ArgumentParser:
         ),
     )
     parser.add_argument(
+        "--supervise",
+        metavar="ID_OR_NAME",
+        help=(
+            "open the supervisor session for this session, creating it if needed; "
+            "--launch-tool picks the supervisor's harness"
+        ),
+    )
+    parser.add_argument(
+        "--target-log",
+        metavar="ID",
+        help="print what a supervisor sees of its target (record id, session id or conversation)",
+    )
+    parser.add_argument(
+        "--since",
+        metavar="ISO_TIME",
+        help="with --target-log: best-effort only, exchanges carry no timestamps",
+    )
+    parser.add_argument(
+        "--tail", type=int, default=20, metavar="N", help="with --target-log: last N exchanges"
+    )
+    parser.add_argument(
+        "--install-hooks",
+        action="store_true",
+        help="register the supervisor hooks in the Claude and Codex hook files",
+    )
+    parser.add_argument(
+        "--uninstall-hooks",
+        action="store_true",
+        help="remove the supervisor hooks from the Claude and Codex hook files",
+    )
+    parser.add_argument(
         "--rename",
         nargs=2,
         metavar=("ID_OR_NAME", "NEW_NAME"),
@@ -4582,7 +5093,24 @@ def main(argv: list[str] | None = None) -> int:
     if args.launch_log is not None:
         launch_log_output(read_launch_log(args.launch_log))
         return 0
+    if args.install_hooks or args.uninstall_hooks:
+        from .supervisor import install as hook_install
+
+        action = hook_install.install if args.install_hooks else hook_install.uninstall
+        for notice in action(*supervisor_hook_files()):
+            print(f"sessions: {notice}")
+        return 0
     state = UserState()
+    if args.target_log:
+        from .supervisor.create import SupervisorError, target_log
+
+        try:
+            output = target_log(state, args.target_log, args.since, args.tail)
+        except SupervisorError as error:
+            print(f"sessions: {error}", file=sys.stderr)
+            return 2
+        print(output)
+        return 0
     launch_config = LaunchConfig.load()
     if args.set_launch_mode:
         launch_config.set_mode(args.set_launch_mode)
@@ -4597,6 +5125,7 @@ def main(argv: list[str] | None = None) -> int:
             args.list
             or args.json
             or args.resume
+            or args.supervise
             or args.reattach
             or args.rename
             or args.hide
@@ -4706,6 +5235,14 @@ def main(argv: list[str] | None = None) -> int:
             item = replace(item, launch_tool=args.launch_tool)
         return launch(item, launch_config, dry_run=args.dry_run, state=state, others=sessions)
 
+    if args.supervise:
+        if args.supervise in state.supervisors:
+            return launch_supervisor(args.supervise, launch_config, state, args.dry_run)
+        item = resolve(args.supervise)
+        if item is None:
+            return 2
+        return supervise_session(item, launch_config, state, args.launch_tool, args.dry_run)
+
     if args.reattach:
         if not IS_WINDOWS:
             print(
@@ -4753,6 +5290,10 @@ def main(argv: list[str] | None = None) -> int:
             loaded = browser.sessions
 
     selected = curses.wrapper(wrapped)
+    if isinstance(selected, tuple):
+        action, selected = selected
+        if action == "supervise":
+            return supervise_session(selected, launch_config, state, "", args.dry_run)
     if selected:
         return launch(selected, launch_config, dry_run=args.dry_run, state=state, others=loaded)
     return 0

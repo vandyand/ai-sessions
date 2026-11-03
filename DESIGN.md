@@ -67,6 +67,21 @@ tokens:
 - **Recovery / exit:** `Esc` cancels; `a` restores all tools; an empty selection cannot be applied.
 - **Evidence:** Multi-select and empty-recovery tests in `tests/test_display.py`.
 
+### Supervise A Session
+
+- **Entry:** Select a session and press `S`.
+- **Actions and decisions:** The first time, choose the supervisor's harness from a short list
+  that starts on the sensible default; Enter accepts it. Later, `S` goes straight to the
+  existing supervisor. On a supervisor row, `S` moves to its target instead.
+- **System feedback:** The supervisor opens in this terminal. A supervised session carries `◉`,
+  and `i` says "supervised by" / "supervises". An open target is never offered for stopping:
+  the status line says to switch tabs with Ctrl+Tab.
+- **Completion and next action:** The user asks the supervisor about the target; `S` on the
+  supervisor returns to the target.
+- **Recovery / exit:** `Esc` cancels the harness choice; `R` then `y` in `i` resets a supervisor
+  so the next `S` starts fresh.
+- **Evidence:** `tests/test_supervisor_browser.py`.
+
 ## Information Architecture And Language
 
 - **Navigation model:** One session list, one detail region, and short modal pickers for filters or

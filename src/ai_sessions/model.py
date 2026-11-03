@@ -56,6 +56,7 @@ class ToolCall:
     name: str
     request: str
     result: str = ""
+    failed: bool = False
 
 
 @dataclass(frozen=True, slots=True)
@@ -229,6 +230,8 @@ class Session:
     compaction_count: int = 0
     prompt_count: int = 0
     conversation_blocker: str = ""
+    supervises: str = ""
+    supervised_by: str = ""
 
     def __post_init__(self) -> None:
         self.source = SourceKind(self.source)

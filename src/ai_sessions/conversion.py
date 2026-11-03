@@ -255,12 +255,14 @@ def flatten(turns: Iterable[Turn]) -> list[Turn]:
     return result
 
 
-def _records(path: Path, *, end: int | None = None) -> Iterator[dict[str, Any]]:
+def _records(path: Path, *, start: int = 0, end: int | None = None) -> Iterator[dict[str, Any]]:
     try:
         handle = path.open("rb")
     except OSError as error:
         raise BridgeError(f"could not read {path}: {error}") from error
     with handle:
+        if start:
+            handle.seek(start)
         while end is None or handle.tell() < end:
             line = handle.readline() if end is None else handle.readline(end - handle.tell())
             if not line:
@@ -348,14 +350,19 @@ class _Conversation:
         if call_id:
             self._pending[call_id] = (len(self.turns) - 1, len(calls) - 1)
 
-    def result(self, call_id: str, text: str) -> None:
+    def result(self, call_id: str, text: str, failed: bool = False) -> None:
+        """Attach a result to its call by id.
+
+        A result whose call is not in this read, such as one that precedes the
+        start of an incremental read, is dropped.
+        """
         location = self._pending.pop(call_id, None)
-        if location is None or not text:
+        if location is None or not (text or failed):
             return
         index, position = location
         turn = self.turns[index]
         calls = list(turn.calls)
-        calls[position] = replace(calls[position], result=_clip(text, RESULT_CHARS))
+        calls[position] = replace(calls[position], result=_clip(text, RESULT_CHARS), failed=failed)
         self.turns[index] = replace(turn, calls=tuple(calls))
 
     def finish(self) -> list[Turn]:
@@ -435,6 +442,43 @@ def read_snapshot(
         ),
         result.checkpoint,
     )
+
+
+def read_since(tool: str, ref: NativeRef, checkpoint: Checkpoint) -> ReadSnapshot | None:
+    """Read the turns after ``checkpoint`` and the new checkpoint.
+
+    None means the checkpoint cannot be located.  Raises BridgeError when the
+    session is unavailable or the adapter cannot read incrementally.
+    """
+    adapter = harness(tool)
+    if not isinstance(ref, NativeRef):
+        raise TypeError("native session reads require an explicit NativeRef")
+    reader = adapter.read_since
+    if isinstance(reader, Unsupported):
+        raise BridgeError(f"{adapter.label} cannot read incrementally: {reader.reason}")
+    availability = native_session_availability(tool, ref)
+    if availability == "unavailable":
+        raise BridgeError(f"the {adapter.label} source session is unavailable")
+    if availability != "available":
+        raise BridgeError(
+            f"the {adapter.label} source session could not be verified safely; "
+            "restore storage access or retry"
+        )
+    if not is_checkpoint(checkpoint):
+        return None
+    try:
+        result = reader(ref, checkpoint)
+    except OSError as error:
+        raise BridgeError(f"could not read the {adapter.label} source session: {error}") from error
+    if result is None:
+        return None
+    if (
+        not isinstance(result, ReadSnapshot)
+        or not isinstance(result.transcript, Transcript)
+        or not is_checkpoint(result.checkpoint)
+    ):
+        raise BridgeError(f"{adapter.label} returned an invalid native read checkpoint")
+    return result
 
 
 def read_turns(tool: str, native: NativeRef, *, tool_calls: bool = True) -> list[Turn]:

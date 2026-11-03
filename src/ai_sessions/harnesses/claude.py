@@ -117,11 +117,13 @@ def claude_project_dir(cwd: str) -> Path:
     return REGISTRY.get("claude").home / "projects" / slug
 
 
-def read_claude(path: Path, *, latest_window: bool = True, end: int | None = None) -> Transcript:
+def read_claude(
+    path: Path, *, latest_window: bool = True, start: int = 0, end: int | None = None
+) -> Transcript:
     """Read mainline Claude messages, using sidechain only for an agent-only file."""
     main = _Conversation()
     sidechain = _Conversation()
-    for record in _records(path, end=end):
+    for record in _records(path, start=start, end=end):
         role = record.get("type")
         if role not in ("user", "assistant") or record.get("isMeta"):
             continue
@@ -149,6 +151,7 @@ def read_claude(path: Path, *, latest_window: bool = True, end: int | None = Non
                 conversation.result(
                     str(block.get("tool_use_id", "")),
                     body if isinstance(body, str) else _block_text(body),
+                    failed=bool(block.get("is_error")),
                 )
     del latest_window
     return Transcript(main.finish() or sidechain.finish(), main.opaque_compactions)
@@ -238,6 +241,62 @@ def _read_claude_snapshot(ref: NativeRef, *, latest_window: bool = True) -> Read
     return ReadSnapshot(
         read_claude(Path(ref.storage), latest_window=latest_window, end=checkpoint), checkpoint
     )
+
+
+def _read_claude_since(ref: NativeRef, checkpoint: int | str) -> ReadSnapshot | None:
+    if isinstance(checkpoint, str):
+        located = locate_checkpoint(ref, checkpoint, _claude_record_identity)
+        if located is None:
+            return None
+        checkpoint = located
+    if not isinstance(checkpoint, int) or isinstance(checkpoint, bool):
+        return None
+    cursor = _claude_checkpoint(ref)
+    if checkpoint > cursor:
+        return None
+    return ReadSnapshot(
+        read_claude(Path(ref.storage), latest_window=False, start=checkpoint, end=cursor), cursor
+    )
+
+
+def claude_pastes(session_id: str, home: Path) -> list[str]:
+    """Return every paste recorded for a session in Claude Code's history.jsonl.
+
+    Inline ``content`` is used as is; a ``contentHash`` is read from ``paste-cache``, and a
+    missing cached file is skipped.
+    """
+    found: list[str] = []
+    try:
+        lines = (home / "history.jsonl").read_text(encoding="utf-8").splitlines()
+    except OSError:
+        return found
+    for line in lines:
+        try:
+            entry = json.loads(line)
+        except ValueError:
+            continue
+        if not isinstance(entry, dict) or entry.get("sessionId") != session_id:
+            continue
+        contents = entry.get("pastedContents")
+        if not isinstance(contents, dict):
+            continue
+        for item in contents.values():
+            if not isinstance(item, dict):
+                continue
+            content = item.get("content")
+            if not isinstance(content, str) and item.get("contentHash"):
+                name = f"{item['contentHash']}.txt"
+                try:
+                    content = (home / "paste-cache" / name).read_text(encoding="utf-8")
+                except OSError:
+                    content = None
+            if isinstance(content, str) and content:
+                found.append(content)
+    return found
+
+
+def _claude_pasted_contents(ref: NativeRef) -> list[str]:
+    return claude_pastes(ref.session_id, REGISTRY.get("claude").home)
 
 
 def _write_claude(
@@ -835,6 +894,15 @@ def resume_args(
     return ["--resume", session_id]
 
 
+def new_session_args(*, session_id: str | None) -> list[str]:
+    return ["--session-id", session_id] if session_id else []
+
+
+def extra_dir_args(directory: str) -> list[str]:
+    # The joined form keeps a variadic option from swallowing the arguments after it.
+    return [f"--add-dir={directory}"]
+
+
 ADAPTER = HarnessAdapter(
     name="claude",
     label="Claude Code",
@@ -857,9 +925,13 @@ ADAPTER = HarnessAdapter(
     availability=_claude_availability,
     checkpoint=_claude_checkpoint,
     change_status=_claude_change_status,
+    read_since=_read_claude_since,
+    pasted_contents=_claude_pasted_contents,
     protect_checkpoint=_protect_claude_checkpoint,
     discover=discover,
     resume_args=resume_args,
+    new_session_args=new_session_args,
+    extra_dir_args=extra_dir_args,
     publish_name=publish_name,
     inspect_liveness=inspect_liveness,
     liveness_executables=frozenset(("claude", "claude.exe", "claude.cmd", "claude.ps1")),

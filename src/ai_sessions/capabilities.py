@@ -51,6 +51,33 @@ class CheckpointHook(Protocol):
     def __call__(self, ref: NativeRef) -> Checkpoint: ...
 
 
+class ReadSinceHook(Protocol):
+    """Read the turns strictly after ``checkpoint``, up to the current complete cursor.
+
+    Returns None when the checkpoint cannot be located.
+    """
+
+    def __call__(self, ref: NativeRef, checkpoint: Checkpoint) -> ReadSnapshot | None: ...
+
+
+class PastedContentsHook(Protocol):
+    """Return the text of every paste the harness recorded for a session."""
+
+    def __call__(self, ref: NativeRef) -> list[str]: ...
+
+
+class InjectedPromptHook(Protocol):
+    """Whether user-role text was injected by the harness rather than typed by the user."""
+
+    def __call__(self, text: str) -> bool: ...
+
+
+class ExtraDirArgsHook(Protocol):
+    """Arguments that let a session read and write ``directory`` outside its workspace."""
+
+    def __call__(self, directory: str) -> list[str]: ...
+
+
 class ChangeStatusHook(Protocol):
     def __call__(self, ref: NativeRef, checkpoint: Checkpoint) -> str: ...
 
@@ -75,6 +102,16 @@ class ResumeArgsHook(Protocol):
         parent_id: str,
         native: bool,
     ) -> list[str]: ...
+
+
+class NewSessionArgsHook(Protocol):
+    """Arguments that start a brand-new session, after the launch prefix.
+
+    ``session_id`` is the id the caller wants the session to have, or None when the
+    harness assigns its own.  A harness that cannot be given an id ignores it.
+    """
+
+    def __call__(self, *, session_id: str | None) -> list[str]: ...
 
 
 class PublishNameHook(Protocol):
@@ -167,6 +204,19 @@ class HarnessAdapter:
         "checkpoint protection is not supported"
     )
     turn_state: TurnStateHook | Unsupported = Unsupported("turn state is not reported")
+    read_since: ReadSinceHook | Unsupported = Unsupported("incremental reads are not supported")
+    pasted_contents: PastedContentsHook | Unsupported = Unsupported(
+        "pastes are not recorded apart from the prompt"
+    )
+    injected_prompt: InjectedPromptHook | Unsupported = Unsupported(
+        "the harness injects no user-role context"
+    )
+    new_session_args: NewSessionArgsHook | Unsupported = Unsupported(
+        "starting a new session with chosen arguments is not supported"
+    )
+    extra_dir_args: ExtraDirArgsHook | Unsupported = Unsupported(
+        "extra working directories are not supported"
+    )
     # Whether everything the harness starts may be stopped along with its
     # launcher.  False for a harness that can start a daemon other windows
     # share, which must outlive the window that happened to start it.
@@ -235,6 +285,11 @@ class HarnessAdapter:
             self.inspect_liveness,
             self.prepare_target,
             self.upgrade_storage,
+            self.read_since,
+            self.pasted_contents,
+            self.injected_prompt,
+            self.new_session_args,
+            self.extra_dir_args,
         )
         if not all(callable(hook) or isinstance(hook, Unsupported) for hook in required + optional):
             raise ValueError("harness capabilities must be callable or Unsupported")

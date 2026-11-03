@@ -1,5 +1,21 @@
 # Changelog
 
+## Unreleased
+
+### Added
+
+- Supervisor sessions. Press `S` on a session to open a second agent session that watches it
+  and answers questions about what it is doing, or `sessions --supervise ID` from the command
+  line. The first `S` asks which harness to use; later presses resume the same supervisor.
+  On a supervisor, `S` jumps to its target and never offers to stop an open one. A session
+  with a supervisor shows `◉`, and its supervisor is listed directly under it as
+  `◎ Supervisor: <title>` with the `Super` origin. The details pane names each row
+  `MAIN SESSION` or `SUPERVISOR`, `i` shows "supervised by" and
+  "supervises", and `R` in `i` resets a supervisor so the next `S` starts a fresh one.
+- `sessions --target-log ID` prints what a supervisor sees of its target, and
+  `sessions --install-hooks` / `--uninstall-hooks` add and remove the Claude Code and Codex
+  hooks that feed it. Codex asks to re-trust its hooks after an install.
+
 ## 3.7.5 — 2026-10-30
 
 ### Fixed
