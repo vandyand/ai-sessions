@@ -42,11 +42,28 @@ class TerminalMemoryTests(unittest.TestCase):
         self.addCleanup(directory.cleanup)
         self.path = Path(directory.name) / "terminals.json"
 
-    def test_a_tab_remembers_its_session_until_the_harness_exits_normally(self) -> None:
+    def test_a_normal_exit_is_kept_for_reopen_but_not_offered_to_reattach(self) -> None:
         detached.remember(session(), "claude", 41, 5.0, "tab-1", path=self.path)
         self.assertEqual(detached.remembered(path=self.path)["tab-1"]["session_id"], "lost")
-        detached.forget(41, path=self.path)
-        self.assertEqual(detached.remembered(path=self.path), {})
+        detached.mark_closed(41, path=self.path)
+        self.assertEqual(list(detached.closed(path=self.path)), ["tab-1"])
+        with patch.object(windows, "is_detached", return_value=False):
+            self.assertEqual(detached.interrupted(path=self.path), {})
+
+    def test_closed_sessions_are_listed_newest_first(self) -> None:
+        for pid, name in ((41, "older"), (42, "newer")):
+            detached.remember(session(name), "claude", pid, 5.0, f"tab-{pid}", path=self.path)
+            detached.mark_closed(pid, path=self.path)
+            time.sleep(0.01)
+        ids = [entry["session_id"] for entry in detached.closed(path=self.path).values()]
+        self.assertEqual(ids, ["newer", "older"])
+
+    def test_reopening_in_another_tab_moves_the_memory_there(self) -> None:
+        detached.remember(session(), "claude", 41, 5.0, "tab-1", path=self.path)
+        detached.mark_closed(41, path=self.path)
+        detached.remember(session(), "claude", 42, 5.0, "tab-2", path=self.path)
+        self.assertEqual(detached.closed(path=self.path), {})
+        self.assertEqual(list(detached.remembered(path=self.path)), ["tab-2"])
 
     def test_a_session_lives_in_one_tab_at_a_time(self) -> None:
         detached.remember(session(), "claude", 41, 5.0, "tab-1", path=self.path)
@@ -167,6 +184,78 @@ class ChooseReattachTests(unittest.TestCase):
         resumed = session("resumed", pid=31)
         lost = {"tab": {"session_id": "resumed", "at": 1}}
         self.assertIsNone(self.choose([resumed], lost=lost))
+
+
+class ChooseReopenTests(unittest.TestCase):
+    def setUp(self) -> None:
+        directory = tempfile.TemporaryDirectory()
+        self.addCleanup(directory.cleanup)
+        self.path = Path(directory.name) / "terminals.json"
+
+    def run_in_tab(self, pid: int, name: str, tab: str) -> None:
+        detached.remember(session(name), "claude", pid, 5.0, tab, path=self.path)
+        detached.mark_closed(pid, path=self.path)
+
+    def choose(self, sessions, *, terminal="tab", answer="1", lost=None):
+        closed, remembered = detached.closed, detached.remembered
+        with (
+            patch.object(detached, "closed", lambda: closed(path=self.path)),
+            patch.object(detached, "remembered", lambda: remembered(path=self.path)),
+            patch.object(detached, "terminal_id", return_value=terminal),
+            patch.object(detached, "interrupted", return_value=lost or {}),
+            patch("builtins.input", return_value=answer),
+            redirect_stderr(io.StringIO()) as errors,
+            patch("sys.stdout", io.StringIO()),
+        ):
+            self.errors = errors
+            return app.choose_reopen(sessions)
+
+    def test_this_tab_reopens_what_it_last_ran(self) -> None:
+        mine, other = session("mine"), session("other")
+        self.run_in_tab(41, "mine", "tab")
+        self.run_in_tab(42, "other", "tab-2")
+        self.assertIs(self.choose([mine, other]), mine)
+
+    def test_this_tab_also_reopens_a_session_it_lost(self) -> None:
+        mine = session("mine")
+        lost = {"tab": {"session_id": "mine", "at": 1}}
+        self.assertIs(self.choose([mine], lost=lost), mine)
+
+    def test_a_session_still_running_in_this_tab_is_not_reopened(self) -> None:
+        detached.remember(session("mine"), "claude", 41, 5.0, "tab", path=self.path)
+        self.assertIsNone(self.choose([session("mine")]))
+        self.assertIn("still running", self.errors.getvalue())
+
+    def test_a_fresh_tab_picks_from_recently_closed_sessions(self) -> None:
+        older, newer = session("older"), session("newer")
+        self.run_in_tab(41, "older", "a")
+        time.sleep(0.01)
+        self.run_in_tab(42, "newer", "b")
+        self.assertIs(self.choose([older, newer], terminal="new-tab"), newer)
+        self.assertIs(self.choose([older, newer], terminal="new-tab", answer="2"), older)
+
+    def test_an_open_session_is_not_offered_from_a_fresh_tab(self) -> None:
+        self.run_in_tab(41, "reopened", "a")
+        self.assertIsNone(self.choose([session("reopened", pid=31)], terminal=""))
+
+    def test_a_supervisor_remembered_by_its_record_is_found(self) -> None:
+        supervisor = session("01a19f75-native")
+        supervisor.supervises = "record-1"
+        self.run_in_tab(41, "supervisor-record-1", "tab")
+        self.assertIs(self.choose([supervisor]), supervisor)
+
+    def test_a_supervisor_reopens_through_its_own_launch(self) -> None:
+        supervisor = session("supervisor")
+        supervisor.supervises = "record-1"
+        with (
+            patch.object(app, "make_room", return_value=True),
+            patch.object(app, "launch_supervisor", return_value=0) as launched,
+            patch.object(app, "launch") as plain,
+        ):
+            app.open_again(supervisor, app.LaunchConfig(), app.UserState(self.path), [])
+        launched.assert_called_once()
+        self.assertEqual(launched.call_args.args[0], "record-1")
+        plain.assert_not_called()
 
 
 class MakeRoomTests(unittest.TestCase):

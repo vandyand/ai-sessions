@@ -10,7 +10,8 @@ nothing here stops a harness that is still working without asking.
 
 Each tab also remembers the session `sessions` last launched in it (keyed by
 Windows Terminal's per-tab ``WT_SESSION``), so ``sessions --reattach`` can
-bring back whatever a tab lost without searching for it.
+bring back whatever a tab lost without searching for it, and ``sessions
+--reopen`` can resume what it ran after a normal exit.
 """
 
 from __future__ import annotations
@@ -94,24 +95,42 @@ def remember(
     _write(path, document)
 
 
-def forget(pid: int, *, path: Path = TERMINALS_FILE) -> None:
-    """The harness ``pid`` exited normally, so there is nothing to bring back."""
+def mark_closed(pid: int, *, path: Path = TERMINALS_FILE) -> None:
+    """The harness ``pid`` exited normally: nothing was lost, but it can be reopened.
+
+    The entry is kept so ``sessions --reopen`` knows what the tab last ran,
+    and marked so ``--reattach`` does not mistake a deliberate exit for a loss.
+    """
     document = _read(path)
-    kept = {key: value for key, value in document.items() if value.get("pid") != pid}
-    if kept != document:
-        _write(path, kept)
+    changed = False
+    for entry in document.values():
+        if entry.get("pid") == pid and not entry.get("closed"):
+            entry["closed"] = True
+            entry["at"] = time.time()
+            changed = True
+    if changed:
+        _write(path, document)
 
 
 def remembered(*, path: Path = TERMINALS_FILE) -> dict[str, dict[str, Any]]:
     return _read(path)
 
 
+def closed(*, path: Path = TERMINALS_FILE) -> dict[str, dict[str, Any]]:
+    """Remembered launches whose harness exited normally, newest first."""
+    entries = [(key, entry) for key, entry in _read(path).items() if entry.get("closed")]
+    entries.sort(key=lambda item: -float(item[1].get("at", 0) or 0))
+    return dict(entries)
+
+
 def interrupted(*, path: Path = TERMINALS_FILE) -> dict[str, dict[str, Any]]:
-    """Remembered launches whose harness is gone or detached."""
+    """Remembered launches whose harness is gone or detached, but did not exit normally."""
     from .platforms.windows import is_detached
 
     result = {}
     for key, entry in _read(path).items():
+        if entry.get("closed"):
+            continue
         pid = int(entry.get("pid", 0) or 0)
         if not _same_process(pid, float(entry.get("started", 0) or 0)) or is_detached(pid):
             result[key] = entry

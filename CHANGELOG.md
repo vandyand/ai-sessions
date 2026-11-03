@@ -1,5 +1,20 @@
 # Changelog
 
+## 3.8.1 — 2026-11-02
+
+### Added
+
+- `sessions --reopen` resumes the session a Windows Terminal tab last ran, after you quit it,
+  so the harness picks up new settings, names or a new login without searching for the
+  session. It follows the conversation to its current copy and reopens a supervisor as a
+  supervisor; in a fresh tab it lists the sessions closed most recently. After a session
+  closes, `sessions` prints this reminder.
+
+### Fixed
+
+- `sessions --reattach` reopens a supervisor through its own launch, so it keeps access to its
+  brief files and ledger.
+
 ## 3.8.0 — 2026-11-02
 
 ### Added
