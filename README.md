@@ -35,6 +35,14 @@ sessions --reattach
 
 It resumes whatever that tab lost (stopping a detached copy still sitting in it first), or, in a fresh tab, lists the sessions that lost their terminal to pick from.
 
+Neither Codex nor Claude Code can reload its settings, its login or a new session name while it runs. To pick them up, quit the session and, in the same tab, run:
+
+```powershell
+sessions --reopen
+```
+
+It resumes the session that tab last ran, following its conversation if it has since moved to another harness, and reopens a supervisor as a supervisor. In a fresh tab it lists the sessions closed most recently. After a session closes, `sessions` prints this reminder.
+
 ## Requirements
 
 - Python 3.11 or newer

@@ -4870,7 +4870,7 @@ def run_harness(session: Session, command: list[str]) -> int:
     job so it cannot outlive this launcher; one that may start a daemon
     other windows share is left out, since that daemon must outlive it.
     """
-    from .detached import forget, remember
+    from .detached import mark_closed, remember, terminal_id
     from .platforms.windows import KillOnCloseJob, process_started
 
     tool = active_launch_tool(session)
@@ -4891,7 +4891,13 @@ def run_harness(session: Session, command: list[str]) -> int:
     finally:
         if job is not None:
             job.release()
-    forget(process.pid)
+    mark_closed(process.pid)
+    if terminal_id():
+        print(
+            f"sessions: closed {display_title(session)!r}; "
+            "run `sessions --reopen` to open it again here.",
+            file=sys.stderr,
+        )
     return code
 
 
@@ -5152,6 +5158,78 @@ def launch_supervisor(
     return 127
 
 
+def open_again(
+    item: Session,
+    config: LaunchConfig,
+    state: UserState,
+    others: Iterable[Session],
+    dry_run: bool = False,
+) -> int:
+    """Resume ``item`` in this tab, the way it was first opened.
+
+    A supervisor goes through its own launch, which gives it its folder and
+    its name; anything else follows its conversation to the current copy.
+    """
+    if not item.supervises:
+        return launch(item, config, dry_run=dry_run, state=state, others=others)
+    if IS_WINDOWS and not dry_run and not make_room(item, others):
+        return 1
+    return launch_supervisor(item.supervises, config, state, dry_run)
+
+
+REOPEN_CHOICES = 10
+
+
+def choose_reopen(sessions: list[Session]) -> Session | None:
+    """The session this tab last ran, or one the user picks from those recently closed.
+
+    In a tab that ran a session, that session, whether it was closed or lost;
+    elsewhere the sessions closed most recently in any tab, newest first.
+    """
+    from .detached import closed, interrupted, remembered, terminal_id
+
+    by_id = {item.session_id: item for item in sessions}
+    # A supervisor started before its harness chose an id was remembered by its record.
+    by_id.update({f"supervisor-{item.supervises}": item for item in sessions if item.supervises})
+    recent = closed()
+    terminal = terminal_id()
+    if terminal:
+        entry = recent.get(terminal) or interrupted().get(terminal)
+        if entry is not None:
+            item = by_id.get(str(entry.get("session_id", "")))
+            if item is None:
+                print(
+                    f"sessions: this tab last ran {entry.get('title') or entry.get('session_id')!r}, "
+                    "which no longer exists.",
+                    file=sys.stderr,
+                )
+            return item
+        if terminal in remembered():
+            print("sessions: the session in this tab is still running.", file=sys.stderr)
+            return None
+    choices: list[Session] = []
+    for entry in recent.values():
+        item = by_id.get(str(entry.get("session_id", "")))
+        if item is not None and not item.is_open and item not in choices:
+            choices.append(item)
+    choices = choices[:REOPEN_CHOICES]
+    if not choices:
+        print("sessions: no recently closed session to reopen.", file=sys.stderr)
+        return None
+    if len(choices) == 1:
+        return choices[0]
+    print("Recently closed sessions:")
+    for index, item in enumerate(choices, 1):
+        print(f"  {index}. {display_title(item)}  [{tool_label(item.tool)}]")
+        print(f"     {short_path(item.cwd)}")
+    try:
+        answer = input("Reopen which? [1] ").strip() or "1"
+        return choices[int(answer) - 1]
+    except (EOFError, OSError, ValueError, IndexError):
+        print("sessions: nothing reopened.", file=sys.stderr)
+        return None
+
+
 def choose_reattach(sessions: list[Session]) -> Session | None:
     """The session this terminal lost, or one the user picks from those that lost theirs.
 
@@ -5356,6 +5434,14 @@ def build_parser() -> argparse.ArgumentParser:
         ),
     )
     parser.add_argument(
+        "--reopen",
+        action="store_true",
+        help=(
+            "Windows: resume the session this terminal last ran, after you closed it, to pick "
+            "up new settings, names or a new login (in a new tab, pick a recently closed one)"
+        ),
+    )
+    parser.add_argument(
         "--launch-tool",
         choices=REGISTRY.names(),
         help=(
@@ -5483,6 +5569,7 @@ def main(argv: list[str] | None = None) -> int:
             or args.resume
             or args.supervise
             or args.reattach
+            or args.reopen
             or args.rename
             or args.hide
             or args.unhide
@@ -5640,7 +5727,20 @@ def main(argv: list[str] | None = None) -> int:
         item = choose_reattach(sessions)
         if item is None:
             return 1
-        return launch(item, launch_config, dry_run=args.dry_run, state=state, others=sessions)
+        return open_again(item, launch_config, state, sessions, args.dry_run)
+
+    if args.reopen:
+        if not IS_WINDOWS:
+            print(
+                "sessions: --reopen is for Windows; elsewhere sessions hands the terminal to "
+                "the harness and cannot see it exit.",
+                file=sys.stderr,
+            )
+            return 2
+        item = choose_reopen(sessions)
+        if item is None:
+            return 1
+        return open_again(item, launch_config, state, sessions, args.dry_run)
 
     if args.list or args.json or not (sys.stdin.isatty() and sys.stdout.isatty()):
         try:
