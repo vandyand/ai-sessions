@@ -13,7 +13,16 @@ import uuid
 from pathlib import Path
 from typing import Any, Iterable
 
+import zstandard
+
 from ..capabilities import HarnessAdapter
+from ..compression import (
+    ZST_SUFFIX,
+    is_compressed_path,
+    open_for_scan,
+    plain_path,
+    resolve_storage,
+)
 from ..conversion import (
     CLAUDE_BUDGET_CONTEXT_TOKENS,
     DEFAULT_CHARS_PER_TOKEN,
@@ -209,27 +218,39 @@ def write_claude_session(
     return session_id, path
 
 
+def _claude_session_files(session_id: str) -> list[Path]:
+    """Every file holding this session, plain files before compressed ones."""
+    projects = REGISTRY.get("claude").home / "projects"
+    return sorted(projects.rglob(f"{session_id}.jsonl")) + sorted(
+        projects.rglob(f"{session_id}.jsonl{ZST_SUFFIX}")
+    )
+
+
 def _claude_exists(session_id: str) -> bool:
-    return any((REGISTRY.get("claude").home / "projects").rglob(f"{session_id}.jsonl"))
+    return bool(_claude_session_files(session_id))
 
 
 def _claude_resolve(session_id: str) -> NativeRef | None:
     try:
-        paths = sorted((REGISTRY.get("claude").home / "projects").rglob(f"{session_id}.jsonl"))
+        paths = _claude_session_files(session_id)
     except OSError:
         return None
     return NativeRef(session_id, str(paths[0])) if paths else None
 
 
 def _claude_availability(ref: NativeRef) -> Availability:
-    path = Path(ref.storage)
     try:
+        path = resolve_storage(Path(ref.storage))
+        if path is None:
+            return Availability.UNAVAILABLE
         metadata = path.stat()
     except FileNotFoundError:
         return Availability.UNAVAILABLE
     except OSError:
         return Availability.UNKNOWN
-    return Availability.AVAILABLE if stat.S_ISREG(metadata.st_mode) else Availability.UNAVAILABLE
+    if not stat.S_ISREG(metadata.st_mode):
+        return Availability.UNAVAILABLE
+    return Availability.COMPRESSED if is_compressed_path(path) else Availability.AVAILABLE
 
 
 def _claude_checkpoint(ref: NativeRef) -> int:
@@ -460,6 +481,25 @@ class DiscoveryCache:
             "updated": 0.0,
         }
 
+    def _carried_over(self, path: Path, stat: os.stat_result) -> dict[str, Any] | None:
+        """The plain file's entry, when compression has kept its modification time."""
+        plain = self.entries.get(str(plain_path(path)))
+        if (
+            not plain
+            or plain.get("mtime_ns") != stat.st_mtime_ns
+            or plain.get("pattern_signature") != self.context.pattern_signature
+            or "candidate_ids" not in plain
+            or "evidence_truncated" not in plain
+        ):
+            return None
+        return dict(
+            plain,
+            inode=stat.st_ino,
+            size=stat.st_size,
+            ctime_ns=getattr(stat, "st_ctime_ns", 0),
+            prefix_identity="",
+        )
+
     def scan(
         self,
         path: Path,
@@ -470,6 +510,8 @@ class DiscoveryCache:
         key = str(path)
         stat = path.stat()
         cached = self.entries.get(key)
+        if cached is None and is_compressed_path(path):
+            cached = self._carried_over(path, stat)
         signature_matches = bool(
             cached and cached.get("pattern_signature") == self.context.pattern_signature
         )
@@ -482,7 +524,12 @@ class DiscoveryCache:
                 or any(name not in cached for name in required_metrics)
             )
         )
-        prefix_matches = bool(cached and signature_matches and _cached_prefix_matches(path, cached))
+        # A compressed file is read once, whole: its bytes are not the transcript's, so there is
+        # nothing to sample and nothing to continue from.
+        compressed = is_compressed_path(path)
+        prefix_matches = compressed or bool(
+            cached and signature_matches and _cached_prefix_matches(path, cached)
+        )
         exact = bool(
             cached
             and signature_matches
@@ -496,6 +543,10 @@ class DiscoveryCache:
             and "evidence_truncated" in cached
         )
         if exact:
+            assert cached is not None
+            if key not in self.entries:
+                self.entries[key] = cached
+                self.dirty = True
             evidence = self.context.accumulator(
                 tokens=list(cached.get("candidate_ids", [])),
                 truncated=bool(cached.get("evidence_truncated")),
@@ -503,6 +554,7 @@ class DiscoveryCache:
             return cached, evidence
         can_continue = bool(
             cached
+            and not compressed
             and signature_matches
             and not needs_count
             and cached.get("inode") == stat.st_ino
@@ -525,8 +577,8 @@ class DiscoveryCache:
         read_stat = stat
         incomplete = False
         try:
-            with path.open("rb") as handle:
-                opened_stat = os.fstat(handle.fileno())
+            with open_for_scan(path) as handle:
+                opened_stat = stat if compressed else os.fstat(handle.fileno())
                 if can_continue and (
                     opened_stat.st_ino != stat.st_ino or opened_stat.st_size < start
                 ):
@@ -610,8 +662,10 @@ class DiscoveryCache:
                             if not meta.get("created"):
                                 meta["created"] = event_time
                             meta["updated"] = max(float(meta.get("updated", 0)), event_time)
-                read_stat = os.fstat(handle.fileno())
-        except OSError:
+                read_stat = stat if compressed else os.fstat(handle.fileno())
+        except (OSError, zstandard.ZstdError):
+            # Unreadable or corrupt: report what was read, but cache nothing, so a
+            # repaired file is scanned again.
             incomplete_evidence = self.context.accumulator(tokens=evidence.tokens, truncated=True)
             return meta, incomplete_evidence
         offset = int(meta.get("offset", start))
@@ -625,11 +679,11 @@ class DiscoveryCache:
             ctime_ns = getattr(read_stat, "st_ctime_ns", 0)
         meta.update(
             inode=read_stat.st_ino,
-            size=offset,
+            size=read_stat.st_size if compressed else offset,
             mtime_ns=read_stat.st_mtime_ns,
             ctime_ns=ctime_ns,
             offset=offset,
-            prefix_identity=_cached_prefix_identity(path, offset) or "",
+            prefix_identity="" if compressed else _cached_prefix_identity(path, offset) or "",
             candidate_ids=evidence.tokens,
             evidence_truncated=evidence.truncated,
             pattern_signature=self.context.pattern_signature,
@@ -668,19 +722,23 @@ def discover(context: HarnessContext, *, use_cache: bool = True) -> list[NativeS
     cache = DiscoveryCache(context)
     result: list[NativeSession] = []
     try:
-        all_files = sorted(projects.rglob("*.jsonl"))
+        found = sorted({*projects.rglob("*.jsonl"), *projects.rglob(f"*.jsonl{ZST_SUFFIX}")})
+        # One file per session: the plain one when both exist.
+        all_files = [
+            path for path in found if not is_compressed_path(path) or plain_path(path) not in found
+        ]
     except OSError:
         all_files = []
         index_complete = False
     else:
         index_complete = True
     for path in all_files:
-        context.index_native("claude", path.stem, str(path))
+        context.index_native("claude", plain_path(path).stem, str(path))
     if index_complete:
         context.complete_native_index("claude")
     files = [path for path in all_files if len(path.relative_to(projects).parts) == 2]
     for path in files:
-        session_id = path.stem
+        session_id = plain_path(path).stem
         if not re.fullmatch(r"[0-9a-fA-F-]{32,36}", session_id):
             continue
         hist = history.get(session_id, {})
@@ -719,6 +777,7 @@ def discover(context: HarnessContext, *, use_cache: bool = True) -> list[NativeS
                 preview=last or first,
                 named=bool(custom),
                 storage=str(path),
+                compressed=is_compressed_path(path),
                 source=SourceKind.SDK if programmatic else SourceKind.INTERACTIVE,
                 resume_id=session_id,
                 message_count=message_count,
@@ -732,7 +791,7 @@ def discover(context: HarnessContext, *, use_cache: bool = True) -> list[NativeS
         path for path in all_files if path.name.startswith("agent-") and "subagents" in path.parts
     ]
     for path in agent_files:
-        fallback_agent_id = path.stem.removeprefix("agent-")
+        fallback_agent_id = plain_path(path).stem.removeprefix("agent-")
         try:
             fallback_parent_id = path.relative_to(projects).parts[1]
         except (ValueError, IndexError):
@@ -764,6 +823,7 @@ def discover(context: HarnessContext, *, use_cache: bool = True) -> list[NativeS
                 preview=last or first,
                 named=False,
                 storage=str(path),
+                compressed=is_compressed_path(path),
                 source=SourceKind.SUBAGENT,
                 resume_id=parent_id,
                 parent_id=parent_id,
@@ -873,12 +933,16 @@ def turn_state(*, pid: int, home: Path, storage: str, command: tuple[str, ...]) 
 
 def publish_name(session: Any, name: str) -> str:
     transcript = Path(session.storage)
-    if not transcript.is_file():
+    if is_compressed_path(transcript):
+        return f"transcript for {session.session_id} is compressed; name kept local only"
+    try:
+        append_jsonl(
+            transcript,
+            {"type": "custom-title", "customTitle": name, "sessionId": session.session_id},
+            create=False,
+        )
+    except FileNotFoundError:
         return f"transcript for {session.session_id} is missing; name kept local only"
-    append_jsonl(
-        transcript,
-        {"type": "custom-title", "customTitle": name, "sessionId": session.session_id},
-    )
     return ""
 
 
@@ -892,6 +956,18 @@ def resume_args(
 ) -> list[str]:
     del source, resume_id, parent_id, native
     return ["--resume", session_id]
+
+
+def transcript_files(ref: NativeRef) -> tuple[Path, ...]:
+    """The main transcript and the subagent logs Claude Code keeps in a folder of its name."""
+    main = plain_path(Path(ref.storage))
+    folder = main.with_suffix("") / "subagents"
+    children = {
+        plain_path(path)
+        for pattern in ("*.jsonl", f"*.jsonl{ZST_SUFFIX}")
+        for path in folder.rglob(pattern)
+    }
+    return (*sorted(children), main)
 
 
 def new_session_args(*, session_id: str | None) -> list[str]:
@@ -932,6 +1008,7 @@ ADAPTER = HarnessAdapter(
     resume_args=resume_args,
     new_session_args=new_session_args,
     extra_dir_args=extra_dir_args,
+    transcript_files=transcript_files,
     publish_name=publish_name,
     inspect_liveness=inspect_liveness,
     liveness_executables=frozenset(("claude", "claude.exe", "claude.cmd", "claude.ps1")),

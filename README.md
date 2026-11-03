@@ -80,6 +80,8 @@ expand it and then choose the exact thread. No title or directory grouping creat
 | `Tab` | Cycle single-tool filter presets |
 | `t` | Choose any combination of tools to show |
 | `o` | Cycle Human, Cross, Agent, Supervisor, and All origins |
+| `z` | Cycle Uncompressed, Compressed, and both |
+| `Z` | Compress the selected session, or decompress it |
 | `v` | Cycle visible, hidden, and all sessions |
 | `d` | Choose a directory |
 | `Space` / `Right` | Expand the selected conversation or thread group |
@@ -122,6 +124,33 @@ and press Enter. Recovery asks before using that selected copy as a new tracked 
 Other copies remain separate; the previous relationship and utility state are backed up.
 Malformed or actively changing transcripts cannot be recovered this way. Recovery never rewrites
 native transcript content or silently merges competing histories.
+
+## Keeping sessions
+
+Nothing is deleted by age. Sessions idle for 30 days are compressed instead, and stay in `sessions`.
+
+- **What counts as idle:** nothing written to the transcript and not opened from `sessions` for 30
+  days. Hidden sessions, agents and supervisors count like any other. Open sessions are left alone.
+  A session and its subagents count as one: while any of them is active, none is compressed.
+- **When it runs:** in the background when `sessions` starts, at most every six hours, one run at a
+  time. `sessions --compress-idle` runs it now, and adding `--dry-run` previews it. Each run is
+  recorded in `retention.log` in the ai-sessions cache folder.
+- **The setting:** `[retention] compress_after_days` in `config.toml`. The default is 30; 0 turns it
+  off.
+- **Finding them:** the default view shows uncompressed sessions. `z` or `--compression
+  compressed|both` shows the rest, and the header says how many matches are compressed.
+- **By hand:** `Z`, or `sessions --compress ID` and `sessions --decompress ID`.
+- **Opening one:** Enter asks, decompresses it, then opens it. It then has a fresh 30 days.
+  Decompressing gives back the exact original bytes.
+- **Safety:** a transcript any program has open is left plain and tried again later. A compressed
+  copy that does not match its plain file is never replaced: both are kept and the message says so.
+- **Bridging and supervising:** only uncompressed sessions can be bridged or get a new supervisor.
+  A supervisor whose target is compressed says so and resumes once it is decompressed.
+- **Outside `sessions`:** Claude Code cannot read a compressed session, so `claude --resume` reports it
+  missing; decompress it first. Codex restores a compressed rollout itself when resuming.
+- **Claude Code's own cleanup:** Claude Code deletes transcripts after `cleanupPeriodDays`, default
+  30. Set it high in `~/.claude/settings.json`, for example `"cleanupPeriodDays": 36500`. Do not use
+  0, which it rejects. This is what stops the deletion; compression alone cannot.
 
 ## Supervisor sessions
 

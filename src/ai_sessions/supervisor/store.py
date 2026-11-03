@@ -19,7 +19,7 @@ from ai_sessions.paths import APP_CONFIG_DIR
 SUPERVISORS_DIR = APP_CONFIG_DIR / "supervisors"
 RECORD_NAME = "record.json"
 TITLE_SUFFIX = " · supervisor"
-_RETRIES = 40
+_RETRIES = 400
 _RETRY_SLEEP = 0.005
 
 

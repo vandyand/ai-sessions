@@ -19,7 +19,16 @@ from dataclasses import replace
 from pathlib import Path
 from typing import Any, Callable, Iterable, Mapping
 
+import zstandard
+
 from ..capabilities import HarnessAdapter, StorageUpgrade
+from ..compression import (
+    ZST_SUFFIX,
+    is_compressed_path,
+    open_for_scan,
+    plain_path,
+    resolve_storage,
+)
 from ..conversion import (
     CODEX_BUDGET_CONTEXT_TOKENS,
     CODEX_CONTEXT_WINDOW,
@@ -373,9 +382,9 @@ def _dated_rollouts(root: Path, session_id: str) -> list[Path]:
     found: list[Path] = []
     for shift in (0, -1, 1):
         day = created + dt.timedelta(days=shift)
-        found += (root / f"{day:%Y}" / f"{day:%m}" / f"{day:%d}").glob(
-            f"rollout-*-{session_id}.jsonl"
-        )
+        folder = root / f"{day:%Y}" / f"{day:%m}" / f"{day:%d}"
+        found += folder.glob(f"rollout-*-{session_id}.jsonl")
+        found += folder.glob(f"rollout-*-{session_id}.jsonl{ZST_SUFFIX}")
     return found
 
 
@@ -389,15 +398,18 @@ def _indexed_rollouts(root: Path, session_id: str) -> list[Path]:
         or now - _rollout_index[0] > _ROLLOUT_INDEX_SECONDS
     ):
         index: dict[str, list[Path]] = {}
-        for path in root.rglob("rollout-*.jsonl"):
-            index.setdefault(path.stem[-36:], []).append(path)
+        for pattern in ("rollout-*.jsonl", f"rollout-*.jsonl{ZST_SUFFIX}"):
+            for path in root.rglob(pattern):
+                index.setdefault(plain_path(path).stem[-36:], []).append(path)
         _rollout_index = (now, root, index)
     return list(_rollout_index[2].get(session_id, ()))
 
 
 def _codex_rollouts(session_id: str) -> list[Path]:
     root = REGISTRY.get("codex").home / "sessions"
-    return sorted(_dated_rollouts(root, session_id) or _indexed_rollouts(root, session_id))
+    found = _dated_rollouts(root, session_id) or _indexed_rollouts(root, session_id)
+    # Plain files first, so a restored rollout wins over its leftover compressed copy.
+    return sorted(found, key=lambda path: (is_compressed_path(path), str(path)))
 
 
 def _codex_exists(session_id: str) -> bool:
@@ -416,14 +428,18 @@ def _codex_resolve(session_id: str) -> NativeRef | None:
 
 
 def _codex_availability(ref: NativeRef) -> Availability:
-    path = Path(ref.storage)
     try:
+        path = resolve_storage(Path(ref.storage))
+        if path is None:
+            return Availability.UNAVAILABLE
         metadata = path.stat()
     except FileNotFoundError:
         return Availability.UNAVAILABLE
     except OSError:
         return Availability.UNKNOWN
-    return Availability.AVAILABLE if stat.S_ISREG(metadata.st_mode) else Availability.UNAVAILABLE
+    if not stat.S_ISREG(metadata.st_mode):
+        return Availability.UNAVAILABLE
+    return Availability.COMPRESSED if is_compressed_path(path) else Availability.AVAILABLE
 
 
 def _codex_checkpoint(ref: NativeRef) -> int:
@@ -634,6 +650,19 @@ class DiscoveryCache:
             except (OSError, json.JSONDecodeError, AttributeError):
                 pass
 
+    def _carried_over(self, path: Path, stat: os.stat_result) -> dict[str, Any] | None:
+        """The plain file's entry, when compression has kept its modification time."""
+        plain = self.entries.get(str(plain_path(path)))
+        if not plain or plain.get("mtime_ns") != stat.st_mtime_ns:
+            return None
+        return dict(
+            plain,
+            inode=stat.st_ino,
+            size=stat.st_size,
+            ctime_ns=getattr(stat, "st_ctime_ns", 0),
+            prefix_identity="",
+        )
+
     def scan(self, path: Path, source: SourceKind) -> tuple[int, int, int, str, Any]:
         key = str(path)
         try:
@@ -641,10 +670,17 @@ class DiscoveryCache:
         except OSError:
             return 0, 0, 0, "", self.context.accumulator()
         cached = self.entries.get(key)
+        compressed = is_compressed_path(path)
+        if cached is None and compressed:
+            cached = self._carried_over(path, stat)
         signature_matches = bool(
             cached and cached.get("pattern_signature") == self.context.pattern_signature
         )
-        prefix_matches = bool(cached and signature_matches and _cached_prefix_matches(path, cached))
+        # A compressed file is read once, whole: its bytes are not the transcript's, so there is
+        # nothing to sample and nothing to continue from.
+        prefix_matches = compressed or bool(
+            cached and signature_matches and _cached_prefix_matches(path, cached)
+        )
         exact = bool(
             cached
             and signature_matches
@@ -663,6 +699,10 @@ class DiscoveryCache:
             and "evidence_truncated" in cached
         )
         if exact:
+            assert cached is not None
+            if key not in self.entries:
+                self.entries[key] = cached
+                self.dirty = True
             evidence = self.context.accumulator(
                 tokens=list(cached.get("candidate_ids", [])),
                 truncated=bool(cached.get("evidence_truncated")),
@@ -676,6 +716,7 @@ class DiscoveryCache:
             )
         can_continue = bool(
             cached
+            and not compressed
             and signature_matches
             and cached.get("mode") == source.value
             and cached.get("inode") == stat.st_ino
@@ -711,7 +752,7 @@ class DiscoveryCache:
         )
         incomplete = False
         try:
-            with path.open("rb") as handle:
+            with open_for_scan(path) as handle:
                 handle.seek(start)
                 while True:
                     line = handle.readline()
@@ -787,7 +828,9 @@ class DiscoveryCache:
                             turn_count += 1
                         last_kind = "event_user"
                         last_text = value
-        except OSError:
+        except (OSError, zstandard.ZstdError):
+            # Unreadable or corrupt: report what was read, but cache nothing, so a
+            # repaired file is scanned again.
             return turn_count, compaction_count, prompt_count, latest, evidence
         try:
             final_stat = path.stat()
@@ -798,11 +841,11 @@ class DiscoveryCache:
             "inode": final_stat.st_ino,
             # ``offset`` is the complete-record boundary.  A concurrent
             # writer's partial final record must be replayed next time.
-            "size": offset,
+            "size": final_stat.st_size if compressed else offset,
             "mtime_ns": final_stat.st_mtime_ns,
             "ctime_ns": getattr(final_stat, "st_ctime_ns", 0),
             "offset": offset,
-            "prefix_identity": _cached_prefix_identity(path, offset) or "",
+            "prefix_identity": "" if compressed else _cached_prefix_identity(path, offset) or "",
             "user_messages": prompt_count,
             "turn_count": turn_count,
             "compaction_count": compaction_count,
@@ -923,8 +966,11 @@ def discover(context: HarnessContext, *, use_cache: bool = True) -> list[NativeS
                 or field("updated_at")
             )
             rollout_path = str(field("rollout_path", "") or "")
-            if rollout_path and not Path(rollout_path).is_file():
-                continue
+            if rollout_path:
+                found = resolve_storage(Path(rollout_path))
+                if found is None:
+                    continue
+                rollout_path = str(found)
             turn_count = 0
             compaction_count = 0
             prompt_count = 0
@@ -953,6 +999,7 @@ def discover(context: HarnessContext, *, use_cache: bool = True) -> list[NativeS
                     preview=latest or indexed_preview,
                     named=bool(name),
                     storage=rollout_path,
+                    compressed=is_compressed_path(rollout_path),
                     source=source,
                     archived=bool(field("archived", False)),
                     resume_id=parent_id
@@ -972,8 +1019,85 @@ def discover(context: HarnessContext, *, use_cache: bool = True) -> list[NativeS
     finally:
         if connection is not None:
             connection.close()
+    known = {item.session_id for item in result}
+    result.extend(_unregistered_sessions(home, known, cache, context))
     cache.save()
     return result
+
+
+def _rollout_meta(path: Path) -> dict[str, Any]:
+    """The ``session_meta`` payload a rollout starts with, or an empty mapping."""
+    try:
+        with open_for_scan(path) as handle:
+            record = json.loads(handle.readline())
+    except (OSError, ValueError, zstandard.ZstdError):
+        return {}
+    if not isinstance(record, dict) or record.get("type") != "session_meta":
+        return {}
+    payload = record.get("payload")
+    return payload if isinstance(payload, dict) else {}
+
+
+def _meta_timestamp(value: object, fallback: float) -> float:
+    try:
+        return dt.datetime.fromisoformat(str(value).replace("Z", "+00:00")).timestamp()
+    except ValueError:
+        return fallback
+
+
+def _unregistered_sessions(
+    home: Path, known: set[str], cache: DiscoveryCache, context: HarnessContext
+) -> list[NativeSession]:
+    """Rollouts missing from the thread database, which Codex can still resume by file."""
+    root = home / "sessions"
+    found: dict[str, Path] = {}
+    try:
+        for pattern in (f"rollout-*.jsonl{ZST_SUFFIX}", "rollout-*.jsonl"):  # plain wins
+            for path in root.rglob(pattern):
+                session_id = plain_path(path).stem[-36:]
+                if session_id not in known:
+                    found[session_id] = path
+    except OSError:
+        return []
+    sessions: list[NativeSession] = []
+    for session_id, path in found.items():
+        meta = _rollout_meta(path)
+        if str(meta.get("id", "")) != session_id:
+            continue
+        try:
+            modified = path.stat().st_mtime
+        except OSError:
+            continue
+        origin = meta.get("source")
+        if isinstance(origin, dict) and "subagent" in origin:
+            source = SourceKind.SUBAGENT
+        elif origin == "exec":
+            source = SourceKind.NON_INTERACTIVE
+        else:
+            source = SourceKind.INTERACTIVE
+        turns, compactions, prompts, latest, evidence = cache.scan(path, source)
+        context.publish("codex", session_id, evidence)
+        sessions.append(
+            NativeSession(
+                tool="codex",
+                session_id=session_id,
+                title=latest,
+                cwd=str(meta.get("cwd") or ""),
+                updated=modified,
+                created=_meta_timestamp(meta.get("timestamp"), modified),
+                preview=latest,
+                named=False,
+                storage=str(path),
+                compressed=is_compressed_path(path),
+                source=source,
+                resume_id=session_id,
+                message_count=prompts,
+                turn_count=turns,
+                compaction_count=compactions,
+                prompt_count=prompts,
+            )
+        )
+    return sessions
 
 
 def _numbered_database_key(path: Path) -> tuple[int, float]:
@@ -1386,6 +1510,10 @@ def resume_args(
     return result
 
 
+def transcript_files(ref: NativeRef) -> tuple[Path, ...]:
+    return (plain_path(Path(ref.storage)),)
+
+
 def new_session_args(*, session_id: str | None) -> list[str]:
     del session_id
     return []
@@ -1426,6 +1554,7 @@ ADAPTER = HarnessAdapter(
     resume_args=resume_args,
     new_session_args=new_session_args,
     extra_dir_args=extra_dir_args,
+    transcript_files=transcript_files,
     publish_name=publish_name,
     upgrade_storage=upgrade_storage,
     inspect_liveness=inspect_liveness,

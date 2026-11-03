@@ -141,3 +141,17 @@ tokens:
   loading status, and refreshed completion status.
 - **Known research gaps:** Keyboard behavior is deterministically tested, but recognition and
   preference for `t` versus Tab require human use rather than agent inference.
+
+## Retention
+
+A compressed transcript is `<name>.jsonl.zst` beside where the plain file was, the form Codex writes
+and reads. `compression.py` holds the file operations: the original is removed only after the copy is
+read back and matches, and only while nothing else has it open: on Windows it holds the file with no
+sharing, because an ordinary delete succeeds under a process that is appending. An existing `.zst` is
+replaced only by a file that contains all of it, so a short file cannot destroy a full history; the
+two are kept and reported instead. `retention.py` works on sessions:
+harnesses name their files through `transcript_files`, and it decides what is idle, treating a
+session and its subagents as one unit so that reopening a parent also protects its logs. A compressed
+session's `storage` is the `.zst`, and `Availability.COMPRESSED` keeps it distinct from a missing
+file, so a compressed copy can never be mistaken for no copy and bridged again. Requirements are in
+`openspec/specs/session-compression/spec.md`.

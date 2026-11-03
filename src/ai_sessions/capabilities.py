@@ -47,6 +47,12 @@ class AvailabilityHook(Protocol):
     def __call__(self, ref: NativeRef) -> Availability: ...
 
 
+class TranscriptFilesHook(Protocol):
+    """A session's transcript files by their plain names, the main file last."""
+
+    def __call__(self, ref: NativeRef) -> tuple[Path, ...]: ...
+
+
 class CheckpointHook(Protocol):
     def __call__(self, ref: NativeRef) -> Checkpoint: ...
 
@@ -217,6 +223,9 @@ class HarnessAdapter:
     extra_dir_args: ExtraDirArgsHook | Unsupported = Unsupported(
         "extra working directories are not supported"
     )
+    transcript_files: TranscriptFilesHook | Unsupported = Unsupported(
+        "sessions are not stored as transcript files"
+    )
     # Whether everything the harness starts may be stopped along with its
     # launcher.  False for a harness that can start a daemon other windows
     # share, which must outlive the window that happened to start it.
@@ -290,6 +299,7 @@ class HarnessAdapter:
             self.injected_prompt,
             self.new_session_args,
             self.extra_dir_args,
+            self.transcript_files,
         )
         if not all(callable(hook) or isinstance(hook, Unsupported) for hook in required + optional):
             raise ValueError("harness capabilities must be callable or Unsupported")

@@ -58,6 +58,8 @@ class LaunchConfig:
     # client left.  Empty means auto-detect.  {session}, {window} and
     # {pane} are substituted into each argument.
     terminal_command: list[str] = field(default_factory=list)
+    # Sessions idle this many days are compressed; 0 turns that off.
+    compress_after_days: int = 30
 
     @classmethod
     def load(cls, path: Path = CONFIG_FILE) -> "LaunchConfig":
@@ -117,6 +119,11 @@ class LaunchConfig:
             allow_lossy = bridge.get("allow_lossy")
             if isinstance(allow_lossy, bool):
                 result.bridge_allow_lossy = allow_lossy
+        retention = payload.get("retention", {})
+        if isinstance(retention, dict):
+            days = retention.get("compress_after_days")
+            if isinstance(days, int) and not isinstance(days, bool) and days >= 0:
+                result.compress_after_days = days
         terminal = payload.get("terminal", {})
         if isinstance(terminal, dict):
             result.terminal_command = _string_list(terminal.get("command"), [])
@@ -243,6 +250,8 @@ class LaunchConfig:
             f"allow_lossy = {str(self.bridge_allow_lossy).lower()}\n"
             f"tool_calls = {str(self.bridge_tool_calls).lower()}\n"
             f"latest_window = {str(self.bridge_latest_window).lower()}\n\n"
+            "[retention]\n"
+            f"compress_after_days = {self.compress_after_days}\n\n"
             "[terminal]\n"
             f"command = {_toml_array(self.terminal_command)}\n"
         )

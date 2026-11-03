@@ -15,6 +15,14 @@
 - `sessions --target-log ID` prints what a supervisor sees of its target, and
   `sessions --install-hooks` / `--uninstall-hooks` add and remove the Claude Code and Codex
   hooks that feed it. Codex asks to re-trust its hooks after an install.
+- Compressed sessions are listed. Codex rollouts stored as `.jsonl.zst` no longer disappear, nor do
+  rollouts missing from Codex's database. `z` or `--compression` chooses uncompressed (the
+  default), compressed or both, and the header counts matches the filter is excluding.
+  The first refresh indexes existing compressed sessions once, in the background.
+- Sessions idle for 30 days are compressed automatically, hidden ones included. `Z`, `--compress`,
+  `--decompress` and `--compress-idle` do it by hand, `[retention] compress_after_days` sets the
+  days, and opening a compressed session decompresses it after asking. Only uncompressed sessions
+  can be bridged or get a new supervisor.
 
 ## 3.7.5 — 2026-10-30
 

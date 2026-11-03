@@ -34,6 +34,7 @@ from typing import Any, Iterable
 
 from . import __version__ as VERSION
 from .capabilities import HarnessAdapter, Unsupported
+from .compression import CompressionError
 from .config import LAUNCH_MODES, LaunchConfig
 from .conversion import (
     BridgeError,
@@ -66,6 +67,7 @@ from .paths import (
     STATE_FILE,
 )
 from .registry import REGISTRY
+from .retention import acquire_lock, note_opened, release_lock, run_sweep, start_background_sweep
 
 ORIGIN_ORDER = ("human", "cross", "agent", "supervisor", "all")
 ORIGIN_LABELS = {
@@ -80,6 +82,12 @@ SUPERVISOR_GLYPH = "◎"
 SUPERVISOR_TITLE_PREFIX = "Supervisor: "
 VISIBILITY_ORDER = ("visible", "hidden", "all")
 VISIBILITY_LABELS = {"visible": "Visible", "hidden": "Hidden", "all": "Visible + hidden"}
+COMPRESSION_ORDER = ("uncompressed", "compressed", "both")
+COMPRESSION_LABELS = {
+    "uncompressed": "Uncompressed",
+    "compressed": "Compressed",
+    "both": "Uncompressed + compressed",
+}
 SORT_LABELS = {
     "recent": "Recent",
     "title": "Title",
@@ -133,7 +141,7 @@ def available_launch_tools(item: Session) -> tuple[str, ...]:
 
 
 def can_bridge(item: Session) -> bool:
-    if not item.storage:
+    if not item.storage or item.compressed:
         return False
     try:
         reader = REGISTRY.get(item.tool).read
@@ -485,6 +493,23 @@ class UserState:
                 "unstable": [],
                 "unknown": [],
             }
+        compressed = [
+            (key, member)
+            for key, member in all_members
+            if int(member.get("generation", 0)) == maximum
+            and availability[key] == "compressed"
+            and str(member.get("frontier", "")) not in current_frontiers
+        ]
+        if compressed:
+            return {
+                "conflict": False,
+                "heads": current,
+                "advanced": [],
+                "unavailable": [],
+                "unstable": [],
+                "unknown": [],
+                "compressed": compressed,
+            }
         unknown = [
             pair
             for pair in all_members
@@ -564,12 +589,14 @@ class UserState:
     ) -> tuple[str, list[tuple[str, dict[str, Any]]]]:
         """Report a conversation's head state without mutating anything.
 
-        Returns ``("ok" | "diverged" | "unavailable" | "unknown", heads)``.
+        Returns ``("ok" | "diverged" | "compressed" | "unavailable" | "unknown", heads)``.
         """
         if conversation_id not in self.conversations:
             return "unknown", []
         status = self._conversation_status(conversation_id)
         heads: list[tuple[str, dict[str, Any]]] = list(status["heads"])
+        if status.get("compressed"):
+            return "compressed", heads
         if status["unknown"]:
             return "unknown", heads
         if status["unavailable"] or status["unstable"]:
@@ -608,6 +635,11 @@ class UserState:
         if not conversation_id:
             return item, item if item.tool == target_tool else None, ""
         status = self._conversation_status(conversation_id)
+        if status.get("compressed"):
+            labels = ", ".join(key for key, _ in status["compressed"])
+            raise BridgeError(
+                f"conversation {conversation_id[:8]} is compressed ({labels}); decompress it first"
+            )
         if status["unknown"]:
             labels = ", ".join(key for key, _ in status["unknown"])
             raise BridgeError(
@@ -673,7 +705,10 @@ class UserState:
             blocker = next(
                 (name for name in ("unknown", "unstable", "unavailable") if status[name]), ""
             )
-            head_keys = {key for key, _ in status["heads"]}
+            compressed_heads = status.get("compressed", ())
+            if compressed_heads:
+                blocker = "compressed"
+            head_keys = {key for key, _ in (*status["heads"], *compressed_heads)}
             for key in conversation["members"]:
                 item = by_key.get(key)
                 if item is None:
@@ -689,7 +724,8 @@ class UserState:
             if source_key in self.session_conversations:
                 continue
             source = by_key.get(source_key)
-            if source is None:
+            if source is None or source.compressed:
+                # A compressed source has no plain position yet; it migrates once restored.
                 continue
             conversation_id, source_member = self._ensure_conversation(source)
             source_updated = max(
@@ -880,6 +916,11 @@ class UserState:
             raise BridgeError(
                 f"the recorded {tool_label(tool)} copy {session_id} could not be verified; "
                 "restore storage access or retry; refusing to create a duplicate"
+            )
+        if availability == "compressed":
+            raise BridgeError(
+                f"the recorded {tool_label(tool)} copy {session_id} is compressed; "
+                "decompress it first; refusing to create a duplicate"
             )
         if availability != "available":
             return ""
@@ -1246,6 +1287,11 @@ def _view_representative(items: tuple[Session, ...]) -> Session:
     return sorted(heads, key=lambda item: (-item.updated, item.tool, item.session_id))[0]
 
 
+def blocks_actions(item: Session) -> bool:
+    """A compressed conversation is whole, so a row can still act on it."""
+    return bool(item.conversation_blocker) and item.conversation_blocker != "compressed"
+
+
 def _tracked_target(items: tuple[Session, ...]) -> Session | None:
     """Return a deterministic native representative for a validated head set.
 
@@ -1254,7 +1300,7 @@ def _tracked_target(items: tuple[Session, ...]) -> Session | None:
     time.  Divergence is different and must remain both non-actionable here and
     refused by UserState.resolve_launch().
     """
-    if any(item.diverged or item.conversation_blocker for item in items):
+    if any(item.diverged or blocks_actions(item) for item in items):
         return None
     heads = tuple(item for item in items if not item.superseded and not item.diverged)
     return _view_representative(heads) if heads else None
@@ -1392,13 +1438,13 @@ def build_view_rows(
                 (item,),
                 (item,),
                 item,
-                None if item.conversation_blocker else item,
+                None if blocks_actions(item) else item,
                 conversation_status(item)
                 if logical.status != "independent thread"
                 else "independent thread",
                 display_title(item),
                 project_identity(item.cwd),
-                actionable=not bool(item.conversation_blocker),
+                actionable=not blocks_actions(item),
             )
             for item in logical.members
         )
@@ -1642,6 +1688,7 @@ def session_from_native(item: NativeSession) -> Session:
         original_title=item.title,
         original_named=item.named,
         message_count=item.message_count,
+        compressed=item.compressed,
         agent_nickname=item.agent_nickname,
         turn_count=item.turn_count,
         compaction_count=item.compaction_count,
@@ -1929,6 +1976,7 @@ def load_session_catalog(
         return []
     field_names = {field.name for field in fields(Session)}
     migratable_fields = {
+        "compressed",
         "turn_count",
         "compaction_count",
         "prompt_count",
@@ -1947,6 +1995,7 @@ def load_session_catalog(
             if not isinstance(message_count, int) or isinstance(message_count, bool):
                 continue
             defaults = {
+                "compressed": False,
                 "turn_count": message_count,
                 "compaction_count": 0,
                 "prompt_count": message_count,
@@ -2175,8 +2224,11 @@ class SessionRefresh:
 
 def detect_open_sessions(
     sessions: Iterable[Session], *, context: HarnessContext | None = None
-) -> None:
-    """Fan one shared host snapshot through registered adapter liveness hooks."""
+) -> bool:
+    """Fan one shared host snapshot through registered adapter liveness hooks.
+
+    Returns False when part of the answer could not be established.
+    """
     session_list = list(sessions)
     for item in session_list:
         item.is_open = False
@@ -2193,11 +2245,12 @@ def detect_open_sessions(
         if own:
             pending.append((adapter, own))
     if not pending:
-        return
+        return True
     shared = context or HarnessContext.create()
     populate_liveness_context(shared)
     snapshot = immutable_liveness_context(shared)
     live_pids = {process.pid for process in snapshot.process_snapshot}
+    complete = bool(live_pids)
     for adapter, own in pending:
         hook = adapter.inspect_liveness
         assert not isinstance(hook, Unsupported)
@@ -2209,6 +2262,7 @@ def detect_open_sessions(
             pairs = tuple(detected.items())
         except Exception as error:
             record_warning(f"could not inspect {adapter.label} liveness: {error}")
+            complete = False
             continue
         by_id = {item.session_id: item for item in own}
         for session_id, pid in pairs:
@@ -2224,6 +2278,7 @@ def detect_open_sessions(
                 continue
             item.is_open = True
             item.open_pid = pid
+    return complete
 
 
 def process_environment(pid: int) -> dict[str, str]:
@@ -2645,6 +2700,10 @@ def query_match(session: Session, query: str) -> tuple[bool, int]:
     return True, score
 
 
+def compression_matches(item: Session, compression: str) -> bool:
+    return compression == "both" or item.compressed == (compression == "compressed")
+
+
 def filtered_sessions(
     sessions: Iterable[Session],
     tool: str = "all",
@@ -2655,6 +2714,7 @@ def filtered_sessions(
     visibility: str = "visible",
     include_auxiliary: bool | None = None,
     sort_mode: str = "recent",
+    compression: str = "uncompressed",
 ) -> list[Session]:
     # Backward compatibility for scripts written against v1.
     if include_auxiliary:
@@ -2666,6 +2726,8 @@ def filtered_sessions(
         if visibility == "visible" and item.hidden:
             continue
         if visibility == "hidden" and not item.hidden:
+            continue
+        if not compression_matches(item, compression):
             continue
         if tools is not None:
             if item.tool not in tools:
@@ -2787,6 +2849,8 @@ def updated_age(value: float, *, now: float | None = None) -> str:
 
 def blocked_row_message(row: ViewRow) -> str:
     problem = row.representative.conversation_blocker
+    if problem == "compressed":
+        return "This session is compressed. Press Z to decompress it."
     if problem:
         return (
             f"Linked history validation blocked ({problem}); the transcript exists, "
@@ -2860,6 +2924,7 @@ class Browser:
         self._tools = set(REGISTRY.names())
         self.origin = "human"
         self.visibility = "visible"
+        self.compression = "uncompressed"
         self.directory = ""
         self.query = ""
         self.sort_mode = "recent"
@@ -3072,7 +3137,7 @@ class Browser:
         except curses.error:
             pass
 
-    def current(self) -> list[Session]:
+    def current(self, compression: str | None = None) -> list[Session]:
         items = filtered_sessions(
             self.sessions,
             tools=self.tools,
@@ -3081,6 +3146,7 @@ class Browser:
             origin=self.origin,
             visibility=self.visibility,
             sort_mode=self.sort_mode,
+            compression=compression or self.compression,
         )
         if self.project_focus:
             focus = project_identity(self.project_focus)
@@ -3093,7 +3159,11 @@ class Browser:
         records = {item.supervised_by for item in eligible if item.supervised_by}
         if records and self.visibility != "hidden":
             keys.extend(
-                item.key for item in self.sessions if item.supervises in records and not item.hidden
+                item.key
+                for item in self.sessions
+                if item.supervises in records
+                and not item.hidden
+                and compression_matches(item, self.compression)
             )
         return pair_supervisor_rows(
             build_view_rows(self.sessions, expanded=self.expanded, visible_keys=keys)
@@ -3171,8 +3241,11 @@ class Browser:
         mode_style = "warning" if self.launch_config.mode == "dangerous" else "success"
         self.add(0, 14, mode_text, self.style(mode_style, curses.A_BOLD))
         refresh_text = " · refreshing" if self.refresh is not None else ""
+        excluded = self.compressed_excluded()
+        excluded_text = f" · {excluded} compressed" if excluded else ""
         count_text = (
-            f"{open_count} open · {len(rows)} shown · {len(self.sessions)} indexed{refresh_text}"
+            f"{open_count} open · {len(rows)} shown{excluded_text} · "
+            f"{len(self.sessions)} indexed{refresh_text}"
         )
         self.add(0, max(1, width - len(count_text) - 2), count_text, self.style("muted"))
 
@@ -3181,6 +3254,7 @@ class Browser:
         filters = (
             f"{tool_text}  ·  {ORIGIN_LABELS[self.origin]}  ·  "
             f"{VISIBILITY_LABELS[self.visibility]}  ·  "
+            f"{COMPRESSION_LABELS[self.compression]}  ·  "
             f"{ellipsize(dir_text, max(10, width // 4))}  ·  {SORT_LABELS[self.sort_mode]}"
         )
         self.add(1, 1, filters, self.style("muted"), width - 2)
@@ -3252,6 +3326,13 @@ class Browser:
                 "Esc clears the search; t chooses tools; d changes directory.",
                 self.style("muted"),
             )
+            if excluded:
+                self.add(
+                    list_top + 4,
+                    3,
+                    f"{excluded} compressed sessions match; z shows them.",
+                    self.style("warning"),
+                )
         else:
             for row, view_row in enumerate(rows[self.offset : self.offset + visible_rows]):
                 index = self.offset + row
@@ -3296,9 +3377,9 @@ class Browser:
                 status = view_row.status
                 segment(column_cell(connection_label(item), connection_width), "muted")
                 segment(
-                    column_cell(copy_status(status), status_width),
+                    column_cell(status_label(item, status), status_width),
                     "muted"
-                    if status == "standalone"
+                    if status == "standalone" or item.compressed
                     else ("success" if status == "latest copy" else "warning"),
                     curses.A_BOLD,
                 )
@@ -3334,6 +3415,8 @@ class Browser:
             name_badge = " · utility name" if item.renamed else (" · named" if item.named else "")
             source_badge = f" · {item.source}" if item.source != "interactive" else ""
             hidden_badge = " · hidden" if item.hidden else ""
+            if item.compressed:
+                hidden_badge += " · compressed"
             launch_tool = tool_label(active_launch_tool(item))
             if session_needs_bridge(item):
                 launch_tool += " (bridged copy)"
@@ -3405,7 +3488,7 @@ class Browser:
 
         footer = self.message or (
             "Enter open  t tools  i details  f focus  Space/Right expand  Left collapse  "
-            "Ctrl-F search  r rename  h hide  q quit  ? help"
+            "Ctrl-F search  r rename  h hide  Z compress  q quit  ? help"
         )
         self.add(footer_row, 1, footer, self.style("accent", curses.A_BOLD), width - 2)
         if self.searching:
@@ -3513,6 +3596,93 @@ class Browser:
         self.origin = ORIGIN_ORDER[(index + (-1 if backwards else 1)) % len(ORIGIN_ORDER)]
         self.keep_selection(previous)
 
+    def toggle_compression(self) -> None:
+        """``Z``: compress what is plain in the selected row, or restore all of it."""
+        from .retention import can_compress, compress_session, decompress_session
+
+        self.finish_refresh()
+        row = self.selected_row()
+        if row is None:
+            return
+        previous = row.row_id
+        known = detect_open_sessions(self.sessions) is not False
+        members = [item for item in row.all_members if can_compress(item)]
+        if not members:
+            self.message = "Sessions from this harness cannot be compressed."
+            return
+        plain = [item for item in members if not item.compressed]
+        if plain:
+            if not known:
+                self.message = "Could not tell which sessions are open, so nothing changed."
+                return
+            ready = [item for item in plain if not item.is_open]
+            if not ready:
+                self.message = "This session is open, so it stays uncompressed."
+                return
+            verb, change = "Compress", compress_session
+        else:
+            ready, verb, change = members, "Decompress", decompress_session
+        self.message = f"{verb}ing {len(ready)} session(s)…"
+        self.draw()
+        notes: list[str] = []
+        try:
+            for item in ready:
+                notes.append(change(item) or "")
+        except CompressionError as error:
+            self.message = str(error)
+        else:
+            self.message = f"{verb}ed {len(ready)} session(s). z changes which are shown."
+            self.message = " ".join((self.message, *filter(None, notes)))
+        self.state.apply(self.sessions)
+        self.keep_selection(previous)
+        self.begin_refresh()
+
+    def restore_to_open(self, row: ViewRow, chosen: Session) -> Session | None:
+        """Ask to decompress what opening ``row`` needs; return the session to open."""
+        from .retention import decompress_session, needs_restore, sync_storage
+
+        for item in (*row.all_members, chosen):
+            sync_storage(item)
+        needed = [item for item in row.all_members if needs_restore(item) and not item.superseded]
+        if needs_restore(chosen) and chosen not in needed:
+            needed.append(chosen)
+        if not needed:
+            return chosen
+        self.message = (
+            f"Compressed. Decompress {ellipsize(display_title(chosen), 38)!r} and open it? "
+            "y=yes; other key=cancel."
+        )
+        self.draw()
+        key = self.screen.get_wch()
+        self.message = ""
+        if not isinstance(key, str) or key.casefold() != "y":
+            self.message = "Left compressed; nothing changed."
+            return None
+        self.message = "Decompressing…"
+        self.draw()
+        notes: list[str] = []
+        try:
+            for item in needed:
+                notes.append(decompress_session(item))
+        except CompressionError as error:
+            self.message = str(error)
+            return None
+        self.message = " ".join(filter(None, notes))
+        self.state.apply(self.sessions)
+        return chosen
+
+    def compressed_excluded(self) -> int:
+        """How many sessions match everything but the compression filter."""
+        if self.compression != "uncompressed":
+            return 0
+        return len(self.current("compressed"))
+
+    def cycle_compression(self) -> None:
+        previous = self.selected_id()
+        index = COMPRESSION_ORDER.index(self.compression)
+        self.compression = COMPRESSION_ORDER[(index + 1) % len(COMPRESSION_ORDER)]
+        self.keep_selection(previous)
+
     def cycle_visibility(self, backwards: bool = False) -> None:
         previous = self.selected_id()
         index = VISIBILITY_ORDER.index(self.visibility)
@@ -3574,6 +3744,7 @@ class Browser:
             tools=self.tools,
             origin=self.origin,
             visibility=self.visibility,
+            compression=self.compression,
         )
         for item in eligible:
             if item.cwd:
@@ -3980,6 +4151,7 @@ class Browser:
             if attempt == 0:
                 self.origin = "all"
                 self.visibility = "all"
+                self.compression = "both"
                 self.tools = set(REGISTRY.names())
                 self.directory = ""
                 self.project_focus = ""
@@ -4068,7 +4240,9 @@ class Browser:
                 "on a supervisor, go to its target",
             ),
             ("v", "Cycle Visible → Hidden → Visible + hidden"),
-            ("A", "Show every session: all origins, visible and hidden"),
+            ("z", "Cycle Uncompressed → Compressed → both"),
+            ("Z", "Compress the selected session, or decompress it"),
+            ("A", "Show every session: all origins, visible and hidden, compressed or not"),
             ("H", "Show every hidden session across all origins"),
             ("r", "Rename; an empty name restores the vendor/original title"),
             ("h", "Hide or unhide the selected native session (never deletes it)"),
@@ -4249,6 +4423,9 @@ class Browser:
                         else:
                             self.message = blocked_row_message(chosen_row)
                             continue
+                    chosen = self.restore_to_open(chosen_row, chosen)
+                    if chosen is None:
+                        continue
                     if chosen.is_open and IS_WINDOWS:
                         # Windows Terminal cannot be asked to raise one tab, so
                         # resume here instead, once the running copy has stopped:
@@ -4330,10 +4507,15 @@ class Browser:
                 self.rename_selected()
             elif not self.searching and key == "h":
                 self.toggle_hidden()
+            elif not self.searching and key == "z":
+                self.cycle_compression()
+            elif not self.searching and key == "Z":
+                self.toggle_compression()
             elif not self.searching and key == "A":
                 self.tool = "all"
                 self.origin = "all"
                 self.visibility = "all"
+                self.compression = "both"
                 self.directory = ""
                 self.project_focus = ""
                 self.query = ""
@@ -4342,6 +4524,7 @@ class Browser:
                 self.tool = "all"
                 self.origin = "all"
                 self.visibility = "hidden"
+                self.compression = "both"
                 self.directory = ""
                 self.project_focus = ""
                 self.query = ""
@@ -4430,6 +4613,13 @@ def command_for(session: Session, config: LaunchConfig) -> list[str]:
     return argv
 
 
+def compressed_message(session: Session) -> str:
+    return (
+        f"{tool_label(session.tool)} session {session.session_id} is compressed; decompress it "
+        f"first: sessions --decompress {session.session_id}, or Z in the browser"
+    )
+
+
 def prepare_launch(
     session: Session,
     *,
@@ -4444,10 +4634,25 @@ def prepare_launch(
     repeatedly launching the same pairing continues one conversation rather
     than spawning a new snapshot each time.
     """
+    from .retention import decompress_session, needs_restore, sync_storage
+
     tool = active_launch_tool(session)
     conversation_id = session.conversation_id
+    sync_storage(session)
+    if session.compressed:
+        raise BridgeError(compressed_message(session))
+    if needs_restore(session):
+        try:
+            leftover = decompress_session(session)
+        except CompressionError as error:
+            raise BridgeError(str(error)) from error
+        if leftover:
+            print(f"sessions: {leftover}", file=sys.stderr)
     if state is not None:
         source, target, conversation_id = state.resolve_launch(session, tool)
+        for resolved in (source, target):
+            if resolved is not None and resolved.compressed:
+                raise BridgeError(compressed_message(resolved))
         if target is not None:
             target.launch_tool = ""
             if target.key == session.key:
@@ -4692,6 +4897,7 @@ def launch(
     if note:
         print(f"sessions: {note}", file=sys.stderr)
     if not dry_run:
+        note_opened(session)
         for notice in upgrade_native_storage(session, config, state):
             print(f"sessions: {notice}", file=sys.stderr)
     argv = command_for(session, config)
@@ -4769,6 +4975,27 @@ def supervise_session(
     return launch_supervisor(record_id, config, state, dry_run)
 
 
+def _restore_native_session(adapter: HarnessAdapter, tool: str, session_id: str) -> bool:
+    """Decompress a session about to be resumed; False when that failed and was reported."""
+    from .retention import decompress_session, needs_restore
+
+    resolve = adapter.resolve
+    ref = None if isinstance(resolve, Unsupported) or not session_id else resolve(session_id)
+    if ref is None:
+        return True
+    placeholder = Session(tool, session_id, "", "", 0.0, 0.0, "", False, ref.storage)
+    if not needs_restore(placeholder):
+        return True
+    try:
+        leftover = decompress_session(placeholder)
+    except CompressionError as error:
+        print(f"sessions: {error}", file=sys.stderr)
+        return False
+    if leftover:
+        print(f"sessions: {leftover}", file=sys.stderr)
+    return True
+
+
 def launch_supervisor(
     record_id: str,
     config: LaunchConfig,
@@ -4793,6 +5020,8 @@ def launch_supervisor(
     adapter = REGISTRY.get(tool)
     cwd = strip_extended_prefix(str(record.get("cwd", ""))) or str(HOME)
     title = str(record.get("title", "")) or "supervisor"
+    if not dry_run and not _restore_native_session(adapter, tool, hook_state.native_session_id):
+        return 2
     # Resume only a native session the harness actually stored; one that was started and quit
     # before its first prompt has nothing to resume, so it starts again under the same id.
     fresh = not _native_session_stored(adapter, hook_state.native_session_id)
@@ -4845,6 +5074,7 @@ def launch_supervisor(
             print(f"sessions: {argv[0]!r} is not on PATH", file=sys.stderr)
             return 127
         record_launch(session, argv, executable)
+        note_opened(session)
         if IS_WINDOWS:
             return run_harness(session, [executable, *argv[1:]])
         os.execvp(argv[0], argv)
@@ -4905,6 +5135,10 @@ def choose_reattach(sessions: list[Session]) -> Session | None:
         return None
 
 
+def status_label(item: Session, status: str) -> str:
+    return "compressed" if item.compressed else copy_status(status)
+
+
 def list_output(items: list[Session], as_json: bool = False) -> None:
     if as_json:
         print(json.dumps([asdict(item) for item in items], indent=2, ensure_ascii=False))
@@ -4940,11 +5174,51 @@ def list_output(items: list[Session], as_json: bool = False) -> None:
             f"{ORIGIN_LABELS[item.origin]:<7} {open_symbol:<5} "
             f"{activity_label(item):<{activity_width}} "
             f"{('hidden' if item.hidden else 'visible'):<8} "
-            f"{connection_label(item):<11} {copy_status(conversation_status(item)):<{conversation_width}} "
+            f"{connection_label(item):<11} "
+            f"{status_label(item, conversation_status(item)):<{conversation_width}} "
             f"{relative_time(item.created):<12} {updated_age(item.updated):<17} "
             f"{rendered_title:<{title_width}} "
             f"{short_path(item.cwd)}"
         )
+
+
+def sessions_are_known(sessions: list[Session]) -> bool:
+    """Update which sessions are open; False when that could not be established."""
+    try:
+        return detect_open_sessions(sessions) is not False
+    except Exception as error:
+        record_warning(f"could not inspect open sessions: {error}")
+        return False
+
+
+def compress_idle(sessions: list[Session], config: LaunchConfig, *, dry_run: bool) -> int:
+    """Run idle compression once, or show what it would do."""
+    days = config.compress_after_days
+    if not days:
+        print("sessions: idle compression is off (retention.compress_after_days = 0)")
+        return 0
+    if dry_run:
+        preview = run_sweep(sessions, days, dry_run=True)
+        print(
+            f"sessions: would compress {preview.compressed} session(s), "
+            f"{preview.bytes_before / 1e9:.2f} GB, idle for {days} days or more"
+        )
+        return 0
+    if not acquire_lock():
+        print("sessions: idle compression is already running")
+        return 0
+    try:
+        result = run_sweep(sessions, days, refresh=sessions_are_known)
+        save_session_catalog(sessions)
+    finally:
+        release_lock()
+    print(
+        f"sessions: compressed {result.compressed} session(s), "
+        f"{result.bytes_before / 1e9:.2f} GB to {result.bytes_after / 1e9:.2f} GB"
+    )
+    for failure in result.failures:
+        print(f"sessions: {failure}", file=sys.stderr)
+    return 0
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -4977,6 +5251,12 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--tool", choices=tool_order(), default="all", help="initial tool filter")
     parser.add_argument(
         "--origin", choices=ORIGIN_ORDER, default="human", help="filter by who launched the session"
+    )
+    parser.add_argument(
+        "--compression",
+        choices=COMPRESSION_ORDER,
+        default="uncompressed",
+        help="filter by whether sessions are compressed on disk",
     )
     parser.add_argument(
         "--visibility",
@@ -5061,6 +5341,13 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("--hide", metavar="ID_OR_NAME", help="hide a session from the normal view")
     parser.add_argument("--unhide", metavar="ID_OR_NAME", help="restore a hidden session")
+    parser.add_argument("--compress", metavar="ID_OR_NAME", help="compress a session on disk")
+    parser.add_argument("--decompress", metavar="ID_OR_NAME", help="restore a compressed session")
+    parser.add_argument(
+        "--compress-idle",
+        action="store_true",
+        help="compress sessions idle for the configured days; --dry-run previews it",
+    )
     parser.add_argument(
         "--dry-run", action="store_true", help="print the resume command instead of running it"
     )
@@ -5130,6 +5417,9 @@ def main(argv: list[str] | None = None) -> int:
             or args.rename
             or args.hide
             or args.unhide
+            or args.compress
+            or args.decompress
+            or args.compress_idle
         )
         and sys.stdin.isatty()
         and sys.stdout.isatty()
@@ -5190,8 +5480,31 @@ def main(argv: list[str] | None = None) -> int:
         print(f"Session name: {display_title(item)}")
         if note:
             print(f"sessions: {note}", file=sys.stderr)
-    if args.hide or args.unhide or args.rename:
+    for action, target in (("compress", args.compress), ("decompress", args.decompress)):
+        if target:
+            from . import retention
+
+            item = resolve(target)
+            if item is None:
+                return 2
+            if action == "compress" and not sessions_are_known(sessions):
+                print(
+                    "sessions: could not tell which sessions are open, so nothing changed",
+                    file=sys.stderr,
+                )
+                return 2
+            try:
+                note = getattr(retention, f"{action}_session")(item)
+            except CompressionError as error:
+                print(f"sessions: {error}", file=sys.stderr)
+                return 2
+            print(f"{display_title(item)}: {action}ed")
+            if note:
+                print(f"sessions: {note}", file=sys.stderr)
+    if args.hide or args.unhide or args.rename or args.compress or args.decompress:
         return 0
+    if args.compress_idle:
+        return compress_idle(sessions, launch_config, dry_run=args.dry_run)
 
     directory = ""
     if args.directory:
@@ -5217,6 +5530,7 @@ def main(argv: list[str] | None = None) -> int:
         origin=selected_origin,
         visibility=args.visibility,
         sort_mode=args.sort,
+        compression=args.compression,
     )
 
     if args.resume:
@@ -5224,6 +5538,9 @@ def main(argv: list[str] | None = None) -> int:
         if item is None:
             return 2
         if args.launch_tool and not supports_launch_tool(item, args.launch_tool):
+            if item.compressed:
+                print(f"sessions: {compressed_message(item)}", file=sys.stderr)
+                return 2
             tools = ", ".join(sorted({tool_label(tool) for tool in available_launch_tools(item)}))
             print(
                 f"sessions: --launch-tool={args.launch_tool} is not available for "
@@ -5278,6 +5595,7 @@ def main(argv: list[str] | None = None) -> int:
         browser.tool = args.tool
         browser.origin = selected_origin
         browser.visibility = args.visibility
+        browser.compression = args.compression
         browser.directory = directory
         browser.query = args.query
         browser.sort_mode = args.sort
@@ -5289,6 +5607,8 @@ def main(argv: list[str] | None = None) -> int:
         finally:
             loaded = browser.sessions
 
+    if launch_config.compress_after_days and not args.dry_run:
+        start_background_sweep()
     selected = curses.wrapper(wrapped)
     if isinstance(selected, tuple):
         action, selected = selected

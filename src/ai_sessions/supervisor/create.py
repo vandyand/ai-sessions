@@ -96,6 +96,10 @@ def create_supervisor(
     save: bool = True,
 ) -> str:
     """Register a supervisor for ``target`` and return its record id."""
+    if target.compressed:
+        raise SupervisorError(
+            "This session is compressed, so it cannot be supervised. Decompress it with Z first."
+        )
     if not supports_supervising(target.tool):
         label = REGISTRY.get(target.tool).label if target.tool in REGISTRY else target.tool
         raise SupervisorError(

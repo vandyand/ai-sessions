@@ -34,6 +34,7 @@ from pathlib import Path
 from typing import Any, Callable, Iterable, Iterator, Mapping
 
 from .capabilities import HarnessAdapter, Unsupported
+from .compression import is_compressed_path, plain_path, resolve_storage
 from .model import (
     DEFAULT_MAX_CHARS,
     HANDOFF_NOTE_RESERVE_CHARS,
@@ -115,7 +116,7 @@ class BridgeError(RuntimeError):
     """A session could not be carried into another harness."""
 
 
-def append_jsonl(path: Path, payload: dict[str, Any]) -> None:
+def append_jsonl(path: Path, payload: dict[str, Any], *, create: bool = True) -> None:
     """Append one compact JSON line, repairing a missing final newline first.
 
     Both providers append to these files while they run, so the line is
@@ -131,6 +132,12 @@ def append_jsonl(path: Path, payload: dict[str, Any]) -> None:
                     prefix = b"\n"
     except OSError:
         pass
+    if not create:
+        # A transcript compressed a moment ago must not come back as a file holding one line.
+        flags = os.O_WRONLY | os.O_APPEND | getattr(os, "O_BINARY", 0)
+        with os.fdopen(os.open(path, flags), "wb") as handle:
+            handle.write(prefix + line + b"\n")
+        return
     path.parent.mkdir(parents=True, exist_ok=True)
     with path.open("ab") as handle:
         handle.write(prefix + line + b"\n")
@@ -389,6 +396,15 @@ def read_transcript(
     ).transcript
 
 
+def _compressed_message(label: str) -> str:
+    return f"the {label} source session is compressed; decompress it first"
+
+
+def _plain_ref(ref: NativeRef) -> NativeRef:
+    """A reference to an available session names its plain file even if stored as ``.zst``."""
+    return replace(ref, storage=str(plain_path(Path(ref.storage))))
+
+
 def read_snapshot(
     tool: str,
     native: NativeRef,
@@ -410,11 +426,14 @@ def read_snapshot(
         raise BridgeError(
             f"the {adapter.label} source session is unavailable, so there is nothing to carry over"
         )
+    if availability == "compressed":
+        raise BridgeError(_compressed_message(adapter.label))
     if availability != "available":
         raise BridgeError(
             f"the {adapter.label} source session could not be verified safely; "
             "restore storage access or retry"
         )
+    native = _plain_ref(native)
     reader = adapter.read
     if isinstance(reader, Unsupported):
         raise BridgeError(f"{adapter.label} cannot read native transcripts: {reader.reason}")
@@ -459,6 +478,8 @@ def read_since(tool: str, ref: NativeRef, checkpoint: Checkpoint) -> ReadSnapsho
     availability = native_session_availability(tool, ref)
     if availability == "unavailable":
         raise BridgeError(f"the {adapter.label} source session is unavailable")
+    if availability == "compressed":
+        raise BridgeError(_compressed_message(adapter.label))
     if availability != "available":
         raise BridgeError(
             f"the {adapter.label} source session could not be verified safely; "
@@ -466,6 +487,7 @@ def read_since(tool: str, ref: NativeRef, checkpoint: Checkpoint) -> ReadSnapsho
         )
     if not is_checkpoint(checkpoint):
         return None
+    ref = _plain_ref(ref)
     try:
         result = reader(ref, checkpoint)
     except OSError as error:
@@ -1129,7 +1151,7 @@ def native_session_exists(tool: str, session_id: str, storage: str = "") -> bool
 
 
 def native_session_availability(tool: str, ref: NativeRef) -> str:
-    """Return available, unavailable, or unknown for one exact native ref."""
+    """Return available, compressed, unavailable, or unknown for one exact native ref."""
     if tool not in REGISTRY:
         return "unknown"
     probe = REGISTRY.get(tool).availability
@@ -1168,6 +1190,10 @@ def conversation_change_status(
     """Classify semantic activity, instability, or unavailable harness support."""
     if tool not in REGISTRY:
         return "unknown"
+    if is_compressed_path(native.storage):
+        found = resolve_storage(Path(native.storage))
+        if found is not None:
+            native = NativeRef(native.session_id, str(found))
     if not is_checkpoint(checkpoint):
         return "unstable"
     resolved_availability = (

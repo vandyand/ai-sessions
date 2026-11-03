@@ -306,6 +306,13 @@ def _prepare(
             "in the sessions browser.",
             hook,
         )
+    if status == "compressed":
+        return (
+            f"⚠ supervisor: the target has been compressed since {_when(hook.updated)}, so no new "
+            "activity can be shown. The checkpoint is unchanged, and updates resume once the user "
+            "decompresses it with Z in the sessions browser.",
+            hook,
+        )
     if status != "ok" or not heads:
         what = "unavailable" if status == "unavailable" or not heads else "unverifiable"
         return _unavailable(hook, what), hook
