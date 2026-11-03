@@ -112,6 +112,16 @@ class FailureTests(Fixture):
         self.assertEqual(self.names(), ["session.jsonl"])
         self.assertEqual(self.path.read_bytes(), BODY)
 
+    @unittest.skipIf(os.name == "nt", "Windows deletes through the held handle itself")
+    def test_a_name_that_now_belongs_to_a_newer_file_is_not_deleted(self) -> None:
+        with self.path.open("rb") as held:
+            replacement = self.path.with_name("replacement")
+            replacement.write_bytes(b"newer\n")
+            os.replace(replacement, self.path)
+            with self.assertRaises(FileExistsError):
+                compression._delete_open(held, self.path)
+        self.assertEqual(self.path.read_bytes(), b"newer\n")
+
     def test_write_during_compression_keeps_the_original(self) -> None:
         real = compression._hash_compressed
 

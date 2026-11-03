@@ -424,10 +424,18 @@ class LockTests(Fixture):
         self.assertTrue(retention.acquire_lock())
         retention.release_lock()
 
-    def test_garbled_lock_is_taken_over(self) -> None:
+    def test_garbled_lock_is_taken_over_once_it_is_not_being_written(self) -> None:
         retention.LOCK_FILE.write_text("?", encoding="utf-8")
+        a_while_ago = time.time() - 2 * retention.LOCK_UNWRITTEN_SECONDS
+        os.utime(retention.LOCK_FILE, (a_while_ago, a_while_ago))
         self.assertTrue(retention.acquire_lock())
         retention.release_lock()
+
+    def test_a_lock_still_being_written_is_not_taken_over(self) -> None:
+        # Its creator has made the file but not yet written its process id.
+        retention.LOCK_FILE.write_text("", encoding="utf-8")
+        self.assertFalse(retention.acquire_lock())
+        retention.LOCK_FILE.unlink()
 
 
 class BackgroundStartTests(Fixture):

@@ -35,6 +35,7 @@ from .registry import REGISTRY
 DAY_SECONDS = 86_400.0
 SWEEP_INTERVAL_SECONDS = 6 * 3_600.0
 LOCK_STALE_SECONDS = 12 * 3_600.0
+LOCK_UNWRITTEN_SECONDS = 60.0
 LIVENESS_SECONDS = 15.0
 OPENS_FILE = APP_CACHE_DIR / "session-opens.jsonl"
 LOCK_FILE = APP_CACHE_DIR / "retention.lock"
@@ -296,11 +297,18 @@ def run_sweep(
 def _lock_is_stale() -> bool:
     try:
         age = time.time() - LOCK_FILE.stat().st_mtime
+    except FileNotFoundError:
+        return False
+    except OSError:
+        return True
+    try:
         owner = int(LOCK_FILE.read_text(encoding="utf-8").strip())
     except FileNotFoundError:
         return False
     except (OSError, ValueError):
-        return True
+        # A lock created a moment ago may not have its owner written yet.  Windows refuses to
+        # delete it while it is open, but elsewhere taking it over would make two sweeps.
+        return age > LOCK_UNWRITTEN_SECONDS
     return age > LOCK_STALE_SECONDS or not psutil.pid_exists(owner)
 
 

@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import contextlib
 import ctypes
+import errno
 import hashlib
 import io
 import os
@@ -59,6 +60,8 @@ if os.name == "nt":
         wintypes.DWORD,
     )
 else:
+    import fcntl
+
     _ERROR_SHARING_VIOLATION = 0
 
 
@@ -150,7 +153,10 @@ def _sync(handle: BinaryIO) -> None:
 
 
 def _is_sharing_violation(error: OSError) -> bool:
-    return getattr(error, "winerror", None) == _ERROR_SHARING_VIOLATION
+    return (
+        isinstance(error, BlockingIOError)
+        or getattr(error, "winerror", None) == _ERROR_SHARING_VIOLATION
+    )
 
 
 @contextlib.contextmanager
@@ -159,9 +165,12 @@ def _exclusive(path: Path) -> Iterator[BinaryIO]:
 
     Ordinary deletion succeeds on Windows against a file another process is appending to, whose
     next writes then vanish.  Refusing to share is the only reliable way to see such a writer.
+    Elsewhere no lock binds a harness, but an advisory one still keeps a compress and a restore
+    of the same session from interleaving; a held file raises BlockingIOError.
     """
     if os.name != "nt":
         with path.open("rb") as handle:
+            fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
             yield handle
         return
     handle = _kernel32.CreateFileW(
@@ -173,9 +182,33 @@ def _exclusive(path: Path) -> Iterator[BinaryIO]:
         yield stream
 
 
+@contextlib.contextmanager
+def _claimed(path: Path) -> Iterator[None]:
+    """Hold an existing ``path`` while it is replaced, so a restore reading it is not undercut.
+
+    Windows already refuses to replace a file a restore holds; elsewhere the replacement would
+    succeed and the restore would then delete the new copy by name, losing both.
+    """
+    if os.name == "nt":
+        yield
+        return
+    try:
+        handle = path.open("rb")
+    except FileNotFoundError:
+        yield
+        return
+    with handle:
+        fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+        yield
+
+
 def _delete_open(stream: BinaryIO, path: Path) -> None:
     """Remove the file behind an exclusive handle; it goes when the handle closes."""
     if os.name != "nt":
+        # Deletion is by name here, and the name may now belong to a newer file.
+        held, current = os.fstat(stream.fileno()), os.stat(path)
+        if (held.st_dev, held.st_ino) != (current.st_dev, current.st_ino):
+            raise FileExistsError(errno.EEXIST, "replaced while it was held", str(path))
         path.unlink()
         return
     delete = ctypes.c_ubyte(1)
@@ -252,7 +285,8 @@ def compress_file(path: Path, *, level: int = COMPRESSION_LEVEL) -> Path:
             if (after.st_size, after.st_mtime_ns) != (before.st_size, before.st_mtime_ns):
                 raise CompressionError(f"{path.name} changed while it was being compressed")
             os.utime(temporary, ns=(before.st_atime_ns, before.st_mtime_ns))
-            os.replace(temporary, target)
+            with _claimed(target):
+                os.replace(temporary, target)
             try:
                 _delete_open(source, path)
             except OSError as error:
