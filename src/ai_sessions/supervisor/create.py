@@ -13,6 +13,7 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
 from ..capabilities import Unsupported
+from ..conversion import base_title
 from ..model import NativeRef, Session
 from ..registry import REGISTRY
 from . import store
@@ -23,6 +24,7 @@ if TYPE_CHECKING:
     from ..config import LaunchConfig
 
 ENV_VAR = "AI_SESSIONS_SUPERVISOR"
+TITLE_PREFIX = "Supervisor: "
 DEFAULT_TAIL = 20
 SLOW_BUILD_SECONDS = 1.0
 
@@ -58,6 +60,16 @@ class SupervisorError(Exception):
 
 def _root(root: Path | None) -> Path:
     return store.SUPERVISORS_DIR if root is None else root
+
+
+def supervisor_title(record: dict[str, Any]) -> str:
+    """The name a supervisor shows in the list and in its own harness.
+
+    The target's title is taken as it was at creation, without the ``(from …)``
+    suffixes bridges add, so a tab names the conversation it watches.
+    """
+    title = base_title(str(record.get("title", "")).removesuffix(TITLE_SUFFIX))
+    return TITLE_PREFIX + (title or "untitled session")
 
 
 def supports_supervising(tool: str) -> bool:

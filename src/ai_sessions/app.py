@@ -46,6 +46,7 @@ from .conversion import (
     native_session_exists,
     prepare_target,
     resolve_budget,
+    tidy_title,
 )
 from .conversion import append_jsonl as append_jsonl
 from .diagnostics import clear_warnings, record_warning
@@ -79,7 +80,6 @@ ORIGIN_LABELS = {
 }
 SUPERVISED_GLYPH = "◉"
 SUPERVISOR_GLYPH = "◎"
-SUPERVISOR_TITLE_PREFIX = "Supervisor: "
 VISIBILITY_ORDER = ("visible", "hidden", "all")
 VISIBILITY_LABELS = {"visible": "Visible", "hidden": "Hidden", "all": "Visible + hidden"}
 COMPRESSION_ORDER = ("uncompressed", "compressed", "both")
@@ -375,6 +375,16 @@ class UserState:
         if conversation_id or not create:
             return conversation_id
         return self._ensure_conversation(item)[0]
+
+    def conversation_copies(self, item: Session) -> list[Session]:
+        """The other loaded copies of the conversation ``item`` belongs to."""
+        conversation = self.conversations.get(self.conversation_id_for(item), {})
+        copies = (self._sessions_by_key.get(key) for key in conversation.get("members", {}))
+        return [
+            copy
+            for copy in copies
+            if copy is not None and self.stable_key(copy.key) != self.stable_key(item.key)
+        ]
 
     def recover_session(self, item: Session) -> Session:
         """Persist the user's explicit choice of an exact native history, without merging."""
@@ -774,7 +784,8 @@ class UserState:
 
     def _apply_supervisors(self, items: list[Session]) -> None:
         """Mark supervised targets and the supervisor sessions that watch them."""
-        from .supervisor.store import TITLE_SUFFIX, load_hook_state
+        from .supervisor.create import supervisor_title
+        from .supervisor.store import load_hook_state
 
         for item in items:
             item.supervises = ""
@@ -798,9 +809,8 @@ class UserState:
                 continue
             supervisor.origin = "supervisor"
             supervisor.supervises = record_id
-            title = str(record.get("title", ""))
-            if title:
-                title = SUPERVISOR_TITLE_PREFIX + title.removesuffix(TITLE_SUFFIX)
+            if record.get("title"):
+                title = supervisor_title(record)
                 supervisor.original_title = title
                 supervisor.original_named = True
                 if not supervisor.renamed:
@@ -1038,6 +1048,20 @@ def publish_name(
 
 
 def rename_session(state: UserState, item: Session, name: str) -> str:
+    """Rename a session and every other copy of its conversation.
+
+    Each copy is renamed in its own harness, so whichever one is opened next
+    shows the same name in its tab.  A reset restores each copy's own title.
+    """
+    notes = [_rename_one(state, item, name)]
+    for copy in state.conversation_copies(item):
+        note = _rename_one(state, copy, name)
+        if note:
+            notes.append(f"{tool_label(copy.tool)} copy: {note}")
+    return "; ".join(note for note in notes if note)
+
+
+def _rename_one(state: UserState, item: Session, name: str) -> str:
     """Rename locally and in provider storage while preserving reset history."""
     value = normalize_space(name)[:200]
     state.remember_original_name(item)
@@ -4871,6 +4895,22 @@ def run_harness(session: Session, command: list[str]) -> int:
     return code
 
 
+def tidy_launched_title(session: Session) -> None:
+    """Give a copy named by older bridges one ``(from …)`` suffix before it opens.
+
+    Earlier versions added a suffix on every round trip, which crowded the
+    harness tab.  The user's own names are left alone.
+    """
+    if session.renamed or active_launch_tool(session) != session.tool:
+        return
+    tidy = tidy_title(session.title)
+    if tidy == session.title:
+        return
+    note = publish_name(session, tidy)
+    if note:
+        print(f"sessions: {note}", file=sys.stderr)
+
+
 def launch(
     session: Session,
     config: LaunchConfig,
@@ -4900,6 +4940,7 @@ def launch(
         note_opened(session)
         for notice in upgrade_native_storage(session, config, state):
             print(f"sessions: {notice}", file=sys.stderr)
+        tidy_launched_title(session)
     argv = command_for(session, config)
     cwd = strip_extended_prefix(session.cwd) or str(HOME)
     if config.custom_args_missing(active_launch_tool(session)):
@@ -5005,7 +5046,7 @@ def launch_supervisor(
 ) -> int:
     """Start a new supervisor session, or resume an existing one by its native id."""
     from .supervisor.context import supervisor_dir as supervisor_folder
-    from .supervisor.create import ENV_VAR
+    from .supervisor.create import ENV_VAR, supervisor_title
     from .supervisor.store import load_hook_state, save_hook_state
 
     record = state.supervisors.get(record_id)
@@ -5019,12 +5060,29 @@ def launch_supervisor(
         return 2
     adapter = REGISTRY.get(tool)
     cwd = strip_extended_prefix(str(record.get("cwd", ""))) or str(HOME)
-    title = str(record.get("title", "")) or "supervisor"
+    title = supervisor_title(record)
     if not dry_run and not _restore_native_session(adapter, tool, hook_state.native_session_id):
         return 2
     # Resume only a native session the harness actually stored; one that was started and quit
     # before its first prompt has nothing to resume, so it starts again under the same id.
     fresh = not _native_session_stored(adapter, hook_state.native_session_id)
+    if fresh and not dry_run and not isinstance(adapter.create_session, Unsupported):
+        # This harness cannot name a session it starts, so store one already named and
+        # resume it; the tab shows the name from the start and no title is generated.
+        try:
+            created = adapter.create_session(cwd=cwd, name=title)
+        except (BridgeError, OSError) as error:
+            print(f"sessions: could not create the supervisor session: {error}", file=sys.stderr)
+            return 2
+        hook_state = replace(hook_state, native_session_id=created.session_id)
+        save_hook_state(hook_state, root)
+        record["published_title"] = title
+        state.save()
+        fresh = False
+    resolve = adapter.resolve
+    stored = None
+    if not fresh and hook_state.native_session_id and not isinstance(resolve, Unsupported):
+        stored = resolve(hook_state.native_session_id)
     session = Session(
         tool=tool,
         session_id=hook_state.native_session_id or f"supervisor-{record_id}",
@@ -5034,7 +5092,7 @@ def launch_supervisor(
         created=float(record.get("created", 0) or 0),
         preview="",
         named=True,
-        storage="",
+        storage=stored.storage if stored is not None else "",
         origin="supervisor",
     )
     if fresh:
@@ -5043,12 +5101,23 @@ def launch_supervisor(
             print(f"sessions: {adapter.label} cannot start supervisors", file=sys.stderr)
             return 2
         chosen = hook_state.native_session_id or None
-        args = hook(session_id=chosen)
+        args = hook(session_id=chosen, name=title)
         if chosen and chosen not in args and not dry_run:
             # The harness picks its own id, so the hook must bind the new session afresh.
             save_hook_state(replace(hook_state, native_session_id=""), root)
+        if not dry_run:
+            record["published_title"] = title
+            state.save()
         argv = config.provider_prefix(tool) + args
     else:
+        if not dry_run and record.get("published_title") != title:
+            # Supervisors made before names were published carry a generated title.
+            note = publish_name(session, title)
+            if note:
+                print(f"sessions: {note}", file=sys.stderr)
+            else:
+                record["published_title"] = title
+                state.save()
         try:
             argv = command_for(session, config)
         except BridgeError as error:

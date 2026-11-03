@@ -114,10 +114,21 @@ class NewSessionArgsHook(Protocol):
     """Arguments that start a brand-new session, after the launch prefix.
 
     ``session_id`` is the id the caller wants the session to have, or None when the
-    harness assigns its own.  A harness that cannot be given an id ignores it.
+    harness assigns its own.  ``name`` is the title it should show from the start.
+    A harness that cannot be given either ignores it.
     """
 
-    def __call__(self, *, session_id: str | None) -> list[str]: ...
+    def __call__(self, *, session_id: str | None, name: str = "") -> list[str]: ...
+
+
+class CreateSessionHook(Protocol):
+    """Store an empty session named ``name`` that the harness can then resume.
+
+    For a harness that cannot name a session it starts, so the title is in
+    place before its first prompt and the harness never generates its own.
+    """
+
+    def __call__(self, *, cwd: str, name: str) -> NativeRef: ...
 
 
 class PublishNameHook(Protocol):
@@ -220,6 +231,9 @@ class HarnessAdapter:
     new_session_args: NewSessionArgsHook | Unsupported = Unsupported(
         "starting a new session with chosen arguments is not supported"
     )
+    create_session: CreateSessionHook | Unsupported = Unsupported(
+        "new sessions are named through their launch arguments"
+    )
     extra_dir_args: ExtraDirArgsHook | Unsupported = Unsupported(
         "extra working directories are not supported"
     )
@@ -298,6 +312,7 @@ class HarnessAdapter:
             self.pasted_contents,
             self.injected_prompt,
             self.new_session_args,
+            self.create_session,
             self.extra_dir_args,
             self.transcript_files,
         )

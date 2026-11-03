@@ -6,12 +6,14 @@ import datetime as dt
 import hashlib
 import json
 import os
+import queue
 import re
 import secrets
 import shutil
 import sqlite3
 import stat
 import subprocess
+import threading
 import time
 import uuid
 from contextlib import closing
@@ -70,6 +72,9 @@ from ..registry import REGISTRY
 
 CODEX_CLI_VERSION = "0.147.0"
 CODEX_HOME = env_path("CODEX_HOME", HOME / ".codex")
+CODEX_COMMAND = "codex"
+RENAME_TIMEOUT_SECONDS = 20.0
+_CLIENT_INFO = {"name": "ai-sessions", "version": "rename"}
 _RESULT_FAILED = re.compile(r"^Script failed|timed out", re.I)
 _RESULT_NOISE = re.compile(r"^Script completed\s*(Wall time[^\n]*)?\s*Output:\s*", re.I)
 DISCOVERY_CACHE_VERSION = 8
@@ -953,7 +958,11 @@ def discover(context: HarnessContext, *, use_cache: bool = True) -> list[NativeS
                     nickname = nickname or normalize_space(spawn.get("agent_nickname"))
                 except (json.JSONDecodeError, KeyError, TypeError):
                     pass
-            name = indexed_names.get(session_id) or normalize_space(field("name"))
+            # Show the name Codex shows: a paginated thread's lives only in the database.
+            if field("history_mode") == PAGINATED_HISTORY_MODE:
+                name = normalize_space(field("name"))
+            else:
+                name = indexed_names.get(session_id) or normalize_space(field("name"))
             fallback = field("title") or field("preview") or field("first_user_message")
             title = name or clean_prompt(fallback)
             indexed_preview = clean_prompt(field("preview") or field("first_user_message"))
@@ -1481,13 +1490,94 @@ def upgrade_storage(
     return StorageUpgrade(tuple(notices), translated)
 
 
+def _thread_set_name(home: Path, session_id: str, name: str) -> str:
+    """Rename a thread through Codex's own app-server; return the error or "".
+
+    Codex reads a paginated thread's name only from its state database and a
+    legacy thread's only from ``session_index.jsonl``.  ``thread/name/set``
+    writes whichever the thread uses, so the name reaches Codex either way.
+    """
+    executable = shutil.which(CODEX_COMMAND)
+    if executable is None:
+        return f"{CODEX_COMMAND!r} is not on PATH"
+    requests = [
+        {"id": 1, "method": "initialize", "params": {"clientInfo": _CLIENT_INFO}},
+        {"method": "initialized"},
+        {"id": 2, "method": "thread/name/set", "params": {"threadId": session_id, "name": name}},
+    ]
+    try:
+        process = subprocess.Popen(  # noqa: S603
+            [executable, "app-server", "--listen", "stdio://"],
+            stdin=subprocess.PIPE,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL,
+            text=True,
+            encoding="utf-8",
+            env={**os.environ, "CODEX_HOME": str(home)},
+            creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+        )
+    except OSError as error:
+        return str(error)
+    replies: queue.Queue[dict[str, Any] | None] = queue.Queue()
+
+    def read() -> None:
+        assert process.stdout is not None
+        for line in process.stdout:
+            try:
+                message = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            if isinstance(message, dict) and message.get("id") == 2:
+                replies.put(message)
+                return
+        replies.put(None)
+
+    threading.Thread(target=read, daemon=True).start()
+    try:
+        assert process.stdin is not None
+        process.stdin.write("".join(json.dumps(request) + "\n" for request in requests))
+        process.stdin.flush()
+        reply = replies.get(timeout=RENAME_TIMEOUT_SECONDS)
+    except (OSError, queue.Empty):
+        reply = None
+    finally:
+        try:
+            if process.stdin is not None:
+                process.stdin.close()
+            process.wait(timeout=5)
+        except (OSError, subprocess.TimeoutExpired):
+            process.kill()
+    if reply is None:
+        return "Codex did not answer the rename"
+    if "error" in reply:
+        return str(reply["error"].get("message") or reply["error"])
+    return ""
+
+
 def publish_name(session: Any, name: str) -> str:
+    home = REGISTRY.get("codex").home
+    problem = _thread_set_name(home, session.session_id, name)
+    if not problem:
+        return ""
     stamp = dt.datetime.now(dt.timezone.utc).isoformat().replace("+00:00", "Z")
     append_jsonl(
-        REGISTRY.get("codex").home / "session_index.jsonl",
+        home / "session_index.jsonl",
         {"id": session.session_id, "thread_name": name, "updated_at": stamp},
     )
-    return ""
+    return (
+        f"Codex could not record the name ({problem}); it was added to session_index.jsonl, "
+        "which Codex reads only for sessions on the legacy format"
+    )
+
+
+def create_session(*, cwd: str, name: str) -> NativeRef:
+    """An empty rollout already named ``name``, for ``codex resume`` to open.
+
+    Codex generates a title only for a thread that has no name, and a fresh
+    ``codex`` cannot be given one, so a supervisor is stored first and resumed.
+    """
+    session_id, path = write_codex_session(cwd=cwd, turns=[], title=name)
+    return NativeRef(session_id, str(path))
 
 
 def resume_args(
@@ -1514,8 +1604,8 @@ def transcript_files(ref: NativeRef) -> tuple[Path, ...]:
     return (plain_path(Path(ref.storage)),)
 
 
-def new_session_args(*, session_id: str | None) -> list[str]:
-    del session_id
+def new_session_args(*, session_id: str | None, name: str = "") -> list[str]:
+    del session_id, name
     return []
 
 
@@ -1553,6 +1643,7 @@ ADAPTER = HarnessAdapter(
     discover=discover,
     resume_args=resume_args,
     new_session_args=new_session_args,
+    create_session=create_session,
     extra_dir_args=extra_dir_args,
     transcript_files=transcript_files,
     publish_name=publish_name,

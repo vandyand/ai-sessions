@@ -24,6 +24,23 @@
   days, and opening a compressed session decompresses it after asking. Only uncompressed sessions
   can be bridged or get a new supervisor.
 
+### Fixed
+
+- A supervisor's name now reaches its harness, so its terminal tab reads `Supervisor: <title>`
+  instead of a title the harness generated from the first question. A new Claude Code
+  supervisor starts with `--name`; a new Codex supervisor is stored already named and resumed,
+  because Codex cannot name a session it starts. Existing supervisors are named the next time
+  they are opened.
+- Renaming a Codex session now reaches Codex. Codex reads a paginated thread's name only from
+  its database, so renames appended to `session_index.jsonl` were ignored for every session on
+  the current format; renames now go through Codex's own `thread/name/set`, and the list shows
+  the name Codex shows.
+- A rename applies to every copy of a conversation, so whichever harness opens it next shows
+  the same name. Claude Code renames now also set the name shown in its prompt box and tab.
+- Bridging no longer stacks a `(from …)` suffix on every round trip. A copy names only the
+  harness it came from, and a copy that older versions named
+  `elevate-futures (from Codex) (from Claude) (from Codex)` is tidied when it is next opened.
+
 ## 3.7.5 — 2026-10-30
 
 ### Fixed

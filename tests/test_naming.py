@@ -3,6 +3,7 @@ import unittest
 from dataclasses import replace
 from pathlib import Path
 from tempfile import TemporaryDirectory
+from unittest.mock import patch
 
 from ai_sessions import app
 from ai_sessions.app import (
@@ -16,6 +17,7 @@ from ai_sessions.app import (
 )
 from ai_sessions.capabilities import Unsupported
 from ai_sessions.conversion import BridgeError
+from ai_sessions.harnesses import codex as codex_harness
 from ai_sessions.registry import REGISTRY
 
 
@@ -33,6 +35,12 @@ def session(**overrides) -> Session:
     )
     base.update(overrides)
     return Session(**base)
+
+
+def last_title(transcript: Path) -> dict:
+    """The last title record a rename appended to a Claude transcript."""
+    records = [json.loads(line) for line in transcript.read_text(encoding="utf-8").splitlines()]
+    return [record for record in records if record.get("type") == "custom-title"][-1]
 
 
 class AppendJsonlTests(unittest.TestCase):
@@ -112,27 +120,98 @@ class PublishNameTests(unittest.TestCase):
         self.assertEqual(reloaded.title, "After")
         self.assertTrue(reloaded.renamed)
 
+    def test_rename_reaches_every_copy_of_the_conversation(self) -> None:
+        published: list[tuple[str, str, str]] = []
+
+        def recorder(item: Session, name: str) -> str:
+            published.append((item.tool, item.session_id, name))
+            return ""
+
+        with TemporaryDirectory() as directory:
+            state = UserState(Path(directory) / "state.json")
+            original = session(tool="claude", session_id="claude-copy", title="work")
+            copy = session(tool="codex", session_id="codex-copy", title="work (from Claude)")
+            other = session(tool="codex", session_id="unrelated", title="other")
+            state.conversations["conv"] = {"members": {original.key: {}, copy.key: {}}}
+            state.session_conversations = {
+                state.stable_key(original.key): "conv",
+                state.stable_key(copy.key): "conv",
+            }
+            state._sessions_by_key = {item.key: item for item in (original, copy, other)}
+            with (
+                REGISTRY.temporary(replace(REGISTRY.get("claude"), publish_name=recorder)),
+                REGISTRY.temporary(replace(REGISTRY.get("codex"), publish_name=recorder)),
+            ):
+                self.assertEqual(rename_session(state, copy, "minecraft"), "")
+            self.assertEqual(
+                published,
+                [("codex", "codex-copy", "minecraft"), ("claude", "claude-copy", "minecraft")],
+            )
+            self.assertEqual(state.names[state.stable_key(original.key)], "minecraft")
+            self.assertNotIn(state.stable_key(other.key), state.names)
+
+    def test_launch_tidies_a_stacked_bridge_title_but_not_a_chosen_name(self) -> None:
+        published: list[str] = []
+        stacked = session(
+            tool="codex", title="TOP-Assistant (from Codex) (from Claude) (from Codex)"
+        )
+        with patch.object(app, "publish_name", lambda item, name: published.append(name) or ""):
+            app.tidy_launched_title(stacked)
+            app.tidy_launched_title(replace(stacked, renamed=True))
+            app.tidy_launched_title(session(tool="codex", title="open-phone (from Claude)"))
+        self.assertEqual(published, ["TOP-Assistant (from Codex)"])
+
     def test_claude_rename_appends_custom_title(self) -> None:
         with TemporaryDirectory() as directory:
             transcript = Path(directory) / "abc.jsonl"
             transcript.write_text('{"type":"ai-title","aiTitle":"Auto"}\n', encoding="utf-8")
             item = session(session_id="abc", storage=str(transcript))
             self.assertEqual(publish_name(item, "my-name"), "")
-            last = json.loads(transcript.read_text(encoding="utf-8").splitlines()[-1])
+            lines = transcript.read_text(encoding="utf-8").splitlines()
             self.assertEqual(
-                last, {"type": "custom-title", "customTitle": "my-name", "sessionId": "abc"}
+                [json.loads(line) for line in lines[-2:]],
+                [
+                    {"type": "custom-title", "customTitle": "my-name", "sessionId": "abc"},
+                    {"type": "agent-name", "agentName": "my-name", "sessionId": "abc"},
+                ],
             )
 
     def test_claude_rename_reports_missing_transcript(self) -> None:
         item = session(storage="/nonexistent/path.jsonl")
         self.assertIn("missing", publish_name(item, "my-name"))
 
-    def test_codex_rename_appends_thread_name(self) -> None:
+    def test_codex_rename_goes_through_codex(self) -> None:
+        # A paginated thread's name lives only in Codex's database, so the
+        # rename must be Codex's own thread/name/set, not an index append.
+        calls: list[tuple[Path, str, str]] = []
         with TemporaryDirectory() as directory:
             home = Path(directory)
-            with REGISTRY.temporary(replace(REGISTRY.get("codex"), home=home)):
+            with (
+                REGISTRY.temporary(replace(REGISTRY.get("codex"), home=home)),
+                patch.object(
+                    codex_harness,
+                    "_thread_set_name",
+                    lambda *args: calls.append(args) or "",
+                ),
+            ):
                 item = session(tool="codex", session_id="019f-thread")
                 self.assertEqual(publish_name(item, "my-name"), "")
+            self.assertEqual(calls, [(home, "019f-thread", "my-name")])
+            self.assertFalse((home / "session_index.jsonl").exists())
+
+    def test_codex_rename_falls_back_to_the_index_and_says_so(self) -> None:
+        with TemporaryDirectory() as directory:
+            home = Path(directory)
+            with (
+                REGISTRY.temporary(replace(REGISTRY.get("codex"), home=home)),
+                patch.object(
+                    codex_harness, "_thread_set_name", lambda *_: "'codex' is not on PATH"
+                ),
+            ):
+                item = session(tool="codex", session_id="019f-thread")
+                note = publish_name(item, "my-name")
+            self.assertIn("not on PATH", note)
+            self.assertIn("legacy format", note)
             written = json.loads((home / "session_index.jsonl").read_text().splitlines()[-1])
             self.assertEqual(written["id"], "019f-thread")
             self.assertEqual(written["thread_name"], "my-name")
@@ -149,7 +228,7 @@ class PublishNameTests(unittest.TestCase):
                 original_title="original",
             )
             self.assertEqual(publish_name(item, ""), "")
-            last = json.loads(transcript.read_text(encoding="utf-8").splitlines()[-1])
+            last = last_title(transcript)
             self.assertEqual(last["customTitle"], "original")
 
     def test_reset_republishes_a_generated_title(self) -> None:
@@ -165,7 +244,7 @@ class PublishNameTests(unittest.TestCase):
             )
             note = publish_name(item, "")
             self.assertIn("explicit title", note)
-            last = json.loads(transcript.read_text(encoding="utf-8").splitlines()[-1])
+            last = last_title(transcript)
             self.assertEqual(last["customTitle"], "Auto Generated")
 
     def test_reset_does_not_mask_provider_publication_failure(self) -> None:
@@ -236,7 +315,7 @@ class PublishNameTests(unittest.TestCase):
             state.apply([reloaded])
             self.assertIn("explicit title", rename_session(state, reloaded, ""))
 
-            published = json.loads(transcript.read_text(encoding="utf-8").splitlines()[-1])
+            published = last_title(transcript)
             self.assertEqual(published["customTitle"], "Explore Seeking Alpha")
 
             after = make("Explore Seeking Alpha", True, "Explore Seeking Alpha", True)
@@ -278,7 +357,7 @@ class PublishNameTests(unittest.TestCase):
             self.assertEqual(reloaded.title, "Renamed")
 
             self.assertEqual(rename_session(state, reloaded, ""), "")
-            last = json.loads(transcript.read_text(encoding="utf-8").splitlines()[-1])
+            last = last_title(transcript)
             self.assertEqual(last["customTitle"], "Original")
 
             after_reset = session(

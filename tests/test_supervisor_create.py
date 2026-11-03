@@ -1,15 +1,18 @@
 import io
+import json
 import os
 import tempfile
 import unittest
 import uuid
 from contextlib import redirect_stdout
+from dataclasses import replace
 from pathlib import Path
-from unittest.mock import patch
+from unittest.mock import ANY, patch
 
 from ai_sessions import app
 from ai_sessions.config import LaunchConfig
 from ai_sessions.model import Session
+from ai_sessions.registry import REGISTRY
 from ai_sessions.supervisor import create
 from ai_sessions.supervisor.create import (
     LEDGER_TEMPLATE,
@@ -45,6 +48,10 @@ class Fixture(unittest.TestCase):
         self.dir = Path(tmp.name)
         self.root = self.dir / "supervisors"
         self.state = app.UserState(path=self.dir / "state.json")
+        # A launch may store the supervisor's session, so no harness may see a real home.
+        for name in ("claude", "codex"):
+            home = self.dir / name
+            self.enterContext(REGISTRY.temporary(replace(REGISTRY.get(name), home=home)))
         for patcher in (
             patch.object(TargetIndex, "build", return_value=7),
             patch.object(TargetIndex, "extend", return_value=None),
@@ -117,12 +124,13 @@ class CreateTests(Fixture):
 
 
 class LaunchTests(Fixture):
-    def test_new_supervisor_argv_claude_includes_session_id_and_no_prompt(self) -> None:
+    def test_new_supervisor_argv_claude_includes_session_id_name_and_no_prompt(self) -> None:
         record_id = self.make("codex", "claude")
         native_id = load_hook_state(record_id, self.root).native_session_id
         output = self.command(record_id)
-        self.assertIn(f"claude --session-id {native_id}", output)
-        self.assertTrue(output.endswith(native_id))
+        self.assertIn(f"claude --session-id {native_id} --name", output)
+        # The name is the last argument: there is no opening prompt after it.
+        self.assertTrue(output.rstrip("'\"").endswith("Supervisor: Fix the build"), output)
 
     def test_new_supervisor_argv_codex_has_no_prompt(self) -> None:
         record_id = self.make("claude", "codex")
@@ -174,22 +182,66 @@ class LaunchTests(Fixture):
         self.assertEqual(code, 0)
         self.assertEqual(seen["env"], record_id)
 
-    def test_unstored_codex_supervisor_is_unbound_before_a_fresh_start(self) -> None:
-        record_id = self.make("claude", "codex")
-        hook_state = load_hook_state(record_id, self.root)
-        hook_state.native_session_id = "019abcde-0000-0000-0000-000000000000"
-        save_hook_state(hook_state, self.root)
+    def launch(self, record_id: str) -> list[list[str]]:
+        commands: list[list[str]] = []
+
+        def fake_run(session: Session, command: list[str]) -> int:
+            commands.append(command)
+            return 0
+
         with (
             patch.dict(os.environ, {}, clear=False),
-            patch.object(app, "_native_session_stored", return_value=False),
             patch.object(app, "IS_WINDOWS", True),
-            patch.object(app, "run_harness", return_value=0),
+            patch.object(app, "run_harness", fake_run),
             patch.object(app, "record_launch"),
-            patch.object(app.shutil, "which", return_value="codex.exe"),
+            patch.object(app.shutil, "which", side_effect=lambda name: f"{name}.exe"),
             patch.object(app.os, "chdir"),
         ):
             app.launch_supervisor(record_id, LaunchConfig(), self.state, root=self.root)
-        self.assertEqual(load_hook_state(record_id, self.root).native_session_id, "")
+        return commands
+
+    def test_new_codex_supervisor_is_stored_named_and_resumed(self) -> None:
+        # Codex cannot name a session it starts and titles an unnamed one
+        # itself, so the supervisor is stored with its name and resumed.
+        record_id = self.make("claude", "codex")
+        commands = self.launch(record_id)
+        native_id = load_hook_state(record_id, self.root).native_session_id
+        self.assertTrue(native_id)
+        self.assertEqual(commands[0][1:3], ["resume", native_id])
+        index = (self.dir / "codex" / "session_index.jsonl").read_text(encoding="utf-8")
+        self.assertEqual(
+            json.loads(index.splitlines()[-1]),
+            {"id": native_id, "thread_name": "Supervisor: Fix the build", "updated_at": ANY},
+        )
+        self.assertEqual(
+            self.state.supervisors[record_id]["published_title"], "Supervisor: Fix the build"
+        )
+
+    def test_older_supervisor_gets_its_name_published_once(self) -> None:
+        record_id = self.make("codex", "claude")
+        published: list[tuple[str, str]] = []
+        with (
+            patch.object(app, "_native_session_stored", return_value=True),
+            patch.object(
+                app, "publish_name", lambda item, name: published.append((item.tool, name)) or ""
+            ),
+        ):
+            self.launch(record_id)
+            self.launch(record_id)
+        self.assertEqual(published, [("claude", "Supervisor: Fix the build")])
+
+    def test_unpublished_name_is_retried_on_the_next_launch(self) -> None:
+        record_id = self.make("codex", "claude")
+        with (
+            patch.object(app, "_native_session_stored", return_value=True),
+            patch.object(app, "publish_name", return_value="transcript is missing"),
+        ):
+            self.launch(record_id)
+        self.assertNotIn("published_title", self.state.supervisors[record_id])
+
+    def test_supervisor_title_drops_bridge_suffixes(self) -> None:
+        record = {"title": "minecraft-mods (from Claude) (from Codex) · supervisor"}
+        self.assertEqual(create.supervisor_title(record), "Supervisor: minecraft-mods")
 
 
 class TargetLogTests(Fixture):

@@ -771,5 +771,63 @@ class GenericDiscoveryTests(unittest.TestCase):
         self.assertEqual(survivor.launch_targets["claude"], "publisher")
 
 
+class CodexNameSourceTests(unittest.TestCase):
+    def test_list_shows_the_name_codex_itself_reads(self) -> None:
+        # Codex reads a paginated thread's name only from its database and a
+        # legacy thread's from session_index.jsonl; the list must match Codex.
+        paginated = "019f59af-e300-7bd1-be75-e47599b5b593"
+        legacy = "019f59af-e300-7bd1-be75-e47599b5b594"
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            codex_home = root / "codex"
+            codex_home.mkdir()
+            database = sqlite3.connect(codex_home / "state_5.sqlite")
+            database.execute(
+                "CREATE TABLE threads (id TEXT, rollout_path TEXT, source TEXT, cwd TEXT, "
+                "title TEXT, created_at INTEGER, updated_at INTEGER, archived INTEGER, "
+                "name TEXT, history_mode TEXT)"
+            )
+            for thread, name, mode in (
+                (paginated, "Name in the database", "paginated"),
+                (legacy, None, "legacy"),
+            ):
+                rollout = codex_home / f"rollout-{thread}.jsonl"
+                rollout.write_text(
+                    json.dumps({"type": "event_msg", "payload": {"type": "user_message"}}) + "\n",
+                    encoding="utf-8",
+                )
+                database.execute(
+                    "INSERT INTO threads VALUES (?, ?, 'cli', '/work', 'first prompt', 1, 2, 0, ?, ?)",
+                    (thread, str(rollout), name, mode),
+                )
+            database.commit()
+            database.close()
+            (codex_home / "session_index.jsonl").write_text(
+                "".join(
+                    json.dumps({"id": thread, "thread_name": name}) + "\n"
+                    for thread, name in (
+                        (paginated, "Stale name Codex ignores"),
+                        (legacy, "Name in the index"),
+                    )
+                ),
+                encoding="utf-8",
+            )
+            with (
+                REGISTRY.temporary(replace(REGISTRY.get("claude"), home=root / "claude")),
+                REGISTRY.temporary(replace(REGISTRY.get("codex"), home=codex_home)),
+                REGISTRY.temporary(
+                    replace(
+                        REGISTRY.get("opencode"),
+                        home=root / "opencode",
+                        discover=Unsupported("isolated discovery test"),
+                    )
+                ),
+            ):
+                rows = load_sessions(use_cache=False)
+        titles = {row.session_id: row.title for row in rows}
+        self.assertEqual(titles[paginated], "Name in the database")
+        self.assertEqual(titles[legacy], "Name in the index")
+
+
 if __name__ == "__main__":
     unittest.main()

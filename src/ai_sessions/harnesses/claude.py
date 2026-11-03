@@ -936,9 +936,16 @@ def publish_name(session: Any, name: str) -> str:
     if is_compressed_path(transcript):
         return f"transcript for {session.session_id} is compressed; name kept local only"
     try:
+        # The same pair of records `claude --name` writes: the title, and the
+        # name shown in the prompt box and the terminal tab.
         append_jsonl(
             transcript,
             {"type": "custom-title", "customTitle": name, "sessionId": session.session_id},
+            create=False,
+        )
+        append_jsonl(
+            transcript,
+            {"type": "agent-name", "agentName": name, "sessionId": session.session_id},
             create=False,
         )
     except FileNotFoundError:
@@ -970,8 +977,9 @@ def transcript_files(ref: NativeRef) -> tuple[Path, ...]:
     return (*sorted(children), main)
 
 
-def new_session_args(*, session_id: str | None) -> list[str]:
-    return ["--session-id", session_id] if session_id else []
+def new_session_args(*, session_id: str | None, name: str = "") -> list[str]:
+    # --name is what Claude Code shows in its prompt box, /resume picker and tab title.
+    return (["--session-id", session_id] if session_id else []) + (["--name", name] if name else [])
 
 
 def extra_dir_args(directory: str) -> list[str]:

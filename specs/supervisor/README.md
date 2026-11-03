@@ -292,7 +292,11 @@ the update. The checkpoint moves to the end of that brief. No other size handlin
   - no indentation, because indentation already means parent and child.
 - **Title:** shown as `Supervisor: <target title>`, because a suffix was cut off in the narrow
   title column (revised 2026-11-01). It does not follow renames of the target (my call), and the
-  user can rename it with `r`.
+  user can rename it with `r`. The name is published to the supervisor's own harness, so its
+  terminal tab shows it (added 2026-11-02, after the user found tabs titled by the harness from
+  the first question): a Claude supervisor starts with `--name`, and a Codex supervisor is stored
+  as an empty, already-named rollout and resumed, because Codex cannot name a session it starts
+  and titles any unnamed thread itself.
 - **Reset:** from the `i` details, a reset action archives the ledger and record, hides the old
   supervisor session, and the next `S` creates a fresh one.
 - **Command line:** `sessions --supervise ID [--launch-tool claude|codex]` does the same as `S`.
@@ -390,7 +394,8 @@ Notes:
 
 - **Launch:** the supervisor opens in the current terminal, like Enter, not in a new tab.
 - **Default harness:** the opposite of the target's, unless `[supervisor] default_tool` is set.
-- **Title:** a `· supervisor` suffix, and it does not follow renames of the target.
+- **Title:** `Supervisor: <target title>`, published to the supervisor's harness; it does not
+  follow renames of the target.
 - **Hook-owned state:** the checkpoint and the supervisor's native id live in the supervisor's
   folder, not in `state.json`.
 - **`S` on a supervisor:** selects the target, and never offers to stop an open target.
