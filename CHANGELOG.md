@@ -1,13 +1,17 @@
 # Changelog
 
-## 3.8.4 — 2026-11-03
+## 3.8.5 — 2026-11-04
 
 ### Fixed
 
-- `sessions` is ready to open a session in about half the time again, which shows most when
-  you search with `-q` and press Enter straight away. Enter waits for the session refresh;
-  that refresh no longer rereads transcripts that have not changed, walks each harness's
-  folders once, checks files in parallel, and keeps titles and previews to 1,000
+- The session table appears about three times sooner: around 1 second instead of 3 on a
+  machine with 6,000 sessions, with or without `-q`. The first draw no longer rereads every
+  copied conversation's transcripts to work out which copy is current; it uses the answer
+  from the last refresh, which checks again behind it. The saved list stores each title
+  once, and is written to a new file, so an older `sessions` still running is unaffected.
+- `sessions` is ready to open a session in about half the time. Enter waits for the session
+  refresh; that refresh no longer rereads transcripts that have not changed, walks each
+  harness's folders once, checks files in parallel, and keeps titles and previews to 1,000
   characters instead of whole pasted prompts, which had grown the saved list to 52 MB.
 
 ## 3.8.3 — 2026-11-03
