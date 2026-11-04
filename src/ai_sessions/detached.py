@@ -95,18 +95,21 @@ def remember(
     _write(path, document)
 
 
-def mark_closed(pid: int, *, path: Path = TERMINALS_FILE) -> bool:
+def mark_closed(pid: int, *, path: Path = TERMINALS_FILE) -> str | None:
     """The harness ``pid`` exited normally: nothing was lost, but it can be reopened.
 
     The entry is kept so ``sessions --reopen`` knows what the tab last ran,
     and marked so ``--reattach`` does not mistake a deliberate exit for a loss.
-    Returns whether ``sessions --restart`` asked for it to be reopened.
+    Returns None unless ``sessions --restart`` asked for it to be reopened;
+    then the harness to reopen it in, or "" for the one it ran in.
     """
     document = _read(path)
-    restart = False
+    restart: str | None = None
     for entry in document.values():
         if entry.get("pid") == pid and not entry.get("closed"):
-            restart = restart or bool(entry.pop("restart", False))
+            if entry.pop("restart", False):
+                restart = str(entry.get("restart_tool", "") or "")
+            entry.pop("restart_tool", None)
             entry["closed"] = True
             entry["at"] = time.time()
     if any(entry.get("pid") == pid for entry in document.values()):
@@ -133,11 +136,19 @@ def running_here(*, path: Path = TERMINALS_FILE) -> tuple[str, dict[str, Any]] |
     return None
 
 
-def request_restart(key: str, *, path: Path = TERMINALS_FILE) -> None:
-    """Ask the launcher of the tab ``key`` to reopen its session once the harness exits."""
+def request_restart(key: str, tool: str = "", *, path: Path = TERMINALS_FILE) -> None:
+    """Ask the launcher of the tab ``key`` to reopen its session once the harness exits.
+
+    ``tool`` names another harness to carry the conversation into; "" keeps it
+    in the one it ran in.
+    """
     document = _read(path)
     if key in document:
         document[key]["restart"] = True
+        if tool:
+            document[key]["restart_tool"] = tool
+        else:
+            document[key].pop("restart_tool", None)
         _write(path, document)
 
 

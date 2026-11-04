@@ -1,5 +1,25 @@
 # Changelog
 
+## 3.8.3 — 2026-11-03
+
+### Added
+
+- `! sessions --restart --claude`, `--codex` or `--opencode` restarts a session in another
+  harness: the conversation is copied across and reopens there in the same tab. Without a
+  harness flag, `--restart` still reopens it where it was. `--launch-tool NAME` works too,
+  and `--reopen` now honours it.
+
+### Fixed
+
+- Choosing another harness for a supervisor (`x`, then Enter) opens it there again. Since
+  3.8.2 it reopened in the harness it was made in. The supervisor is copied across and
+  keeps its folder, hooks and name; its old copy stays out of the main list.
+- A conversation copied into Claude Code opens on your default model. Copies were credited
+  to Opus 5, and Claude Code resumes a session on the model of its last reply, so every
+  copy opened on Opus 5 until you changed it.
+- A timed-out OpenCode import no longer leaves its temporary copy of the conversation behind
+  on a busy Windows machine.
+
 ## 3.8.2 — 2026-11-03
 
 ### Added

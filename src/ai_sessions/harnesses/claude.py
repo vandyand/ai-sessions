@@ -60,6 +60,10 @@ from ..paths import APP_CACHE_DIR, HOME, env_path
 from ..registry import REGISTRY
 
 CLAUDE_VERSION = "2.1.227"
+# The model a copied reply is credited to.  Claude Code resumes a session on the model
+# of its last reply, so naming a real model pins every copy to it; "<synthetic>", the
+# name Claude Code gives replies it wrote itself, leaves the user's own default in force.
+COPIED_REPLY_MODEL = "<synthetic>"
 CLAUDE_HOME = env_path("CLAUDE_CONFIG_DIR", HOME / ".claude")
 DISCOVERY_CACHE_VERSION = 7
 DISCOVERY_CACHE_FILE = APP_CACHE_DIR / f"claude-discovery-v{DISCOVERY_CACHE_VERSION}.json"
@@ -201,7 +205,7 @@ def write_claude_session(
                 "id": "msg_" + secrets.token_hex(12),
                 "type": "message",
                 "role": "assistant",
-                "model": "claude-opus-5",
+                "model": COPIED_REPLY_MODEL,
                 "content": [{"type": "text", "text": turn.text}],
                 "stop_reason": None,
                 "stop_sequence": None,

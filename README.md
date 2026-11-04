@@ -51,6 +51,16 @@ To do both in one step, type this inside the session, in Claude Code or Codex:
 
 The session closes and `sessions` reopens it in the same tab, reading its settings, names and login afresh. Run it between turns, as the `!` prefix does: it stops the harness at once, so a reply still being written would be cut off. A Codex app-server another window depends on is left running.
 
+To carry the conversation into another harness as it restarts, name that harness:
+
+```text
+! sessions --restart --claude
+! sessions --restart --codex
+! sessions --restart --opencode
+```
+
+The session is copied across first, as when you pick another harness in the list, and reopens there in the same tab. If the conversation already has a copy there that is just as far along, that copy is opened instead of making a new one. `--launch-tool NAME` does the same thing. Naming the harness the session is already in is a plain restart.
+
 ## Requirements
 
 - Python 3.11 or newer

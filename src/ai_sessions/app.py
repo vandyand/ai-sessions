@@ -897,6 +897,11 @@ class UserState:
             if supervisor is None:
                 continue
             supervisor.origin = "supervisor"
+            # Copies it left behind in another harness are the supervisor's too.
+            for member in by_conversation.get(supervisor.conversation_id, ()):
+                if member is not supervisor:
+                    member.origin = "supervisor"
+                    member.hidden = member.hidden or archived
             supervisor.supervises = record_id
             # Until the harness has the supervisor's name, show it here; after that the
             # harness's own name is shown, so a rename made there is not overridden.
@@ -5060,10 +5065,12 @@ def run_harness(session: Session, command: list[str]) -> int:
     finally:
         if job is not None:
             job.release()
-    global _restart_pending
-    if mark_closed(process.pid):
-        _restart_pending = True
-        print(f"sessions: restarting {display_title(session)!r}…", file=sys.stderr)
+    global _restart_into
+    wanted = mark_closed(process.pid)
+    if wanted is not None:
+        _restart_into = wanted
+        where = f" in {tool_label(wanted, short=False)}" if wanted and wanted != tool else ""
+        print(f"sessions: restarting {display_title(session)!r}{where}…", file=sys.stderr)
     elif terminal_id():
         print(
             f"sessions: closed {display_title(session)!r}; "
@@ -5073,17 +5080,19 @@ def run_harness(session: Session, command: list[str]) -> int:
     return code
 
 
-# Set when the harness that just exited was stopped by `sessions --restart`.
-_restart_pending = False
+# Set when the harness that just exited was stopped by `sessions --restart`:
+# the harness to reopen it in, or "" for the one it ran in.
+_restart_into: str | None = None
 
 
-def restart_here() -> int:
+def restart_here(launch_tool: str = "") -> int:
     """Stop the harness this command runs inside, so its launcher reopens the session.
 
     Meant for ``! sessions --restart`` typed in the harness itself.  The
     launcher that started the harness waits for it, sees the request, and
     reopens the session the way ``--reopen`` does, with settings, names and
-    login read afresh.
+    login read afresh.  ``launch_tool`` names another harness to reopen it
+    in, copying the conversation across first.
     """
     from .detached import request_restart, running_here, stop_for_restart
 
@@ -5097,9 +5106,20 @@ def restart_here() -> int:
         return 2
     key, entry = found
     tool = str(entry.get("tool", ""))
+    if launch_tool == tool:
+        launch_tool = ""
+    if launch_tool and launch_tool not in REGISTRY.bridge_targets():
+        # Checked before anything stops, so a session is never closed for nothing.
+        print(
+            f"sessions: {tool_label(launch_tool, short=False)} cannot take a conversation "
+            "from another harness; the session was left running.",
+            file=sys.stderr,
+        )
+        return 2
     names = REGISTRY.get(tool).liveness_executables if tool in REGISTRY else frozenset()
-    request_restart(key)
-    print(f"sessions: restarting {entry.get('title') or entry.get('session_id')!r}…")
+    request_restart(key, launch_tool)
+    where = f" in {tool_label(launch_tool, short=False)}" if launch_tool else ""
+    print(f"sessions: restarting {entry.get('title') or entry.get('session_id')!r}{where}…")
     sys.stdout.flush()
     problem = stop_for_restart(int(entry["pid"]), float(entry.get("started", 0) or 0), names)
     if problem:
@@ -5378,13 +5398,57 @@ def open_again(
     """Resume ``item`` in this tab, the way it was first opened.
 
     A supervisor goes through its own launch, which gives it its folder and
-    its name; anything else follows its conversation to the current copy.
+    its name, in the harness chosen for it; anything else follows its
+    conversation to the current copy.
     """
     if not item.supervises:
         return launch(item, config, dry_run=dry_run, state=state, others=others)
     if IS_WINDOWS and not dry_run and not make_room(item, others):
         return 1
+    tool = active_launch_tool(item)
+    if tool != item.tool:
+        if dry_run:
+            print(f"sessions: the supervisor would be copied to {tool_label(tool, short=False)}")
+            return 0
+        problem = move_supervisor(item, tool, state)
+        if problem:
+            # Never open it in a harness other than the one asked for.
+            print(f"sessions: {problem}", file=sys.stderr)
+            return 2
     return launch_supervisor(item.supervises, config, state, dry_run)
+
+
+def move_supervisor(item: Session, tool: str, state: UserState) -> str:
+    """Carry the supervisor ``item`` into ``tool``; return why it could not, or ""."""
+    from .supervisor.store import load_hook_state, save_hook_state
+
+    record_id = item.supervises
+    record = state.supervisors.get(record_id)
+    hook_state = load_hook_state(record_id)
+    if record is None or hook_state is None:
+        return f"no supervisor record {record_id!r}"
+    label = tool_label(tool, short=False)
+    try:
+        target, note = prepare_launch(item, state=state)
+    except BridgeError as error:
+        return f"could not copy the supervisor to {label}: {error}"
+    session_id = target.session_id if target.tool == tool else target.launch_targets.get(tool, "")
+    if not session_id:
+        return f"could not copy the supervisor to {label}"
+    try:
+        # Its hook looks for compaction only in what the supervisor writes from here on.
+        offset = os.stat(target.storage).st_size if target.storage else 0
+    except OSError:
+        offset = 0
+    save_hook_state(replace(hook_state, native_session_id=session_id, own_offset=offset))
+    record["tool"] = tool
+    # The copy carries the name, but its harness has not been given it yet.
+    record.pop("published_title", None)
+    state.set_launch_tool(item, "")
+    state.save()
+    if note:
+        print(f"sessions: {note}", file=sys.stderr)
+    return ""
 
 
 REOPEN_CHOICES = 10
@@ -5656,7 +5720,8 @@ def build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help=(
             "Windows, typed inside a session as `! sessions --restart`: close it and reopen it "
-            "in the same tab, picking up new settings, names or a new login"
+            "in the same tab, picking up new settings, names or a new login; add one of the "
+            "harness flags below to carry it into that harness instead"
         ),
     )
     parser.add_argument(
@@ -5667,6 +5732,17 @@ def build_parser() -> argparse.ArgumentParser:
             "other CLI is copied across first"
         ),
     )
+    for name in REGISTRY.names():
+        flag = f"--{name}"
+        if flag in parser._option_string_actions:
+            continue
+        parser.add_argument(
+            flag,
+            dest="launch_tool",
+            action="store_const",
+            const=name,
+            help=f"same as --launch-tool {name}, as in `! sessions --restart {flag}`",
+        )
     parser.add_argument(
         "--supervise",
         metavar="ID_OR_NAME",
@@ -5736,16 +5812,16 @@ def build_parser() -> argparse.ArgumentParser:
 
 def main(argv: list[str] | None = None) -> int:
     """Run ``sessions``, reopening the session for as long as ``--restart`` asks."""
-    global _restart_pending
-    _restart_pending = False
+    global _restart_into
+    _restart_into = None
     code = _main(argv)
-    if _restart_pending:
+    if _restart_into is not None:
         # Keep a launch mode chosen on the command line; everything else is read afresh.
         mode = build_parser().parse_known_args(argv)[0].launch_mode
-        again = ["--reopen", *(["--launch-mode", mode] if mode else [])]
-        while _restart_pending:
-            _restart_pending = False
-            code = _main(again)
+        kept = ["--launch-mode", mode] if mode else []
+        while _restart_into is not None:
+            into, _restart_into = _restart_into, None
+            code = _main(["--reopen", *kept, *(["--launch-tool", into] if into else [])])
     return code
 
 
@@ -5773,7 +5849,7 @@ def _main(argv: list[str] | None = None) -> int:
                 file=sys.stderr,
             )
             return 2
-        return restart_here()
+        return restart_here(args.launch_tool or "")
     if args.launch_log is not None:
         launch_log_output(read_launch_log(args.launch_log))
         return 0
@@ -5982,6 +6058,17 @@ def _main(argv: list[str] | None = None) -> int:
         item = choose_reopen(sessions)
         if item is None:
             return 1
+        if args.launch_tool and args.launch_tool != item.tool:
+            if supports_launch_tool(item, args.launch_tool):
+                item = replace(item, launch_tool=args.launch_tool)
+            else:
+                # The harness is already closed, so reopening where it was beats nothing.
+                print(
+                    f"sessions: {display_title(item)!r} cannot be copied to "
+                    f"{tool_label(args.launch_tool, short=False)}; reopening it in "
+                    f"{tool_label(item.tool, short=False)}.",
+                    file=sys.stderr,
+                )
         return open_again(item, launch_config, state, sessions, args.dry_run)
 
     if args.list or args.json or not (sys.stdin.isatty() and sys.stdout.isatty()):
