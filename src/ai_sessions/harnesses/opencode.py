@@ -1894,8 +1894,12 @@ def _write_temporary_export(payload: dict[str, Any]) -> Path:
 
 
 def _remove_temporary_export(path: Path) -> OSError | None:
-    """Remove a sensitive import file, tolerating brief Windows lock release."""
-    attempts = 6 if IS_WINDOWS else 1
+    """Remove a sensitive import file, tolerating slow Windows lock release.
+
+    A killed import can hold the file for a moment after it exits; on a busy
+    machine that has taken longer than a third of a second, so allow two.
+    """
+    attempts = 40 if IS_WINDOWS else 1
     last_error: OSError | None = None
     for attempt in range(attempts):
         try:

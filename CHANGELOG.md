@@ -17,6 +17,8 @@
 - A conversation copied into Claude Code opens on your default model. Copies were credited
   to Opus 5, and Claude Code resumes a session on the model of its last reply, so every
   copy opened on Opus 5 until you changed it.
+- A timed-out OpenCode import no longer leaves its temporary copy of the conversation behind
+  on a busy Windows machine.
 
 ## 3.8.2 — 2026-11-03
 
