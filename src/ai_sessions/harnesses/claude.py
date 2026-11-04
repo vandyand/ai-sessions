@@ -15,6 +15,7 @@ from typing import Any, Iterable
 
 import zstandard
 
+from .. import fastjson
 from ..capabilities import HarnessAdapter
 from ..compression import (
     ZST_SUFFIX,
@@ -44,11 +45,13 @@ from ..discovery import (
     HarnessContext,
     clean_prompt,
     normalize_space,
-    prefetch_stats,
     prefix_settled,
+    prune_entries,
+    same_inode,
     stat_key,
     timestamp,
     trim_labels,
+    walk_files,
 )
 from ..jsonl_tracking import locate_checkpoint, protect_checkpoint
 from ..liveness import LivenessContext, ProcessInfo
@@ -460,13 +463,13 @@ class DiscoveryCache:
         self.stats: dict[str, os.stat_result] = {}
         if context.use_cache:
             try:
-                payload = json.loads(DISCOVERY_CACHE_FILE.read_text(encoding="utf-8"))
+                payload = fastjson.read(DISCOVERY_CACHE_FILE)
                 if payload.get("version") == DISCOVERY_CACHE_VERSION and isinstance(
                     payload.get("entries"), dict
                 ):
                     self.entries = payload["entries"]
                     self.dirty = trim_labels(self.entries, ("first_prompt", "last_prompt"))
-            except (OSError, json.JSONDecodeError, AttributeError):
+            except (OSError, ValueError, AttributeError):
                 pass
 
     @staticmethod
@@ -551,7 +554,7 @@ class DiscoveryCache:
             cached
             and signature_matches
             and not needs_count
-            and cached.get("inode") == stat.st_ino
+            and same_inode(cached, stat)
             and cached.get("size") == stat.st_size
             and cached.get("mtime_ns") == stat.st_mtime_ns
             and cached.get("ctime_ns", 0) == getattr(stat, "st_ctime_ns", 0)
@@ -573,6 +576,9 @@ class DiscoveryCache:
                 truncated=bool(cached.get("evidence_truncated")),
             )
             return cached, evidence
+        if not stat.st_ino:
+            # A listing's stat answered "unchanged?"; reading needs the file's own.
+            stat = path.stat()
         can_continue = bool(
             cached
             and not compressed
@@ -720,28 +726,16 @@ class DiscoveryCache:
         if not self.context.use_cache or not self.dirty:
             return
         try:
-            DISCOVERY_CACHE_FILE.parent.mkdir(parents=True, exist_ok=True)
-            temporary = DISCOVERY_CACHE_FILE.with_suffix(f".tmp-{os.getpid()}")
-            temporary.write_text(
-                json.dumps(
-                    {"version": DISCOVERY_CACHE_VERSION, "entries": self.entries},
-                    ensure_ascii=False,
-                ),
-                encoding="utf-8",
+            fastjson.write_atomic(
+                DISCOVERY_CACHE_FILE,
+                {"version": DISCOVERY_CACHE_VERSION, "entries": self.entries},
             )
-            temporary.chmod(0o600)
-            temporary.replace(DISCOVERY_CACHE_FILE)
         except OSError:
             pass
 
 
-def _walk_transcripts(projects: Path) -> set[Path]:
-    """Every transcript under ``projects``, plain or compressed, in one pass over the tree."""
-    suffixes = (".jsonl", f".jsonl{ZST_SUFFIX}")
-    found: set[Path] = set()
-    for folder, _dirs, names in os.walk(projects):
-        found.update(Path(folder, name) for name in names if name.casefold().endswith(suffixes))
-    return found
+def _is_transcript_name(name: str) -> bool:
+    return name.casefold().endswith((".jsonl", f".jsonl{ZST_SUFFIX}"))
 
 
 def discover(context: HarnessContext, *, use_cache: bool = True) -> list[NativeSession]:
@@ -753,19 +747,23 @@ def discover(context: HarnessContext, *, use_cache: bool = True) -> list[NativeS
     cache = DiscoveryCache(context)
     result: list[NativeSession] = []
     try:
-        found = sorted(_walk_transcripts(projects))
+        walked, stats = walk_files(projects, _is_transcript_name)
+        found = sorted(walked)
+        present = set(walked)
         # One file per session: the plain one when both exist.
         all_files = [
-            path for path in found if not is_compressed_path(path) or plain_path(path) not in found
+            path
+            for path in found
+            if not is_compressed_path(path) or plain_path(path) not in present
         ]
     except OSError:
         all_files = []
+        stats = {}
         index_complete = False
     else:
         index_complete = True
     for path in all_files:
         context.index_native("claude", plain_path(path).stem, str(path))
-    stats = prefetch_stats(all_files)
     cache.stats = dict(stats)
     if index_complete:
         context.complete_native_index("claude")
@@ -867,6 +865,8 @@ def discover(context: HarnessContext, *, use_cache: bool = True) -> list[NativeS
                 prompt_count=int(meta.get("prompt_count") or 0),
             )
         )
+    if index_complete and projects.is_dir() and prune_entries(cache.entries, projects, found):
+        cache.dirty = True
     cache.save()
     return result
 

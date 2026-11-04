@@ -5,11 +5,11 @@ from __future__ import annotations
 import functools
 import hashlib
 import json
-import os
 import threading
 from pathlib import Path
 from typing import Any, Callable
 
+from . import fastjson
 from .model import NativeRef
 from .paths import APP_CACHE_DIR
 
@@ -105,15 +105,14 @@ def _load_locations() -> dict[str, dict[str, Any]]:
 def _save_location(key: str, entry: dict[str, Any]) -> None:
     with _locations_lock:
         locations = _load_locations()
+        if locations and next(reversed(locations)) == key and locations[key] == entry:
+            return  # Already saved, and already the most recent.
         locations.pop(key, None)
         locations[key] = entry
         while len(locations) > _LOCATION_ENTRIES:
             locations.pop(next(iter(locations)))
         try:
-            LOCATIONS_FILE.parent.mkdir(parents=True, exist_ok=True)
-            temporary = LOCATIONS_FILE.with_suffix(f".tmp-{os.getpid()}")
-            temporary.write_text(json.dumps(locations), encoding="utf-8")
-            temporary.replace(LOCATIONS_FILE)
+            fastjson.write_atomic(LOCATIONS_FILE, locations)
         except OSError:
             pass
 

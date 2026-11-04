@@ -8,8 +8,6 @@ from pathlib import Path
 from types import MappingProxyType
 from typing import Any, Mapping
 
-import psutil
-
 WINDOWS_EPOCH_FILETIME = 116_444_736_000_000_000
 
 
@@ -51,6 +49,52 @@ def _basename(value: str) -> str:
     return value.replace("\\", "/").rsplit("/", 1)[-1].casefold()
 
 
+# Programs that can run a harness inside them, so their command line says which one.
+# Reading a command line on Windows is the slow part of a snapshot; nothing else
+# needs one.
+_HOSTS = frozenset(
+    name + suffix
+    for name in (
+        "node",
+        "nodejs",
+        "bun",
+        "deno",
+        "npx",
+        "pnpm",
+        "yarn",
+        "python",
+        "python3",
+        "py",
+        "pythonw",
+        "uv",
+        "uvx",
+        "bash",
+        "sh",
+        "zsh",
+        "fish",
+        "dash",
+        "env",
+        "cmd",
+        "pwsh",
+        "powershell",
+        "wsl",
+        "wslhost",
+        "conhost",
+        "openconsole",
+        "tmux",
+        "screen",
+    )
+    for suffix in ("", ".exe")
+)
+
+
+def _wants_command(name: str, executables: frozenset[str] | None) -> bool:
+    if executables is None:
+        return True
+    base = _basename(name)
+    return base in executables or base in _HOSTS
+
+
 def _needs_start_time(
     name: str,
     command: tuple[str, ...],
@@ -71,9 +115,14 @@ def process_snapshot(
     """Enumerate live processes once without retaining provider-specific state."""
     current_platform = platform or sys.platform
     result: list[ProcessInfo] = []
-    attributes = ["pid", "name", "cmdline"]
+    # On Windows a command line costs a separate query per process; take it only
+    # where it can matter.  Elsewhere it is read with the rest.
+    lazy_command = current_platform == "win32" and start_time_executables is not None
+    attributes = ["pid", "name"] if lazy_command else ["pid", "name", "cmdline"]
     if start_time_executables is None:
         attributes.append("create_time")
+    import psutil  # Loaded on first use: it is a tenth of a second of every start.
+
     try:
         processes = iter(psutil.process_iter(attributes))
     except Exception:
@@ -96,7 +145,13 @@ def process_snapshot(
         try:
             pid = int(process.info["pid"])
             name = str(process.info.get("name") or "")
-            command = tuple(str(value) for value in (process.info.get("cmdline") or ()))
+            if lazy_command:
+                raw_command = (
+                    process.cmdline() if _wants_command(name, start_time_executables) else ()
+                )
+            else:
+                raw_command = process.info.get("cmdline") or ()
+            command = tuple(str(value) for value in raw_command)
             started_at = 0.0
             start = ""
             if _needs_start_time(name, command, start_time_executables):

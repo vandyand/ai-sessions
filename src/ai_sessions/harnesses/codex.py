@@ -23,6 +23,7 @@ from typing import Any, Callable, Iterable, Mapping
 
 import zstandard
 
+from .. import fastjson
 from ..capabilities import HarnessAdapter, StorageUpgrade
 from ..compression import (
     ZST_SUFFIX,
@@ -52,14 +53,17 @@ from ..conversion import (
 )
 from ..diagnostics import record_warning
 from ..discovery import (
+    PROMPT_SCAN_CHARS,
     HarnessContext,
     clean_prompt,
     normalize_space,
-    prefetch_stats,
     prefix_settled,
+    prune_entries,
+    same_inode,
     stat_key,
     timestamp,
     trim_labels,
+    walk_files,
 )
 from ..jsonl_tracking import PREFIX, locate_checkpoint, protect_checkpoint
 from ..liveness import LivenessContext, ProcessInfo
@@ -428,7 +432,9 @@ class RolloutListing:
     def __init__(self, root: Path) -> None:
         global _rollout_index
         self.root = root
-        self.paths = _walk_rollouts(root)
+        self.paths, self.stats = walk_files(root, _is_rollout_name)
+        # A walk that could not read the tree must not make every file look deleted.
+        self.complete = root.is_dir()
         self._present = {self._key(str(path)) for path in self.paths}
         self._prefix = self._key(str(root)).rstrip("\\/") + os.sep
         index: dict[str, list[Path]] = {}
@@ -709,7 +715,7 @@ class DiscoveryCache:
         self.stats: dict[str, os.stat_result] = {}
         if context.use_cache:
             try:
-                payload = json.loads(DISCOVERY_CACHE_FILE.read_text(encoding="utf-8"))
+                payload = fastjson.read(DISCOVERY_CACHE_FILE)
                 if payload.get("version") == DISCOVERY_CACHE_VERSION and isinstance(
                     payload.get("entries"), dict
                 ):
@@ -717,7 +723,7 @@ class DiscoveryCache:
                     self.dirty = trim_labels(
                         self.entries, ("latest_user_message", "last_activity_text")
                     )
-            except (OSError, json.JSONDecodeError, AttributeError):
+            except (OSError, ValueError, AttributeError):
                 pass
 
     def _carried_over(self, path: Path, stat: os.stat_result) -> dict[str, Any] | None:
@@ -756,7 +762,7 @@ class DiscoveryCache:
             cached
             and signature_matches
             and cached.get("mode") == source.value
-            and cached.get("inode") == stat.st_ino
+            and same_inode(cached, stat)
             and cached.get("size") == stat.st_size
             and cached.get("mtime_ns") == stat.st_mtime_ns
             and cached.get("ctime_ns", 0) == getattr(stat, "st_ctime_ns", 0)
@@ -789,6 +795,12 @@ class DiscoveryCache:
                 clean_prompt(cached.get("latest_user_message")),
                 evidence,
             )
+        if not stat.st_ino:
+            # A listing's stat answered "unchanged?"; reading needs the file's own.
+            try:
+                stat = path.stat()
+            except OSError:
+                return 0, 0, 0, "", self.context.accumulator()
         can_continue = bool(
             cached
             and not compressed
@@ -937,21 +949,39 @@ class DiscoveryCache:
         self.dirty = True
         return turn_count, compaction_count, prompt_count, latest, evidence
 
+    def rollout_meta(self, path: Path, stat: Any) -> dict[str, Any]:
+        """The parts of a rollout's first line discovery uses, read once per file.
+
+        That line never changes once written, and it carries the whole system prompt,
+        so it is kept with the rollout's cache entry for as long as the file is the
+        same one: same path and creation time.
+        """
+        entry = self.entries.get(str(path))
+        saved = entry.get("meta") if isinstance(entry, dict) else None
+        if isinstance(saved, dict) and saved.get("ctime_ns") == getattr(stat, "st_ctime_ns", 0):
+            value = saved.get("value")
+            if isinstance(value, dict):
+                return value
+        meta = _rollout_meta(path)
+        return {name: meta[name] for name in ("id", "source", "cwd", "timestamp") if name in meta}
+
+    def remember_rollout_meta(self, path: Path, stat: Any, meta: dict[str, Any]) -> None:
+        entry = self.entries.get(str(path))
+        if not isinstance(entry, dict) or not meta:
+            return
+        saved = {"ctime_ns": getattr(stat, "st_ctime_ns", 0), "value": meta}
+        if entry.get("meta") != saved:
+            entry["meta"] = saved
+            self.dirty = True
+
     def save(self) -> None:
         if not self.context.use_cache or not self.dirty:
             return
         try:
-            DISCOVERY_CACHE_FILE.parent.mkdir(parents=True, exist_ok=True)
-            temporary = DISCOVERY_CACHE_FILE.with_suffix(f".tmp-{os.getpid()}")
-            temporary.write_text(
-                json.dumps(
-                    {"version": DISCOVERY_CACHE_VERSION, "entries": self.entries},
-                    ensure_ascii=False,
-                ),
-                encoding="utf-8",
+            fastjson.write_atomic(
+                DISCOVERY_CACHE_FILE,
+                {"version": DISCOVERY_CACHE_VERSION, "entries": self.entries},
             )
-            temporary.chmod(0o600)
-            temporary.replace(DISCOVERY_CACHE_FILE)
         except OSError:
             pass
 
@@ -995,16 +1025,16 @@ def discover(context: HarnessContext, *, use_cache: bool = True) -> list[NativeS
     result: list[NativeSession] = []
     history = load_history()
     cache = DiscoveryCache(context)
-    cache.stats = prefetch_stats(listing.paths)
+    cache.stats = listing.stats
     connection: sqlite3.Connection | None = None
     try:
         connection = sqlite3.connect(f"file:{database}?mode=ro", uri=True, timeout=2)
-        connection.row_factory = sqlite3.Row
-        for row in connection.execute("SELECT * FROM threads"):
-            keys = set(row.keys())
+        columns, query = _threads_query(connection)
+        for values in connection.execute(query):
+            row = dict(zip(columns, values))
 
             def field(name: str, default: Any = None) -> Any:
-                return row[name] if name in keys else default
+                return row.get(name, default)
 
             session_id = str(field("id", ""))
             if not session_id:
@@ -1103,8 +1133,50 @@ def discover(context: HarnessContext, *, use_cache: bool = True) -> list[NativeS
             connection.close()
     known = {item.session_id for item in result}
     result.extend(_unregistered_sessions(listing, known, cache, context))
+    if listing.complete and prune_entries(cache.entries, listing.root, listing.paths):
+        cache.dirty = True
     cache.save()
     return result
+
+
+# The thread columns discovery reads; Codex versions differ in which exist.
+_THREAD_COLUMNS = (
+    "id",
+    "source",
+    "thread_source",
+    "agent_path",
+    "agent_nickname",
+    "history_mode",
+    "name",
+    "title",
+    "preview",
+    "first_user_message",
+    "created_at_ms",
+    "created_at",
+    "updated_at_ms",
+    "recency_at_ms",
+    "updated_at",
+    "rollout_path",
+    "cwd",
+    "archived",
+)
+# Labels hold whole pasted prompts; cleaning never looks past this much of one.
+_LONG_TEXT_COLUMNS = frozenset(("title", "preview", "first_user_message"))
+
+
+def _threads_query(connection: sqlite3.Connection) -> tuple[tuple[str, ...], str]:
+    """Select only the columns discovery uses, with long text cut where cleaning stops."""
+    present = {str(row[1]) for row in connection.execute("PRAGMA table_info(threads)")}
+    columns = tuple(name for name in _THREAD_COLUMNS if name in present)
+    if not columns:
+        raise sqlite3.OperationalError("the threads table has none of the expected columns")
+    selected = ", ".join(
+        f'substr("{name}", 1, {PROMPT_SCAN_CHARS}) AS "{name}"'
+        if name in _LONG_TEXT_COLUMNS
+        else f'"{name}"'
+        for name in columns
+    )
+    return columns, f"SELECT {selected} FROM threads"
 
 
 def _rollout_meta(path: Path) -> dict[str, Any]:
@@ -1139,12 +1211,13 @@ def _unregistered_sessions(
             found[session_id] = path
     sessions: list[NativeSession] = []
     for session_id, path in found.items():
-        meta = _rollout_meta(path)
-        if str(meta.get("id", "")) != session_id:
-            continue
         try:
-            modified = path.stat().st_mtime
+            stat = listing.stats.get(stat_key(path)) or path.stat()
         except OSError:
+            continue
+        modified = stat.st_mtime
+        meta = cache.rollout_meta(path, stat)
+        if str(meta.get("id", "")) != session_id:
             continue
         origin = meta.get("source")
         if isinstance(origin, dict) and "subagent" in origin:
@@ -1154,6 +1227,7 @@ def _unregistered_sessions(
         else:
             source = SourceKind.INTERACTIVE
         turns, compactions, prompts, latest, evidence = cache.scan(path, source)
+        cache.remember_rollout_meta(path, stat, meta)
         context.publish("codex", session_id, evidence)
         sessions.append(
             NativeSession(
@@ -1265,7 +1339,13 @@ def _windows_liveness(context: LivenessContext, home: Path, eligible: set[str]) 
         )
         and not _is_app_server(process)
     ]
-    if any(process.started_at <= 0 for process in candidates):
+    # A shell whose command line merely mentions codex.exe has no start time taken;
+    # the Codex it runs is its own process in the snapshot.  Only a Codex process
+    # itself without one is worth a warning.
+    if any(
+        process.started_at <= 0 and process.name.casefold() in ("codex.exe", "codex")
+        for process in candidates
+    ):
         record_warning("could not verify the start time of a live Codex process")
     live_processes = [process for process in candidates if process.started_at > 0]
     if not live_processes:

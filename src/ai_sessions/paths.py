@@ -23,6 +23,6 @@ else:
     CACHE_HOME = env_path("XDG_CACHE_HOME", HOME / ".cache")
 
 APP_CONFIG_DIR = CONFIG_HOME / "ai-sessions"
-APP_CACHE_DIR = CACHE_HOME / "ai-sessions"
+APP_CACHE_DIR = env_path("AI_SESSIONS_CACHE_DIR", CACHE_HOME / "ai-sessions")
 STATE_FILE = env_path("AI_SESSIONS_STATE_FILE", APP_CONFIG_DIR / "state.json")
 CONFIG_FILE = env_path("AI_SESSIONS_CONFIG_FILE", APP_CONFIG_DIR / "config.toml")

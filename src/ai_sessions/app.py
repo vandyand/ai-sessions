@@ -34,6 +34,7 @@ from pathlib import Path
 from typing import Any, Iterable
 
 from . import __version__ as VERSION
+from . import fastjson
 from .capabilities import HarnessAdapter, Unsupported
 from .compression import CompressionError
 from .config import LAUNCH_MODES, LaunchConfig
@@ -178,7 +179,48 @@ def supports_launch_tool(item: Session, value: str) -> bool:
     return value in available_launch_tools(item)
 
 
+# id(session) -> (the fields the text is made from, the text).  Built once per change
+# instead of once per session on every keystroke.
+_SEARCHABLE: dict[int, tuple[tuple[Any, ...], tuple[str, str, str]]] = {}
+
+
 def session_searchable(item: Session) -> str:
+    return search_fields(item)[0]
+
+
+def search_fields(item: Session) -> tuple[str, str, str]:
+    """The search text, title and folder of ``item``, casefolded."""
+    signature = (
+        REGISTRY.generation,
+        item.tool,
+        item.session_id,
+        item.launch_tool,
+        tuple(item.launch_targets),
+        item.storage,
+        item.compressed,
+        item.title,
+        item.cwd,
+        item.preview,
+        item.source,
+        item.origin,
+        item.parent_id,
+        item.hidden,
+        item.is_open,
+        item.original_title,
+        item.message_count,
+        item.open_pid,
+    )
+    cached = _SEARCHABLE.get(id(item))
+    if cached is not None and cached[0] == signature:
+        return cached[1]
+    if len(_SEARCHABLE) > 100_000:
+        _SEARCHABLE.clear()
+    fields = (_session_searchable(item), item.title.casefold(), item.cwd.casefold())
+    _SEARCHABLE[id(item)] = (signature, fields)
+    return fields
+
+
+def _session_searchable(item: Session) -> str:
     return " ".join(
         (
             item.tool,
@@ -223,8 +265,11 @@ class UserState:
         self.session_conversations: dict[str, str] = {}
         self.supervisors: dict[str, dict[str, Any]] = {}
         self._sessions_by_key: dict[str, Session] = {}
+        # A background refresh applies itself to this state while the browser can
+        # still change and save it; each of those holds this lock.
+        self.lock = threading.RLock()
         try:
-            payload = json.loads(path.read_text(encoding="utf-8"))
+            payload = fastjson.read(path)
             if payload.get("version") in (1, 2, 3, 4, 5, 6, 7):
                 names = payload.get("names", {})
                 original_names = payload.get("original_names", {})
@@ -880,6 +925,10 @@ class UserState:
                 self.session_conversations[key] = conversation_id
 
     def apply(self, sessions: Iterable[Session], *, check_copies: bool = True) -> None:
+        with self.lock:
+            self._apply(sessions, check_copies=check_copies)
+
+    def _apply(self, sessions: Iterable[Session], *, check_copies: bool) -> None:
         """Apply saved choices and conversation state to freshly loaded sessions.
 
         Working out which copy of a conversation is current reads each copy's
@@ -980,30 +1029,27 @@ class UserState:
             item.hidden = item.key in self.hidden
 
     def save(self) -> None:
-        self.path.parent.mkdir(parents=True, exist_ok=True)
-        temp = self.path.with_suffix(f".tmp-{os.getpid()}")
-        temp.write_text(
-            json.dumps(
-                {
-                    "version": 7,
-                    "names": self.names,
-                    "local_names": sorted(self.local_names),
-                    "original_names": self.original_names,
-                    "hidden": sorted(self.hidden),
-                    "launch_tools": self.launch_tools,
-                    "bridges": self.bridges,
-                    "conversations": self.conversations,
-                    "session_conversations": self.session_conversations,
-                    "supervisors": self.supervisors,
-                },
-                indent=2,
-                ensure_ascii=False,
-            )
-            + "\n",
-            encoding="utf-8",
+        with self.lock:
+            self._save()
+
+    def _save(self) -> None:
+        fastjson.write_atomic(
+            self.path,
+            {
+                "version": 7,
+                "names": self.names,
+                "local_names": sorted(self.local_names),
+                "original_names": self.original_names,
+                "hidden": sorted(self.hidden),
+                "launch_tools": self.launch_tools,
+                "bridges": self.bridges,
+                "conversations": self.conversations,
+                "session_conversations": self.session_conversations,
+                "supervisors": self.supervisors,
+            },
+            indent=True,
+            newline=True,
         )
-        temp.chmod(0o600)
-        temp.replace(self.path)
 
     def remember_original_name(self, item: Session) -> None:
         """Keep the pre-rename provider title stable across provider reloads."""
@@ -1042,12 +1088,14 @@ class UserState:
         self.save()
 
     def set_launch_tool(self, item: Session, launch_tool: str) -> None:
-        key = self.stable_key(item.key)
-        if launch_tool and launch_tool in available_launch_tools(item) and launch_tool != item.tool:
-            self.launch_tools[key] = launch_tool
-        else:
-            self.launch_tools.pop(key, None)
-        self.save()
+        with self.lock:
+            key = self.stable_key(item.key)
+            choice = launch_tool in available_launch_tools(item) and launch_tool != item.tool
+            if launch_tool and choice:
+                self.launch_tools[key] = launch_tool
+            else:
+                self.launch_tools.pop(key, None)
+            self.save()
 
     def bridge_for(self, item: Session, tool: str) -> str:
         """The id of an existing bridged copy that is still worth resuming.
@@ -1250,8 +1298,12 @@ def short_path(value: str) -> str:
         return value
 
 
+# Titles are drawn and grouped on every redraw; cleaning one is pure, so remember it.
+_clean_title = functools.lru_cache(maxsize=16_384)(clean_prompt)
+
+
 def display_title(session: Session) -> str:
-    title = clean_prompt(session.title)
+    title = _clean_title(session.title)
     if not title:
         title = f"Untitled {tool_label(session.tool)} session"
     return title
@@ -1418,12 +1470,22 @@ def _common_project_path(projects: Iterable[str]) -> str:
         return known[0]
 
 
+@functools.lru_cache(maxsize=16_384)
+def _title_key(title: str) -> str:
+    return normalize_space(title).casefold()
+
+
+@functools.lru_cache(maxsize=16_384)
+def _ancestor_paths(project: str) -> tuple[str, ...]:
+    return tuple(str(ancestor) for ancestor in Path(project).parents)
+
+
 def _independent_group_key(item: Session) -> tuple[str, str]:
     """Make unknown-cwd independent sessions permanently presentation-distinct."""
     project = project_identity(item.cwd)
     if project == "(unknown project)":
         project = f"{project}:{item.key}"
-    return project, normalize_space(display_title(item)).casefold()
+    return project, _title_key(display_title(item))
 
 
 def activity_counts(session: Session) -> tuple[int, int, int]:
@@ -1636,7 +1698,7 @@ def build_view_rows(
 
     def add_logical_row(rows: list[ViewRow], logical: ViewRow) -> None:
         expanded_here = logical.expandable and logical.row_id in expanded_ids
-        rows.append(replace(logical, expanded=expanded_here))
+        rows.append(replace(logical, expanded=True) if expanded_here else logical)
         if not expanded_here:
             return
         rows.extend(
@@ -1661,7 +1723,7 @@ def build_view_rows(
     # while sibling directories with no direct ancestor relation stay separate.
     title_indexes: dict[str, list[int]] = {}
     for index, row in enumerate(logical_rows):
-        title_indexes.setdefault(normalize_space(row.title).casefold(), []).append(index)
+        title_indexes.setdefault(_title_key(row.title), []).append(index)
 
     components: dict[int, tuple[int, ...]] = {}
     for indexes in title_indexes.values():
@@ -1697,8 +1759,8 @@ def build_view_rows(
                 by_project[project] = index
 
         for project, index in by_project.items():
-            for ancestor in Path(project).parents:
-                ancestor_index = by_project.get(str(ancestor))
+            for ancestor in _ancestor_paths(project):
+                ancestor_index = by_project.get(ancestor)
                 if ancestor_index is not None:
                     union(index, ancestor_index)
                     break
@@ -1767,7 +1829,12 @@ def build_view_rows(
             for child in children:
                 add_logical_row(rows, child)
     labels = view_collision_labels(row for row in rows if "/member:" not in row.row_id)
-    return tuple(replace(row, collision_label=labels.get(row.row_id, "")) for row in rows)
+    return tuple(
+        replace(row, collision_label=label)
+        if (label := labels.get(row.row_id, "")) != row.collision_label
+        else row
+        for row in rows
+    )
 
 
 def pair_supervisor_rows(rows: tuple[ViewRow, ...]) -> tuple[ViewRow, ...]:
@@ -2128,6 +2195,7 @@ def _catalog_signature() -> list[dict[str, Any]]:
     ]
 
 
+_SESSION_FIELDS = tuple(field.name for field in fields(Session))
 # Fields a catalog row leaves out when they only repeat the title.
 _TITLE_COPIES = ("original_title", "provider_title")
 
@@ -2139,8 +2207,10 @@ def save_session_catalog(sessions: Iterable[Session], path: Path = CATALOG_CACHE
     copies as the last refresh did without reading their transcripts.
     """
     rows: list[dict[str, Any]] = []
+    names = _SESSION_FIELDS
     for item in sessions:
-        payload = asdict(item)
+        # A shallow copy is enough: the rows are only serialised, never changed.
+        payload = {name: getattr(item, name) for name in names}
         payload.update(
             renamed=False,
             hidden=False,
@@ -2157,23 +2227,10 @@ def save_session_catalog(sessions: Iterable[Session], path: Path = CATALOG_CACHE
         "registry": _catalog_signature(),
         "sessions": rows,
     }
-    temporary = path.with_suffix(f".tmp-{os.getpid()}-{threading.get_ident()}")
     try:
-        path.parent.mkdir(parents=True, exist_ok=True)
-        temporary.write_text(
-            json.dumps(document, ensure_ascii=False, separators=(",", ":")),
-            encoding="utf-8",
-        )
-        try:
-            temporary.chmod(0o600)
-        except OSError:
-            pass
-        temporary.replace(path)
+        fastjson.write_atomic(path, document)
     except OSError:
-        try:
-            temporary.unlink(missing_ok=True)
-        except OSError:
-            pass
+        pass
 
 
 def load_session_catalog(
@@ -2184,8 +2241,8 @@ def load_session_catalog(
     if path == CATALOG_CACHE_FILE and not path.exists():
         path = LEGACY_CATALOG_FILE
     try:
-        document = json.loads(path.read_text(encoding="utf-8"))
-    except (OSError, json.JSONDecodeError, UnicodeError):
+        document = fastjson.read(path)
+    except (OSError, ValueError):
         return []
     if (
         not isinstance(document, dict)
@@ -2388,6 +2445,19 @@ def launch_log_output(entries: list[dict[str, Any]]) -> None:
             print(f"  ran       {subprocess.list2cmdline([str(part) for part in argv])}")
 
 
+# Refreshes whose results are out but whose catalog may still be being written.
+_SAVING: set["SessionRefresh"] = set()
+
+
+def finish_catalog_saves(timeout: float = 10.0) -> None:
+    """Let a refresh that already has its result finish writing the catalog.
+
+    One still discovering is left behind: waiting for it would make quitting slow.
+    """
+    for refresh in list(_SAVING):
+        refresh.wait_saved(timeout)
+
+
 class SessionRefresh:
     """One background provider refresh with a pollable, single-consumer result."""
 
@@ -2399,13 +2469,16 @@ class SessionRefresh:
         config: LaunchConfig,
         catalog_path: Path = CATALOG_CACHE_FILE,
         stop_detached: bool = False,
+        tidy: bool = False,
     ) -> None:
         self._stop_detached = stop_detached
+        self._tidy = tidy
         self._use_cache = use_cache
         self._state = state
         self._config = config
         self._catalog_path = catalog_path
         self._done = threading.Event()
+        self._saved = threading.Event()
         self._taken = False
         self._sessions: list[Session] | None = None
         self._warnings: tuple[str, ...] = ()
@@ -2418,6 +2491,14 @@ class SessionRefresh:
         self._thread.start()
 
     def _run(self) -> None:
+        if self._tidy:
+            from .housekeeping import remove_obsolete_caches, sweep_temporary_files
+
+            try:
+                sweep_temporary_files((APP_CACHE_DIR, STATE_FILE.parent))
+                remove_obsolete_caches(APP_CACHE_DIR)
+            except Exception:
+                pass
         try:
             sessions = load_sessions(
                 use_cache=self._use_cache,
@@ -2430,16 +2511,30 @@ class SessionRefresh:
 
                 if note := cleanup_note(*stop_detached(sessions)):
                     notes.insert(0, note)
-            save_session_catalog(sessions, self._catalog_path)
             self._sessions = sessions
             self._warnings = tuple(notes)
         except Exception as error:
             self._error = f"refresh failed: {error}"
-        finally:
             self._done.set()
+            self._saved.set()
+            return
+        # The browser can use the result while the catalog for the next start is
+        # written; writing it took half a second of the wait.
+        _SAVING.add(self)
+        self._done.set()
+        try:
+            save_session_catalog(sessions, self._catalog_path)
+        except Exception:
+            pass
+        finally:
+            self._saved.set()
+            _SAVING.discard(self)
 
     def ready(self) -> bool:
         return self._done.is_set()
+
+    def wait_saved(self, timeout: float | None = None) -> bool:
+        return self._saved.wait(timeout)
 
     def take(self, *, wait: bool = False) -> tuple[list[Session] | None, tuple[str, ...], str]:
         if wait:
@@ -2846,13 +2941,18 @@ def focus_open_session(item: Session, config: LaunchConfig | None = None) -> tup
     )
 
 
-def query_match(session: Session, query: str) -> tuple[bool, int]:
-    words = [word for word in query.casefold().split() if word]
+def query_words(query: str) -> tuple[str, ...]:
+    return tuple(word for word in query.casefold().split() if word)
+
+
+def query_match(
+    session: Session, query: str, words: tuple[str, ...] | None = None
+) -> tuple[bool, int]:
+    if words is None:
+        words = query_words(query)
     if not words:
         return True, 0
-    haystack = session_searchable(session)
-    title = session.title.casefold()
-    cwd = session.cwd.casefold()
+    haystack, title, cwd = search_fields(session)
     score = 0
     for word in words:
         if word.startswith("tool:"):
@@ -2947,6 +3047,7 @@ def filtered_sessions(
     # Backward compatibility for scripts written against v1.
     if include_auxiliary:
         origin = "all"
+    words = query_words(query)
     matches: list[tuple[int, Session]] = []
     for item in sessions:
         if origin != "all" and item.origin != origin:
@@ -2964,7 +3065,7 @@ def filtered_sessions(
             continue
         if directory and item.cwd != directory:
             continue
-        matched, score = query_match(item, query)
+        matched, score = query_match(item, query, words)
         if matched:
             matches.append((score, item))
     if query:
@@ -3133,6 +3234,20 @@ def ellipsize_with_suffix(value: str, suffix: str, width: int) -> str:
     return ellipsize(value, title_width) + separator + suffix
 
 
+_NAVIGATION_KEYS = frozenset(
+    (
+        curses.KEY_UP,
+        curses.KEY_DOWN,
+        curses.KEY_PPAGE,
+        curses.KEY_NPAGE,
+        curses.KEY_HOME,
+        curses.KEY_END,
+        "\x10",
+        "\x0e",
+    )
+)
+
+
 class Browser:
     def __init__(
         self,
@@ -3149,6 +3264,15 @@ class Browser:
         self.launch_config = launch_config
         self.use_cache = use_cache
         self.refresh = refresh
+        # Rows are cached only while the key loop says nothing can have changed them.
+        self._rows_memo = False
+        self._rows_generation = 0
+        self._rows_key: tuple[Any, ...] | None = None
+        self._rows_value: tuple[ViewRow, ...] = ()
+        self._excluded_key: tuple[Any, ...] | None = None
+        self._excluded_value = 0
+        # (everything but the query, the query, what it matched), for narrowing.
+        self._matches: tuple[tuple[Any, ...], str, list[Session]] | None = None
         self._tools = set(REGISTRY.names())
         self.origin = "human"
         self.visibility = "visible"
@@ -3231,6 +3355,7 @@ class Browser:
         # otherwise vanish here, and Enter would resume the native harness.
         self.state.apply_choices(sessions)
         self.sessions = sessions
+        self.invalidate_rows()
         # A disappeared child cannot retain launch intent or selection. Restore
         # its aggregate only when that exact stable parent still exists.
         self.keep_selection(previous, fallback_id=previous_parent)
@@ -3366,22 +3491,94 @@ class Browser:
             pass
 
     def current(self, compression: str | None = None) -> list[Session]:
+        compression = compression or self.compression
+        pool: Iterable[Session] = self.sessions
+        base = (
+            self._rows_generation,
+            id(self.sessions),
+            len(self.sessions),
+            None if self.tools is None else tuple(sorted(self.tools)),
+            self.directory,
+            self.origin,
+            self.visibility,
+            self.sort_mode,
+            compression,
+        )
+        previous = self._matches if self._rows_memo else None
+        if (
+            previous is not None
+            and previous[0] == base
+            and previous[1]
+            and self.query.startswith(previous[1])
+            and ":" not in self.query
+        ):
+            # Adding characters only narrows a plain-word search: every word still
+            # has to match, and a longer word matches a subset of what it did.
+            # Filters such as ``is:open`` change meaning once complete, so a query
+            # with one always starts again from every session.
+            pool = previous[2]
         items = filtered_sessions(
-            self.sessions,
+            pool,
             tools=self.tools,
             directory=self.directory,
             query=self.query,
             origin=self.origin,
             visibility=self.visibility,
             sort_mode=self.sort_mode,
-            compression=compression or self.compression,
+            compression=compression,
         )
+        if self._rows_memo and compression == self.compression:
+            self._matches = (base, self.query, items)
         if self.project_focus:
             focus = project_identity(self.project_focus)
             items = [item for item in items if _projects_related(focus, project_identity(item.cwd))]
         return items
 
+    def _rows_cache_key(self) -> tuple[Any, ...]:
+        tools = self.tools
+        return (
+            self._rows_generation,
+            id(self.sessions),
+            len(self.sessions),
+            self.query,
+            None if tools is None else tuple(sorted(tools)),
+            self.directory,
+            self.origin,
+            self.visibility,
+            self.sort_mode,
+            self.compression,
+            self.project_focus,
+            frozenset(self.expanded),
+        )
+
+    def invalidate_rows(self) -> None:
+        self._rows_generation += 1
+
     def view_rows(self) -> tuple[ViewRow, ...]:
+        if not self._rows_memo:
+            return self._build_rows()
+        key = self._rows_cache_key()
+        if key != self._rows_key:
+            self._rows_value = self._build_rows()
+            self._rows_key = key
+        return self._rows_value
+
+    def _keeps_rows(self, key: object) -> bool:
+        """Whether handling ``key`` can only move the cursor or edit the search.
+
+        Every other key may rename, hide, retarget or reload sessions in place, so
+        its handler runs uncached and the rows are rebuilt after it.
+        """
+        if key in _NAVIGATION_KEYS or key == "\x1b":
+            # Escape leaves the search, clears the query or quits.
+            return True
+        if self.searching:
+            if key in ("\x7f", "\b", "\x15", "\x17", curses.KEY_BACKSPACE):
+                return True
+            return isinstance(key, str) and len(key) == 1 and key.isprintable()
+        return key in ("j", "k", "g", "G")
+
+    def _build_rows(self) -> tuple[ViewRow, ...]:
         eligible = self.current()
         keys = [item.key for item in eligible]
         records = {item.supervised_by for item in eligible if item.supervised_by}
@@ -3911,7 +4108,13 @@ class Browser:
         """How many sessions match everything but the compression filter."""
         if self.compression != "uncompressed":
             return 0
-        return len(self.current("compressed"))
+        if not self._rows_memo:
+            return len(self.current("compressed"))
+        key = self._rows_cache_key()
+        if self._excluded_key != key:
+            self._excluded_value = len(self.current("compressed"))
+            self._excluded_key = key
+        return self._excluded_value
 
     def cycle_compression(self) -> None:
         previous = self.selected_id()
@@ -4601,16 +4804,30 @@ class Browser:
     def run(self) -> Session | None:
         if self.refresh is not None:
             self._set_input_timeout(100)
+        rows_changed = True
+        idle = False
         while True:
-            self.apply_refresh()
-            self.draw()
+            if rows_changed:
+                self.invalidate_rows()
+                rows_changed = False
+            self._rows_memo = True
+            # While waiting for the refresh, input times out ten times a second.  An
+            # unchanged screen is not redrawn then: the redraws competed with the
+            # refresh for the interpreter and made it several times slower.
+            if self.apply_refresh() or not idle:
+                self.draw()
+            idle = False
             try:
                 key = self.screen.get_wch()
             except curses.error:
                 if self.refresh is not None:
+                    idle = True
                     continue
                 raise
             self.message = ""
+            if not self._keeps_rows(key):
+                self._rows_memo = False
+                rows_changed = True
             rows = self.view_rows()
             page = max(1, self.screen.getmaxyx()[0] - 12)
 
@@ -5956,6 +6173,7 @@ def _main(argv: list[str] | None = None) -> int:
             state=state,
             config=launch_config,
             stop_detached=IS_WINDOWS,
+            tidy=True,
         )
     else:
         sessions = load_sessions(
@@ -5963,7 +6181,9 @@ def _main(argv: list[str] | None = None) -> int:
             state=state,
             config=launch_config,
         )
-        save_session_catalog(sessions)
+        if not args.compress_idle:
+            # Idle compression changes sessions, and saves the catalog once it has.
+            save_session_catalog(sessions)
         for note in load_warnings():
             print(f"sessions: {note}", file=sys.stderr)
 
@@ -6046,16 +6266,6 @@ def _main(argv: list[str] | None = None) -> int:
             args.query = (args.query + " dir:" + args.directory.casefold()).strip()
 
     selected_origin = "all" if args.include_auxiliary else args.origin
-    items = filtered_sessions(
-        sessions,
-        tool=args.tool,
-        directory=directory,
-        query=args.query,
-        origin=selected_origin,
-        visibility=args.visibility,
-        sort_mode=args.sort,
-        compression=args.compression,
-    )
 
     if args.resume:
         item = resolve(args.resume)
@@ -6122,6 +6332,16 @@ def _main(argv: list[str] | None = None) -> int:
         return open_again(item, launch_config, state, sessions, args.dry_run)
 
     if args.list or args.json or not (sys.stdin.isatty() and sys.stdout.isatty()):
+        items = filtered_sessions(
+            sessions,
+            tool=args.tool,
+            directory=directory,
+            query=args.query,
+            origin=selected_origin,
+            visibility=args.visibility,
+            sort_mode=args.sort,
+            compression=args.compression,
+        )
         try:
             list_output(items, as_json=args.json)
         except BrokenPipeError:
@@ -6158,14 +6378,17 @@ def _main(argv: list[str] | None = None) -> int:
     if launch_config.compress_after_days and not args.dry_run:
         start_background_sweep()
     selected = curses.wrapper(wrapped)
-    if isinstance(selected, tuple):
-        action, selected = selected
-        if action == "supervise":
-            return supervise_session(selected, launch_config, state, "", args.dry_run)
-    if selected:
-        # Enter on a supervisor row must open it as a supervisor, with its folder and name.
-        return open_again(selected, launch_config, state, loaded, args.dry_run)
-    return 0
+    try:
+        if isinstance(selected, tuple):
+            action, selected = selected
+            if action == "supervise":
+                return supervise_session(selected, launch_config, state, "", args.dry_run)
+        if selected:
+            # Enter on a supervisor row must open it as a supervisor, with its folder and name.
+            return open_again(selected, launch_config, state, loaded, args.dry_run)
+        return 0
+    finally:
+        finish_catalog_saves()
 
 
 if __name__ == "__main__":

@@ -7,9 +7,9 @@ import hashlib
 import os
 import re
 import sys
-from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
-from typing import Any, Mapping
+from pathlib import Path
+from typing import Any, Callable, Iterable, Mapping
 
 from .capabilities import Unsupported
 from .liveness import ProcessInfo
@@ -40,12 +40,54 @@ def prefix_settled(cached: Mapping[str, Any], stat: Any) -> bool:
     except (TypeError, ValueError):
         return False
     return bool(
-        cached.get("inode") == stat.st_ino
+        same_inode(cached, stat)
         and cached.get("size") == stat.st_size
         and cached.get("mtime_ns") == stat.st_mtime_ns
         and cached.get("ctime_ns", 0) == getattr(stat, "st_ctime_ns", 0)
         and verified - stat.st_mtime_ns > SETTLED_NS
     )
+
+
+def same_inode(cached: Mapping[str, Any], stat: Any) -> bool:
+    """Whether ``stat`` can be the file ``cached`` describes, as far as its inode tells.
+
+    A Windows directory listing reports no inode.  Its creation time, compared
+    alongside, already tells a replaced file from the one that was cached.
+    """
+    return not stat.st_ino or not cached.get("inode") or cached.get("inode") == stat.st_ino
+
+
+def walk_files(root: Path, accept: Callable[[str], bool]) -> tuple[list[Path], dict[str, Any]]:
+    """Every accepted file under ``root``, and its stat keyed by ``stat_key``.
+
+    On Windows the directory listing already carries each file's size and times, so
+    the walk costs no further system call per file; elsewhere the files are stat'ed
+    together afterwards.
+    """
+    found: list[Path] = []
+    if sys.platform != "win32":
+        for folder, _dirs, names in os.walk(root):
+            found.extend(Path(folder, name) for name in names if accept(name))
+        return found, prefetch_stats(found)
+    stats: dict[str, Any] = {}
+    pending = [str(root)]
+    while pending:
+        folder = pending.pop()
+        try:
+            entries = list(os.scandir(folder))
+        except OSError:
+            continue
+        for entry in entries:
+            try:
+                if entry.is_dir(follow_symlinks=False):
+                    pending.append(entry.path)
+                elif accept(entry.name):
+                    path = Path(entry.path)
+                    found.append(path)
+                    stats[stat_key(entry.path)] = entry.stat()
+            except OSError:
+                continue
+    return found, stats
 
 
 # A stat costs a quarter of a millisecond on Windows, and a refresh needs one per
@@ -70,9 +112,29 @@ def prefetch_stats(paths: Any) -> dict[str, os.stat_result]:
     if len(paths) < 64:
         results = [one(path) for path in paths]
     else:
+        from concurrent.futures import ThreadPoolExecutor
+
         with ThreadPoolExecutor(STAT_WORKERS, thread_name_prefix="ai-sessions-stat") as pool:
             results = list(pool.map(one, paths, chunksize=64))
     return {stat_key(path): found for path, found in zip(paths, results) if found is not None}
+
+
+def prune_entries(entries: dict[str, Any], root: Path, present: Iterable[Path]) -> bool:
+    """Drop cached files under ``root`` that a complete walk of it no longer found.
+
+    Entries elsewhere are left alone: only the walked tree is known.  Returns whether
+    anything was dropped.
+    """
+    prefix = stat_key(root).rstrip("\\/") + os.sep
+    kept = {stat_key(path) for path in present}
+    stale = [
+        key
+        for key in entries
+        if (folded := stat_key(key)).startswith(prefix) and folded not in kept
+    ]
+    for key in stale:
+        del entries[key]
+    return bool(stale)
 
 
 def trim_labels(entries: Mapping[str, Any], names: tuple[str, ...]) -> bool:
@@ -102,13 +164,13 @@ def normalize_space(value: Any) -> str:
 # at every refresh, and every search went through all of it.
 PROMPT_LABEL_CHARS = 1_000
 # Scaffolding blocks are a few kilobytes, so cleaning never needs more than this.
-_PROMPT_SCAN_CHARS = 65_536
+PROMPT_SCAN_CHARS = 65_536
 
 
 def clean_prompt(value: Any) -> str:
     """Turn a first prompt or generated title into a useful one-line label."""
-    if isinstance(value, str) and len(value) > _PROMPT_SCAN_CHARS:
-        value = value[:_PROMPT_SCAN_CHARS]
+    if isinstance(value, str) and len(value) > PROMPT_SCAN_CHARS:
+        value = value[:PROMPT_SCAN_CHARS]
     text = normalize_space(value)
     if not text:
         return ""

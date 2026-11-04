@@ -1,5 +1,36 @@
 # Changelog
 
+## 3.8.6 — 2026-11-04
+
+### Fixed
+
+- Keys answer at once in every view. Moving the cursor in the All or Agent view took about
+  half a second and each typed search character over a second, because the whole table was
+  rebuilt from every session several times per key. Rows are now rebuilt only when something
+  that shapes them changes, each session's search text is kept until the session changes,
+  and a search that grows filters the previous matches instead of every session.
+- The background refresh finishes about a third sooner. The table no longer redraws ten
+  times a second while it waits, which slowed the refresh several times over in larger
+  views; files are checked from the folder listing instead of one at a time; only the
+  command lines of programs that can run a harness are read when looking for open
+  sessions; the result is handed to the table before the saved list is written; and the
+  saved list, state and caches are read and written with orjson when it is installed.
+- A Codex rollout that is missing from Codex's own database is no longer reopened on every
+  refresh, and the threads query reads only the columns `sessions` uses.
+- The table appears a little sooner: psutil is loaded only when it is needed.
+- A cache or state save that cannot finish no longer leaves its temporary file behind, and
+  leftovers from processes that have exited are cleared, along with caches from older
+  versions. Cached details of files that no longer exist are dropped.
+- The warning "could not verify the start time of a live Codex process" no longer appears
+  for a shell whose command line merely mentions Codex.
+- The background refresh and the table can no longer change the saved state at the same
+  moment.
+
+### Added
+
+- `AI_SESSIONS_CACHE_DIR` moves the cache folder, like `AI_SESSIONS_STATE_FILE` does for
+  the state.
+
 ## 3.8.5 — 2026-11-04
 
 ### Fixed

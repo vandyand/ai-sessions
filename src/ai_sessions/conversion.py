@@ -33,6 +33,7 @@ from dataclasses import replace
 from pathlib import Path
 from typing import Any, Callable, Iterable, Iterator, Mapping
 
+from . import fastjson
 from .capabilities import HarnessAdapter, Unsupported
 from .compression import is_compressed_path, plain_path, resolve_storage
 from .model import (
@@ -875,15 +876,14 @@ def _load_tail_progress() -> dict[str, dict[str, Any]]:
 def _save_tail_progress(key: str, entry: dict[str, Any]) -> None:
     with _tail_lock:
         progress = _load_tail_progress()
+        if progress and next(reversed(progress)) == key and progress[key] == entry:
+            return  # Already saved, and already the most recent.
         progress.pop(key, None)
         progress[key] = entry
         while len(progress) > _TAIL_PROGRESS_ENTRIES:
             progress.pop(next(iter(progress)))
         try:
-            TAIL_PROGRESS_FILE.parent.mkdir(parents=True, exist_ok=True)
-            temporary = TAIL_PROGRESS_FILE.with_suffix(f".tmp-{os.getpid()}")
-            temporary.write_text(json.dumps(progress), encoding="utf-8")
-            temporary.replace(TAIL_PROGRESS_FILE)
+            fastjson.write_atomic(TAIL_PROGRESS_FILE, progress)
         except OSError:
             pass
 
