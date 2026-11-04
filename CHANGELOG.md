@@ -1,5 +1,15 @@
 # Changelog
 
+## 3.8.4 — 2026-11-03
+
+### Fixed
+
+- `sessions` is ready to open a session in about half the time again, which shows most when
+  you search with `-q` and press Enter straight away. Enter waits for the session refresh;
+  that refresh no longer rereads transcripts that have not changed, walks each harness's
+  folders once, checks files in parallel, and keeps titles and previews to 1,000
+  characters instead of whole pasted prompts, which had grown the saved list to 52 MB.
+
 ## 3.8.3 — 2026-11-03
 
 ### Added

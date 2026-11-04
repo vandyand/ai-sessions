@@ -53,7 +53,7 @@ from .conversion import (
 from .conversion import append_jsonl as append_jsonl
 from .diagnostics import clear_warnings, record_warning
 from .diagnostics import warnings as load_warnings
-from .discovery import MAX_EXISTENCE_PROBES_PER_PASS, HarnessContext
+from .discovery import MAX_EXISTENCE_PROBES_PER_PASS, PROMPT_LABEL_CHARS, HarnessContext
 from .discovery import clean_prompt as clean_prompt
 from .discovery import normalize_space as normalize_space
 from .discovery import prompt_text as prompt_text
@@ -1845,14 +1845,17 @@ def session_from_native(item: NativeSession) -> Session:
         origin = "cross"
     else:
         origin = "agent"
+    # A name the harness holds is kept whole, since it is compared with the harness;
+    # a title made from a prompt is only a label.
+    title = item.title if item.named else item.title[:PROMPT_LABEL_CHARS]
     return Session(
         tool=item.tool,
         session_id=item.session_id,
-        title=item.title,
+        title=title,
         cwd=item.cwd,
         updated=item.updated,
         created=item.created,
-        preview=item.preview,
+        preview=item.preview[:PROMPT_LABEL_CHARS],
         named=item.named,
         storage=item.storage,
         source=item.source,
@@ -1860,9 +1863,9 @@ def session_from_native(item: NativeSession) -> Session:
         origin=origin,
         resume_id=item.resume_id or item.session_id,
         parent_id=item.parent_id,
-        original_title=item.title,
+        original_title=title,
         original_named=item.named,
-        provider_title=item.title,
+        provider_title=title,
         message_count=item.message_count,
         compressed=item.compressed,
         agent_nickname=item.agent_nickname,

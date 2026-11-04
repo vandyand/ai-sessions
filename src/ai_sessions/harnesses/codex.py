@@ -26,6 +26,7 @@ import zstandard
 from ..capabilities import HarnessAdapter, StorageUpgrade
 from ..compression import (
     ZST_SUFFIX,
+    compressed_path,
     is_compressed_path,
     open_for_scan,
     plain_path,
@@ -50,7 +51,16 @@ from ..conversion import (
     scrub,
 )
 from ..diagnostics import record_warning
-from ..discovery import HarnessContext, clean_prompt, normalize_space, timestamp
+from ..discovery import (
+    HarnessContext,
+    clean_prompt,
+    normalize_space,
+    prefetch_stats,
+    prefix_settled,
+    stat_key,
+    timestamp,
+    trim_labels,
+)
 from ..jsonl_tracking import PREFIX, locate_checkpoint, protect_checkpoint
 from ..liveness import LivenessContext, ProcessInfo
 from ..model import (
@@ -393,6 +403,57 @@ def _dated_rollouts(root: Path, session_id: str) -> list[Path]:
     return found
 
 
+def _is_rollout_name(name: str) -> bool:
+    folded = name.casefold()
+    return folded.startswith("rollout-") and (
+        folded.endswith(".jsonl") or folded.endswith(f".jsonl{ZST_SUFFIX}")
+    )
+
+
+def _walk_rollouts(root: Path) -> list[Path]:
+    """Every rollout under ``root``, plain or compressed, in one pass over the tree."""
+    found: list[Path] = []
+    for folder, _dirs, names in os.walk(root):
+        found.extend(Path(folder, name) for name in names if _is_rollout_name(name))
+    return found
+
+
+class RolloutListing:
+    """One walk of the rollout tree, shared by everything a discovery pass looks up.
+
+    Answers whether a rollout exists without a stat per file; a path outside
+    the tree is still checked on disk.
+    """
+
+    def __init__(self, root: Path) -> None:
+        global _rollout_index
+        self.root = root
+        self.paths = _walk_rollouts(root)
+        self._present = {self._key(str(path)) for path in self.paths}
+        self._prefix = self._key(str(root)).rstrip("\\/") + os.sep
+        index: dict[str, list[Path]] = {}
+        for path in self.paths:
+            index.setdefault(plain_path(path).stem[-36:], []).append(path)
+        # Lookups made soon after reuse this walk instead of making their own.
+        _rollout_index = (time.monotonic(), root, index)
+
+    @staticmethod
+    def _key(path: str) -> str:
+        return os.path.normcase(os.path.normpath(path))
+
+    def resolve(self, path: Path) -> Path | None:
+        """The file holding this rollout now, in either form; the plain file wins."""
+        key = self._key(str(path))
+        if not key.startswith(self._prefix):
+            return resolve_storage(path)
+        plain = key[: -len(ZST_SUFFIX)] if key.endswith(ZST_SUFFIX) else key
+        if plain in self._present:
+            return plain_path(path)
+        if plain + ZST_SUFFIX in self._present:
+            return compressed_path(path)
+        return None
+
+
 def _indexed_rollouts(root: Path, session_id: str) -> list[Path]:
     """Find a rollout anywhere, sharing one recent walk between lookups."""
     global _rollout_index
@@ -403,9 +464,8 @@ def _indexed_rollouts(root: Path, session_id: str) -> list[Path]:
         or now - _rollout_index[0] > _ROLLOUT_INDEX_SECONDS
     ):
         index: dict[str, list[Path]] = {}
-        for pattern in ("rollout-*.jsonl", f"rollout-*.jsonl{ZST_SUFFIX}"):
-            for path in root.rglob(pattern):
-                index.setdefault(plain_path(path).stem[-36:], []).append(path)
+        for path in _walk_rollouts(root):
+            index.setdefault(plain_path(path).stem[-36:], []).append(path)
         _rollout_index = (now, root, index)
     return list(_rollout_index[2].get(session_id, ()))
 
@@ -645,6 +705,8 @@ class DiscoveryCache:
         self.context = context
         self.entries: dict[str, dict[str, Any]] = {}
         self.dirty = False
+        # Stats taken together just before the scans; each is used once.
+        self.stats: dict[str, os.stat_result] = {}
         if context.use_cache:
             try:
                 payload = json.loads(DISCOVERY_CACHE_FILE.read_text(encoding="utf-8"))
@@ -652,6 +714,9 @@ class DiscoveryCache:
                     payload.get("entries"), dict
                 ):
                     self.entries = payload["entries"]
+                    self.dirty = trim_labels(
+                        self.entries, ("latest_user_message", "last_activity_text")
+                    )
             except (OSError, json.JSONDecodeError, AttributeError):
                 pass
 
@@ -671,7 +736,7 @@ class DiscoveryCache:
     def scan(self, path: Path, source: SourceKind) -> tuple[int, int, int, str, Any]:
         key = str(path)
         try:
-            stat = path.stat()
+            stat = self.stats.pop(stat_key(path), None) or path.stat()
         except OSError:
             return 0, 0, 0, "", self.context.accumulator()
         cached = self.entries.get(key)
@@ -683,8 +748,9 @@ class DiscoveryCache:
         )
         # A compressed file is read once, whole: its bytes are not the transcript's, so there is
         # nothing to sample and nothing to continue from.
+        settled = bool(cached and prefix_settled(cached, stat))
         prefix_matches = compressed or bool(
-            cached and signature_matches and _cached_prefix_matches(path, cached)
+            cached and signature_matches and (settled or _cached_prefix_matches(path, cached))
         )
         exact = bool(
             cached
@@ -707,6 +773,10 @@ class DiscoveryCache:
             assert cached is not None
             if key not in self.entries:
                 self.entries[key] = cached
+                self.dirty = True
+            if not settled and not compressed:
+                # Sampled and unchanged, so it is known good as of now.
+                cached["verified_ns"] = time.time_ns()
                 self.dirty = True
             evidence = self.context.accumulator(
                 tokens=list(cached.get("candidate_ids", [])),
@@ -851,6 +921,7 @@ class DiscoveryCache:
             "ctime_ns": getattr(final_stat, "st_ctime_ns", 0),
             "offset": offset,
             "prefix_identity": "" if compressed else _cached_prefix_identity(path, offset) or "",
+            "verified_ns": time.time_ns(),
             "user_messages": prompt_count,
             "turn_count": turn_count,
             "compaction_count": compaction_count,
@@ -893,6 +964,7 @@ def discover(context: HarnessContext, *, use_cache: bool = True) -> list[NativeS
         if home.is_dir():
             record_warning(f"no Codex state database found in {home}")
         return []
+    listing = RolloutListing(home / "sessions")
 
     def database_version(path: Path) -> tuple[int, float]:
         match = re.search(r"state_(\d+)\.sqlite$", path.name)
@@ -923,6 +995,7 @@ def discover(context: HarnessContext, *, use_cache: bool = True) -> list[NativeS
     result: list[NativeSession] = []
     history = load_history()
     cache = DiscoveryCache(context)
+    cache.stats = prefetch_stats(listing.paths)
     connection: sqlite3.Connection | None = None
     try:
         connection = sqlite3.connect(f"file:{database}?mode=ro", uri=True, timeout=2)
@@ -976,7 +1049,7 @@ def discover(context: HarnessContext, *, use_cache: bool = True) -> list[NativeS
             )
             rollout_path = str(field("rollout_path", "") or "")
             if rollout_path:
-                found = resolve_storage(Path(rollout_path))
+                found = listing.resolve(Path(rollout_path))
                 if found is None:
                     continue
                 rollout_path = str(found)
@@ -1029,7 +1102,7 @@ def discover(context: HarnessContext, *, use_cache: bool = True) -> list[NativeS
         if connection is not None:
             connection.close()
     known = {item.session_id for item in result}
-    result.extend(_unregistered_sessions(home, known, cache, context))
+    result.extend(_unregistered_sessions(listing, known, cache, context))
     cache.save()
     return result
 
@@ -1055,19 +1128,15 @@ def _meta_timestamp(value: object, fallback: float) -> float:
 
 
 def _unregistered_sessions(
-    home: Path, known: set[str], cache: DiscoveryCache, context: HarnessContext
+    listing: RolloutListing, known: set[str], cache: DiscoveryCache, context: HarnessContext
 ) -> list[NativeSession]:
     """Rollouts missing from the thread database, which Codex can still resume by file."""
-    root = home / "sessions"
     found: dict[str, Path] = {}
-    try:
-        for pattern in (f"rollout-*.jsonl{ZST_SUFFIX}", "rollout-*.jsonl"):  # plain wins
-            for path in root.rglob(pattern):
-                session_id = plain_path(path).stem[-36:]
-                if session_id not in known:
-                    found[session_id] = path
-    except OSError:
-        return []
+    # Compressed first, so the plain file wins.
+    for path in sorted(listing.paths, key=lambda item: not is_compressed_path(item)):
+        session_id = plain_path(path).stem[-36:]
+        if session_id not in known:
+            found[session_id] = path
     sessions: list[NativeSession] = []
     for session_id, path in found.items():
         meta = _rollout_meta(path)
