@@ -43,6 +43,14 @@ sessions --reopen
 
 It resumes the session that tab last ran, following its conversation if it has since moved to another harness, and reopens a supervisor as a supervisor. In a fresh tab it lists the sessions closed most recently. After a session closes, `sessions` prints this reminder.
 
+To do both in one step, type this inside the session, in Claude Code or Codex:
+
+```text
+! sessions --restart
+```
+
+The session closes and `sessions` reopens it in the same tab, reading its settings, names and login afresh. Run it between turns, as the `!` prefix does: it stops the harness at once, so a reply still being written would be cut off. A Codex app-server another window depends on is left running.
+
 ## Requirements
 
 - Python 3.11 or newer

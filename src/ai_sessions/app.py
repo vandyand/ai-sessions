@@ -25,6 +25,7 @@ import subprocess
 import sys
 import textwrap
 import threading
+import time
 import uuid
 from collections.abc import Mapping
 from contextlib import redirect_stderr
@@ -38,7 +39,9 @@ from .compression import CompressionError
 from .config import LAUNCH_MODES, LaunchConfig
 from .conversion import (
     BridgeError,
+    base_title,
     bridge,
+    bridge_sources,
     bridge_tools,
     conversation_change_status,
     native_checkpoint,
@@ -46,7 +49,6 @@ from .conversion import (
     native_session_exists,
     prepare_target,
     resolve_budget,
-    tidy_title,
 )
 from .conversion import append_jsonl as append_jsonl
 from .diagnostics import clear_warnings, record_warning
@@ -207,6 +209,9 @@ class UserState:
     def __init__(self, path: Path = STATE_FILE) -> None:
         self.path = path
         self.names: dict[str, str] = {}
+        # Names the harness could not record; they hold until it can.  Any other name
+        # yields to whatever the harness shows, so a rename made there wins.
+        self.local_names: set[str] = set()
         self.original_names: dict[str, dict[str, Any]] = {}
         self.hidden: set[str] = set()
         self.launch_tools: dict[str, str] = {}
@@ -266,6 +271,13 @@ class UserState:
                                 self.conversations[str(conversation_id)]["recovery"] = value[
                                     "recovery"
                                 ]
+                            history = value.get("history")
+                            if isinstance(history, list):
+                                self.conversations[str(conversation_id)]["history"] = [
+                                    step
+                                    for step in history
+                                    if isinstance(step, dict) and isinstance(step.get("tool"), str)
+                                ]
                 if isinstance(session_conversations, dict):
                     self.session_conversations = {
                         self.stable_key(str(key)): str(value)
@@ -281,6 +293,9 @@ class UserState:
                         for key, value in names.items()
                         if normalize_space(value)
                     }
+                local_names = payload.get("local_names", [])
+                if isinstance(local_names, list):
+                    self.local_names = {self.stable_key(str(key)) for key in local_names}
                 if isinstance(original_names, dict):
                     for key, value in original_names.items():
                         if not isinstance(value, dict) or not isinstance(value.get("named"), bool):
@@ -385,6 +400,74 @@ class UserState:
             for copy in copies
             if copy is not None and self.stable_key(copy.key) != self.stable_key(item.key)
         ]
+
+    def history(self, conversation_id: str) -> list[dict[str, Any]]:
+        """The harnesses this conversation has run in, oldest first.
+
+        Each step is ``{"tool", "session_id", "at"}``; ``at`` is None where an
+        earlier version left no date.
+        """
+        conversation = self.conversations.get(conversation_id)
+        if conversation is None:
+            return []
+        if "history" not in conversation:
+            conversation["history"] = self._reconstructed_history(conversation)
+        return conversation["history"]
+
+    def note_handoff(self, conversation_id: str, tool: str, session_id: str) -> None:
+        """Record that the conversation now continues in ``tool``."""
+        if conversation_id not in self.conversations:
+            return
+        history = self.history(conversation_id)
+        if history and history[-1].get("tool") == tool:
+            return
+        history.append({"tool": tool, "session_id": session_id, "at": time.time()})
+        self.save()
+
+    def _loaded(self, key: str) -> Session | None:
+        return self._sessions_by_key.get(key) or next(
+            (item for item in self._sessions_by_key.values() if self.stable_key(item.key) == key),
+            None,
+        )
+
+    def _reconstructed_history(self, conversation: dict[str, Any]) -> list[dict[str, Any]]:
+        """Rebuild what versions before 3.8.2 did not record.
+
+        They named each copy after its source, ``x (from Codex) (from Claude)``,
+        so the longest such chain among the copies is the fullest account of
+        the hand-offs.  The copies' own creation order is the fallback.  Only
+        steps that match a known copy get a date.
+        """
+        ordered = sorted(
+            conversation.get("members", {}).items(),
+            key=lambda pair: int(pair[1].get("generation", 0) or 0),
+        )
+
+        def step(key: str, member: dict[str, Any]) -> dict[str, Any]:
+            loaded = self._loaded(key)
+            created = loaded.created if loaded is not None and loaded.created else None
+            return {"tool": member["tool"], "session_id": member["session_id"], "at": created}
+
+        by_copies: list[dict[str, Any]] = []
+        for key, member in ordered:
+            if not by_copies or by_copies[-1]["tool"] != member["tool"]:
+                by_copies.append(step(key, member))
+        by_titles: list[dict[str, Any]] = []
+        for key, member in ordered:
+            loaded = self._loaded(key)
+            titles = [str(member.get("title", ""))]
+            if loaded is not None:
+                titles.append(loaded.provider_title or loaded.title)
+            for title in titles:
+                sources = bridge_sources(title)
+                if sources and len(sources) + 1 > len(by_titles):
+                    by_titles = [
+                        {"tool": source, "session_id": "", "at": None} for source in sources
+                    ] + [step(key, member)]
+        history = by_titles if len(by_titles) > len(by_copies) else by_copies
+        if history and ordered and history[0]["tool"] == ordered[0][1]["tool"]:
+            history[0] = step(*ordered[0])
+        return history
 
     def recover_session(self, item: Session) -> Session:
         """Persist the user's explicit choice of an exact native history, without merging."""
@@ -781,6 +864,12 @@ class UserState:
         self.apply_choices(items)
         self._apply_conversation_status(items)
         self._apply_supervisors(items)
+        # Capture each conversation's history while older copy names still record it.
+        missing = [cid for cid, value in self.conversations.items() if "history" not in value]
+        for conversation_id in missing:
+            self.history(conversation_id)
+        if missing:
+            self.save()
 
     def _apply_supervisors(self, items: list[Session]) -> None:
         """Mark supervised targets and the supervisor sessions that watch them."""
@@ -809,7 +898,9 @@ class UserState:
                 continue
             supervisor.origin = "supervisor"
             supervisor.supervises = record_id
-            if record.get("title"):
+            # Until the harness has the supervisor's name, show it here; after that the
+            # harness's own name is shown, so a rename made there is not overridden.
+            if record.get("title") and not record.get("published_title"):
                 title = supervisor_title(record)
                 supervisor.original_title = title
                 supervisor.original_named = True
@@ -829,13 +920,22 @@ class UserState:
             elif not item.original_title:
                 item.original_title = item.title
                 item.original_named = item.named
-            item.title = item.original_title
-            item.named = item.original_named
+            # What the harness shows now; the remembered original only serves a reset.
+            item.title = item.provider_title or item.original_title
+            item.named = item.original_named or item.title != item.original_title
             item.renamed = False
             item.launch_tool = self.launch_tools.get(item.key, "")
             if item.launch_tool and item.launch_tool not in available_launch_tools(item):
                 item.launch_tool = ""
             custom = self.names.get(item.key, "")
+            if (
+                custom
+                and item.provider_title
+                and item.provider_title != custom
+                and item.key not in self.local_names
+            ):
+                # Renamed in the harness since this name was published; the harness wins.
+                custom = ""
             if custom:
                 item.title = custom
                 item.named = True
@@ -850,6 +950,7 @@ class UserState:
                 {
                     "version": 7,
                     "names": self.names,
+                    "local_names": sorted(self.local_names),
                     "original_names": self.original_names,
                     "hidden": sorted(self.hidden),
                     "launch_tools": self.launch_tools,
@@ -882,13 +983,17 @@ class UserState:
             return item.original_title, item.original_named
         return str(remembered["title"]), bool(remembered["named"])
 
-    def set_name(self, item: Session, name: str) -> None:
+    def set_name(self, item: Session, name: str, *, published: bool = True) -> None:
         value = normalize_space(name)[:200]
         key = self.stable_key(item.key)
         if value:
             self.names[key] = value
         else:
             self.names.pop(key, None)
+        if value and not published:
+            self.local_names.add(key)
+        else:
+            self.local_names.discard(key)
         self.save()
 
     def set_hidden(self, item: Session, hidden: bool) -> None:
@@ -1041,6 +1146,8 @@ def publish_name(
         return f"could not update the provider title: {error}"
     if note:
         return note
+    # The harness shows this name now, so nothing this utility shows overrides it.
+    item.provider_title = name
     if restored_generated:
         label = tool_label(item.tool)
         return f"restored {name!r}; {label} now records it as an explicit title"
@@ -1072,7 +1179,9 @@ def _rename_one(state: UserState, item: Session, name: str) -> str:
         original_title=original_title,
         original_named=original_named,
     )
-    state.set_name(item, value)
+    # A name the harness could not record is kept here until it can; any other
+    # yields once the harness is renamed.
+    state.set_name(item, value, published=item.provider_title == value)
     return note
 
 
@@ -1176,6 +1285,43 @@ def conversation_status(session: Session) -> str:
 
 def connection_label(session: Session) -> str:
     return "linked" if session.conversation_id else "standalone"
+
+
+def history_lines(history: list[dict[str, Any]]) -> list[str]:
+    """The details pane's account of every harness the conversation ran in, with dates."""
+    if len(history) < 2:
+        return []
+    labels = [tool_label(str(step.get("tool", "")), short=False) for step in history]
+    width = max(len(label) for label in labels)
+    lines = []
+    for index, (step, label) in enumerate(zip(history, labels)):
+        when = exact_time(float(step["at"])) if step.get("at") else "date not recorded"
+        # Both leads are as wide, so the names and the dates line up.
+        lead = "History    " if index == 0 else "         → "
+        lines.append(f"{lead}{label:<{width}}  {when}")
+    return lines
+
+
+def history_letter(tool: str) -> str:
+    """The one letter a harness goes by in the HISTORY column."""
+    adapter = REGISTRY.get(tool) if tool in REGISTRY else None
+    if adapter is not None and adapter.letter:
+        return adapter.letter
+    return (adapter.short_label if adapter is not None else tool or "?")[:1].upper()
+
+
+def route_label(history: list[dict[str, Any]], width: int = 0) -> str:
+    """``C→A→C`` for a conversation that moved between harnesses; "" if it never did.
+
+    When it does not fit in ``width``, the most recent steps are kept.
+    """
+    if len(history) < 2:
+        return ""
+    letters = [history_letter(str(step.get("tool", ""))) for step in history]
+    route = "→".join(letters)
+    if width and len(route) > width:
+        route = "…" + route[len(route) - width + 1 :].lstrip("→")
+    return route
 
 
 def copy_status(status: str) -> str:
@@ -1711,6 +1857,7 @@ def session_from_native(item: NativeSession) -> Session:
         parent_id=item.parent_id,
         original_title=item.title,
         original_named=item.named,
+        provider_title=item.title,
         message_count=item.message_count,
         compressed=item.compressed,
         agent_nickname=item.agent_nickname,
@@ -2005,6 +2152,7 @@ def load_session_catalog(
         "compaction_count",
         "prompt_count",
         "conversation_blocker",
+        "provider_title",
     }
     result: list[Session] = []
     for payload in document["sessions"][:100_000]:
@@ -2024,6 +2172,7 @@ def load_session_catalog(
                 "compaction_count": 0,
                 "prompt_count": message_count,
                 "conversation_blocker": "",
+                "provider_title": "",
             }
             payload = {**payload, **{name: defaults[name] for name in missing}}
         try:
@@ -3314,6 +3463,7 @@ class Browser:
         tool_width = tool_column_width(8) + 1
         origin_width, open_width, activity_width, time_width, status_width = 7, 6, 18, 10, 19
         connection_width = 11
+        history_width = 10
         updated_width = 17
         directory_width = min(34, max(16, width // 4)) if show_directory else 0
         title_width = (
@@ -3327,13 +3477,15 @@ class Browser:
             - updated_width
             - status_width
             - connection_width
+            - history_width
             - directory_width
         )
         heading = (
             f"  {'TOOL':<{tool_width}}{'ORIGIN':<{origin_width}}"
             f"{'OPEN':<{open_width}}{'ACTIVITY':<{activity_width}}"
             f"{'STARTED':<{time_width}}{'UPDATED':<{updated_width}}"
-            f"{'CONNECTION':<{connection_width}}{'STATUS':<{status_width}}TITLE"
+            f"{'CONNECTION':<{connection_width}}{'STATUS':<{status_width}}"
+            f"{'HISTORY':<{history_width}}TITLE"
         )
         self.add(3, 1, heading, self.style("muted", curses.A_BOLD), width - 2)
 
@@ -3407,6 +3559,11 @@ class Browser:
                     else ("success" if status == "latest copy" else "warning"),
                     curses.A_BOLD,
                 )
+                route = route_label(
+                    self.state.history(item.conversation_id) if item.conversation_id else [],
+                    history_width - 1,
+                )
+                segment(column_cell(route, history_width), "muted")
                 title = _normal_agent_tag(item) + view_row.title
                 is_supervisor = any(member.supervises for member in view_row.all_members)
                 if is_supervisor:
@@ -3949,6 +4106,11 @@ class Browser:
             f"Thread     {row.title}",
             f"Status     {row.status}",
             f"Members    {len(members)} (shown {len(row.members)})",
+            *history_lines(
+                self.state.history(row.representative.conversation_id)
+                if row.representative.conversation_id
+                else []
+            ),
             "Lineage / related threads",
             "",
         ]
@@ -4679,6 +4841,7 @@ def prepare_launch(
                 raise BridgeError(compressed_message(resolved))
         if target is not None:
             target.launch_tool = ""
+            state.note_handoff(conversation_id, target.tool, target.session_id)
             if target.key == session.key:
                 return target, ""
             return target, (
@@ -4718,6 +4881,8 @@ def prepare_launch(
                 parent_id="",
                 launch_targets={tool: session_id},
                 launch_tool="",
+                # The bridge just named the copy; the source's harness title is not its own.
+                provider_title="",
             )
         return replace(
             session,
@@ -4749,6 +4914,9 @@ def prepare_launch(
         migrated=config.bridge_max_chars_migrated if config is not None else False,
         policy=prepared.budget_policy,
     )
+    if state is not None:
+        # Settle the history before the copy exists, so the copy's step is dated.
+        state.history(conversation_id)
     result = bridge(
         source_tool=session.tool,
         target_tool=tool,
@@ -4773,6 +4941,7 @@ def prepare_launch(
             source_checkpoint=result.source_checkpoint,
             target_checkpoint=result.target_checkpoint,
         )
+        state.note_handoff(conversation_id, tool, result.session_id)
     carried = (
         f"{result.turns} source message(s), assembled as {result.written_turns} target message(s)"
     )
@@ -4891,8 +5060,11 @@ def run_harness(session: Session, command: list[str]) -> int:
     finally:
         if job is not None:
             job.release()
-    mark_closed(process.pid)
-    if terminal_id():
+    global _restart_pending
+    if mark_closed(process.pid):
+        _restart_pending = True
+        print(f"sessions: restarting {display_title(session)!r}…", file=sys.stderr)
+    elif terminal_id():
         print(
             f"sessions: closed {display_title(session)!r}; "
             "run `sessions --reopen` to open it again here.",
@@ -4901,20 +5073,58 @@ def run_harness(session: Session, command: list[str]) -> int:
     return code
 
 
-def tidy_launched_title(session: Session) -> None:
-    """Give a copy named by older bridges one ``(from …)`` suffix before it opens.
+# Set when the harness that just exited was stopped by `sessions --restart`.
+_restart_pending = False
 
-    Earlier versions added a suffix on every round trip, which crowded the
-    harness tab.  The user's own names are left alone.
+
+def restart_here() -> int:
+    """Stop the harness this command runs inside, so its launcher reopens the session.
+
+    Meant for ``! sessions --restart`` typed in the harness itself.  The
+    launcher that started the harness waits for it, sees the request, and
+    reopens the session the way ``--reopen`` does, with settings, names and
+    login read afresh.
     """
-    if session.renamed or active_launch_tool(session) != session.tool:
+    from .detached import request_restart, running_here, stop_for_restart
+
+    found = running_here()
+    if found is None:
+        print(
+            "sessions: --restart works inside a session that `sessions` opened in Windows "
+            "Terminal; this one was started some other way. Quit it and run `sessions` instead.",
+            file=sys.stderr,
+        )
+        return 2
+    key, entry = found
+    tool = str(entry.get("tool", ""))
+    names = REGISTRY.get(tool).liveness_executables if tool in REGISTRY else frozenset()
+    request_restart(key)
+    print(f"sessions: restarting {entry.get('title') or entry.get('session_id')!r}…")
+    sys.stdout.flush()
+    problem = stop_for_restart(int(entry["pid"]), float(entry.get("started", 0) or 0), names)
+    if problem:
+        print(f"sessions: {problem}", file=sys.stderr)
+        return 1
+    return 0
+
+
+def tidy_launched_title(session: Session) -> None:
+    """Drop the ``(from …)`` suffixes older bridges gave a copy, before it opens.
+
+    The hand-offs they recorded are kept in the conversation's history, which
+    ``UserState.apply`` captures first.  Only the harness's own name is tidied,
+    and nothing else is pushed to it: a name chosen in the harness stands.
+    """
+    if not session.provider_title or active_launch_tool(session) != session.tool:
         return
-    tidy = tidy_title(session.title)
-    if tidy == session.title:
+    tidy = base_title(session.provider_title)
+    if not tidy or tidy == session.provider_title:
         return
     note = publish_name(session, tidy)
     if note:
         print(f"sessions: {note}", file=sys.stderr)
+    elif not session.renamed:
+        session.title = tidy
 
 
 def launch(
@@ -5442,6 +5652,14 @@ def build_parser() -> argparse.ArgumentParser:
         ),
     )
     parser.add_argument(
+        "--restart",
+        action="store_true",
+        help=(
+            "Windows, typed inside a session as `! sessions --restart`: close it and reopen it "
+            "in the same tab, picking up new settings, names or a new login"
+        ),
+    )
+    parser.add_argument(
         "--launch-tool",
         choices=REGISTRY.names(),
         help=(
@@ -5517,6 +5735,21 @@ def build_parser() -> argparse.ArgumentParser:
 
 
 def main(argv: list[str] | None = None) -> int:
+    """Run ``sessions``, reopening the session for as long as ``--restart`` asks."""
+    global _restart_pending
+    _restart_pending = False
+    code = _main(argv)
+    if _restart_pending:
+        # Keep a launch mode chosen on the command line; everything else is read afresh.
+        mode = build_parser().parse_known_args(argv)[0].launch_mode
+        again = ["--reopen", *(["--launch-mode", mode] if mode else [])]
+        while _restart_pending:
+            _restart_pending = False
+            code = _main(again)
+    return code
+
+
+def _main(argv: list[str] | None = None) -> int:
     if IS_WINDOWS:
         # Windows PowerShell and SSH sessions may still expose a legacy code
         # page even though Windows Terminal itself is Unicode-capable.
@@ -5532,6 +5765,15 @@ def main(argv: list[str] | None = None) -> int:
     except locale.Error:
         pass
     args = build_parser().parse_args(argv)
+    if args.restart:
+        if not IS_WINDOWS:
+            print(
+                "sessions: --restart is for Windows; elsewhere sessions hands the terminal to "
+                "the harness and is not there to reopen it.",
+                file=sys.stderr,
+            )
+            return 2
+        return restart_here()
     if args.launch_log is not None:
         launch_log_output(read_launch_log(args.launch_log))
         return 0
@@ -5706,7 +5948,7 @@ def main(argv: list[str] | None = None) -> int:
             return 2
         if args.launch_tool:
             item = replace(item, launch_tool=args.launch_tool)
-        return launch(item, launch_config, dry_run=args.dry_run, state=state, others=sessions)
+        return open_again(item, launch_config, state, sessions, args.dry_run)
 
     if args.supervise:
         if args.supervise in state.supervisors:
@@ -5784,7 +6026,8 @@ def main(argv: list[str] | None = None) -> int:
         if action == "supervise":
             return supervise_session(selected, launch_config, state, "", args.dry_run)
     if selected:
-        return launch(selected, launch_config, dry_run=args.dry_run, state=state, others=loaded)
+        # Enter on a supervisor row must open it as a supervisor, with its folder and name.
+        return open_again(selected, launch_config, state, loaded, args.dry_run)
     return 0
 
 

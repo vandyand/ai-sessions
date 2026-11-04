@@ -1618,6 +1618,7 @@ ADAPTER = HarnessAdapter(
     name="codex",
     label="Codex",
     short_label="Codex",
+    letter="C",
     order=10,
     home=CODEX_HOME,
     default_command=("codex",),

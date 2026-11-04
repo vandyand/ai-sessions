@@ -123,6 +123,16 @@ class SupervisorBrowserTests(Fixture):
         self.state.apply(self.sessions)
         self.assertEqual(supervisor.title, "My watcher")
 
+    def test_once_its_harness_has_the_name_the_harness_name_is_shown(self) -> None:
+        # After publication a rename made inside the harness must not be overridden.
+        record_id, supervisor = self.supervise()
+        self.state.supervisors[record_id]["published_title"] = "Supervisor: Fix the build"
+        supervisor.title = supervisor.original_title = "Renamed in Codex"
+        supervisor.provider_title = "Renamed in Codex"
+        self.state.apply(self.sessions)
+        self.assertEqual(supervisor.title, "Renamed in Codex")
+        self.assertEqual(supervisor.origin, "supervisor")
+
     def test_rows_show_supervised_supervisor_and_unsupervised_states(self) -> None:
         self.supervise()
         plain = Session(

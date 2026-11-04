@@ -95,21 +95,102 @@ def remember(
     _write(path, document)
 
 
-def mark_closed(pid: int, *, path: Path = TERMINALS_FILE) -> None:
+def mark_closed(pid: int, *, path: Path = TERMINALS_FILE) -> bool:
     """The harness ``pid`` exited normally: nothing was lost, but it can be reopened.
 
     The entry is kept so ``sessions --reopen`` knows what the tab last ran,
     and marked so ``--reattach`` does not mistake a deliberate exit for a loss.
+    Returns whether ``sessions --restart`` asked for it to be reopened.
     """
     document = _read(path)
-    changed = False
+    restart = False
     for entry in document.values():
         if entry.get("pid") == pid and not entry.get("closed"):
+            restart = restart or bool(entry.pop("restart", False))
             entry["closed"] = True
             entry["at"] = time.time()
-            changed = True
-    if changed:
+    if any(entry.get("pid") == pid for entry in document.values()):
         _write(path, document)
+    return restart
+
+
+def running_here(*, path: Path = TERMINALS_FILE) -> tuple[str, dict[str, Any]] | None:
+    """The remembered launch this process runs inside, found through its parents."""
+    try:
+        me = psutil.Process()
+        ancestors = {process.pid: process for process in me.parents()}
+    except psutil.Error:
+        return None
+    for key, entry in _read(path).items():
+        pid = int(entry.get("pid", 0) or 0)
+        if entry.get("closed") or pid not in ancestors:
+            continue
+        try:
+            if abs(ancestors[pid].create_time() - float(entry.get("started", 0) or 0)) <= 1:
+                return key, entry
+        except psutil.Error:
+            continue
+    return None
+
+
+def request_restart(key: str, *, path: Path = TERMINALS_FILE) -> None:
+    """Ask the launcher of the tab ``key`` to reopen its session once the harness exits."""
+    document = _read(path)
+    if key in document:
+        document[key]["restart"] = True
+        _write(path, document)
+
+
+def _shared_daemon(process: psutil.Process) -> bool:
+    # A Codex window can start the app-server other windows depend on.
+    try:
+        return any(argument.casefold() == "app-server" for argument in process.cmdline()[1:])
+    except psutil.Error:
+        return False
+
+
+def stop_for_restart(pid: int, started: float, harness_names: Iterable[str]) -> str:
+    """Stop the harness this process runs inside, sparing itself and any shared daemon.
+
+    Everything ``pid`` started goes, except this process, the shell between it
+    and the harness, and a shared daemon with what it started.  Returns an
+    empty string on success, otherwise why the harness is still running.
+    """
+    names = {name.casefold() for name in harness_names}
+    try:
+        root = psutil.Process(pid)
+        if abs(root.create_time() - started) > 1:
+            return f"PID {pid} is now a different process; nothing was stopped."
+        me = psutil.Process()
+        keep = {me.pid}
+        for parent in me.parents():
+            if parent.pid == pid or parent.name().casefold() in names:
+                break
+            keep.add(parent.pid)
+        spared = set(keep)
+        for process in root.children(recursive=True):
+            if _shared_daemon(process):
+                spared |= {process.pid, *(child.pid for child in process.children(recursive=True))}
+        tree = [
+            process
+            for process in [*root.children(recursive=True), root]
+            if process.pid not in spared
+        ]
+    except psutil.NoSuchProcess:
+        return ""
+    except (psutil.Error, ValueError) as error:
+        return f"Could not inspect PID {pid}: {error}"
+    for process in tree:
+        try:
+            process.terminate()
+        except psutil.NoSuchProcess:
+            pass
+        except psutil.Error as error:
+            return f"Could not stop PID {process.pid}: {error}"
+    _, alive = psutil.wait_procs(tree, timeout=5.0)
+    if any(process.pid == pid for process in alive):
+        return f"PID {pid} did not exit within 5 seconds."
+    return ""
 
 
 def remembered(*, path: Path = TERMINALS_FILE) -> dict[str, dict[str, Any]]:

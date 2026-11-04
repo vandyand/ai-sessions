@@ -179,10 +179,8 @@ class ThirdHarnessContractTests(unittest.TestCase):
             budget = resolve_budget("fixture")
             self.assertEqual((budget.tokens, budget.chars), (25_000, 75_000))
             self.assertEqual(budget.origin, "target-default")
-            self.assertEqual(
-                bridged_title("Portable", "fixture"),
-                "Portable (from FixtureHarness)",
-            )
+            # A suffix an older version gave a copy from this harness is still recognised.
+            self.assertEqual(bridged_title("Portable (from FixtureHarness)", "fixture"), "Portable")
             self.assertTrue(path.is_file())
         self.assertNotIn("fixture", REGISTRY)
         self.assertNotIn("fixture", Browser._pair_layout())
