@@ -17,6 +17,8 @@ class Registry:
         self._generation = 0
         self._ordered_generation = -1
         self._ordered: tuple[HarnessAdapter, ...] = ()
+        self._bridge_generation = -1
+        self._bridge_targets: tuple[str, ...] = ()
 
     @property
     def generation(self) -> int:
@@ -71,6 +73,13 @@ class Registry:
         return tuple(adapter.name for adapter in self.adapters())
 
     def bridge_targets(self) -> tuple[str, ...]:
+        # Asked twice per session on every redraw and search, so kept per registration.
+        if self._bridge_generation != self._generation:
+            self._bridge_targets = self._find_bridge_targets()
+            self._bridge_generation = self._generation
+        return self._bridge_targets
+
+    def _find_bridge_targets(self) -> tuple[str, ...]:
         return tuple(
             adapter.name
             for adapter in self.adapters()

@@ -6,6 +6,8 @@ from dataclasses import FrozenInstanceError, replace
 from pathlib import Path
 from unittest.mock import patch
 
+import psutil
+
 from ai_sessions import diagnostics, liveness
 from ai_sessions.app import Session, detect_open_sessions
 from ai_sessions.discovery import HarnessContext
@@ -39,8 +41,15 @@ class LivenessTests(unittest.TestCase):
     def test_selective_snapshot_queries_start_only_for_declared_executables(self) -> None:
         class FakeProcess:
             def __init__(self, pid: int, name: str, command: list[str]) -> None:
-                self.info = {"pid": pid, "name": name, "cmdline": command}
+                # Windows snapshots ask for the command line separately, per process.
+                self.info = {"pid": pid, "name": name}
+                self.command = command
                 self.start_queries = 0
+                self.command_queries = 0
+
+            def cmdline(self) -> list[str]:
+                self.command_queries += 1
+                return self.command
 
             def create_time(self) -> float:
                 self.start_queries += 1
@@ -48,7 +57,8 @@ class LivenessTests(unittest.TestCase):
 
         unrelated = FakeProcess(7, "python.exe", ["python.exe", "worker.py"])
         wrapped = FakeProcess(8, "node.exe", ["node.exe", "C:/tools/opencode.cmd"])
-        with patch.object(liveness.psutil, "process_iter", return_value=[unrelated, wrapped]):
+        browser = FakeProcess(9, "chrome.exe", ["chrome.exe", "--type=renderer"])
+        with patch.object(psutil, "process_iter", return_value=[unrelated, wrapped, browser]):
             snapshot = liveness.process_snapshot(
                 "win32",
                 start_time_executables=frozenset(("opencode.cmd",)),
@@ -57,6 +67,10 @@ class LivenessTests(unittest.TestCase):
         self.assertEqual(snapshot[0].start_token, "")
         self.assertEqual(wrapped.start_queries, 1)
         self.assertNotEqual(snapshot[1].start_token, "")
+        self.assertEqual(snapshot[1].command, ("node.exe", "C:/tools/opencode.cmd"))
+        # A program that cannot host a harness never has its command line read.
+        self.assertEqual(browser.command_queries, 0)
+        self.assertEqual(snapshot[2].command, ())
 
     def test_windows_process_snapshot_emits_filetime_start_token(self) -> None:
         process = type(
@@ -71,7 +85,7 @@ class LivenessTests(unittest.TestCase):
                 }
             },
         )()
-        with patch.object(liveness.psutil, "process_iter", return_value=[process]):
+        with patch.object(psutil, "process_iter", return_value=[process]):
             snapshot = liveness.process_snapshot("win32")
         self.assertEqual(
             snapshot[0].start_token,
@@ -91,7 +105,7 @@ class LivenessTests(unittest.TestCase):
                 }
             },
         )()
-        with patch.object(liveness.psutil, "process_iter", return_value=[process]):
+        with patch.object(psutil, "process_iter", return_value=[process]):
             snapshot = liveness.process_snapshot("win32")
         self.assertEqual(snapshot[0].started_at, 0)
         self.assertEqual(snapshot[0].start_token, "")
@@ -110,7 +124,7 @@ class LivenessTests(unittest.TestCase):
             },
         )()
         with (
-            patch.object(liveness.psutil, "process_iter", return_value=[process]),
+            patch.object(psutil, "process_iter", return_value=[process]),
             patch.object(liveness, "process_start_token", return_value="start-token"),
         ):
             snapshot = liveness.process_snapshot("linux")
@@ -148,7 +162,7 @@ class LivenessTests(unittest.TestCase):
                 raise StopIteration
 
         with (
-            patch.object(liveness.psutil, "process_iter", return_value=BrokenIterator()),
+            patch.object(psutil, "process_iter", return_value=BrokenIterator()),
             patch.object(liveness, "process_start_token", side_effect=("one", "two")),
         ):
             snapshot = liveness.process_snapshot("linux")

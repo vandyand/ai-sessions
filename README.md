@@ -468,7 +468,7 @@ launch-harness preferences, conversation ids, native members, equivalence fronti
 opaque native checkpoints are stored there too. Unset sessions default to the harness where they were
 started. Caches use `~/.cache/ai-sessions` on
 Linux and `%LOCALAPPDATA%\ai-sessions` on Windows. Environment overrides are available
-through `AI_SESSIONS_CONFIG_FILE`, `AI_SESSIONS_STATE_FILE`, `CODEX_HOME`,
+through `AI_SESSIONS_CONFIG_FILE`, `AI_SESSIONS_STATE_FILE`, `AI_SESSIONS_CACHE_DIR`, `CODEX_HOME`,
 `CLAUDE_CONFIG_DIR`, and `OPENCODE_DB`. Prefer the configured OpenCode command's authoritative
 `db path`; `OPENCODE_DB` is the explicit fallback override when that command cannot report one.
 

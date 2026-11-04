@@ -15,8 +15,6 @@ from collections.abc import Callable, Iterable
 from dataclasses import dataclass, field
 from pathlib import Path
 
-import psutil
-
 from .capabilities import Unsupported
 from .compression import (
     CompressionError,
@@ -309,6 +307,8 @@ def _lock_is_stale() -> bool:
         # A lock created a moment ago may not have its owner written yet.  Windows refuses to
         # delete it while it is open, but elsewhere taking it over would make two sweeps.
         return age > LOCK_UNWRITTEN_SECONDS
+    import psutil  # Only needed to check a lock's owner, so not at every start.
+
     return age > LOCK_STALE_SECONDS or not psutil.pid_exists(owner)
 
 
