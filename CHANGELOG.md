@@ -1,5 +1,19 @@
 # Changelog
 
+## 3.9.1 — 2026-11-04
+
+### Changed
+
+- `sessions -q "..."` brings the rows it found up to date first. As soon as the table is
+  drawn, the matching sessions and their copies in other harnesses are reread from their
+  own files: titles, times, activity counts, whether they are open, and which copy of a
+  conversation is current. That takes about a second; the rest of the list is reread in the
+  background as before. Names given in `sessions` are kept. A search matching more than
+  300 sessions is left to the full refresh. The status line says "updating matches" while
+  it runs.
+- Claude Code and Codex can reread a single session. The reread lists it exactly as a full
+  scan would, and was checked against one for every session on a machine with 6,300.
+
 ## 3.9.0 — 2026-11-04
 
 ### Changed

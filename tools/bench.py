@@ -47,7 +47,11 @@ class Screen:
 
 result = {}
 if mode == "start":
+    import curses as _curses
+
     original = app.Browser.draw
+    original_quick = app.Browser.apply_quick_reread
+
     def draw(self):
         original(self)
         if self.sessions and "first_frame" not in result:
@@ -60,15 +64,25 @@ if mode == "start":
                 check(rows[0])
                 # What Enter waits for when the refresh has not finished.
                 result["enter_check"] = time.perf_counter() - started
-        if self.refresh is not None and "refresh_done" not in result:
-            self.refresh.take(wait=True)
-            result["refresh_done"] = time.perf_counter() - T
-            raise SystemExit(0)
         if self.refresh is None and "first_frame" in result:
-            result.setdefault("refresh_done", result["first_frame"])
+            result.setdefault("refresh_done", time.perf_counter() - T)
             raise SystemExit(0)
+
+    def quick(self):
+        applied = original_quick(self)
+        if applied:
+            result["matches_current"] = time.perf_counter() - T
+        return applied
+
+    class Waiting(Screen):
+        def get_wch(self):
+            # Someone looking at the table: input times out every 100 ms.
+            time.sleep(0.1)
+            raise _curses.error()
+
     app.Browser.draw = draw
-    app.curses.wrapper = lambda function: function(Screen(["\x1b"] * 5))
+    app.Browser.apply_quick_reread = quick
+    app.curses.wrapper = lambda function: function(Waiting([]))
     app.start_background_sweep = lambda: None
     sys.stdin.isatty = lambda: True
     sys.stdout.isatty = lambda: True

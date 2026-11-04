@@ -31,7 +31,7 @@ from collections.abc import Mapping
 from contextlib import redirect_stderr
 from dataclasses import asdict, dataclass, fields, replace
 from pathlib import Path
-from typing import Any, Iterable
+from typing import Any, Iterable, Sequence
 
 from . import __version__ as VERSION
 from . import fastjson
@@ -852,9 +852,33 @@ class UserState:
                 if conversation_id in self.conversations:
                     self._set_conversation_status(conversation_id, by_key)
 
-    def _set_conversation_status(self, conversation_id: str, by_key: dict[str, Session]) -> None:
+    def conversation_statuses(self, conversation_ids: Iterable[str]) -> dict[str, dict[str, Any]]:
+        """Which copy of each conversation is current, read from the disk; changes nothing."""
+        result: dict[str, dict[str, Any]] = {}
+        for conversation_id in conversation_ids:
+            with self.lock:
+                if conversation_id in self.conversations:
+                    result[conversation_id] = self._conversation_status(conversation_id)
+        return result
+
+    def apply_conversation_statuses(
+        self, statuses: Mapping[str, dict[str, Any]], sessions: list[Session]
+    ) -> None:
+        with self.lock:
+            by_key = {item.key: item for item in sessions}
+            for conversation_id, status in statuses.items():
+                if conversation_id in self.conversations:
+                    self._set_conversation_status(conversation_id, by_key, status)
+
+    def _set_conversation_status(
+        self,
+        conversation_id: str,
+        by_key: dict[str, Session],
+        status: dict[str, Any] | None = None,
+    ) -> None:
         conversation = self.conversations[conversation_id]
-        status = self._conversation_status(conversation_id)
+        if status is None:
+            status = self._conversation_status(conversation_id)
         blocker = next(
             (name for name in ("unknown", "unstable", "unavailable") if status[name]), ""
         )
@@ -3302,6 +3326,122 @@ def check_before_open(sessions: list[Session], chosen: Iterable[Session], state:
     return True
 
 
+# What a reread of a few sessions brings up to date.  How sessions relate to each
+# other (origin, parent, conversation) needs every session, so it waits for the full
+# refresh; the user's own names and choices are applied again afterwards.
+_REREAD_FIELDS = (
+    "title",
+    "cwd",
+    "updated",
+    "created",
+    "preview",
+    "named",
+    "storage",
+    "compressed",
+    "original_title",
+    "original_named",
+    "provider_title",
+    "message_count",
+    "turn_count",
+    "compaction_count",
+    "prompt_count",
+    "agent_nickname",
+)
+# A search that matches more than this is left to the full refresh.
+QUICK_REREAD_LIMIT = 300
+
+
+@dataclass(slots=True)
+class Reread:
+    """Fresh details of a few sessions, made on another thread, applied on the UI's."""
+
+    fields: dict[str, dict[str, Any]]
+    open: dict[str, tuple[bool, int]]
+    statuses: dict[str, dict[str, Any]]
+
+
+def reread_sessions(
+    targets: Sequence[Session], state: UserState, config: LaunchConfig | None = None
+) -> Reread:
+    """Reread ``targets`` from their harnesses without changing any of them."""
+    commands = (
+        {name: tuple(config.provider_command(name)) for name in REGISTRY.names()}
+        if config is not None
+        else None
+    )
+    context = HarnessContext.create(use_cache=True, provider_commands=commands)
+    wanted = {item.key for item in targets}
+    refs: dict[str, list[NativeRef]] = {}
+    for item in targets:
+        if item.storage:  # One with no file of its own waits for the full refresh.
+            refs.setdefault(item.tool, []).append(NativeRef(item.session_id, item.storage))
+    fields: dict[str, dict[str, Any]] = {}
+    for adapter in REGISTRY.adapters():
+        wanted_refs = refs.get(adapter.name)
+        if not wanted_refs:
+            continue
+        try:
+            if not isinstance(adapter.rediscover, Unsupported):
+                natives = list(adapter.rediscover(context, wanted_refs))
+            elif not isinstance(adapter.discover, Unsupported):
+                natives = list(adapter.discover(context, use_cache=True))
+            else:
+                continue
+        except Exception:
+            continue
+        for native in natives:
+            if native.tool != adapter.name:
+                continue
+            session = session_from_native(native)
+            if session.key in wanted:
+                fields[session.key] = {name: getattr(session, name) for name in _REREAD_FIELDS}
+    copies = [replace(item) for item in targets]
+    for copy in copies:
+        if copy.key in fields:
+            for name, value in fields[copy.key].items():
+                setattr(copy, name, value)
+    detect_open_sessions(copies)
+    conversations = {
+        conversation_id
+        for item in targets
+        if (conversation_id := item.conversation_id or state.conversation_id_for(item))
+    }
+    return Reread(
+        fields=fields,
+        open={copy.key: (copy.is_open, copy.open_pid) for copy in copies},
+        statuses=state.conversation_statuses(conversations),
+    )
+
+
+class QuickReread:
+    """A reread of the rows a search matched, ready long before the full refresh."""
+
+    def __init__(
+        self, targets: Sequence[Session], state: UserState, config: LaunchConfig | None
+    ) -> None:
+        self._targets = tuple(targets)
+        self._state = state
+        self._config = config
+        self._done = threading.Event()
+        self._result: Reread | None = None
+        self._thread = threading.Thread(target=self._run, name="ai-sessions-reread", daemon=True)
+        self._thread.start()
+
+    def _run(self) -> None:
+        try:
+            self._result = reread_sessions(self._targets, self._state, self._config)
+        except Exception:
+            self._result = None
+        finally:
+            self._done.set()
+
+    def ready(self) -> bool:
+        return self._done.is_set()
+
+    def result(self) -> Reread | None:
+        return self._result
+
+
 def reopen_from_catalog(state: UserState) -> tuple[Session, list[Session]] | None:
     """The session this tab last ran, found in the saved list instead of by a full scan.
 
@@ -3373,6 +3513,9 @@ class Browser:
         self.launch_config = launch_config
         self.use_cache = use_cache
         self.refresh = refresh
+        self.quick: QuickReread | None = None
+        self._quick_list: int | None = None
+        self._quick_started = False
         # Rows are cached only while the key loop says nothing can have changed them.
         self._rows_memo = False
         self._rows_generation = 0
@@ -3482,6 +3625,54 @@ class Browser:
         checked = check_before_open(self.sessions, row.all_members, self.state)
         self.invalidate_rows()
         return checked
+
+    def start_quick_reread(self) -> None:
+        """Reread what the search shows now, so it is current before the full refresh."""
+        self._quick_started = True
+        if self.refresh is None or not self.query:
+            return
+        by_key = {item.key: item for item in self.sessions}
+        targets: dict[str, Session] = {}
+        for row in self.view_rows():
+            for item in row.all_members:
+                targets[item.key] = item
+                conversation_id = item.conversation_id
+                members = self.state.conversations.get(conversation_id, {}).get("members", {})
+                for key in members if conversation_id else ():
+                    if key in by_key:
+                        targets[key] = by_key[key]
+            if len(targets) > QUICK_REREAD_LIMIT:
+                return
+        if targets:
+            self._quick_list = id(self.sessions)
+            self.quick = QuickReread(list(targets.values()), self.state, self.launch_config)
+
+    def apply_quick_reread(self) -> bool:
+        """Bring the searched rows up to date once their reread is in; True if it was."""
+        if self.quick is None or not self.quick.ready():
+            return False
+        result = self.quick.result()
+        self.quick = None
+        if result is None or self._quick_list != id(self.sessions):
+            return False  # Failed, or the full refresh already replaced every row.
+        by_key = {item.key: item for item in self.sessions}
+        changed: list[Session] = []
+        for key, values in result.fields.items():
+            item = by_key.get(key)
+            if item is None:
+                continue
+            for name, value in values.items():
+                setattr(item, name, value)
+            changed.append(item)
+        for key, (is_open, pid) in result.open.items():
+            item = by_key.get(key)
+            if item is not None:
+                item.is_open, item.open_pid = is_open, pid
+        with self.state.lock:
+            self.state.apply_choices(changed)
+        self.state.apply_conversation_statuses(result.statuses, self.sessions)
+        self.invalidate_rows()
+        return True
 
     def finish_refresh(self) -> None:
         if self.refresh is None:
@@ -3784,7 +3975,12 @@ class Browser:
         mode_text = f"Launch: {self.launch_config.mode.upper()}"
         mode_style = "warning" if self.launch_config.mode == "dangerous" else "success"
         self.add(0, 14, mode_text, self.style(mode_style, curses.A_BOLD))
-        refresh_text = " · refreshing" if self.refresh is not None else ""
+        if self.quick is not None:
+            refresh_text = " · updating matches"
+        elif self.refresh is not None:
+            refresh_text = " · refreshing"
+        else:
+            refresh_text = ""
         excluded = self.compressed_excluded()
         excluded_text = f" · {excluded} compressed" if excluded else ""
         count_text = (
@@ -4933,8 +5129,12 @@ class Browser:
             # While waiting for the refresh, input times out ten times a second.  An
             # unchanged screen is not redrawn then: the redraws competed with the
             # refresh for the interpreter and made it several times slower.
-            if self.apply_refresh() or not idle:
+            changed = self.apply_refresh()
+            changed = self.apply_quick_reread() or changed
+            if changed or not idle:
                 self.draw()
+            if not self._quick_started:
+                self.start_quick_reread()
             idle = False
             try:
                 key = self.screen.get_wch()
