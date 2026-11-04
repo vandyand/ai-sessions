@@ -1,5 +1,23 @@
 # Changelog
 
+## 3.10.0 — 2026-11-04
+
+### Changed
+
+- `state.json` no longer carries the bookmarks' record fingerprints. A bookmark on a long
+  transcript lists one fingerprint per record, and these made up 17 of the file's 18 MB,
+  rewritten whole on every rename, hide or copy. They now live in `checkpoint-records`
+  beside it, one file per list named by its own hash, and are read only when a transcript
+  has been rewritten and a bookmark has to be found again. On this machine the state file
+  went from 18.3 MB to 0.17 MB; loading it takes 2 ms instead of 29, saving 8 ms instead
+  of 48. The first `sessions` start after upgrading moves them, unless another process
+  wrote the file since it was read, in which case a later start does. Lists that no
+  bookmark names and nothing has used for a week are deleted at startup.
+- An older `sessions` still running reads the new bookmarks safely: it can still tell
+  whether a copy changed, but cannot find a bookmark again in a transcript that was
+  rewritten since, and reports that copy as one it cannot verify until it is restarted.
+- Copying a conversation into another harness writes the state file once instead of twice.
+
 ## 3.9.1 — 2026-11-04
 
 ### Changed

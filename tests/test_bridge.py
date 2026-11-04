@@ -1446,6 +1446,24 @@ class LaunchIntegrationTests(unittest.TestCase):
             self.assertIn("Copied", note)
             self.assertNotEqual(prepared.launch_target("claude"), "foreign-claude-id")
 
+    def test_a_copy_writes_the_state_once(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            claude_home = Path(directory) / "claude"
+            (claude_home / "projects" / "-tmp").mkdir(parents=True)
+            item = session(directory, launch_tool="claude")
+            state = UserState(path=Path(directory) / "state.json")
+            state.conversation_id_for(item, create=True)
+            item.launch_tool = "claude"
+
+            with (
+                harness_home("claude", claude_home),
+                patch.object(UserState, "_save", autospec=True) as saved,
+            ):
+                _, note = prepare_launch(item, state=state)
+
+            self.assertIn("Copied", note)
+            self.assertEqual(saved.call_count, 1)
+
     def test_a_tracked_row_without_loaded_state_ignores_a_foreign_launch_target(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             claude_home = Path(directory) / "claude"
