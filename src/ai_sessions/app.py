@@ -841,23 +841,35 @@ class UserState:
             item.diverged = False
             item.conversation_blocker = ""
         by_key = {item.key: item for item in sessions}
-        for conversation_id, conversation in self.conversations.items():
-            status = self._conversation_status(conversation_id)
-            blocker = next(
-                (name for name in ("unknown", "unstable", "unavailable") if status[name]), ""
-            )
-            compressed_heads = status.get("compressed", ())
-            if compressed_heads:
-                blocker = "compressed"
-            head_keys = {key for key, _ in (*status["heads"], *compressed_heads)}
-            for key in conversation["members"]:
-                item = by_key.get(key)
-                if item is None:
-                    continue
-                item.conversation_id = conversation_id
-                item.conversation_blocker = blocker
-                item.diverged = bool(status["conflict"] and key in head_keys)
-                item.superseded = key not in head_keys
+        for conversation_id in self.conversations:
+            self._set_conversation_status(conversation_id, by_key)
+
+    def check_conversations(self, conversation_ids: Iterable[str], sessions: list[Session]) -> None:
+        """Re-read which copy of each named conversation is current, from the disk."""
+        with self.lock:
+            by_key = {item.key: item for item in sessions}
+            for conversation_id in conversation_ids:
+                if conversation_id in self.conversations:
+                    self._set_conversation_status(conversation_id, by_key)
+
+    def _set_conversation_status(self, conversation_id: str, by_key: dict[str, Session]) -> None:
+        conversation = self.conversations[conversation_id]
+        status = self._conversation_status(conversation_id)
+        blocker = next(
+            (name for name in ("unknown", "unstable", "unavailable") if status[name]), ""
+        )
+        compressed_heads = status.get("compressed", ())
+        if compressed_heads:
+            blocker = "compressed"
+        head_keys = {key for key, _ in (*status["heads"], *compressed_heads)}
+        for key in conversation["members"]:
+            item = by_key.get(key)
+            if item is None:
+                continue
+            item.conversation_id = conversation_id
+            item.conversation_blocker = blocker
+            item.diverged = bool(status["conflict"] and key in head_keys)
+            item.superseded = key not in head_keys
 
     def _apply_saved_conversation_status(self, sessions: list[Session]) -> None:
         """Group copies by the conversations recorded now, keeping each copy's saved status.
@@ -2472,6 +2484,7 @@ class SessionRefresh:
         tidy: bool = False,
     ) -> None:
         self._stop_detached = stop_detached
+        self._cleanup = True
         self._tidy = tidy
         self._use_cache = use_cache
         self._state = state
@@ -2506,7 +2519,7 @@ class SessionRefresh:
                 config=self._config,
             )
             notes = list(load_warnings())
-            if self._stop_detached:
+            if self._stop_detached and self._cleanup:
                 from .detached import cleanup_note, stop_detached
 
                 if note := cleanup_note(*stop_detached(sessions)):
@@ -2535,6 +2548,18 @@ class SessionRefresh:
 
     def wait_saved(self, timeout: float | None = None) -> bool:
         return self._saved.wait(timeout)
+
+    def outlive_browser(self) -> None:
+        """Let a launch go ahead while this refresh finishes behind it.
+
+        Its result then only updates the catalog for the next start.  Stopping
+        sessions that lost their terminal is left to that start too: by the time
+        this refresh would get there, its view of the processes is old.
+        """
+        self._cleanup = False
+
+    def wait(self) -> None:
+        self._saved.wait()
 
     def take(self, *, wait: bool = False) -> tuple[list[Session] | None, tuple[str, ...], str]:
         if wait:
@@ -3234,6 +3259,90 @@ def ellipsize_with_suffix(value: str, suffix: str, width: int) -> str:
     return ellipsize(value, title_width) + separator + suffix
 
 
+def check_before_open(sessions: list[Session], chosen: Iterable[Session], state: UserState) -> bool:
+    """Bring what opening ``chosen`` depends on up to date, without a full refresh.
+
+    Opening needs to know which copy of the conversation is current and whether any
+    of it is open somewhere.  Both are read here for these sessions alone, every copy
+    in their conversations, and a supervisor's target.  Returns False when the
+    saved list cannot answer (a copy it has never seen), so a full refresh is needed.
+    """
+    from .retention import sync_storage
+
+    chosen = tuple(chosen)
+    by_key = {item.key: item for item in sessions}
+    involved = {item.key: item for item in chosen}
+    records = {
+        record for item in chosen for record in (item.supervises, item.supervised_by) if record
+    }
+    if records:
+        for item in sessions:
+            if item.supervises in records or item.supervised_by in records:
+                involved[item.key] = item
+    conversations: set[str] = set()
+    with state.lock:
+        for item in list(involved.values()):
+            conversation_id = item.conversation_id or state.conversation_id_for(item)
+            if not conversation_id:
+                continue
+            conversations.add(conversation_id)
+            members = state.conversations.get(conversation_id, {}).get("members", {})
+            for key, record in members.items():
+                member = by_key.get(key)
+                if member is not None:
+                    involved[key] = member
+                elif _recorded_copy_exists(record):
+                    # A copy made after the list was saved; only a refresh knows it.
+                    return False
+    for item in involved.values():
+        sync_storage(item)
+    if conversations:
+        state.check_conversations(conversations, sessions)
+    detect_open_sessions(list(involved.values()))
+    return True
+
+
+def reopen_from_catalog(state: UserState) -> tuple[Session, list[Session]] | None:
+    """The session this tab last ran, found in the saved list instead of by a full scan.
+
+    None when the tab ran nothing, the session is not in the list (one started
+    since it was saved), or the list cannot vouch for it; the caller then scans.
+    """
+    from .detached import closed, interrupted, terminal_id
+
+    terminal = terminal_id()
+    if not terminal:
+        return None
+    entry = closed().get(terminal) or interrupted().get(terminal)
+    if entry is None:
+        return None
+    wanted = str(entry.get("session_id", ""))
+    sessions = load_session_catalog(state)
+    by_id = {item.session_id: item for item in sessions}
+    by_id.update({f"supervisor-{item.supervises}": item for item in sessions if item.supervises})
+    item = by_id.get(wanted)
+    if item is None or not check_before_open(sessions, [item], state):
+        return None
+    return item, sessions
+
+
+def _recorded_copy_exists(record: Any) -> bool:
+    """Whether a conversation's recorded copy still has its file, or may have one.
+
+    A copy whose transcript is gone is missing from every refresh too, so it is no
+    reason to wait for one.  Without a recorded file it cannot be ruled out.
+    """
+    from .compression import resolve_storage
+
+    storage = record.get("storage") if isinstance(record, dict) else ""
+    if not isinstance(storage, str) or not storage:
+        return True
+    try:
+        return resolve_storage(Path(storage)) is not None
+    except (OSError, ValueError):
+        return True
+
+
 _NAVIGATION_KEYS = frozenset(
     (
         curses.KEY_UP,
@@ -3363,6 +3472,16 @@ class Browser:
         self.expanded.intersection_update(row_id for row_id in live_ids if "/member:" not in row_id)
         self.message = "; ".join(warnings) or "Sessions refreshed."
         return True
+
+    def check_before_open(self, row: ViewRow) -> bool:
+        """Bring what opening ``row`` depends on up to date, without the full refresh.
+
+        Returns False when the saved list cannot answer, so the caller waits for
+        the full refresh instead.
+        """
+        checked = check_before_open(self.sessions, row.all_members, self.state)
+        self.invalidate_rows()
+        return checked
 
     def finish_refresh(self) -> None:
         if self.refresh is None:
@@ -4860,7 +4979,19 @@ class Browser:
                 elif not self.toggle_expansion(collapse=True):
                     self.message = "This row is not expanded."
             elif key in ("\n", "\r", curses.KEY_ENTER):
-                self.finish_refresh()
+                rows = self.view_rows()
+                if rows and self.refresh is not None:
+                    # Only what this row depends on is checked, so Enter does not wait
+                    # for every other session to be reread.
+                    row_id = rows[self.selected].row_id
+                    try:
+                        checked = self.check_before_open(rows[self.selected])
+                    except Exception:
+                        checked = False
+                    if checked:
+                        self.keep_selection(row_id)
+                    else:
+                        self.finish_refresh()
                 rows = self.view_rows()
                 if rows:
                     chosen_row = rows[self.selected]
@@ -6166,6 +6297,13 @@ def _main(argv: list[str] | None = None) -> int:
         and sys.stdout.isatty()
     )
     background_refresh: SessionRefresh | None = None
+    reopened: tuple[Session, list[Session]] | None = None
+    if args.reopen and IS_WINDOWS and not args.no_cache and not tui_mode:
+        # Restarting reopens one known session; finding it needs no scan of them all.
+        try:
+            reopened = reopen_from_catalog(state)
+        except Exception:
+            reopened = None
     if tui_mode:
         sessions = [] if args.no_cache else load_session_catalog(state)
         background_refresh = SessionRefresh(
@@ -6175,6 +6313,8 @@ def _main(argv: list[str] | None = None) -> int:
             stop_detached=IS_WINDOWS,
             tidy=True,
         )
+    elif reopened is not None:
+        sessions = reopened[1]
     else:
         sessions = load_sessions(
             use_cache=not args.no_cache,
@@ -6315,7 +6455,7 @@ def _main(argv: list[str] | None = None) -> int:
                 file=sys.stderr,
             )
             return 2
-        item = choose_reopen(sessions)
+        item = reopened[0] if reopened is not None else choose_reopen(sessions)
         if item is None:
             return 1
         if args.launch_tool and args.launch_tool != item.tool:
@@ -6349,9 +6489,10 @@ def _main(argv: list[str] | None = None) -> int:
         return 0
 
     loaded: list[Session] = sessions
+    unfinished: SessionRefresh | None = None
 
     def wrapped(screen: Any) -> Session | None:
-        nonlocal loaded
+        nonlocal loaded, unfinished
         browser = Browser(
             screen,
             sessions,
@@ -6374,6 +6515,7 @@ def _main(argv: list[str] | None = None) -> int:
             return browser.run()
         finally:
             loaded = browser.sessions
+            unfinished = browser.refresh
 
     if launch_config.compress_after_days and not args.dry_run:
         start_background_sweep()
@@ -6383,10 +6525,20 @@ def _main(argv: list[str] | None = None) -> int:
             action, selected = selected
             if action == "supervise":
                 return supervise_session(selected, launch_config, state, "", args.dry_run)
-        if selected:
+        if not selected:
+            return 0
+        if unfinished is None:
             # Enter on a supervisor row must open it as a supervisor, with its folder and name.
             return open_again(selected, launch_config, state, loaded, args.dry_run)
-        return 0
+        # Chosen before the refresh finished.  It carries on behind the launch, kept
+        # off the shared state until the launch is done with it, and is waited for
+        # so the next start in this tab does not race it.
+        unfinished.outlive_browser()
+        try:
+            with state.lock:
+                return open_again(selected, launch_config, state, loaded, args.dry_run)
+        finally:
+            unfinished.wait()
     finally:
         finish_catalog_saves()
 

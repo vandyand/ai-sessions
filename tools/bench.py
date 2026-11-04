@@ -53,6 +53,13 @@ if mode == "start":
         if self.sessions and "first_frame" not in result:
             result["first_frame"] = time.perf_counter() - T
             result["sessions"] = len(self.sessions)
+            rows = self.view_rows()
+            check = getattr(self, "check_before_open", None)
+            if rows and check is not None:
+                started = time.perf_counter()
+                check(rows[0])
+                # What Enter waits for when the refresh has not finished.
+                result["enter_check"] = time.perf_counter() - started
         if self.refresh is not None and "refresh_done" not in result:
             self.refresh.take(wait=True)
             result["refresh_done"] = time.perf_counter() - T
