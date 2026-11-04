@@ -11,7 +11,7 @@ import stat
 import time
 import uuid
 from pathlib import Path
-from typing import Any, Iterable
+from typing import Any, Iterable, Mapping, Sequence
 
 import zstandard
 
@@ -770,104 +770,160 @@ def discover(context: HarnessContext, *, use_cache: bool = True) -> list[NativeS
     # Top-level transcripts sit one folder down, in their project folder.
     files = [path for path in all_files if path.parent.parent == projects]
     for path in files:
-        session_id = plain_path(path).stem
-        if not re.fullmatch(r"[0-9a-fA-F-]{32,36}", session_id):
-            continue
-        hist = history.get(session_id, {})
-        try:
-            meta, evidence = cache.scan(
-                path,
-                count_user_messages=True,
-            )
-            stat = stats.get(stat_key(path)) or path.stat()
-        except OSError:
-            continue
-        context.publish("claude", session_id, evidence)
-        custom = normalize_space(meta.get("custom_title"))
-        automatic = normalize_space(meta.get("ai_title"))
-        first = clean_prompt(meta.get("first_prompt") or hist.get("first_prompt"))
-        last = clean_prompt(hist.get("last_prompt") or meta.get("last_prompt"))
-        title = custom or automatic or first
-        cwd = str(meta.get("cwd") or hist.get("cwd") or "")
-        created = float(meta.get("created") or hist.get("created") or stat.st_ctime)
-        updated = max(
-            float(meta.get("updated") or 0),
-            float(hist.get("updated") or 0),
-            stat.st_mtime,
-        )
-        prompt_count = int(meta.get("prompt_count") or 0)
-        message_count = prompt_count
-        programmatic = meta.get("entrypoint") == "sdk-cli" or meta.get("prompt_source") == "sdk"
-        result.append(
-            NativeSession(
-                tool="claude",
-                session_id=session_id,
-                title=title,
-                cwd=cwd,
-                updated=updated,
-                created=created,
-                preview=last or first,
-                named=bool(custom),
-                storage=str(path),
-                compressed=is_compressed_path(path),
-                source=SourceKind.SDK if programmatic else SourceKind.INTERACTIVE,
-                resume_id=session_id,
-                message_count=message_count,
-                turn_count=int(meta.get("turn_count") or 0),
-                compaction_count=int(meta.get("compaction_count") or 0),
-                prompt_count=prompt_count,
-            )
-        )
+        session = _top_level_session(path, cache, history, stats, context)
+        if session is not None:
+            result.append(session)
 
     agent_files = [
         path for path in all_files if path.name.startswith("agent-") and "subagents" in path.parts
     ]
     for path in agent_files:
-        fallback_agent_id = plain_path(path).stem.removeprefix("agent-")
-        try:
-            fallback_parent_id = path.relative_to(projects).parts[1]
-        except (ValueError, IndexError):
-            fallback_parent_id = ""
-        try:
-            meta, evidence = cache.scan(path, allow_sidechain=True, count_user_messages=True)
-            stat = stats.get(stat_key(path)) or path.stat()
-        except OSError:
-            continue
-        agent_id = str(meta.get("agent_id") or fallback_agent_id)
-        parent_id = str(meta.get("parent_session_id") or fallback_parent_id)
-        if not agent_id or not parent_id:
-            continue
-        context.index_native("claude", agent_id, str(path))
-        context.publish("claude", agent_id, evidence)
-        first = clean_prompt(meta.get("first_prompt"))
-        last = clean_prompt(meta.get("last_prompt"))
-        slug = normalize_space(meta.get("slug"))
-        title = slug or first or f"Claude subagent {agent_id[:8]}"
-        parent_history = history.get(parent_id, {})
-        result.append(
-            NativeSession(
-                tool="claude",
-                session_id=agent_id,
-                title=title,
-                cwd=str(meta.get("cwd") or parent_history.get("cwd") or ""),
-                updated=max(float(meta.get("updated") or 0), stat.st_mtime),
-                created=float(meta.get("created") or stat.st_ctime),
-                preview=last or first,
-                named=False,
-                storage=str(path),
-                compressed=is_compressed_path(path),
-                source=SourceKind.SUBAGENT,
-                resume_id=parent_id,
-                parent_id=parent_id,
-                message_count=int(meta.get("user_messages") or 0),
-                turn_count=int(meta.get("turn_count") or 0),
-                compaction_count=int(meta.get("compaction_count") or 0),
-                prompt_count=int(meta.get("prompt_count") or 0),
-            )
-        )
+        session = _subagent_session(path, projects, cache, history, stats, context)
+        if session is not None:
+            result.append(session)
     if index_complete and projects.is_dir() and prune_entries(cache.entries, projects, found):
         cache.dirty = True
     cache.save()
+    return result
+
+
+def _top_level_session(
+    path: Path,
+    cache: DiscoveryCache,
+    history: dict[str, dict[str, Any]],
+    stats: Mapping[str, Any],
+    context: HarnessContext,
+) -> NativeSession | None:
+    """The session one top-level transcript describes, as discovery lists it."""
+    session_id = plain_path(path).stem
+    if not re.fullmatch(r"[0-9a-fA-F-]{32,36}", session_id):
+        return None
+    hist = history.get(session_id, {})
+    try:
+        meta, evidence = cache.scan(
+            path,
+            count_user_messages=True,
+        )
+        stat = stats.get(stat_key(path)) or path.stat()
+    except OSError:
+        return None
+    context.publish("claude", session_id, evidence)
+    custom = normalize_space(meta.get("custom_title"))
+    automatic = normalize_space(meta.get("ai_title"))
+    first = clean_prompt(meta.get("first_prompt") or hist.get("first_prompt"))
+    last = clean_prompt(hist.get("last_prompt") or meta.get("last_prompt"))
+    title = custom or automatic or first
+    cwd = str(meta.get("cwd") or hist.get("cwd") or "")
+    created = float(meta.get("created") or hist.get("created") or stat.st_ctime)
+    updated = max(
+        float(meta.get("updated") or 0),
+        float(hist.get("updated") or 0),
+        stat.st_mtime,
+    )
+    prompt_count = int(meta.get("prompt_count") or 0)
+    message_count = prompt_count
+    programmatic = meta.get("entrypoint") == "sdk-cli" or meta.get("prompt_source") == "sdk"
+    return NativeSession(
+        tool="claude",
+        session_id=session_id,
+        title=title,
+        cwd=cwd,
+        updated=updated,
+        created=created,
+        preview=last or first,
+        named=bool(custom),
+        storage=str(path),
+        compressed=is_compressed_path(path),
+        source=SourceKind.SDK if programmatic else SourceKind.INTERACTIVE,
+        resume_id=session_id,
+        message_count=message_count,
+        turn_count=int(meta.get("turn_count") or 0),
+        compaction_count=int(meta.get("compaction_count") or 0),
+        prompt_count=prompt_count,
+    )
+
+
+def _subagent_session(
+    path: Path,
+    projects: Path,
+    cache: DiscoveryCache,
+    history: dict[str, dict[str, Any]],
+    stats: Mapping[str, Any],
+    context: HarnessContext,
+) -> NativeSession | None:
+    """The subagent one ``subagents/agent-*.jsonl`` transcript describes."""
+    fallback_agent_id = plain_path(path).stem.removeprefix("agent-")
+    try:
+        fallback_parent_id = path.relative_to(projects).parts[1]
+    except (ValueError, IndexError):
+        fallback_parent_id = ""
+    try:
+        meta, evidence = cache.scan(path, allow_sidechain=True, count_user_messages=True)
+        stat = stats.get(stat_key(path)) or path.stat()
+    except OSError:
+        return None
+    agent_id = str(meta.get("agent_id") or fallback_agent_id)
+    parent_id = str(meta.get("parent_session_id") or fallback_parent_id)
+    if not agent_id or not parent_id:
+        return None
+    context.index_native("claude", agent_id, str(path))
+    context.publish("claude", agent_id, evidence)
+    first = clean_prompt(meta.get("first_prompt"))
+    last = clean_prompt(meta.get("last_prompt"))
+    slug = normalize_space(meta.get("slug"))
+    title = slug or first or f"Claude subagent {agent_id[:8]}"
+    parent_history = history.get(parent_id, {})
+    return NativeSession(
+        tool="claude",
+        session_id=agent_id,
+        title=title,
+        cwd=str(meta.get("cwd") or parent_history.get("cwd") or ""),
+        updated=max(float(meta.get("updated") or 0), stat.st_mtime),
+        created=float(meta.get("created") or stat.st_ctime),
+        preview=last or first,
+        named=False,
+        storage=str(path),
+        compressed=is_compressed_path(path),
+        source=SourceKind.SUBAGENT,
+        resume_id=parent_id,
+        parent_id=parent_id,
+        message_count=int(meta.get("user_messages") or 0),
+        turn_count=int(meta.get("turn_count") or 0),
+        compaction_count=int(meta.get("compaction_count") or 0),
+        prompt_count=int(meta.get("prompt_count") or 0),
+    )
+
+
+def rediscover(context: HarnessContext, refs: Sequence[NativeRef]) -> list[NativeSession]:
+    """Reread only the sessions in ``refs``, exactly as a full discovery would list them.
+
+    Each is found from its recorded transcript; one that has gone is left out.  The
+    caches are read but not written, and the session index is not declared complete:
+    only a full discovery sees every session.
+    """
+    projects = REGISTRY.get("claude").home / "projects"
+    if not refs or not projects.exists():
+        return []
+    history = load_history()
+    cache = DiscoveryCache(context)
+    result: list[NativeSession] = []
+    seen: set[str] = set()
+    for ref in refs:
+        if not ref.storage:
+            continue
+        path = resolve_storage(Path(ref.storage))
+        if path is None or str(path) in seen:
+            continue
+        seen.add(str(path))
+        if path.parent.parent == projects:
+            session = _top_level_session(path, cache, history, {}, context)
+        elif path.name.startswith("agent-") and "subagents" in path.parts:
+            session = _subagent_session(path, projects, cache, history, {}, context)
+        else:
+            session = None
+        if session is not None:
+            context.index_native("claude", session.session_id, str(path))
+            result.append(session)
     return result
 
 
@@ -1049,6 +1105,7 @@ ADAPTER = HarnessAdapter(
     pasted_contents=_claude_pasted_contents,
     protect_checkpoint=_protect_claude_checkpoint,
     discover=discover,
+    rediscover=rediscover,
     resume_args=resume_args,
     new_session_args=new_session_args,
     extra_dir_args=extra_dir_args,

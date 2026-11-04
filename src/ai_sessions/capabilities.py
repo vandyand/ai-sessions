@@ -5,7 +5,7 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from pathlib import Path
 from re import Pattern
-from typing import Any, Callable, Iterable, Mapping, Protocol
+from typing import Any, Callable, Iterable, Mapping, Protocol, Sequence
 
 from .liveness import LivenessContext
 from .model import (
@@ -96,6 +96,12 @@ class PrepareTargetHook(Protocol):
 
 class DiscoverHook(Protocol):
     def __call__(self, context: Any, *, use_cache: bool = True) -> Iterable[NativeSession]: ...
+
+
+class RediscoverHook(Protocol):
+    """Reread only the sessions ``refs`` name, giving what ``discover`` would for them."""
+
+    def __call__(self, context: Any, refs: Sequence[NativeRef]) -> Iterable[NativeSession]: ...
 
 
 class ResumeArgsHook(Protocol):
@@ -208,6 +214,7 @@ class HarnessAdapter:
     liveness_executables: frozenset[str] = frozenset()
     scratch_patterns: tuple[Pattern[str], ...] = ()
     discover: DiscoverHook | Unsupported = Unsupported("discovery is not installed")
+    rediscover: RediscoverHook | Unsupported = Unsupported("rereading one session is not supported")
     resume_args: ResumeArgsHook | Unsupported = Unsupported("resume is not installed")
     publish_name: PublishNameHook | Unsupported = Unsupported("rename is not supported")
     inspect_liveness: LivenessHook | Unsupported = Unsupported("liveness is not installed")
@@ -308,6 +315,7 @@ class HarnessAdapter:
         )
         optional = (
             self.discover,
+            self.rediscover,
             self.resume_args,
             self.publish_name,
             self.inspect_liveness,

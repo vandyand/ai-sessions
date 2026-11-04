@@ -19,7 +19,7 @@ import uuid
 from contextlib import closing
 from dataclasses import replace
 from pathlib import Path
-from typing import Any, Callable, Iterable, Mapping
+from typing import Any, Callable, Iterable, Mapping, Sequence
 
 import zstandard
 
@@ -986,16 +986,7 @@ class DiscoveryCache:
             pass
 
 
-def discover(context: HarnessContext, *, use_cache: bool = True) -> list[NativeSession]:
-    del use_cache
-    home = REGISTRY.get("codex").home
-    databases = list(home.glob("state_*.sqlite"))
-    if not databases:
-        if home.is_dir():
-            record_warning(f"no Codex state database found in {home}")
-        return []
-    listing = RolloutListing(home / "sessions")
-
+def _codex_database(home: Path) -> Path | None:
     def database_version(path: Path) -> tuple[int, float]:
         match = re.search(r"state_(\d+)\.sqlite$", path.name)
         try:
@@ -1004,7 +995,11 @@ def discover(context: HarnessContext, *, use_cache: bool = True) -> list[NativeS
             modified = 0.0
         return (int(match.group(1)) if match else 0, modified)
 
-    database = max(databases, key=database_version)
+    databases = list(home.glob("state_*.sqlite"))
+    return max(databases, key=database_version) if databases else None
+
+
+def _indexed_names(home: Path) -> dict[str, str]:
     indexed_names: dict[str, str] = {}
     index_file = home / "session_index.jsonl"
     if index_file.exists():
@@ -1021,7 +1016,117 @@ def discover(context: HarnessContext, *, use_cache: bool = True) -> list[NativeS
                         indexed_names[session_id] = name
         except OSError:
             pass
+    return indexed_names
 
+
+def _session_from_thread(
+    row: Mapping[str, Any],
+    resolve: Callable[[Path], Path | None],
+    cache: DiscoveryCache,
+    history: dict[str, dict[str, Any]],
+    indexed_names: dict[str, str],
+    context: HarnessContext,
+) -> NativeSession | None:
+    """The session one ``threads`` row describes, as discovery lists it."""
+
+    def field(name: str, default: Any = None) -> Any:
+        return row.get(name, default)
+
+    session_id = str(field("id", ""))
+    if not session_id:
+        return None
+    launch_source = str(field("source", "") or "")
+    thread_source = str(field("thread_source", "") or "")
+    is_subagent = (
+        bool(field("agent_path")) or thread_source == "subagent" or "subagent" in launch_source
+    )
+    if is_subagent:
+        source = SourceKind.SUBAGENT
+    elif launch_source == "exec":
+        source = SourceKind.NON_INTERACTIVE
+    else:
+        source = SourceKind.INTERACTIVE
+    parent_id = ""
+    nickname = normalize_space(field("agent_nickname"))
+    if launch_source.startswith("{"):
+        try:
+            spawn = json.loads(launch_source)["subagent"]["thread_spawn"]
+            parent_id = str(spawn.get("parent_thread_id") or "")
+            nickname = nickname or normalize_space(spawn.get("agent_nickname"))
+        except (json.JSONDecodeError, KeyError, TypeError):
+            pass
+    # Show the name Codex shows: a paginated thread's lives only in the database.
+    if field("history_mode") == PAGINATED_HISTORY_MODE:
+        name = normalize_space(field("name"))
+    else:
+        name = indexed_names.get(session_id) or normalize_space(field("name"))
+    fallback = field("title") or field("preview") or field("first_user_message")
+    title = name or clean_prompt(fallback)
+    indexed_preview = clean_prompt(field("preview") or field("first_user_message"))
+    created = timestamp(field("created_at_ms") or field("created_at"))
+    updated = timestamp(
+        max(
+            int(field("updated_at_ms", 0) or 0),
+            int(field("recency_at_ms", 0) or 0),
+        )
+        or field("updated_at")
+    )
+    rollout_path = str(field("rollout_path", "") or "")
+    if rollout_path:
+        found = resolve(Path(rollout_path))
+        if found is None:
+            return None
+        rollout_path = str(found)
+    turn_count = 0
+    compaction_count = 0
+    prompt_count = 0
+    latest = ""
+    evidence = context.accumulator()
+    if rollout_path:
+        turn_count, compaction_count, prompt_count, latest, evidence = cache.scan(
+            Path(rollout_path), source
+        )
+        context.publish("codex", session_id, evidence)
+    if source is SourceKind.INTERACTIVE and session_id in history:
+        if not rollout_path:
+            prompt_count = int(history[session_id].get("count", 0))
+            turn_count = prompt_count
+        if not latest:
+            latest = clean_prompt(history[session_id].get("latest"))
+    cwd = str(field("cwd", "") or "")
+    return NativeSession(
+        tool="codex",
+        session_id=session_id,
+        title=title,
+        cwd=cwd,
+        updated=updated,
+        created=created,
+        preview=latest or indexed_preview,
+        named=bool(name),
+        storage=rollout_path,
+        compressed=is_compressed_path(rollout_path),
+        source=source,
+        archived=bool(field("archived", False)),
+        resume_id=parent_id if source is SourceKind.SUBAGENT and parent_id else session_id,
+        parent_id=parent_id,
+        message_count=prompt_count,
+        turn_count=turn_count,
+        compaction_count=compaction_count,
+        prompt_count=prompt_count,
+        agent_nickname=nickname,
+    )
+
+
+def discover(context: HarnessContext, *, use_cache: bool = True) -> list[NativeSession]:
+    del use_cache
+    home = REGISTRY.get("codex").home
+    database = _codex_database(home)
+    if database is None:
+        if home.is_dir():
+            record_warning(f"no Codex state database found in {home}")
+        return []
+    listing = RolloutListing(home / "sessions")
+    indexed_names = _indexed_names(home)
     result: list[NativeSession] = []
     history = load_history()
     cache = DiscoveryCache(context)
@@ -1031,100 +1136,16 @@ def discover(context: HarnessContext, *, use_cache: bool = True) -> list[NativeS
         connection = sqlite3.connect(f"file:{database}?mode=ro", uri=True, timeout=2)
         columns, query = _threads_query(connection)
         for values in connection.execute(query):
-            row = dict(zip(columns, values))
-
-            def field(name: str, default: Any = None) -> Any:
-                return row.get(name, default)
-
-            session_id = str(field("id", ""))
-            if not session_id:
-                continue
-            launch_source = str(field("source", "") or "")
-            thread_source = str(field("thread_source", "") or "")
-            is_subagent = (
-                bool(field("agent_path"))
-                or thread_source == "subagent"
-                or "subagent" in launch_source
+            session = _session_from_thread(
+                dict(zip(columns, values)),
+                listing.resolve,
+                cache,
+                history,
+                indexed_names,
+                context,
             )
-            if is_subagent:
-                source = SourceKind.SUBAGENT
-            elif launch_source == "exec":
-                source = SourceKind.NON_INTERACTIVE
-            else:
-                source = SourceKind.INTERACTIVE
-            parent_id = ""
-            nickname = normalize_space(field("agent_nickname"))
-            if launch_source.startswith("{"):
-                try:
-                    spawn = json.loads(launch_source)["subagent"]["thread_spawn"]
-                    parent_id = str(spawn.get("parent_thread_id") or "")
-                    nickname = nickname or normalize_space(spawn.get("agent_nickname"))
-                except (json.JSONDecodeError, KeyError, TypeError):
-                    pass
-            # Show the name Codex shows: a paginated thread's lives only in the database.
-            if field("history_mode") == PAGINATED_HISTORY_MODE:
-                name = normalize_space(field("name"))
-            else:
-                name = indexed_names.get(session_id) or normalize_space(field("name"))
-            fallback = field("title") or field("preview") or field("first_user_message")
-            title = name or clean_prompt(fallback)
-            indexed_preview = clean_prompt(field("preview") or field("first_user_message"))
-            created = timestamp(field("created_at_ms") or field("created_at"))
-            updated = timestamp(
-                max(
-                    int(field("updated_at_ms", 0) or 0),
-                    int(field("recency_at_ms", 0) or 0),
-                )
-                or field("updated_at")
-            )
-            rollout_path = str(field("rollout_path", "") or "")
-            if rollout_path:
-                found = listing.resolve(Path(rollout_path))
-                if found is None:
-                    continue
-                rollout_path = str(found)
-            turn_count = 0
-            compaction_count = 0
-            prompt_count = 0
-            latest = ""
-            evidence = context.accumulator()
-            if rollout_path:
-                turn_count, compaction_count, prompt_count, latest, evidence = cache.scan(
-                    Path(rollout_path), source
-                )
-                context.publish("codex", session_id, evidence)
-            if source is SourceKind.INTERACTIVE and session_id in history:
-                if not rollout_path:
-                    prompt_count = int(history[session_id].get("count", 0))
-                    turn_count = prompt_count
-                if not latest:
-                    latest = clean_prompt(history[session_id].get("latest"))
-            cwd = str(field("cwd", "") or "")
-            result.append(
-                NativeSession(
-                    tool="codex",
-                    session_id=session_id,
-                    title=title,
-                    cwd=cwd,
-                    updated=updated,
-                    created=created,
-                    preview=latest or indexed_preview,
-                    named=bool(name),
-                    storage=rollout_path,
-                    compressed=is_compressed_path(rollout_path),
-                    source=source,
-                    archived=bool(field("archived", False)),
-                    resume_id=parent_id
-                    if source is SourceKind.SUBAGENT and parent_id
-                    else session_id,
-                    parent_id=parent_id,
-                    message_count=prompt_count,
-                    turn_count=turn_count,
-                    compaction_count=compaction_count,
-                    prompt_count=prompt_count,
-                    agent_nickname=nickname,
-                )
-            )
+            if session is not None:
+                result.append(session)
     except (sqlite3.Error, OSError) as error:
         record_warning(f"could not read Codex sessions from {database}: {error}")
         return []
@@ -1136,6 +1157,58 @@ def discover(context: HarnessContext, *, use_cache: bool = True) -> list[NativeS
     if listing.complete and prune_entries(cache.entries, listing.root, listing.paths):
         cache.dirty = True
     cache.save()
+    return result
+
+
+def rediscover(context: HarnessContext, refs: Sequence[NativeRef]) -> list[NativeSession]:
+    """Reread only the sessions in ``refs``, exactly as a full discovery would list them.
+
+    Their rows come from Codex's database by id; a rollout missing from it is read
+    from its recorded file.  The caches are read but not written, and nothing is
+    declared complete: only a full discovery sees every session.
+    """
+    home = REGISTRY.get("codex").home
+    wanted = {ref.session_id: ref for ref in refs if ref.session_id}
+    database = _codex_database(home)
+    if not wanted or database is None:
+        return []
+    indexed_names = _indexed_names(home)
+    history = load_history()
+    cache = DiscoveryCache(context)
+    result: list[NativeSession] = []
+    connection: sqlite3.Connection | None = None
+    try:
+        connection = sqlite3.connect(f"file:{database}?mode=ro", uri=True, timeout=2)
+        columns, query = _threads_query(connection)
+        ids = list(wanted)
+        for start in range(0, len(ids), 500):
+            chunk = ids[start : start + 500]
+            placeholders = ", ".join("?" for _ in chunk)
+            rows = connection.execute(f"{query} WHERE id IN ({placeholders})", chunk)
+            for values in rows:
+                row = dict(zip(columns, values))
+                wanted.pop(str(row.get("id", "")), None)
+                session = _session_from_thread(
+                    row, resolve_storage, cache, history, indexed_names, context
+                )
+                if session is not None:
+                    result.append(session)
+    except (sqlite3.Error, OSError):
+        return []
+    finally:
+        if connection is not None:
+            connection.close()
+    for session_id, ref in wanted.items():
+        path = resolve_storage(Path(ref.storage)) if ref.storage else None
+        if path is None or plain_path(path).stem[-36:] != session_id:
+            continue
+        try:
+            stat = path.stat()
+        except OSError:
+            continue
+        session = _unregistered_session(session_id, path, stat, cache, context)
+        if session is not None:
+            result.append(session)
     return result
 
 
@@ -1215,41 +1288,48 @@ def _unregistered_sessions(
             stat = listing.stats.get(stat_key(path)) or path.stat()
         except OSError:
             continue
-        modified = stat.st_mtime
-        meta = cache.rollout_meta(path, stat)
-        if str(meta.get("id", "")) != session_id:
-            continue
-        origin = meta.get("source")
-        if isinstance(origin, dict) and "subagent" in origin:
-            source = SourceKind.SUBAGENT
-        elif origin == "exec":
-            source = SourceKind.NON_INTERACTIVE
-        else:
-            source = SourceKind.INTERACTIVE
-        turns, compactions, prompts, latest, evidence = cache.scan(path, source)
-        cache.remember_rollout_meta(path, stat, meta)
-        context.publish("codex", session_id, evidence)
-        sessions.append(
-            NativeSession(
-                tool="codex",
-                session_id=session_id,
-                title=latest,
-                cwd=str(meta.get("cwd") or ""),
-                updated=modified,
-                created=_meta_timestamp(meta.get("timestamp"), modified),
-                preview=latest,
-                named=False,
-                storage=str(path),
-                compressed=is_compressed_path(path),
-                source=source,
-                resume_id=session_id,
-                message_count=prompts,
-                turn_count=turns,
-                compaction_count=compactions,
-                prompt_count=prompts,
-            )
-        )
+        session = _unregistered_session(session_id, path, stat, cache, context)
+        if session is not None:
+            sessions.append(session)
     return sessions
+
+
+def _unregistered_session(
+    session_id: str, path: Path, stat: Any, cache: DiscoveryCache, context: HarnessContext
+) -> NativeSession | None:
+    """The session a rollout missing from the database describes, from its first line."""
+    modified = stat.st_mtime
+    meta = cache.rollout_meta(path, stat)
+    if str(meta.get("id", "")) != session_id:
+        return None
+    origin = meta.get("source")
+    if isinstance(origin, dict) and "subagent" in origin:
+        source = SourceKind.SUBAGENT
+    elif origin == "exec":
+        source = SourceKind.NON_INTERACTIVE
+    else:
+        source = SourceKind.INTERACTIVE
+    turns, compactions, prompts, latest, evidence = cache.scan(path, source)
+    cache.remember_rollout_meta(path, stat, meta)
+    context.publish("codex", session_id, evidence)
+    return NativeSession(
+        tool="codex",
+        session_id=session_id,
+        title=latest,
+        cwd=str(meta.get("cwd") or ""),
+        updated=modified,
+        created=_meta_timestamp(meta.get("timestamp"), modified),
+        preview=latest,
+        named=False,
+        storage=str(path),
+        compressed=is_compressed_path(path),
+        source=source,
+        resume_id=session_id,
+        message_count=prompts,
+        turn_count=turns,
+        compaction_count=compactions,
+        prompt_count=prompts,
+    )
 
 
 def _numbered_database_key(path: Path) -> tuple[int, float]:
@@ -1791,6 +1871,7 @@ ADAPTER = HarnessAdapter(
     read_since=_read_codex_since,
     protect_checkpoint=_protect_codex_checkpoint,
     discover=discover,
+    rediscover=rediscover,
     resume_args=resume_args,
     new_session_args=new_session_args,
     create_session=create_session,
