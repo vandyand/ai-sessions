@@ -826,6 +826,8 @@ class WriteSessionTests(unittest.TestCase):
             self.assertEqual(records[1]["parentUuid"], records[0]["uuid"])
             self.assertEqual(records[2]["customTitle"], "Bridged")
             self.assertTrue(all(r.get("sessionId") == session_id for r in records))
+            # Claude Code resumes on the model of the last reply; a copy must not pin one.
+            self.assertEqual(records[1]["message"]["model"], "<synthetic>")
 
     def test_codex_rollout_opens_with_session_meta_and_names_the_thread(self) -> None:
         with tempfile.TemporaryDirectory() as directory:

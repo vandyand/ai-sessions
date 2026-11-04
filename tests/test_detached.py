@@ -195,12 +195,21 @@ class RestartTests(unittest.TestCase):
     def test_a_restart_request_is_reported_once_when_the_harness_exits(self) -> None:
         detached.remember(session(), "claude", 41, 5.0, "tab", path=self.path)
         detached.request_restart("tab", path=self.path)
-        self.assertTrue(detached.mark_closed(41, path=self.path))
+        self.assertEqual(detached.mark_closed(41, path=self.path), "")
         entry = detached.remembered(path=self.path)["tab"]
         self.assertTrue(entry["closed"])
         self.assertNotIn("restart", entry)
         detached.remember(session(), "claude", 42, 5.0, "tab", path=self.path)
-        self.assertFalse(detached.mark_closed(42, path=self.path))
+        self.assertIsNone(detached.mark_closed(42, path=self.path))
+
+    def test_a_restart_into_another_harness_reports_that_harness_once(self) -> None:
+        detached.remember(session(), "claude", 41, 5.0, "tab", path=self.path)
+        detached.request_restart("tab", "codex", path=self.path)
+        self.assertEqual(detached.mark_closed(41, path=self.path), "codex")
+        self.assertNotIn("restart_tool", detached.remembered(path=self.path)["tab"])
+        detached.remember(session(), "codex", 42, 5.0, "tab", path=self.path)
+        detached.request_restart("tab", path=self.path)
+        self.assertEqual(detached.mark_closed(42, path=self.path), "")
 
     def test_the_session_a_process_runs_inside_is_found_through_its_parents(self) -> None:
         parent = psutil.Process().parent()
@@ -263,7 +272,7 @@ class RestartTests(unittest.TestCase):
 
         def fake_main(argv):
             calls.append(argv)
-            app._restart_pending = len(calls) == 1
+            app._restart_into = "" if len(calls) == 1 else None
             return 0
 
         with patch.object(app, "_main", fake_main):
@@ -271,6 +280,54 @@ class RestartTests(unittest.TestCase):
         self.assertEqual(
             calls, [["--launch-mode", "dangerous"], ["--reopen", "--launch-mode", "dangerous"]]
         )
+
+    def test_a_restart_into_another_harness_reopens_there_once(self) -> None:
+        calls: list[list[str] | None] = []
+        wanted = iter(["codex", "", None])
+
+        def fake_main(argv):
+            calls.append(argv)
+            app._restart_into = next(wanted)
+            return 0
+
+        with patch.object(app, "_main", fake_main):
+            app.main([])
+        self.assertEqual(calls, [[], ["--reopen", "--launch-tool", "codex"], ["--reopen"]])
+
+    def test_each_harness_has_a_flag_for_restarting_into_it(self) -> None:
+        for name in app.REGISTRY.names():
+            args = app.build_parser().parse_args(["--restart", f"--{name}"])
+            self.assertEqual((args.restart, args.launch_tool), (True, name))
+
+    def restart(self, tool: str, launch_tool: str) -> tuple[int, list, str]:
+        requests: list = []
+        self.stopped: list = []
+        entry = {"tool": tool, "pid": 41, "started": 5.0, "title": "work"}
+        with (
+            patch.object(detached, "running_here", return_value=("tab", entry)),
+            patch.object(detached, "request_restart", lambda *a: requests.append(a)),
+            patch.object(detached, "stop_for_restart", lambda *a: self.stopped.append(a) or ""),
+            patch("sys.stdout", io.StringIO()) as out,
+            redirect_stderr(io.StringIO()) as errors,
+        ):
+            code = app.restart_here(launch_tool)
+        return code, requests, out.getvalue() + errors.getvalue()
+
+    def test_restart_into_another_harness_asks_its_launcher_for_that_harness(self) -> None:
+        code, requests, output = self.restart("claude", "codex")
+        self.assertEqual((code, requests), (0, [("tab", "codex")]))
+        self.assertEqual(len(self.stopped), 1)
+        self.assertIn("in Codex", output)
+
+    def test_restart_into_the_same_harness_is_a_plain_restart(self) -> None:
+        code, requests, _output = self.restart("claude", "claude")
+        self.assertEqual((code, requests), (0, [("tab", "")]))
+
+    def test_restart_into_a_harness_that_cannot_take_it_leaves_the_session_running(self) -> None:
+        with patch.object(app.REGISTRY, "bridge_targets", return_value=("claude",)):
+            code, requests, output = self.restart("claude", "codex")
+        self.assertEqual((code, requests, self.stopped), (2, [], []))
+        self.assertIn("left running", output)
 
 
 class ChooseReopenTests(unittest.TestCase):

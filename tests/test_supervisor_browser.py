@@ -1,5 +1,8 @@
+import io
 import tempfile
 import unittest
+from contextlib import redirect_stderr
+from dataclasses import replace
 from pathlib import Path
 from unittest.mock import patch
 
@@ -288,6 +291,63 @@ class SupervisorBrowserTests(Fixture):
         record_id, _supervisor = self.supervise()
         self.browser("i", "R", "n", "q").run()
         self.assertFalse(self.state.supervisors[record_id]["archived"])
+
+    def test_a_supervisor_opened_in_another_harness_moves_there(self) -> None:
+        # Regression: x then Enter on a supervisor row reopened it in its old harness.
+        record_id, supervisor = self.supervise()
+        self.assertEqual(supervisor.tool, "claude")
+        browser = self.browser("x", "\n", origin="supervisor")
+        self.select(browser, supervisor)
+        chosen = browser.run()
+        self.assertEqual(app.active_launch_tool(chosen), "codex")
+        moved = Session(
+            "codex", "moved-id", "Supervisor: Fix the build", str(self.dir), 1, 1, "", True, ""
+        )
+        launched: list[str] = []
+
+        def fake_launch(record, config, state, dry_run=False):
+            launched.append((state.supervisors[record]["tool"], load_hook_state(record)))
+            return 0
+
+        with (
+            patch.object(app, "prepare_launch", return_value=(moved, "")),
+            patch.object(app, "launch_supervisor", fake_launch),
+            patch.object(app, "make_room", return_value=True),
+        ):
+            self.assertEqual(app.open_again(chosen, self.config, self.state, self.sessions), 0)
+        tool, hook_state = launched[0]
+        self.assertEqual((tool, hook_state.native_session_id), ("codex", "moved-id"))
+        self.assertNotIn("published_title", self.state.supervisors[record_id])
+        # Reloaded afresh: the new copy is the supervisor, the old one stays out of the human view.
+        old = replace(supervisor, origin="", supervises="", conversation_id="")
+        moved = replace(moved, origin="", conversation_id="")
+        self.state.conversations["sup"] = {
+            "members": {
+                item.key: {"tool": item.tool, "session_id": item.session_id, "generation": n}
+                for n, item in enumerate((old, moved))
+            }
+        }
+        for item in (old, moved):
+            self.state.session_conversations[item.key] = "sup"
+        self.sessions[:] = [self.target, old, moved]
+        self.state.apply(self.sessions)
+        self.assertEqual(moved.supervises, record_id)
+        self.assertEqual((old.origin, moved.origin), ("supervisor", "supervisor"))
+        self.assertEqual(filtered_sessions(self.sessions), [self.target])
+
+    def test_a_supervisor_that_cannot_be_copied_is_not_opened_in_the_wrong_harness(self) -> None:
+        record_id, supervisor = self.supervise()
+        chosen = replace(supervisor, launch_tool="codex")
+        with (
+            patch.object(app, "prepare_launch", side_effect=app.BridgeError("unreadable")),
+            patch.object(app, "launch_supervisor") as launched,
+            patch.object(app, "make_room", return_value=True),
+            redirect_stderr(io.StringIO()) as errors,
+        ):
+            self.assertEqual(app.open_again(chosen, self.config, self.state, self.sessions), 2)
+        launched.assert_not_called()
+        self.assertIn("unreadable", errors.getvalue())
+        self.assertEqual(self.state.supervisors[record_id]["tool"], "claude")
 
     def test_help_lists_S(self) -> None:
         browser = self.browser("?", "x", "q")
