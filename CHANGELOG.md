@@ -1,5 +1,32 @@
 # Changelog
 
+## 3.8.2 — 2026-11-03
+
+### Added
+
+- `! sessions --restart`, typed inside a Claude Code or Codex session that `sessions` opened,
+  closes the session and reopens it in the same tab, so it picks up new settings, names or a
+  new login in one step. A launch mode given on the original command line is kept, and a
+  Codex app-server other windows depend on is left running.
+- A HISTORY column shows the harnesses each conversation has passed through, such as
+  `C→A→C` (C for Codex, A for Anthropic's Claude Code, O for OpenCode). Press `i` for the
+  same history with each harness's full name and the date the conversation moved to it.
+
+### Fixed
+
+- The list shows each session's name as its harness shows it, so a rename made inside Claude
+  Code or Codex is never overridden. A supervisor's name is published to its harness once and
+  then left alone, and a name given in `sessions` gives way once the harness is renamed.
+  Only a name the harness could not record is kept in `sessions` alone.
+- Enter on a supervisor row, and `--resume` of a supervisor, open it as a supervisor, with its
+  folder and its name; they had opened it as an ordinary session.
+
+### Changed
+
+- Copies made in another harness keep the original name, without `(from Codex)` or
+  `(from Claude)` added. Opening a session drops any such suffixes it already has; the
+  harnesses they named are kept in its history first.
+
 ## 3.8.1 — 2026-11-02
 
 ### Added

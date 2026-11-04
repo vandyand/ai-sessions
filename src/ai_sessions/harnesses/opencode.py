@@ -2269,6 +2269,7 @@ ADAPTER = HarnessAdapter(
     name="opencode",
     label="OpenCode",
     short_label="OpenCode",
+    letter="O",
     order=30,
     home=OPENCODE_HOME,
     default_command=("opencode",),

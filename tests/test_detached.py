@@ -186,6 +186,93 @@ class ChooseReattachTests(unittest.TestCase):
         self.assertIsNone(self.choose([resumed], lost=lost))
 
 
+class RestartTests(unittest.TestCase):
+    def setUp(self) -> None:
+        directory = tempfile.TemporaryDirectory()
+        self.addCleanup(directory.cleanup)
+        self.path = Path(directory.name) / "terminals.json"
+
+    def test_a_restart_request_is_reported_once_when_the_harness_exits(self) -> None:
+        detached.remember(session(), "claude", 41, 5.0, "tab", path=self.path)
+        detached.request_restart("tab", path=self.path)
+        self.assertTrue(detached.mark_closed(41, path=self.path))
+        entry = detached.remembered(path=self.path)["tab"]
+        self.assertTrue(entry["closed"])
+        self.assertNotIn("restart", entry)
+        detached.remember(session(), "claude", 42, 5.0, "tab", path=self.path)
+        self.assertFalse(detached.mark_closed(42, path=self.path))
+
+    def test_the_session_a_process_runs_inside_is_found_through_its_parents(self) -> None:
+        parent = psutil.Process().parent()
+        detached.remember(
+            session("outer"), "claude", parent.pid, parent.create_time(), "tab", path=self.path
+        )
+        detached.remember(session("elsewhere"), "claude", 999_999, 5.0, "other", path=self.path)
+        key, entry = detached.running_here(path=self.path)
+        self.assertEqual((key, entry["session_id"]), ("tab", "outer"))
+
+    def test_a_closed_launch_is_not_running_here(self) -> None:
+        parent = psutil.Process().parent()
+        detached.remember(
+            session(), "claude", parent.pid, parent.create_time(), "tab", path=self.path
+        )
+        detached.mark_closed(parent.pid, path=self.path)
+        self.assertIsNone(detached.running_here(path=self.path))
+
+    def test_restart_stops_the_harness_but_spares_a_shared_daemon(self) -> None:
+        # A stand-in harness that starts an ordinary child and a shared app-server.
+        sleeper = "import time; time.sleep(60)"
+        script = (
+            "import subprocess, sys, time\n"
+            f"subprocess.Popen([sys.executable, '-c', {sleeper!r}, 'app-server'])\n"
+            f"subprocess.Popen([sys.executable, '-c', {sleeper!r}])\n"
+            "time.sleep(60)\n"
+        )
+        harness = subprocess.Popen([sys.executable, "-c", script])
+        self.addCleanup(harness.kill)
+        root = psutil.Process(harness.pid)
+        deadline = time.time() + 15
+        while len(root.children()) < 2 and time.time() < deadline:
+            time.sleep(0.05)
+        children = root.children()
+        daemon = next(child for child in children if "app-server" in child.cmdline())
+        ordinary = next(child for child in children if child.pid != daemon.pid)
+        self.addCleanup(lambda: daemon.kill() if daemon.is_running() else None)
+        self.addCleanup(lambda: ordinary.kill() if ordinary.is_running() else None)
+        problem = detached.stop_for_restart(harness.pid, root.create_time(), {"no-such-harness"})
+        self.assertEqual(problem, "")
+        psutil.wait_procs([ordinary], timeout=5)
+        self.assertFalse(root.is_running())
+        self.assertFalse(ordinary.is_running())
+        self.assertTrue(daemon.is_running())
+
+    def test_restart_refuses_a_recycled_pid(self) -> None:
+        me = psutil.Process()
+        self.assertIn("different process", detached.stop_for_restart(me.pid, 1.0, ()))
+
+    def test_restart_outside_a_session_launched_by_sessions_says_so(self) -> None:
+        with (
+            patch.object(detached, "running_here", return_value=None),
+            redirect_stderr(io.StringIO()) as errors,
+        ):
+            self.assertEqual(app.restart_here(), 2)
+        self.assertIn("opened in Windows Terminal", errors.getvalue())
+
+    def test_a_restart_reopens_with_the_same_launch_mode(self) -> None:
+        calls: list[list[str] | None] = []
+
+        def fake_main(argv):
+            calls.append(argv)
+            app._restart_pending = len(calls) == 1
+            return 0
+
+        with patch.object(app, "_main", fake_main):
+            self.assertEqual(app.main(["--launch-mode", "dangerous"]), 0)
+        self.assertEqual(
+            calls, [["--launch-mode", "dangerous"], ["--reopen", "--launch-mode", "dangerous"]]
+        )
+
+
 class ChooseReopenTests(unittest.TestCase):
     def setUp(self) -> None:
         directory = tempfile.TemporaryDirectory()

@@ -991,6 +991,8 @@ ADAPTER = HarnessAdapter(
     name="claude",
     label="Claude Code",
     short_label="Claude",
+    # A for Anthropic: C already names Codex.
+    letter="A",
     order=20,
     home=CLAUDE_HOME,
     default_command=("claude",),

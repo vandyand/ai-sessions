@@ -1232,31 +1232,26 @@ def conversation_changed_since(
     return conversation_change_status(tool, native, checkpoint) != "unchanged"
 
 
+def _suffix_labels() -> str:
+    return "|".join(re.escape(adapter.short_label) for adapter in REGISTRY.adapters())
+
+
 def base_title(title: str) -> str:
-    """``title`` without the ``(from …)`` suffixes earlier bridges added to it."""
-    labels = "|".join(re.escape(adapter.short_label) for adapter in REGISTRY.adapters())
-    return re.sub(rf"(?:\s*\(from (?:{labels})\))+\s*$", "", title or "").strip()
+    """``title`` without the ``(from …)`` suffixes bridges before 3.8.2 added to it."""
+    return re.sub(rf"(?:\s*\(from (?:{_suffix_labels()})\))+\s*$", "", title or "").strip()
 
 
-def tidy_title(title: str) -> str:
-    """Collapse a stack of ``(from …)`` suffixes to the last one, which names the source."""
-    base = base_title(title)
-    suffixes = re.findall(r"\(from [^()]+\)", title[len(base) :])
-    if len(suffixes) < 2:
-        return title
-    return f"{base} {suffixes[-1]}"
+def bridge_sources(title: str) -> list[str]:
+    """The harnesses a pre-3.8.2 copy's ``(from …)`` suffixes name, oldest first."""
+    tail = (title or "")[len(base_title(title)) :]
+    by_label = {adapter.short_label: adapter.name for adapter in REGISTRY.adapters()}
+    return [by_label[label] for label in re.findall(rf"\(from ({_suffix_labels()})\)", tail)]
 
 
 def bridged_title(title: str, source_tool: str) -> str:
-    """Name the copy so the list never shows two identical rows.
-
-    One suffix names the harness it came from; a round trip replaces the
-    earlier suffix instead of stacking another on it.
-    """
-    source = harness(source_tool).short_label
-    base = base_title(title) or "untitled session"
-    suffix = f" (from {source})"
-    return base[: 200 - len(suffix)] + suffix
+    """Name a copy as the conversation is named; its history is kept apart from its name."""
+    del source_tool
+    return base_title(title)[:200] or "untitled session"
 
 
 def complete_jsonl_cursor(path: Path) -> int:

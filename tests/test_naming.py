@@ -150,16 +150,70 @@ class PublishNameTests(unittest.TestCase):
             self.assertEqual(state.names[state.stable_key(original.key)], "minecraft")
             self.assertNotIn(state.stable_key(other.key), state.names)
 
-    def test_launch_tidies_a_stacked_bridge_title_but_not_a_chosen_name(self) -> None:
+    def tidy(self, item: Session) -> list[str]:
         published: list[str] = []
-        stacked = session(
-            tool="codex", title="TOP-Assistant (from Codex) (from Claude) (from Codex)"
+
+        def record(target: Session, name: str) -> str:
+            published.append(name)
+            target.provider_title = name
+            return ""
+
+        with patch.object(app, "publish_name", record):
+            app.tidy_launched_title(item)
+        return published
+
+    def test_launch_drops_old_bridge_suffixes(self) -> None:
+        stacked = "TOP-Assistant (from Codex) (from Claude) (from Codex)"
+        item = session(tool="codex", title=stacked, provider_title=stacked)
+        self.assertEqual(self.tidy(item), ["TOP-Assistant"])
+        self.assertEqual(item.title, "TOP-Assistant")
+        single = "open-phone (from Claude)"
+        self.assertEqual(
+            self.tidy(session(tool="codex", title=single, provider_title=single)), ["open-phone"]
         )
-        with patch.object(app, "publish_name", lambda item, name: published.append(name) or ""):
-            app.tidy_launched_title(stacked)
-            app.tidy_launched_title(replace(stacked, renamed=True))
-            app.tidy_launched_title(session(tool="codex", title="open-phone (from Claude)"))
-        self.assertEqual(published, ["TOP-Assistant (from Codex)"])
+        plain = session(tool="codex", title="plain", provider_title="plain")
+        self.assertEqual(self.tidy(plain), [])
+
+    def test_launch_never_pushes_a_name_over_the_harness(self) -> None:
+        # A name chosen in the harness stands, whatever this list last showed.
+        renamed = session(tool="codex", title="old list name", provider_title="named in Codex")
+        renamed.renamed = True
+        self.assertEqual(self.tidy(renamed), [])
+        supervisor = session(tool="codex", title="Supervisor: x", provider_title="my own name")
+        supervisor.supervises = "record"
+        self.assertEqual(self.tidy(supervisor), [])
+        unknown = session(title="a (from Codex) (from Claude)")
+        self.assertEqual(self.tidy(unknown), [])
+
+    def test_a_rename_made_in_the_harness_wins_over_an_earlier_one_made_here(self) -> None:
+        with TemporaryDirectory() as directory:
+            state = UserState(Path(directory) / "state.json")
+            item = session(tool="codex", title="generated", provider_title="generated")
+            with REGISTRY.temporary(
+                replace(REGISTRY.get("codex"), publish_name=lambda _item, _name: "")
+            ):
+                rename_session(state, item, "named here")
+            state.apply([item])
+            self.assertEqual(item.title, "named here")
+            # Later renamed with /rename inside Codex; discovery reports the new name.
+            reloaded = session(
+                tool="codex", title="named in Codex", provider_title="named in Codex"
+            )
+            UserState(Path(directory) / "state.json").apply([reloaded])
+            self.assertEqual(reloaded.title, "named in Codex")
+            self.assertFalse(reloaded.renamed)
+
+    def test_a_name_the_harness_could_not_record_is_kept_here(self) -> None:
+        with TemporaryDirectory() as directory:
+            state = UserState(Path(directory) / "state.json")
+            item = session(tool="codex", title="generated", provider_title="generated")
+            with REGISTRY.temporary(
+                replace(REGISTRY.get("codex"), publish_name=lambda _item, _name: "compressed")
+            ):
+                rename_session(state, item, "kept locally")
+            reloaded = session(tool="codex", title="generated", provider_title="generated")
+            UserState(Path(directory) / "state.json").apply([reloaded])
+            self.assertEqual(reloaded.title, "kept locally")
 
     def test_claude_rename_appends_custom_title(self) -> None:
         with TemporaryDirectory() as directory:

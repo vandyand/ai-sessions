@@ -240,6 +240,9 @@ class HarnessAdapter:
     transcript_files: TranscriptFilesHook | Unsupported = Unsupported(
         "sessions are not stored as transcript files"
     )
+    # The harness in a conversation's HISTORY column, such as C→A→C; "" uses
+    # the first letter of its label.
+    letter: str = ""
     # Whether everything the harness starts may be stopped along with its
     # launcher.  False for a harness that can start a daemon other windows
     # share, which must outlive the window that happened to start it.
@@ -250,6 +253,8 @@ class HarnessAdapter:
             raise ValueError("harness labels must not be empty")
         if len(self.short_label) > 16:
             raise ValueError("harness short_label must be at most 16 characters")
+        if len(self.letter) > 1:
+            raise ValueError("harness letter must be a single character")
         if not isinstance(self.order, int) or isinstance(self.order, bool):
             raise ValueError("harness order must be an integer")
         if not isinstance(self.home, Path):

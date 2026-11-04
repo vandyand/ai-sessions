@@ -36,6 +36,8 @@ from ai_sessions.bridge import (
     ToolCall,
     Transcript,
     Turn,
+    base_title,
+    bridge_sources,
     bridged_title,
     fit,
     flatten,
@@ -48,7 +50,6 @@ from ai_sessions.bridge import (
     resolve_budget,
     select_messages,
     selection_cost,
-    tidy_title,
     write_claude_session,
     write_codex_session,
 )
@@ -634,32 +635,23 @@ class ShapingTests(unittest.TestCase):
         with self.assertRaisesRegex(BridgeError, "invalid truncated anchor"):
             select_messages([turn], 50, wrong_role)
 
-    def test_bridged_title_names_the_origin(self) -> None:
-        self.assertEqual(
-            bridged_title("ai-sessions-cli-util", "codex"), "ai-sessions-cli-util (from Codex)"
-        )
-        self.assertEqual(bridged_title("", "claude"), "untitled session (from Claude)")
-
-    def test_round_trips_replace_the_suffix_instead_of_stacking_it(self) -> None:
-        self.assertEqual(
-            bridged_title("minecraft-mods (from Claude)", "codex"), "minecraft-mods (from Codex)"
-        )
+    def test_bridged_title_is_the_conversation_name(self) -> None:
+        self.assertEqual(bridged_title("ai-sessions-cli-util", "codex"), "ai-sessions-cli-util")
+        self.assertEqual(bridged_title("", "claude"), "untitled session")
+        # A name earlier versions suffixed comes across without the suffixes.
         self.assertEqual(
             bridged_title("elevate-futures (from Codex) (from Claude)", "claude"),
-            "elevate-futures (from Claude)",
+            "elevate-futures",
         )
         # Parentheses that are not a bridge suffix are part of the name.
-        self.assertEqual(
-            bridged_title("fix (from scratch)", "codex"), "fix (from scratch) (from Codex)"
-        )
+        self.assertEqual(bridged_title("fix (from scratch)", "codex"), "fix (from scratch)")
 
-    def test_tidy_title_keeps_only_the_last_suffix(self) -> None:
-        self.assertEqual(
-            tidy_title("TOP-Assistant (from Codex) (from Claude) (from Codex)"),
-            "TOP-Assistant (from Codex)",
-        )
-        self.assertEqual(tidy_title("open-phone (from Claude)"), "open-phone (from Claude)")
-        self.assertEqual(tidy_title("plain"), "plain")
+    def test_old_suffixes_record_the_harnesses_a_copy_came_through(self) -> None:
+        title = "TOP-Assistant (from Codex) (from Claude) (from Codex)"
+        self.assertEqual(base_title(title), "TOP-Assistant")
+        self.assertEqual(bridge_sources(title), ["codex", "claude", "codex"])
+        self.assertEqual(bridge_sources("plain"), [])
+        self.assertEqual(bridge_sources("fix (from scratch)"), [])
 
 
 class CompactionTests(unittest.TestCase):
