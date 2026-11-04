@@ -4,8 +4,10 @@ from __future__ import annotations
 
 import datetime as dt
 import hashlib
+import os
 import re
 import sys
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
 from typing import Any, Mapping
 
@@ -15,6 +17,11 @@ from .model import NativeRef
 from .registry import REGISTRY
 
 MAX_EVIDENCE_IDS = 4_096
+# A rewrite that keeps a transcript's size can keep its modification time too only on a
+# filesystem with a coarse clock, and only within one tick of the write the cache saw.
+# A file last modified well before its cache entry was checked cannot be rewritten
+# unnoticed, so its contents need no sampling.
+SETTLED_NS = 10_000_000_000
 MAX_EVIDENCE_OVERLAP = 255
 MAX_EXISTENCE_PROBES_PER_PASS = 64
 
@@ -26,6 +33,62 @@ _SCAFFOLDING = re.compile(
 )
 
 
+def prefix_settled(cached: Mapping[str, Any], stat: Any) -> bool:
+    """Whether an unchanged transcript's cached prefix can be trusted without reading it."""
+    try:
+        verified = int(cached.get("verified_ns", 0) or 0)
+    except (TypeError, ValueError):
+        return False
+    return bool(
+        cached.get("inode") == stat.st_ino
+        and cached.get("size") == stat.st_size
+        and cached.get("mtime_ns") == stat.st_mtime_ns
+        and cached.get("ctime_ns", 0) == getattr(stat, "st_ctime_ns", 0)
+        and verified - stat.st_mtime_ns > SETTLED_NS
+    )
+
+
+# A stat costs a quarter of a millisecond on Windows, and a refresh needs one per
+# transcript; they release the interpreter, so a few threads take a third the time.
+STAT_WORKERS = 8
+
+
+def stat_key(path: Any) -> str:
+    return os.path.normcase(os.path.normpath(str(path)))
+
+
+def prefetch_stats(paths: Any) -> dict[str, os.stat_result]:
+    """Stat many files at once, keyed by ``stat_key``; missing files are left out."""
+    paths = list(paths)
+
+    def one(path: Any) -> os.stat_result | None:
+        try:
+            return os.stat(path)
+        except OSError:
+            return None
+
+    if len(paths) < 64:
+        results = [one(path) for path in paths]
+    else:
+        with ThreadPoolExecutor(STAT_WORKERS, thread_name_prefix="ai-sessions-stat") as pool:
+            results = list(pool.map(one, paths, chunksize=64))
+    return {stat_key(path): found for path, found in zip(paths, results) if found is not None}
+
+
+def trim_labels(entries: Mapping[str, Any], names: tuple[str, ...]) -> bool:
+    """Cut cached labels saved before they were bounded; return whether any changed."""
+    changed = False
+    for entry in entries.values():
+        if not isinstance(entry, dict):
+            continue
+        for name in names:
+            value = entry.get(name)
+            if isinstance(value, str) and len(value) > PROMPT_LABEL_CHARS:
+                entry[name] = value[:PROMPT_LABEL_CHARS]
+                changed = True
+    return changed
+
+
 def normalize_space(value: Any) -> str:
     if not isinstance(value, str):
         return ""
@@ -34,8 +97,18 @@ def normalize_space(value: Any) -> str:
     return " ".join(value.split())
 
 
+# How much of a prompt a one-line label keeps.  Prompts can carry whole pasted files;
+# keeping them made the catalog tens of megabytes, read at every start and rewritten
+# at every refresh, and every search went through all of it.
+PROMPT_LABEL_CHARS = 1_000
+# Scaffolding blocks are a few kilobytes, so cleaning never needs more than this.
+_PROMPT_SCAN_CHARS = 65_536
+
+
 def clean_prompt(value: Any) -> str:
     """Turn a first prompt or generated title into a useful one-line label."""
+    if isinstance(value, str) and len(value) > _PROMPT_SCAN_CHARS:
+        value = value[:_PROMPT_SCAN_CHARS]
     text = normalize_space(value)
     if not text:
         return ""
@@ -44,7 +117,7 @@ def clean_prompt(value: Any) -> str:
     for prefix in ("<user>", "Human:", "User:"):
         if text.startswith(prefix):
             text = text[len(prefix) :].lstrip()
-    return text
+    return text[:PROMPT_LABEL_CHARS]
 
 
 def prompt_text(message: Any) -> str:

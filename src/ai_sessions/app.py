@@ -53,7 +53,7 @@ from .conversion import (
 from .conversion import append_jsonl as append_jsonl
 from .diagnostics import clear_warnings, record_warning
 from .diagnostics import warnings as load_warnings
-from .discovery import MAX_EXISTENCE_PROBES_PER_PASS, HarnessContext
+from .discovery import MAX_EXISTENCE_PROBES_PER_PASS, PROMPT_LABEL_CHARS, HarnessContext
 from .discovery import clean_prompt as clean_prompt
 from .discovery import normalize_space as normalize_space
 from .discovery import prompt_text as prompt_text
@@ -102,8 +102,11 @@ CODEX_ID_PATTERN = re.compile(
     re.I,
 )
 _UNSET_CHECKPOINT = object()
-CATALOG_CACHE_VERSION = 1
+# Version 2 keeps copy status and stores a title only once; version 1 still loads.
+CATALOG_CACHE_VERSION = 2
 CATALOG_CACHE_FILE = APP_CACHE_DIR / f"session-catalog-v{CATALOG_CACHE_VERSION}.json"
+# Read only until the first refresh writes the current version.
+LEGACY_CATALOG_FILE = APP_CACHE_DIR / "session-catalog-v1.json"
 LAUNCH_LOG_FILE = APP_CACHE_DIR / "launch-log.jsonl"
 LAUNCH_LOG_ENTRIES = 200
 
@@ -811,6 +814,25 @@ class UserState:
                 item.diverged = bool(status["conflict"] and key in head_keys)
                 item.superseded = key not in head_keys
 
+    def _apply_saved_conversation_status(self, sessions: list[Session]) -> None:
+        """Group copies by the conversations recorded now, keeping each copy's saved status.
+
+        A copy that joined a conversation after the status was saved has no status
+        yet and shows as current until the next check.
+        """
+        recorded = {
+            key: conversation_id
+            for conversation_id, conversation in self.conversations.items()
+            for key in conversation.get("members", {})
+        }
+        for item in sessions:
+            conversation_id = recorded.get(item.key, "")
+            if item.conversation_id != conversation_id:
+                item.conversation_id = conversation_id
+                item.superseded = False
+                item.diverged = False
+                item.conversation_blocker = ""
+
     def _migrate_legacy_bridges(self, sessions: list[Session]) -> None:
         by_key = {item.key: item for item in sessions}
         for source_key, targets in self.bridges.items():
@@ -857,12 +879,22 @@ class UserState:
                 self.conversations[conversation_id]["members"][key] = member
                 self.session_conversations[key] = conversation_id
 
-    def apply(self, sessions: Iterable[Session]) -> None:
+    def apply(self, sessions: Iterable[Session], *, check_copies: bool = True) -> None:
+        """Apply saved choices and conversation state to freshly loaded sessions.
+
+        Working out which copy of a conversation is current reads each copy's
+        transcript.  ``check_copies=False`` keeps the answer the sessions already
+        carry, from the refresh that saved them, so the table can be drawn without
+        touching the disk; the refresh behind it checks again.
+        """
         items = list(sessions)
         self._sessions_by_key = {item.key: item for item in items}
         self._migrate_legacy_bridges(items)
         self.apply_choices(items)
-        self._apply_conversation_status(items)
+        if check_copies:
+            self._apply_conversation_status(items)
+        else:
+            self._apply_saved_conversation_status(items)
         self._apply_supervisors(items)
         # Capture each conversation's history while older copy names still record it.
         missing = [cid for cid, value in self.conversations.items() if "history" not in value]
@@ -1845,14 +1877,17 @@ def session_from_native(item: NativeSession) -> Session:
         origin = "cross"
     else:
         origin = "agent"
+    # A name the harness holds is kept whole, since it is compared with the harness;
+    # a title made from a prompt is only a label.
+    title = item.title if item.named else item.title[:PROMPT_LABEL_CHARS]
     return Session(
         tool=item.tool,
         session_id=item.session_id,
-        title=item.title,
+        title=title,
         cwd=item.cwd,
         updated=item.updated,
         created=item.created,
-        preview=item.preview,
+        preview=item.preview[:PROMPT_LABEL_CHARS],
         named=item.named,
         storage=item.storage,
         source=item.source,
@@ -1860,9 +1895,9 @@ def session_from_native(item: NativeSession) -> Session:
         origin=origin,
         resume_id=item.resume_id or item.session_id,
         parent_id=item.parent_id,
-        original_title=item.title,
+        original_title=title,
         original_named=item.named,
-        provider_title=item.title,
+        provider_title=title,
         message_count=item.message_count,
         compressed=item.compressed,
         agent_nickname=item.agent_nickname,
@@ -2093,8 +2128,16 @@ def _catalog_signature() -> list[dict[str, Any]]:
     ]
 
 
+# Fields a catalog row leaves out when they only repeat the title.
+_TITLE_COPIES = ("original_title", "provider_title")
+
+
 def save_session_catalog(sessions: Iterable[Session], path: Path = CATALOG_CACHE_FILE) -> None:
-    """Persist a safe first-paint catalog; live and utility-owned state is recomputed."""
+    """Persist a safe first-paint catalog; live and utility-owned state is recomputed.
+
+    Which copy of a conversation is current is kept, so the first paint groups
+    copies as the last refresh did without reading their transcripts.
+    """
     rows: list[dict[str, Any]] = []
     for item in sessions:
         payload = asdict(item)
@@ -2102,13 +2145,12 @@ def save_session_catalog(sessions: Iterable[Session], path: Path = CATALOG_CACHE
             renamed=False,
             hidden=False,
             launch_tool="",
-            conversation_id="",
-            superseded=False,
-            diverged=False,
-            conversation_blocker="",
             is_open=False,
             open_pid=0,
         )
+        for name in _TITLE_COPIES:
+            if payload[name] == payload["title"]:
+                del payload[name]
         rows.append(payload)
     document = {
         "version": CATALOG_CACHE_VERSION,
@@ -2139,18 +2181,21 @@ def load_session_catalog(
     path: Path = CATALOG_CACHE_FILE,
 ) -> list[Session]:
     """Load the last complete catalog without touching any provider-owned storage."""
+    if path == CATALOG_CACHE_FILE and not path.exists():
+        path = LEGACY_CATALOG_FILE
     try:
         document = json.loads(path.read_text(encoding="utf-8"))
     except (OSError, json.JSONDecodeError, UnicodeError):
         return []
     if (
         not isinstance(document, dict)
-        or document.get("version") != CATALOG_CACHE_VERSION
+        or document.get("version") not in (1, CATALOG_CACHE_VERSION)
         or document.get("registry") != _catalog_signature()
         or not isinstance(document.get("sessions"), list)
     ):
         return []
     field_names = {field.name for field in fields(Session)}
+    titles_once = document["version"] == CATALOG_CACHE_VERSION
     migratable_fields = {
         "compressed",
         "turn_count",
@@ -2163,6 +2208,10 @@ def load_session_catalog(
     for payload in document["sessions"][:100_000]:
         if not isinstance(payload, dict):
             continue
+        if titles_once:
+            for name in _TITLE_COPIES:
+                if name not in payload:
+                    payload[name] = payload.get("title", "")
         keys = set(payload)
         missing = field_names - keys
         if keys - field_names or missing - migratable_fields:
@@ -2190,7 +2239,8 @@ def load_session_catalog(
             result.append(item)
     result = dedupe_sessions(result)
     if state is not None:
-        state.apply(result)
+        # A catalog from before copy status was saved has none to keep.
+        state.apply(result, check_copies=not titles_once)
     return result
 
 

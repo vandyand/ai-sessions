@@ -40,7 +40,16 @@ from ..conversion import (
     scrub,
 )
 from ..diagnostics import record_warning
-from ..discovery import HarnessContext, clean_prompt, normalize_space, timestamp
+from ..discovery import (
+    HarnessContext,
+    clean_prompt,
+    normalize_space,
+    prefetch_stats,
+    prefix_settled,
+    stat_key,
+    timestamp,
+    trim_labels,
+)
 from ..jsonl_tracking import locate_checkpoint, protect_checkpoint
 from ..liveness import LivenessContext, ProcessInfo
 from ..model import (
@@ -447,6 +456,8 @@ class DiscoveryCache:
         self.context = context
         self.entries: dict[str, dict[str, Any]] = {}
         self.dirty = False
+        # Stats taken together just before the scans; each is used once.
+        self.stats: dict[str, os.stat_result] = {}
         if context.use_cache:
             try:
                 payload = json.loads(DISCOVERY_CACHE_FILE.read_text(encoding="utf-8"))
@@ -454,6 +465,7 @@ class DiscoveryCache:
                     payload.get("entries"), dict
                 ):
                     self.entries = payload["entries"]
+                    self.dirty = trim_labels(self.entries, ("first_prompt", "last_prompt"))
             except (OSError, json.JSONDecodeError, AttributeError):
                 pass
 
@@ -512,7 +524,7 @@ class DiscoveryCache:
         count_user_messages: bool = False,
     ) -> tuple[dict[str, Any], Any]:
         key = str(path)
-        stat = path.stat()
+        stat = self.stats.pop(stat_key(path), None) or path.stat()
         cached = self.entries.get(key)
         if cached is None and is_compressed_path(path):
             cached = self._carried_over(path, stat)
@@ -531,8 +543,9 @@ class DiscoveryCache:
         # A compressed file is read once, whole: its bytes are not the transcript's, so there is
         # nothing to sample and nothing to continue from.
         compressed = is_compressed_path(path)
+        settled = bool(cached and prefix_settled(cached, stat))
         prefix_matches = compressed or bool(
-            cached and signature_matches and _cached_prefix_matches(path, cached)
+            cached and signature_matches and (settled or _cached_prefix_matches(path, cached))
         )
         exact = bool(
             cached
@@ -550,6 +563,10 @@ class DiscoveryCache:
             assert cached is not None
             if key not in self.entries:
                 self.entries[key] = cached
+                self.dirty = True
+            if not settled and not compressed:
+                # Sampled and unchanged, so it is known good as of now.
+                cached["verified_ns"] = time.time_ns()
                 self.dirty = True
             evidence = self.context.accumulator(
                 tokens=list(cached.get("candidate_ids", [])),
@@ -688,6 +705,7 @@ class DiscoveryCache:
             ctime_ns=ctime_ns,
             offset=offset,
             prefix_identity="" if compressed else _cached_prefix_identity(path, offset) or "",
+            verified_ns=time.time_ns(),
             candidate_ids=evidence.tokens,
             evidence_truncated=evidence.truncated,
             pattern_signature=self.context.pattern_signature,
@@ -717,6 +735,15 @@ class DiscoveryCache:
             pass
 
 
+def _walk_transcripts(projects: Path) -> set[Path]:
+    """Every transcript under ``projects``, plain or compressed, in one pass over the tree."""
+    suffixes = (".jsonl", f".jsonl{ZST_SUFFIX}")
+    found: set[Path] = set()
+    for folder, _dirs, names in os.walk(projects):
+        found.update(Path(folder, name) for name in names if name.casefold().endswith(suffixes))
+    return found
+
+
 def discover(context: HarnessContext, *, use_cache: bool = True) -> list[NativeSession]:
     del use_cache
     projects = REGISTRY.get("claude").home / "projects"
@@ -726,7 +753,7 @@ def discover(context: HarnessContext, *, use_cache: bool = True) -> list[NativeS
     cache = DiscoveryCache(context)
     result: list[NativeSession] = []
     try:
-        found = sorted({*projects.rglob("*.jsonl"), *projects.rglob(f"*.jsonl{ZST_SUFFIX}")})
+        found = sorted(_walk_transcripts(projects))
         # One file per session: the plain one when both exist.
         all_files = [
             path for path in found if not is_compressed_path(path) or plain_path(path) not in found
@@ -738,9 +765,12 @@ def discover(context: HarnessContext, *, use_cache: bool = True) -> list[NativeS
         index_complete = True
     for path in all_files:
         context.index_native("claude", plain_path(path).stem, str(path))
+    stats = prefetch_stats(all_files)
+    cache.stats = dict(stats)
     if index_complete:
         context.complete_native_index("claude")
-    files = [path for path in all_files if len(path.relative_to(projects).parts) == 2]
+    # Top-level transcripts sit one folder down, in their project folder.
+    files = [path for path in all_files if path.parent.parent == projects]
     for path in files:
         session_id = plain_path(path).stem
         if not re.fullmatch(r"[0-9a-fA-F-]{32,36}", session_id):
@@ -751,7 +781,7 @@ def discover(context: HarnessContext, *, use_cache: bool = True) -> list[NativeS
                 path,
                 count_user_messages=True,
             )
-            stat = path.stat()
+            stat = stats.get(stat_key(path)) or path.stat()
         except OSError:
             continue
         context.publish("claude", session_id, evidence)
@@ -802,7 +832,7 @@ def discover(context: HarnessContext, *, use_cache: bool = True) -> list[NativeS
             fallback_parent_id = ""
         try:
             meta, evidence = cache.scan(path, allow_sidechain=True, count_user_messages=True)
-            stat = path.stat()
+            stat = stats.get(stat_key(path)) or path.stat()
         except OSError:
             continue
         agent_id = str(meta.get("agent_id") or fallback_agent_id)

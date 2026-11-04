@@ -25,7 +25,13 @@ from typing import Any, Iterable, Iterator
 from ..capabilities import HarnessAdapter
 from ..conversion import DEFAULT_CHARS_PER_TOKEN, DEFAULT_USABLE_FRACTION, BridgeError
 from ..diagnostics import record_warning
-from ..discovery import EvidenceAccumulator, HarnessContext, clean_prompt, timestamp
+from ..discovery import (
+    PROMPT_LABEL_CHARS,
+    EvidenceAccumulator,
+    HarnessContext,
+    clean_prompt,
+    timestamp,
+)
 from ..liveness import LivenessContext
 from ..model import (
     Availability,
@@ -63,7 +69,8 @@ DB_PATH_TIMEOUT_SECONDS = 3.0
 MAINTENANCE_OUTPUT_BYTES = 1_048_576
 DISCOVERY_JSON_BYTES = 262_144
 OPENCODE_EVIDENCE_BYTES = 16_777_216
-DISCOVERY_PREVIEW_CHARS = 4_096
+# The same bound every harness keeps for a one-line label.
+DISCOVERY_PREVIEW_CHARS = PROMPT_LABEL_CHARS
 DISCOVERY_WARNING_CHARS = 512
 SEMANTIC_BUSY_TIMEOUT_SECONDS = 2.0
 MODEL_TIMEOUT_SECONDS = 10.0
