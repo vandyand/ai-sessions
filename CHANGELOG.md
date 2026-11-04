@@ -1,5 +1,22 @@
 # Changelog
 
+## 3.9.0 — 2026-11-04
+
+### Changed
+
+- Enter opens a session straight away instead of waiting several seconds for the session
+  refresh. Before launching it checks only what that row depends on: which copy of its
+  conversation is current, read from the copies' own transcripts, whether any of them is
+  open, and for a supervisor, the session it watches. A copy made since the saved list was
+  written still waits for the refresh. The refresh finishes behind the launch and saves
+  the list for next time; sessions that lost their terminal are tidied up on the next start.
+- `--restart` and `--reopen` find the session this tab last ran in the saved list instead
+  of scanning every session first, then make the same check before reopening it. A session
+  started since the list was saved is still found by a scan.
+- The supervisor hook, which runs on every prompt of a hooked Claude Code or Codex
+  session, no longer loads the harness adapters or psutil: about half a second less per
+  prompt. The harnesses are now installed the first time anything asks for one.
+
 ## 3.8.6 — 2026-11-04
 
 ### Fixed
