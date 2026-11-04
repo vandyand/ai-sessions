@@ -243,6 +243,14 @@ def _session_searchable(item: Session) -> str:
     ).casefold()
 
 
+def _file_stamp(path: Path) -> tuple[int, int] | None:
+    try:
+        stat = path.stat()
+    except OSError:
+        return None
+    return stat.st_mtime_ns, stat.st_size
+
+
 class UserState:
     """Utility-local names and visibility.
 
@@ -268,6 +276,8 @@ class UserState:
         # A background refresh applies itself to this state while the browser can
         # still change and save it; each of those holds this lock.
         self.lock = threading.RLock()
+        # The file as this state read it, so housekeeping never saves over a newer one.
+        self._loaded_stamp = _file_stamp(path)
         try:
             payload = fastjson.read(path)
             if payload.get("version") in (1, 2, 3, 4, 5, 6, 7):
@@ -462,15 +472,19 @@ class UserState:
             conversation["history"] = self._reconstructed_history(conversation)
         return conversation["history"]
 
-    def note_handoff(self, conversation_id: str, tool: str, session_id: str) -> None:
-        """Record that the conversation now continues in ``tool``."""
+    def note_handoff(
+        self, conversation_id: str, tool: str, session_id: str, *, save: bool = True
+    ) -> bool:
+        """Record that the conversation now continues in ``tool``; True if that is news."""
         if conversation_id not in self.conversations:
-            return
+            return False
         history = self.history(conversation_id)
         if history and history[-1].get("tool") == tool:
-            return
+            return False
         history.append({"tool": tool, "session_id": session_id, "at": time.time()})
-        self.save()
+        if save:
+            self.save()
+        return True
 
     def _loaded(self, key: str) -> Session | None:
         return self._sessions_by_key.get(key) or next(
@@ -1068,7 +1082,26 @@ class UserState:
         with self.lock:
             self._save()
 
+    def tidy_checkpoints(self) -> None:
+        """Move long inline bookmark records out of the state file, and sweep old ones.
+
+        Saves only when something moved and no other process wrote the file since
+        it was read: this runs unasked, so it must not undo someone else's change.
+        """
+        from .jsonl_tracking import has_inline_records, referenced_records, sweep_records
+
+        with self.lock:
+            sections = [self.conversations, self.supervisors, self.bridges]
+            if has_inline_records(sections) and _file_stamp(self.path) == self._loaded_stamp:
+                self._save()
+            referenced = referenced_records(sections)
+        sweep_records(referenced)
+
     def _save(self) -> None:
+        from .jsonl_tracking import externalize_checkpoints
+
+        # Records inline make the state megabytes long; they move out as it is written.
+        externalize_checkpoints([self.conversations, self.supervisors, self.bridges])
         fastjson.write_atomic(
             self.path,
             {
@@ -1086,6 +1119,7 @@ class UserState:
             indent=True,
             newline=True,
         )
+        self._loaded_stamp = _file_stamp(self.path)
 
     def remember_original_name(self, item: Session) -> None:
         """Keep the pre-rename provider title stable across provider reloads."""
@@ -1174,6 +1208,7 @@ class UserState:
         *,
         source_checkpoint: Checkpoint,
         target_checkpoint: Checkpoint | None,
+        save: bool = True,
     ) -> None:
         key = self.stable_key(item.key)
         self.bridges.setdefault(key, {})[tool] = {
@@ -1223,7 +1258,8 @@ class UserState:
         self.session_conversations[target_key] = conversation_id
         self._sessions_by_key[item.key] = item
         self._sessions_by_key[target_key] = target
-        self.save()
+        if save:
+            self.save()
 
 
 def publish_name(
@@ -2561,6 +2597,8 @@ class SessionRefresh:
         self._done.set()
         try:
             save_session_catalog(sessions, self._catalog_path)
+            if self._tidy and self._state is not None:
+                self._state.tidy_checkpoints()
         except Exception:
             pass
         finally:
@@ -5536,15 +5574,19 @@ def prepare_launch(
         allow_lossy=config.bridge_allow_lossy if config is not None else False,
     )
     if state is not None:
-        state.set_bridge(
-            session,
-            tool,
-            result.session_id,
-            result.storage,
-            source_checkpoint=result.source_checkpoint,
-            target_checkpoint=result.target_checkpoint,
-        )
-        state.note_handoff(conversation_id, tool, result.session_id)
+        # One write for both: the state file is rewritten whole each time.
+        with state.lock:
+            state.set_bridge(
+                session,
+                tool,
+                result.session_id,
+                result.storage,
+                source_checkpoint=result.source_checkpoint,
+                target_checkpoint=result.target_checkpoint,
+                save=False,
+            )
+            state.note_handoff(conversation_id, tool, result.session_id, save=False)
+            state.save()
     carried = (
         f"{result.turns} source message(s), assembled as {result.written_turns} target message(s)"
     )

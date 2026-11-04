@@ -465,7 +465,10 @@ dangerous authorization for those losses; exact dropped and truncated counts are
 
 Rename/hide state is kept alongside the configuration as `state.json`. Per-session
 launch-harness preferences, conversation ids, native members, equivalence frontiers, and
-opaque native checkpoints are stored there too. Unset sessions default to the harness where they were
+opaque native checkpoints are stored there too. A checkpoint on a long transcript keeps its
+per-record fingerprints in `checkpoint-records\` beside `state.json`, one file per list named
+by its SHA-256, so the state file stays small; lists nothing has used for a week and no
+checkpoint names are swept at startup. Unset sessions default to the harness where they were
 started. Caches use `~/.cache/ai-sessions` on
 Linux and `%LOCALAPPDATA%\ai-sessions` on Windows. Environment overrides are available
 through `AI_SESSIONS_CONFIG_FILE`, `AI_SESSIONS_STATE_FILE`, `AI_SESSIONS_CACHE_DIR`, `CODEX_HOME`,
