@@ -28,6 +28,7 @@ dependencies = [
   "psutil>=5.9",
   "windows-curses>=2.4.1; sys_platform == 'win32'",
   "orjson>=3.9",
+  "websocket-client>=1.8,<2",
   "zstandard>=0.22",
 ]
 
@@ -38,6 +39,7 @@ Issues = "https://github.com/vandyand/ai-sessions/issues"
 
 [project.scripts]
 sessions = "ai_sessions.app:main"
+sesres = "ai_sessions.restart:main"
 
 # The package itself is the one place the version is written.
 [tool.hatch.version]

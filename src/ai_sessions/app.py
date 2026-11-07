@@ -5430,6 +5430,7 @@ def command_for(session: Session, config: LaunchConfig) -> list[str]:
     if source not in source_adapter.source_kinds:
         raise BridgeError(f"{session.tool} does not declare source kind {source.value!r}")
     argv = config.provider_prefix(tool)
+    provider_prefix_length = len(config.provider_command(tool))
     argv += resume(
         session_id=session.launch_target(tool),
         source=source,
@@ -5437,7 +5438,9 @@ def command_for(session: Session, config: LaunchConfig) -> list[str]:
         parent_id=session.parent_id,
         native=native,
     )
-    return argv
+    from .messaging.launch import arguments as messaging_arguments
+
+    return messaging_arguments(argv, tool, prefix_length=provider_prefix_length)
 
 
 def compressed_message(session: Session) -> str:
@@ -5688,6 +5691,9 @@ def run_harness(session: Session, command: list[str]) -> int:
     from .platforms.windows import KillOnCloseJob, process_started
 
     tool = active_launch_tool(session)
+    from .messaging.launch import prepare as prepare_messaging
+
+    prepare_messaging(command, tool)
     if REGISTRY.get(tool).contain_launch:
         process, job = KillOnCloseJob.start(command)
     else:
@@ -5985,6 +5991,9 @@ def launch_supervisor(
             record["published_title"] = title
             state.save()
         argv = config.provider_prefix(tool) + args
+        from .messaging.launch import arguments as messaging_arguments
+
+        argv = messaging_arguments(argv, tool, prefix_length=len(config.provider_command(tool)))
     else:
         if not dry_run and record.get("published_title") != title:
             # Supervisors made before names were published carry a generated title.
@@ -6289,6 +6298,13 @@ def build_parser() -> argparse.ArgumentParser:
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog=textwrap.dedent(
             """
+            Messaging:
+              sessions messaging install
+              sessions messaging status
+              sessions send codex:<session-id> --message "Migration finished"
+              sessions reply <message-id> --message "Received"
+              sesres  (shorthand for sessions --restart)
+
             Search examples:
               sessions --list --tool codex
               sessions --list --origin cross
@@ -6466,6 +6482,7 @@ def main(argv: list[str] | None = None) -> int:
 
 
 def _main(argv: list[str] | None = None) -> int:
+    raw = sys.argv[1:] if argv is None else argv
     if IS_WINDOWS:
         # Windows PowerShell and SSH sessions may still expose a legacy code
         # page even though Windows Terminal itself is Unicode-capable.
@@ -6476,6 +6493,10 @@ def _main(argv: list[str] | None = None) -> int:
                     reconfigure(encoding="utf-8", errors="replace")
                 except (OSError, ValueError):
                     pass
+    if raw and raw[0] in ("send", "reply", "messaging"):
+        from .messaging.cli import main as messaging_main
+
+        return messaging_main(raw)
     try:
         locale.setlocale(locale.LC_ALL, "")
     except locale.Error:
