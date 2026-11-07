@@ -273,7 +273,7 @@ class ReopenTests(unittest.TestCase):
         opened: list = []
         scanned: list = []
 
-        def fake_open_again(chosen, _config, _state, others, _dry_run):
+        def fake_open_again(chosen, _config, _state, others, _dry_run, *, exact_native=False):
             opened.append((chosen.session_id, len(list(others))))
             return 0
 

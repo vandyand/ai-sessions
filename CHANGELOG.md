@@ -1,5 +1,18 @@
 # Changelog
 
+## 3.11.1 — 2026-11-07
+
+### Fixed
+
+- Same-harness restart (`sesres`) and `--reopen` now resume the exact native branch
+  this tab ran, including forked/transpiled conversations with divergent heads.
+  They no longer follow conversation-head selection or saved cross-harness preferences.
+  Normal resumes and explicit cross-harness requests retain the divergence safeguards.
+- Terminal memory matches both the harness and native session ID, avoiding a wrong
+  selection when two harnesses share an ID.
+- Restart commands run by a shared Codex daemon now find their own verified
+  terminal client by native thread ID, while sparing the daemon and unrelated tabs.
+
 ## 3.11.0 — 2026-11-07
 
 ### Added

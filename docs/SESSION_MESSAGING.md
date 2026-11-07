@@ -28,6 +28,13 @@ and exit codes. Like the original command, restarting requires a Windows session
 that ai-sessions launched. Otherwise close and reopen the session normally.
 Codex may ask you to trust the newly installed hooks on the next launch.
 
+Since 3.11.1, same-harness restart/reopen pins the exact native branch the tab ran,
+including forked/transpiled sessions. It does not select between divergent heads.
+Normal resumes and explicitly switching harnesses still enforce divergence checks.
+An older, already-running ai-sessions launcher keeps its imported code until it exits.
+After upgrading, use a fresh `sessions --reopen` from PowerShell to reload that launcher;
+restarting only its child harness cannot update the old launcher code.
+
 New Codex launches through ai-sessions explicitly attach to the native local
 daemon with `--remote unix://`. The terminal and messaging commands therefore
 reach the same owner. Setup never restarts an existing daemon or moves an

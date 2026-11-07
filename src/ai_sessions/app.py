@@ -3480,6 +3480,22 @@ class QuickReread:
         return self._result
 
 
+def remembered_session(entry: dict[str, Any], sessions: Iterable[Session]) -> Session | None:
+    """Resolve terminal memory by harness and native ID, never by conversation head."""
+    wanted = str(entry.get("session_id", ""))
+    tool = str(entry.get("tool", ""))
+    matches = [
+        item
+        for item in sessions
+        if (
+            item.session_id == wanted
+            or (item.supervises and wanted == f"supervisor-{item.supervises}")
+        )
+        and (not tool or item.tool == tool)
+    ]
+    return matches[0] if len(matches) == 1 else None
+
+
 def reopen_from_catalog(state: UserState) -> tuple[Session, list[Session]] | None:
     """The session this tab last ran, found in the saved list instead of by a full scan.
 
@@ -3494,11 +3510,8 @@ def reopen_from_catalog(state: UserState) -> tuple[Session, list[Session]] | Non
     entry = closed().get(terminal) or interrupted().get(terminal)
     if entry is None:
         return None
-    wanted = str(entry.get("session_id", ""))
     sessions = load_session_catalog(state)
-    by_id = {item.session_id: item for item in sessions}
-    by_id.update({f"supervisor-{item.supervises}": item for item in sessions if item.supervises})
-    item = by_id.get(wanted)
+    item = remembered_session(entry, sessions)
     if item is None or not check_before_open(sessions, [item], state):
         return None
     return item, sessions
@@ -5457,6 +5470,7 @@ def prepare_launch(
     config: LaunchConfig | None = None,
     tool_calls: bool = True,
     latest_window: bool = True,
+    exact_native: bool = False,
 ) -> tuple[Session, str]:
     """Ensure the selected harness has something to resume; return a note.
 
@@ -5478,6 +5492,14 @@ def prepare_launch(
             raise BridgeError(str(error)) from error
         if leftover:
             print(f"sessions: {leftover}", file=sys.stderr)
+    if exact_native:
+        if tool != session.tool:
+            raise BridgeError("an exact native reopen cannot switch harnesses")
+        # Terminal memory already identifies the branch. Reopening it is not a
+        # request to select a conversation head or follow legacy counterpart hints.
+        return replace(
+            session, launch_tool="", launch_targets={session.tool: session.session_id}
+        ), ""
     if state is not None:
         source, target, conversation_id = state.resolve_launch(session, tool)
         for resolved in (source, target):
@@ -5799,6 +5821,8 @@ def launch(
     dry_run: bool = False,
     state: UserState | None = None,
     others: Iterable[Session] = (),
+    *,
+    exact_native: bool = False,
 ) -> int:
     if IS_WINDOWS and not dry_run and not make_room(session, others):
         return 1
@@ -5812,6 +5836,7 @@ def launch(
             config=config,
             tool_calls=config.bridge_tool_calls,
             latest_window=config.bridge_latest_window,
+            **({"exact_native": True} if exact_native else {}),
         )
     except BridgeError as error:
         print(f"sessions: {error}", file=sys.stderr)
@@ -6043,15 +6068,25 @@ def open_again(
     state: UserState,
     others: Iterable[Session],
     dry_run: bool = False,
+    *,
+    exact_native: bool = False,
 ) -> int:
     """Resume ``item`` in this tab, the way it was first opened.
 
     A supervisor goes through its own launch, which gives it its folder and
-    its name, in the harness chosen for it; anything else follows its
-    conversation to the current copy.
+    its name, in the harness chosen for it. Only an explicit lifecycle reopen
+    pins the native branch this tab ran. Ordinary resumes and harness switches
+    still resolve the conversation and refuse divergent heads.
     """
     if not item.supervises:
-        return launch(item, config, dry_run=dry_run, state=state, others=others)
+        return launch(
+            item,
+            config,
+            dry_run=dry_run,
+            state=state,
+            others=others,
+            exact_native=exact_native,
+        )
     if IS_WINDOWS and not dry_run and not make_room(item, others):
         return 1
     tool = active_launch_tool(item)
@@ -6111,15 +6146,12 @@ def choose_reopen(sessions: list[Session]) -> Session | None:
     """
     from .detached import closed, interrupted, remembered, terminal_id
 
-    by_id = {item.session_id: item for item in sessions}
-    # A supervisor started before its harness chose an id was remembered by its record.
-    by_id.update({f"supervisor-{item.supervises}": item for item in sessions if item.supervises})
     recent = closed()
     terminal = terminal_id()
     if terminal:
         entry = recent.get(terminal) or interrupted().get(terminal)
         if entry is not None:
-            item = by_id.get(str(entry.get("session_id", "")))
+            item = remembered_session(entry, sessions)
             if item is None:
                 print(
                     f"sessions: this tab last ran {entry.get('title') or entry.get('session_id')!r}, "
@@ -6132,7 +6164,7 @@ def choose_reopen(sessions: list[Session]) -> Session | None:
             return None
     choices: list[Session] = []
     for entry in recent.values():
-        item = by_id.get(str(entry.get("session_id", "")))
+        item = remembered_session(entry, sessions)
         if item is not None and not item.is_open and item not in choices:
             choices.append(item)
     choices = choices[:REOPEN_CHOICES]
@@ -6721,6 +6753,8 @@ def _main(argv: list[str] | None = None) -> int:
         item = reopened[0] if reopened is not None else choose_reopen(sessions)
         if item is None:
             return 1
+        # Saved cross-harness preferences must not redirect a remembered tab.
+        item = replace(item, launch_tool=item.tool)
         if args.launch_tool and args.launch_tool != item.tool:
             if supports_launch_tool(item, args.launch_tool):
                 item = replace(item, launch_tool=args.launch_tool)
@@ -6732,7 +6766,14 @@ def _main(argv: list[str] | None = None) -> int:
                     f"{tool_label(item.tool, short=False)}.",
                     file=sys.stderr,
                 )
-        return open_again(item, launch_config, state, sessions, args.dry_run)
+        return open_again(
+            item,
+            launch_config,
+            state,
+            sessions,
+            args.dry_run,
+            exact_native=active_launch_tool(item) == item.tool,
+        )
 
     if args.list or args.json or not (sys.stdin.isatty() and sys.stdout.isatty()):
         items = filtered_sessions(

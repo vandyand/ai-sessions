@@ -124,7 +124,8 @@ def running_here(*, path: Path = TERMINALS_FILE) -> tuple[str, dict[str, Any]] |
         ancestors = {process.pid: process for process in me.parents()}
     except psutil.Error:
         return None
-    for key, entry in _read(path).items():
+    document = _read(path)
+    for key, entry in document.items():
         pid = int(entry.get("pid", 0) or 0)
         if entry.get("closed") or pid not in ancestors:
             continue
@@ -133,7 +134,49 @@ def running_here(*, path: Path = TERMINALS_FILE) -> tuple[str, dict[str, Any]] |
                 return key, entry
         except psutil.Error:
             continue
-    return None
+    # Shared-server tools are children of the daemon, not of their terminal UI.
+    # A native per-thread identity can identify the remembered client, but only
+    # from a verified harness daemon and with a matching, live PID generation.
+    from .registry import REGISTRY
+
+    matches = []
+    for adapter in REGISTRY.adapters():
+        hooks = adapter.messaging
+        key = hooks.sender_environment if hooks else ""
+        session_id = os.environ.get(key) if key else ""
+        if not session_id:
+            continue
+        try:
+            verified_daemon = any(
+                process.name().casefold() in adapter.liveness_executables
+                and _shared_daemon(process)
+                for process in ancestors.values()
+            )
+        except psutil.Error:
+            continue
+        if not verified_daemon:
+            continue
+        for terminal, entry in document.items():
+            if (
+                entry.get("closed")
+                or entry.get("tool") != adapter.name
+                or entry.get("session_id") != session_id
+            ):
+                continue
+            try:
+                process = psutil.Process(int(entry.get("pid", 0) or 0))
+                # Inspection failure must refuse rather than classify a daemon as a client.
+                command = process.cmdline()
+                if (
+                    process.is_running()
+                    and command
+                    and not any(arg.casefold() == "app-server" for arg in command[1:])
+                    and abs(process.create_time() - float(entry.get("started", 0) or 0)) < 0.01
+                ):
+                    matches.append((terminal, entry))
+            except (psutil.Error, TypeError, ValueError):
+                continue
+    return matches[0] if len(matches) == 1 else None
 
 
 def request_restart(key: str, tool: str = "", *, path: Path = TERMINALS_FILE) -> None:
