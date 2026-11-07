@@ -1,6 +1,6 @@
 # Native session messaging
 
-Status: proposed for approval. No product implementation or installation yet.
+Status: approved by Andrew; implemented for 3.11.0. See docs/SESSION_MESSAGING.md for the shipped contract.
 
 ## Intent and selected approach
 
@@ -202,4 +202,4 @@ Live policy mutation/default-policy behavior remains to be checked in implementa
 Before implementation, review this design for buildability, especially native
 daemon proxy ownership, Claude inbound-policy enforcement with exported tokens,
 and receipt limits. Implementation must stop claiming support at any boundary
-the vendor API cannot actually establish. No product code has yet been changed.
+the vendor API cannot actually establish. The implementation and its tests now enforce these boundaries.

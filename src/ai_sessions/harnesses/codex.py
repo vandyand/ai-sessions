@@ -24,7 +24,7 @@ from typing import Any, Callable, Iterable, Mapping, Sequence
 import zstandard
 
 from .. import fastjson
-from ..capabilities import HarnessAdapter, StorageUpgrade
+from ..capabilities import HarnessAdapter, MessagingHooks, StorageUpgrade
 from ..compression import (
     ZST_SUFFIX,
     compressed_path,
@@ -1843,8 +1843,42 @@ def extra_dir_args(directory: str) -> list[str]:
     return [f"--add-dir={directory}"]
 
 
+def messaging_home(home: Path | None = None) -> Path:
+    return Path(home or os.environ.get("CODEX_HOME") or ADAPTER.home).expanduser()
+
+
+def messaging_environment(home: Path | None = None) -> dict[str, str]:
+    return {**os.environ, "CODEX_HOME": str(messaging_home(home))}
+
+
+def _message_send(receiver: dict, text: str, message_id: str, sender: dict) -> dict:
+    from .messaging_codex import send
+
+    return send(receiver, text, message_id, sender)
+
+
+def _message_receivers(home: Path) -> list[dict]:
+    from .messaging_codex import receivers
+
+    return receivers(home)
+
+
+def _message_prepare(home: Path | None = None) -> dict:
+    from .messaging_codex import ensure_runtime
+
+    return ensure_runtime(home)
+
+
 ADAPTER = HarnessAdapter(
     name="codex",
+    messaging=MessagingHooks(
+        send=_message_send,
+        receivers=_message_receivers,
+        prepare=_message_prepare,
+        hook_file="hooks.json",
+        remote_arg="unix://",
+        sender_environment="CODEX_THREAD_ID",
+    ),
     label="Codex",
     short_label="Codex",
     letter="C",

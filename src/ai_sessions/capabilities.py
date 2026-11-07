@@ -193,6 +193,20 @@ class Unsupported:
 
 
 @dataclass(frozen=True, slots=True)
+class MessagingHooks:
+    """Optional native messaging; transport imports remain lazy."""
+
+    send: Callable[[dict, str, str, dict], dict]
+    receivers: Callable[[Path], list[dict]] | None = None
+    prepare: Callable[[Path | None], dict] | None = None
+    register: Callable[[dict, Mapping[str, str]], dict | None] | None = None
+    forget: Callable[[dict], dict] | None = None
+    hook_file: str = ""
+    remote_arg: str = ""
+    sender_environment: str = ""
+
+
+@dataclass(frozen=True, slots=True)
 class HarnessAdapter:
     name: str
     label: str
@@ -215,6 +229,7 @@ class HarnessAdapter:
     scratch_patterns: tuple[Pattern[str], ...] = ()
     discover: DiscoverHook | Unsupported = Unsupported("discovery is not installed")
     rediscover: RediscoverHook | Unsupported = Unsupported("rereading one session is not supported")
+    messaging: MessagingHooks | None = None
     resume_args: ResumeArgsHook | Unsupported = Unsupported("resume is not installed")
     publish_name: PublishNameHook | Unsupported = Unsupported("rename is not supported")
     inspect_liveness: LivenessHook | Unsupported = Unsupported("liveness is not installed")

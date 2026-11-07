@@ -514,3 +514,17 @@ python -m build
 ```
 
 CI exercises Python 3.11–3.13 on Ubuntu and Windows.
+
+## Messages between running sessions
+
+Run `sessions messaging install`, then reopen the sessions you want to receive
+messages (`! sesres` is shorthand for `! sessions --restart`). Find receivers with
+`sessions messaging status` and send with
+`sessions send <harness:session-id> --message "Migration finished"`.
+Agents can reply with `sessions reply <message-id> --message "Received"`.
+
+Codex steering reaches an active turn without canceling its tools; idle threads
+start a turn. Claude uses its native authenticated inbox and Windows DevSecrets.
+A successful send reports runtime acceptance or pipe submission, not completion.
+See [the messaging guide](docs/SESSION_MESSAGING.md) for setup, replies, delivery
+states, home selection, and current Windows/desktop/private-server limits.

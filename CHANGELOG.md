@@ -1,5 +1,20 @@
 # Changelog
 
+## 3.11.0 — 2026-11-07
+
+### Added
+
+- Native same-machine session messaging: `sessions send`, `sessions reply`, and
+  `sessions messaging status/install/uninstall`. Codex receives messages through
+  its owning daemon, steering active turns and starting idle ones. Claude uses its
+  authenticated native inbox, with credentials kept in Windows DevSecrets.
+- Managed native Codex launches, qualified receiver addresses, correlated replies,
+  bounded delivery records, and explicit unavailable/uncertain outcomes. Sending
+  never silently resumes a saved copy of an already-running session.
+- `sesres`, an executable shorthand for `sessions --restart`, usable as `! sesres`.
+
+See `docs/SESSION_MESSAGING.md` for setup, timing, permissions, and supported receivers.
+
 ## 3.10.0 — 2026-11-04
 
 ### Changed

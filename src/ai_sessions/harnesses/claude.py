@@ -16,7 +16,7 @@ from typing import Any, Iterable, Mapping, Sequence
 import zstandard
 
 from .. import fastjson
-from ..capabilities import HarnessAdapter
+from ..capabilities import HarnessAdapter, MessagingHooks
 from ..compression import (
     ZST_SUFFIX,
     is_compressed_path,
@@ -1077,8 +1077,32 @@ def extra_dir_args(directory: str) -> list[str]:
     return [f"--add-dir={directory}"]
 
 
+def _message_send(receiver: dict, text: str, message_id: str, sender: dict) -> dict:
+    from .messaging_claude import send
+
+    return send(receiver, text, message_id, sender)
+
+
+def _message_register(payload: dict, env: Mapping[str, str]) -> dict | None:
+    from .messaging_claude import register
+
+    return register(payload, env)
+
+
+def _message_forget(receiver: dict) -> dict:
+    from .messaging_claude import forget
+
+    return forget(receiver)
+
+
 ADAPTER = HarnessAdapter(
     name="claude",
+    messaging=MessagingHooks(
+        send=_message_send,
+        register=_message_register,
+        forget=_message_forget,
+        hook_file="settings.json",
+    ),
     label="Claude Code",
     short_label="Claude",
     # A for Anthropic: C already names Codex.
