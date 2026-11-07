@@ -7,6 +7,28 @@ from unittest.mock import patch
 
 
 class MessagingCliTests(unittest.TestCase):
+    def test_receipt_disk_failure_after_submission_is_uncertain_not_retryable(self):
+        from ai_sessions.messaging import cli, store
+
+        row = dict(tool="codex", session_id="a")
+        with tempfile.TemporaryDirectory() as d, patch.object(store, "ROOT", Path(d)):
+            original = store.save_receipt
+
+            def save(data):
+                if data["status"] != "submitting":
+                    raise OSError("disk full")
+                original(data)
+
+            with (
+                patch.object(cli, "reachable", return_value=[row]),
+                patch.object(cli, "deliver", return_value={"status": "accepted"}) as deliver,
+                patch.object(store, "save_receipt", side_effect=save),
+            ):
+                code, result = cli.send_message("codex:a", "hi", "codex:a")
+            self.assertEqual(code, 3)
+            self.assertEqual(result["status"], "uncertain")
+            deliver.assert_called_once()
+
     def test_early_messaging_dispatch_keeps_windows_unicode_setup(self):
         from unittest.mock import Mock
 

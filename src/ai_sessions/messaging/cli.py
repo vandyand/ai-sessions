@@ -104,10 +104,19 @@ def send_message(
         **{k: v for k, v in result.items() if k not in ("sender", "recipient", "message_id")},
         "message_id": mid,
     }
-    store.save_receipt(row)
-    row = store.receipt(mid)
-    if reply_to and row["status"] in ("accepted", "submitted", "acknowledged"):
-        store.acknowledge(reply_to, sender, mid)
+    try:
+        store.save_receipt(row)
+        row = store.receipt(mid) or row
+        if reply_to and row["status"] in ("accepted", "submitted", "acknowledged"):
+            store.acknowledge(reply_to, sender, mid)
+    except OSError:
+        # Submission already happened. A receipt write failure must not turn
+        # into a retryable-looking pre-delivery error (or trigger a resend).
+        return 3, {
+            **row,
+            "status": "uncertain",
+            "reason": "Submission may have arrived but its receipt could not be saved; do not resend automatically",
+        }
     code = (
         0
         if row["status"] in ("accepted", "submitted", "acknowledged")
