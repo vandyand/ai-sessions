@@ -1,5 +1,19 @@
 # Changelog
 
+## 3.11.2 — 2026-11-08
+
+### Fixed
+
+- Session titles now precede optional metadata and retain at least half of the
+  interactive table width. Narrow terminals keep tool, open state, title and
+  updated age; other columns return as space allows.
+- Compact counts and shortcuts keep launch mode, tools, quit and help visible.
+  The browser supports 60-column terminals, and its detail separator no longer
+  overwrites session rows at the minimum 12-row height.
+- Managed Codex supervisors now prepare their ledger folder through the owning
+  thread's settings instead of combining incompatible `--remote` and `--add-dir`
+  flags. The project directory and existing roots remain available on reopen.
+
 ## 3.11.1 — 2026-11-07
 
 ### Fixed

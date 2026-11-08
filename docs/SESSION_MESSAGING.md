@@ -42,6 +42,22 @@ already-running transcript onto a competing server. Explicit custom remote
 launch arguments are preserved; private/custom remote endpoints are not discovered
 by the local-daemon adapter. `--no-daemon` conflicts with managed messaging.
 
+Codex supervisors keep the target project as their working directory. With managed
+messaging, ai-sessions resumes the supervisor on the local daemon and grants its
+own folder through the per-thread `thread/settings/update` API, then verifies the
+result before opening the terminal. This avoids the native CLI's incompatible
+`--remote` plus `--add-dir` combination. Existing writable roots, network settings,
+approval policy and sandbox mode are retained unless explicitly selected in the
+launch profile. Built-in dangerous mode and custom `--sandbox`/approval flags apply
+only to this supervisor. Its preparation attachment stays open until the terminal
+exits so a fresh thread cannot unload and lose its settings before the TUI joins.
+No global roots are changed. Named configuration profiles and permission `-c`
+overrides are not resolved by this preparation API and produce an explicit error.
+Read-only profiles, busy supervisors needing settings changes, custom remote endpoints,
+and unconfirmed folder access stop the launch with an explicit error. Dry runs
+print the terminal command without loading a thread or changing permissions.
+Without remote attachment, supervisors continue using `--add-dir`.
+
 The active harness home determines authentication and the daemon. To install
 for another Codex home, first set `CODEX_HOME` for that PowerShell process and
 launch subsequent sessions with the same home. `--codex-home` must match that

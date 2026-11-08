@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from contextlib import ExitStack
 from dataclasses import dataclass, field
 from pathlib import Path
 from re import Pattern
@@ -82,6 +83,26 @@ class ExtraDirArgsHook(Protocol):
     """Arguments that let a session read and write ``directory`` outside its workspace."""
 
     def __call__(self, directory: str) -> list[str]: ...
+
+
+class SupervisorLaunchHook(Protocol):
+    """Prepare scoped supervisor folder access; dry runs must have no side effects.
+
+    Return the final argv, or raise BridgeError if access cannot be established.
+    Keep preparation attachments in resources until the terminal exits.
+    Providers without this hook use extra_dir_args instead.
+    """
+
+    def __call__(
+        self,
+        command: list[str],
+        *,
+        session_id: str,
+        cwd: str,
+        directory: str,
+        dry_run: bool = False,
+        resources: ExitStack,
+    ) -> list[str]: ...
 
 
 class ChangeStatusHook(Protocol):
@@ -259,6 +280,9 @@ class HarnessAdapter:
     extra_dir_args: ExtraDirArgsHook | Unsupported = Unsupported(
         "extra working directories are not supported"
     )
+    supervisor_launch: SupervisorLaunchHook | Unsupported = Unsupported(
+        "supervisor folder access uses launch arguments"
+    )
     transcript_files: TranscriptFilesHook | Unsupported = Unsupported(
         "sessions are not stored as transcript files"
     )
@@ -342,6 +366,7 @@ class HarnessAdapter:
             self.new_session_args,
             self.create_session,
             self.extra_dir_args,
+            self.supervisor_launch,
             self.transcript_files,
         )
         if not all(callable(hook) or isinstance(hook, Unsupported) for hook in required + optional):

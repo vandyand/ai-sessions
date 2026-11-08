@@ -374,3 +374,50 @@ class MessagingCodexTests(unittest.TestCase):
         with patch.object(rpc.time, "monotonic", return_value=2.0):
             with self.assertRaises(TimeoutError):
                 sock.recv(1)
+
+
+class SupervisorDrainTests(unittest.TestCase):
+    def test_idle_attachment_drains_burst_without_answering_approval_and_closes(self):
+        import queue
+        import threading
+        import time
+
+        incoming = queue.Queue()
+        consumed = threading.Event()
+
+        class Socket:
+            def __init__(self):
+                self.sent = []
+
+            def settimeout(self, value):
+                pass
+
+            def recv(self):
+                try:
+                    value = incoming.get(timeout=0.02)
+                except queue.Empty:
+                    raise rpc.websocket.WebSocketTimeoutException()
+                if value == "last":
+                    consumed.set()
+                return value
+
+            def send(self, value):
+                self.sent.append(value)
+
+        client = rpc.CodexRPC()
+        client._ws = Socket()
+        client.drain_notifications()
+        for i in range(100):
+            incoming.put(json.dumps({"method": "item/updated", "params": {"text": "x" * 65536}}))
+        incoming.put(
+            json.dumps({"id": "approval", "method": "item/commandExecution/requestApproval"})
+        )
+        incoming.put("last")
+        self.assertTrue(consumed.wait(3))
+        self.assertEqual(client._ws.sent, [])
+        with self.assertRaisesRegex(RuntimeError, "draining"):
+            client.call("thread/read", {})
+        start = time.monotonic()
+        client.close()
+        self.assertLess(time.monotonic() - start, 1)
+        self.assertFalse(client._drainer.is_alive())

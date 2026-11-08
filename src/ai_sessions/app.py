@@ -4015,9 +4015,9 @@ class Browser:
         self.screen.erase()
         height, width = self.screen.getmaxyx()
         rows = self.view_rows()
-        if height < 12 or width < 65:
+        if height < 12 or width < 60:
             self.add(0, 0, "Terminal too small", self.style("warning", curses.A_BOLD))
-            self.add(2, 0, "Resize to at least 65 columns × 12 rows.")
+            self.add(2, 0, "Resize to at least 60 columns × 12 rows.")
             self.screen.refresh()
             return
 
@@ -4038,7 +4038,13 @@ class Browser:
             f"{open_count} open · {len(rows)} shown{excluded_text} · "
             f"{len(self.sessions)} indexed{refresh_text}"
         )
-        self.add(0, max(1, width - len(count_text) - 2), count_text, self.style("muted"))
+        count_room = width - 34
+        if len(count_text) > count_room:
+            count_text = f"{open_count} open · {len(rows)} shown{refresh_text}"
+        if len(count_text) > count_room:
+            count_text = f"{len(rows)} shown{refresh_text}"
+        count_text = ellipsize(count_text, count_room)
+        self.add(0, width - len(count_text) - 2, count_text, self.style("muted"))
 
         tool_text = tool_filter_label(self.tools)
         dir_text = "All directories" if not self.directory else short_path(self.directory)
@@ -4065,7 +4071,8 @@ class Browser:
             prompt += "Ctrl-F or / to search"
         self.add(2, 1, prompt, prompt_style, width - 2)
 
-        detail_height = 7
+        # Leave two list rows visible even at the minimum terminal height.
+        detail_height = min(7, height - 7)
         list_top = 4
         footer_row = height - 1
         detail_top = height - detail_height - 1
@@ -4077,33 +4084,44 @@ class Browser:
             self.offset = self.selected - visible_rows + 1
         self.offset = min(self.offset, max(0, len(rows) - visible_rows))
 
-        show_directory = width >= 100
-        tool_width = tool_column_width(8) + 1
-        origin_width, open_width, activity_width, time_width, status_width = 7, 6, 18, 10, 19
-        connection_width = 11
-        history_width = 10
-        updated_width = 17
-        directory_width = min(34, max(16, width // 4)) if show_directory else 0
-        title_width = (
-            width
-            - 5
-            - tool_width
-            - origin_width
-            - open_width
-            - activity_width
-            - time_width
-            - updated_width
-            - status_width
-            - connection_width
-            - history_width
-            - directory_width
-        )
-        heading = (
-            f"  {'TOOL':<{tool_width}}{'ORIGIN':<{origin_width}}"
-            f"{'OPEN':<{open_width}}{'ACTIVITY':<{activity_width}}"
-            f"{'STARTED':<{time_width}}{'UPDATED':<{updated_width}}"
-            f"{'CONNECTION':<{connection_width}}{'STATUS':<{status_width}}"
-            f"{'HISTORY':<{history_width}}TITLE"
+        # Reserve at least half the table for its primary content. Metadata is
+        # admitted in priority order; it must never push titles off the screen.
+        tool_width = min(tool_column_width(8) + 1, max(9, width // 8))
+        open_width, updated_width = 5, 11
+        budget = width - 5 - tool_width - open_width - updated_width - max(30, width // 2)
+        optional = []
+        for preferred in (19, 18, 7, 10, 11, 10, min(34, width // 5)):
+            allocated = preferred if budget >= preferred else 0
+            optional.append(allocated)
+            budget -= allocated
+            if not allocated:
+                # Keep column priority stable as the terminal grows.
+                budget = -1
+        (
+            status_width,
+            activity_width,
+            origin_width,
+            time_width,
+            connection_width,
+            history_width,
+            directory_width,
+        ) = optional
+        title_width = width - 5 - tool_width - open_width - updated_width - sum(optional)
+        heading = "   " + "".join(
+            column_cell(label, cell_width)
+            for label, cell_width in (
+                ("TOOL", tool_width),
+                ("OPEN", open_width),
+                ("TITLE", title_width),
+                ("UPDATED", updated_width),
+                ("STATUS", status_width),
+                ("ACTIVITY", activity_width),
+                ("ORIGIN", origin_width),
+                ("STARTED", time_width),
+                ("CONNECTION", connection_width),
+                ("HISTORY", history_width),
+                ("DIRECTORY", directory_width),
+            )
         )
         self.add(3, 1, heading, self.style("muted", curses.A_BOLD), width - 2)
 
@@ -4158,30 +4176,12 @@ class Browser:
                     curses.A_BOLD if marker.strip() else 0,
                 )
                 segment(column_cell(item_tool_label, tool_width), item.tool, curses.A_BOLD)
-                segment(column_cell(origin_label, origin_width), item.origin, curses.A_BOLD)
                 open_symbol = "Ⅱ" if paused else ("●" if item.is_open else "")
                 segment(
                     column_cell(open_symbol, open_width),
                     "warning" if paused else "success",
                     curses.A_BOLD,
                 )
-                segment(column_cell(activity_label(item), activity_width), "messages")
-                segment(column_cell(relative_time(item.created), time_width), "muted")
-                segment(column_cell(updated_age(item.updated), updated_width), "timestamp")
-                status = view_row.status
-                segment(column_cell(connection_label(item), connection_width), "muted")
-                segment(
-                    column_cell(status_label(item, status), status_width),
-                    "muted"
-                    if status == "standalone" or item.compressed
-                    else ("success" if status == "latest copy" else "warning"),
-                    curses.A_BOLD,
-                )
-                route = route_label(
-                    self.state.history(item.conversation_id) if item.conversation_id else [],
-                    history_width - 1,
-                )
-                segment(column_cell(route, history_width), "muted")
                 title = _normal_agent_tag(item) + view_row.title
                 is_supervisor = any(member.supervises for member in view_row.all_members)
                 if is_supervisor:
@@ -4202,8 +4202,32 @@ class Browser:
                 room = max(0, title_width)
                 title_color = "supervisor" if is_supervisor else "primary"
                 segment(column_cell(title, room), title_color, curses.A_BOLD)
-                if show_directory:
-                    segment(ellipsize(directory, directory_width).ljust(directory_width), "muted")
+                segment(column_cell(updated_age(item.updated), updated_width), "timestamp")
+                status = view_row.status
+                if status_width:
+                    segment(
+                        column_cell(status_label(item, status), status_width),
+                        "muted"
+                        if status == "standalone" or item.compressed
+                        else ("success" if status == "latest copy" else "warning"),
+                        curses.A_BOLD,
+                    )
+                if activity_width:
+                    segment(column_cell(activity_label(item), activity_width), "messages")
+                if origin_width:
+                    segment(column_cell(origin_label, origin_width), item.origin, curses.A_BOLD)
+                if time_width:
+                    segment(column_cell(relative_time(item.created), time_width), "muted")
+                if connection_width:
+                    segment(column_cell(connection_label(item), connection_width), "muted")
+                if history_width:
+                    route = route_label(
+                        self.state.history(item.conversation_id) if item.conversation_id else [],
+                        history_width - 1,
+                    )
+                    segment(column_cell(route, history_width), "muted")
+                if directory_width:
+                    segment(column_cell(directory, directory_width), "muted")
 
         for x in range(1, width - 1):
             self.add(detail_top, x, "─", self.style("muted", curses.A_DIM))
@@ -4289,6 +4313,8 @@ class Browser:
             "Enter open  t tools  i details  f focus  Space/Right expand  Left collapse  "
             "Ctrl-F search  r rename  h hide  Z compress  q quit  ? help"
         )
+        if not self.message and len(footer) > width - 2:
+            footer = "Enter open  / search  t tools  i details  q quit  ? help"
         self.add(footer_row, 1, footer, self.style("accent", curses.A_BOLD), width - 2)
         if self.searching:
             try:
@@ -6033,33 +6059,58 @@ def launch_supervisor(
         except BridgeError as error:
             print(f"sessions: {error}", file=sys.stderr)
             return 2
-    if not isinstance(adapter.extra_dir_args, Unsupported):
-        # The supervisor reads its brief files and keeps its ledger in its own folder.
-        argv += adapter.extra_dir_args(str(supervisor_folder(record_id, root)))
-    if config.custom_args_missing(tool):
-        print(custom_mode_notice(config, tool), file=sys.stderr)
-    if dry_run:
-        if IS_WINDOWS:
-            rendered = subprocess.list2cmdline(argv)
-            print(f"Set-Location -LiteralPath {subprocess.list2cmdline([cwd])}; {rendered}")
-        else:
-            print(f"cd -- {shlex.quote(cwd)} && " + shlex.join(argv))
-        return 0
-    os.environ[ENV_VAR] = record_id
-    try:
-        os.chdir(cwd)
-        executable = shutil.which(argv[0])
-        if executable is None:
-            print(f"sessions: {argv[0]!r} is not on PATH", file=sys.stderr)
-            return 127
-        record_launch(session, argv, executable)
-        note_opened(session)
-        if IS_WINDOWS:
-            return run_harness(session, [executable, *argv[1:]])
-        os.execvp(argv[0], argv)
-    except OSError as error:
-        print(f"sessions: could not launch {argv[0]!r}: {error}", file=sys.stderr)
-    return 127
+    # Providers may need per-thread preparation instead of extra CLI directories.
+    # The supervisor reads its briefs and writes its ledger outside the project.
+    from contextlib import ExitStack
+
+    folder = str(supervisor_folder(record_id, root))
+    with ExitStack() as resources:
+        try:
+            if not isinstance(adapter.supervisor_launch, Unsupported):
+                argv = adapter.supervisor_launch(
+                    argv,
+                    session_id=hook_state.native_session_id,
+                    cwd=cwd,
+                    directory=folder,
+                    dry_run=dry_run,
+                    resources=resources,
+                )
+            elif not isinstance(adapter.extra_dir_args, Unsupported):
+                argv += adapter.extra_dir_args(folder)
+        except (BridgeError, OSError) as error:
+            print(f"sessions: could not prepare the supervisor folder: {error}", file=sys.stderr)
+            return 2
+        if config.custom_args_missing(tool):
+            print(custom_mode_notice(config, tool), file=sys.stderr)
+        if dry_run:
+            if IS_WINDOWS:
+                rendered = subprocess.list2cmdline(argv)
+                print(f"Set-Location -LiteralPath {subprocess.list2cmdline([cwd])}; {rendered}")
+            else:
+                print(f"cd -- {shlex.quote(cwd)} && " + shlex.join(argv))
+            return 0
+        os.environ[ENV_VAR] = record_id
+        try:
+            os.chdir(cwd)
+            executable = shutil.which(argv[0])
+            if executable is None:
+                print(f"sessions: {argv[0]!r} is not on PATH", file=sys.stderr)
+                return 127
+            record_launch(session, argv, executable)
+            note_opened(session)
+            if IS_WINDOWS:
+                return run_harness(session, [executable, *argv[1:]])
+            if not isinstance(adapter.supervisor_launch, Unsupported):
+                process = subprocess.Popen(argv)
+                while True:
+                    try:
+                        return process.wait()
+                    except KeyboardInterrupt:
+                        continue  # The terminal child interprets Ctrl-C.
+            os.execvp(argv[0], argv)
+        except OSError as error:
+            print(f"sessions: could not launch {argv[0]!r}: {error}", file=sys.stderr)
+        return 127
 
 
 def open_again(

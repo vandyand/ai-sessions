@@ -168,6 +168,8 @@ class CodexRPC:
         self._socket = None
         self._ws = None
         self._next_id = 0
+        self._drain_stop = threading.Event()
+        self._drainer = None
 
     def __enter__(self):
         try:
@@ -203,6 +205,8 @@ class CodexRPC:
             raise RPCUnavailable("Codex connection unavailable") from None
 
     def call(self, method: str, params: dict) -> dict:
+        if self._drainer is not None:
+            raise RuntimeError("Codex attachment is draining notifications")
         if self._ws is None:
             raise RPCUnavailable("Codex connection unavailable")
         self._next_id += 1
@@ -239,7 +243,36 @@ class CodexRPC:
         except Exception:
             raise RPCUnavailable("Codex request outcome unavailable") from None
 
+    def drain_notifications(self):
+        """Keep an idle attachment flowing without answering any server requests.
+
+        This transfers receive ownership to a bounded-lifetime background reader;
+        further calls are forbidden. It retains no messages or approval payloads.
+        """
+        if self._drainer is not None:
+            return
+        if self._ws is None:
+            raise RPCUnavailable("Codex connection unavailable")
+        if self._socket is not None:
+            self._socket.deadline = None
+        self._ws.settimeout(0.5)
+        ws = self._ws
+
+        def drain():
+            while not self._drain_stop.is_set():
+                try:
+                    if not ws.recv():
+                        return
+                except (websocket.WebSocketTimeoutException, TimeoutError):
+                    continue
+                except Exception:
+                    return
+
+        self._drainer = threading.Thread(target=drain, daemon=True)
+        self._drainer.start()
+
     def close(self):
+        self._drain_stop.set()
         if self._socket is not None:
             self._socket.close()
         # No WebSocket close handshake: bounded child cleanup also covers a
@@ -263,6 +296,8 @@ class CodexRPC:
                             stream.close()
                         except OSError:
                             pass
+        if self._drainer is not None:
+            self._drainer.join(timeout=1)
         self._ws = None
 
     def __exit__(self, *args):

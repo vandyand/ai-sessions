@@ -24,7 +24,7 @@ tokens:
 
 - **Primary user:** A developer with conversation history in two or more AI coding harnesses.
 - **Context and constraints:** Keyboard-first terminal use on Linux or Windows, sometimes over SSH,
-  with large local histories and terminals as narrow as 65 columns.
+  with large local histories and terminals as narrow as 60 columns.
 - **Primary job:** Find the right conversation, understand where it lives and whether it is open,
   then focus, resume, or bridge it with minimal delay.
 - **Success means:** The first useful list appears promptly; active filters and refresh status are
@@ -98,8 +98,11 @@ tokens:
 - **Color roles:** Accent for actions, muted for secondary context, warning for risk or recovery,
   success for open/healthy state; every role also has a text or symbol cue.
 - **Imagery and iconography:** Text and terminal-safe symbols only.
-- **Responsive behavior:** At least 65×12; optional directory columns disappear before required
-  controls or status text.
+- **Responsive behavior:** At least 60×12. Tool, open state, title and updated age always fit.
+  The title precedes other metadata and receives at least half the table width (30 cells minimum).
+  Additional columns return in order: status, activity, origin, started, connection, history, directory.
+  Hidden metadata remains available in the selected-session details (`i`). Compact counts and
+  footer shortcuts keep launch mode, quit, tools and help visible at narrow widths.
 
 ## Component Contracts
 
@@ -130,12 +133,13 @@ tokens:
 - **Semantic labels and status:** Checkboxes use `[x]`/`[ ]`; progress and empty states use text.
 - **Contrast and non-color cues:** `NO_COLOR` and low-color terminals retain every state cue.
 - **Motion:** No animation; background refresh updates once on completion.
-- **Terminal constraints:** Required actions remain discoverable at 65 columns and 12 rows.
+- **Terminal constraints:** Required actions remain discoverable at 60 columns and 12 rows.
 
 ## Validation
 
 - **Wide terminal:** 120×30 scripted render and picker journey.
-- **Narrow terminal:** Existing 65×12 minimum-state contract plus manual terminal review.
+- **Narrow terminal:** Positioned table assertions at 60, 65, 80, 100, 140 and 200 columns,
+  including 60×12; native Windows ConPTY renders at 60, 80 and 140 columns with keyboard exit.
 - **Automated journeys:** `tests/test_display.py`, `tests/test_startup.py`, and the full unit suite.
 - **Visual checkpoints:** Main footer/filter bar, tool picker checked states, empty-filter recovery,
   loading status, and refreshed completion status.
