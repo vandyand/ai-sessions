@@ -1,5 +1,20 @@
 # Changelog
 
+## 3.12.0 — 2026-11-08
+
+### Added
+
+- Unique, persistent session slugs independent of display names, accepted wherever
+  session IDs are accepted: resume, rename, hide/unhide, compress/decompress,
+  supervise, target logs and messaging receiver/sender references.
+- `--set-slug ID_OR_SLUG NEW_SLUG` changes a slug without renaming the session.
+  Generated slugs survive renaming, catalog rebuilds and older state writers.
+- Slugs appear in list/JSON output, browser details and messaging status. Each
+  native copy/fork/home has its own slug, with transactional collision handling.
+- Retired slugs remain reserved; ambiguous or unavailable references fail without
+  falling back to another session's display name. Existing native IDs and unique
+  display-name references remain accepted.
+
 ## 3.11.2 — 2026-11-08
 
 ### Fixed

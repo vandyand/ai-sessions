@@ -64,6 +64,21 @@ launch subsequent sessions with the same home. `--codex-home` must match that
 active home; it does not switch authentication behind your back. The usage-only
 `.codex-plan` login is unaffected unless you explicitly select it.
 
+## Session slugs
+
+Since 3.12, `sessions messaging status` includes a unique slug beside each native
+address. A slug identifies one exact native session and home; linked copies have
+separate slugs. Use the slug in `sessions send SLUG --message ...` and `--from SLUG`
+for send/reply. Native IDs and qualified addresses continue working, and envelopes
+and receipts retain their original native identity, home and generation.
+
+Find all indexed slugs through `sessions --list` or `--json`, or inspect a row with
+`i`. Change one with `sessions --set-slug ID_OR_SLUG NEW_SLUG`. Display-name changes
+do not change slugs, and retired slugs cannot be reassigned to another session.
+The same slugs work in resume, rename, hide, compression, supervision and target-log
+commands. Reply/receipt message IDs remain message IDs. A slug for an offline
+session remains unavailable for messaging; resolving one never resumes a saved copy.
+
 ## Discover, send, and reply
 
 ```powershell

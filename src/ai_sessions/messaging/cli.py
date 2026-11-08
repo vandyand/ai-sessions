@@ -11,7 +11,14 @@ from pathlib import Path
 from . import install, store
 
 
+def _slug_store():
+    from ..references import SlugStore
+
+    return SlugStore()
+
+
 def reachable() -> list[dict]:
+    from ..references import native_key
     from ..registry import REGISTRY
 
     rows = store.receivers()
@@ -22,6 +29,14 @@ def reachable() -> list[dict]:
                     rows.extend(adapter.messaging.receivers(home))
                 except (OSError, RuntimeError, ValueError):
                     pass
+    if rows:
+        keys = [native_key(row["tool"], row["session_id"], row.get("home")) for row in rows]
+        entries = [
+            (key, (row.get("name") or "") if row.get("name") != row["session_id"] else "")
+            for key, row in zip(keys, rows)
+        ]
+        slugs = _slug_store().ensure(entries)
+        rows = [{**row, "slug": slugs[key]} for key, row in zip(keys, rows)]
     return rows
 
 
@@ -58,7 +73,7 @@ def send_message(
             )
         receiver = matches[0]
     else:
-        receiver = store.resolve(target, rows)
+        receiver = store.resolve(target, rows, slugs=_slug_store())
     source = source or os.environ.get("AI_SESSIONS_MESSAGE_FROM")
     if not source:
         from ..registry import REGISTRY
@@ -69,7 +84,7 @@ def send_message(
                 source = adapter.name + ":" + os.environ[key]
                 break
     sender = (
-        _address(store.resolve(source, rows))
+        _address(store.resolve(source, rows, slugs=_slug_store()))
         if source
         else {"tool": "user", "session_id": "terminal"}
     )
@@ -181,7 +196,10 @@ def main(argv: list[str]) -> int:
         elif args.command == "messaging" and args.action == "status":
             print("Messaging " + ("enabled" if result["enabled"] else "not installed"))
             for row in result["receivers"]:
-                print(f"{store.endpoint_id(row)}  {row.get('name', '')}  {row.get('cwd', '')}")
+                print(
+                    f"{store.endpoint_id(row)}  {row.get('slug', '')}  "
+                    f"{row.get('name', '')}  {row.get('cwd', '')}"
+                )
             if not result["receivers"]:
                 print("No reachable sessions. Reopen sessions after messaging setup.")
         else:

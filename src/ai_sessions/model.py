@@ -236,6 +236,7 @@ class Session:
     compressed: bool = False
     # The name the harness itself shows, which ``title`` may override; "" when unknown.
     provider_title: str = ""
+    slug: str = ""
 
     def __post_init__(self) -> None:
         self.source = SourceKind(self.source)
