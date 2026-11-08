@@ -118,6 +118,33 @@ class DisplayTests(unittest.TestCase):
                         self.assertNotIn("HISTORY", heading)
                         self.assertNotIn("CONNECTION", heading)
 
+    def test_slug_is_visible_in_details_json_and_plain_list(self) -> None:
+        item = replace(self.titled_session("native"), slug="market-anomaly")
+        with tempfile.TemporaryDirectory() as directory:
+            screen = ScriptedScreen("x", size=(30, 80))
+            with (
+                patch.dict(os.environ, {"TERM": "dumb"}, clear=False),
+                patch.object(app.curses, "curs_set"),
+            ):
+                browser = Browser(
+                    screen,
+                    [item],
+                    UserState(Path(directory) / "state.json"),
+                    LaunchConfig(path=Path(directory) / "config.toml"),
+                )
+                browser.draw()
+                self.assertIn("Slug market-anomaly", screen.frames[-1])
+                browser.details()
+                self.assertIn("Slug       market-anomaly", screen.frames[-1])
+        output = io.StringIO()
+        with redirect_stdout(output):
+            app.list_output([item], as_json=True)
+        self.assertEqual(json.loads(output.getvalue())[0]["slug"], "market-anomaly")
+        output = io.StringIO()
+        with redirect_stdout(output):
+            app.list_output([item])
+        self.assertIn("slug: market-anomaly", output.getvalue())
+
     def test_unique_title_is_byte_for_byte_unchanged(self) -> None:
         item = self.titled_session("081c1234567890")
         self.assertEqual(app.title_disambiguators([item]), {})

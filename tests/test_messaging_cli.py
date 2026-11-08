@@ -7,6 +7,18 @@ from unittest.mock import patch
 
 
 class MessagingCliTests(unittest.TestCase):
+    def setUp(self):
+        from ai_sessions.messaging import cli
+        from ai_sessions.references import SlugStore
+
+        temporary = tempfile.TemporaryDirectory()
+        self.addCleanup(temporary.cleanup)
+        self.enterContext(
+            patch.object(
+                cli, "_slug_store", return_value=SlugStore(Path(temporary.name) / "slugs.sqlite3")
+            )
+        )
+
     def test_receipt_disk_failure_after_submission_is_uncertain_not_retryable(self):
         from ai_sessions.messaging import cli, store
 

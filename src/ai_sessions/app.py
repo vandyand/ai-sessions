@@ -194,6 +194,7 @@ def search_fields(item: Session) -> tuple[str, str, str]:
         REGISTRY.generation,
         item.tool,
         item.session_id,
+        item.slug,
         item.launch_tool,
         tuple(item.launch_targets),
         item.storage,
@@ -226,6 +227,7 @@ def _session_searchable(item: Session) -> str:
             item.tool,
             tool_label(item.tool),
             item.session_id,
+            item.slug,
             active_launch_tool(item),
             *available_launch_tools(item),
             item.title,
@@ -261,6 +263,9 @@ class UserState:
 
     def __init__(self, path: Path = STATE_FILE) -> None:
         self.path = path
+        from .references import SlugStore
+
+        self.slugs = SlugStore(path.with_suffix(".slugs.sqlite3"))
         self.names: dict[str, str] = {}
         # Names the harness could not record; they hold until it can.  Any other name
         # yields to whatever the harness shows, so a rename made there wins.
@@ -765,8 +770,9 @@ class UserState:
         actual = self._sessions_by_key.get(key)
         if actual is not None:
             return actual
-        return replace(
+        result = replace(
             template,
+            slug="",
             tool=str(member["tool"]),
             session_id=str(member["session_id"]),
             storage=str(member.get("storage", "")),
@@ -781,6 +787,10 @@ class UserState:
             launch_targets={str(member["tool"]): str(member["session_id"])},
             launch_tool="",
         )
+        from .references import assign_sessions
+
+        assign_sessions([result], self.slugs)
+        return result
 
     def resolve_launch(
         self, item: Session, target_tool: str
@@ -995,6 +1005,9 @@ class UserState:
         else:
             self._apply_saved_conversation_status(items)
         self._apply_supervisors(items)
+        from .references import assign_sessions
+
+        assign_sessions(items, self.slugs)
         # Capture each conversation's history while older copy names still record it.
         missing = [cid for cid, value in self.conversations.items() if "history" not in value]
         for conversation_id in missing:
@@ -1238,6 +1251,7 @@ class UserState:
         target_key = self._member_key(tool, session_id)
         target = replace(
             item,
+            slug="",
             tool=tool,
             session_id=session_id,
             storage=storage,
@@ -1249,6 +1263,9 @@ class UserState:
             launch_targets={tool: session_id},
             launch_tool="",
         )
+        from .references import assign_sessions
+
+        assign_sessions([item, target], self.slugs)
         conversation["members"][target_key] = self._member_from_session(
             target,
             generation=generation,
@@ -2267,7 +2284,7 @@ def _catalog_signature() -> list[dict[str, Any]]:
     ]
 
 
-_SESSION_FIELDS = tuple(field.name for field in fields(Session))
+_SESSION_FIELDS = tuple(field.name for field in fields(Session) if field.name != "slug")
 # Fields a catalog row leaves out when they only repeat the title.
 _TITLE_COPIES = ("original_title", "provider_title")
 
@@ -2332,6 +2349,7 @@ def load_session_catalog(
         "prompt_count",
         "conversation_blocker",
         "provider_title",
+        "slug",
     }
     result: list[Session] = []
     for payload in document["sessions"][:100_000]:
@@ -2356,6 +2374,7 @@ def load_session_catalog(
                 "prompt_count": message_count,
                 "conversation_blocker": "",
                 "provider_title": "",
+                "slug": "",
             }
             payload = {**payload, **{name: defaults[name] for name in missing}}
         try:
@@ -4250,7 +4269,8 @@ class Browser:
             self.add(
                 detail_top + 1,
                 2,
-                f"{tool_label(item.tool)} · {ORIGIN_LABELS[item.origin]}"
+                (f"Slug {item.slug} · " if item.slug else "")
+                + f"{tool_label(item.tool)} · {ORIGIN_LABELS[item.origin]}"
                 f"{self.supervision_role(item)} · launch via {launch_tool} · "
                 f"{activity_label(item)}{name_badge}{source_badge}{hidden_badge}{open_badge}",
                 self.style(item.origin, curses.A_BOLD),
@@ -4754,6 +4774,7 @@ class Browser:
             "CONVERSATION DETAILS",
             f"Project    {row.project}",
             f"Thread     {row.title}",
+            f"Slug       {row.representative.slug or '(not assigned)'}",
             f"Status     {row.status}",
             f"Members    {len(members)} (shown {len(row.members)})",
             *history_lines(
@@ -4771,6 +4792,7 @@ class Browser:
                 (
                     f"{connection_label(item)} {copy_status(conversation_status(item))} · {tool_label(item.tool)} · "
                     f"{exact_time(item.updated)}{filtered}",
+                    f"Slug       {item.slug or '(not assigned)'}",
                     f"Harness    {item.tool} · Native ID {item.session_id}",
                     f"Storage    {item.storage or '(unknown)'}",
                     f"Dates      {exact_time(item.created)} → {exact_time(item.updated)}",
@@ -5561,8 +5583,9 @@ def prepare_launch(
 
     def attach(session_id: str, storage: str = "") -> Session:
         if storage:
-            return replace(
+            target = replace(
                 session,
+                slug="",
                 tool=tool,
                 session_id=session_id,
                 storage=storage,
@@ -5576,6 +5599,11 @@ def prepare_launch(
                 # The bridge just named the copy; the source's harness title is not its own.
                 provider_title="",
             )
+            if state is not None:
+                from .references import assign_sessions
+
+                assign_sessions([target], state.slugs)
+            return target
         return replace(
             session,
             launch_targets={**session.launch_targets, tool: session_id},
@@ -6028,6 +6056,10 @@ def launch_supervisor(
         storage=stored.storage if stored is not None else "",
         origin="supervisor",
     )
+    if not dry_run and hook_state.native_session_id:
+        from .references import assign_sessions
+
+        assign_sessions([session], state.slugs)
     if fresh:
         hook = adapter.new_session_args
         if isinstance(hook, Unsupported):
@@ -6333,6 +6365,8 @@ def list_output(items: list[Session], as_json: bool = False) -> None:
             f"{rendered_title:<{title_width}} "
             f"{short_path(item.cwd)}"
         )
+        if item.slug:
+            print(f"  slug: {item.slug}")
 
 
 def sessions_are_known(sessions: list[Session]) -> bool:
@@ -6436,7 +6470,7 @@ def build_parser() -> argparse.ArgumentParser:
         help="rebuild provider metadata without discovery caches",
     )
     parser.add_argument(
-        "--resume", metavar="ID_OR_NAME", help="resume an exact session ID or named session"
+        "--resume", metavar="ID_OR_SLUG", help="resume an exact session ID, slug or named session"
     )
     parser.add_argument(
         "--reattach",
@@ -6484,7 +6518,7 @@ def build_parser() -> argparse.ArgumentParser:
         )
     parser.add_argument(
         "--supervise",
-        metavar="ID_OR_NAME",
+        metavar="ID_OR_SLUG",
         help=(
             "open the supervisor session for this session, creating it if needed; "
             "--launch-tool picks the supervisor's harness"
@@ -6492,8 +6526,8 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument(
         "--target-log",
-        metavar="ID",
-        help="print what a supervisor sees of its target (record id, session id or conversation)",
+        metavar="REF",
+        help="print target context (supervisor record, session ID/slug or conversation)",
     )
     parser.add_argument(
         "--since",
@@ -6516,8 +6550,14 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--rename",
         nargs=2,
-        metavar=("ID_OR_NAME", "NEW_NAME"),
+        metavar=("ID_OR_SLUG", "NEW_NAME"),
         help="rename a session in Claude Code or Codex too; empty name resets it",
+    )
+    parser.add_argument(
+        "--set-slug",
+        nargs=2,
+        metavar=("REF", "NEW_SLUG"),
+        help="set a unique session slug independently of its display name",
     )
     parser.add_argument(
         "--launch-log",
@@ -6527,10 +6567,10 @@ def build_parser() -> argparse.ArgumentParser:
         metavar="COUNT",
         help="print the last resumes with the exact id and command sent to the harness",
     )
-    parser.add_argument("--hide", metavar="ID_OR_NAME", help="hide a session from the normal view")
-    parser.add_argument("--unhide", metavar="ID_OR_NAME", help="restore a hidden session")
-    parser.add_argument("--compress", metavar="ID_OR_NAME", help="compress a session on disk")
-    parser.add_argument("--decompress", metavar="ID_OR_NAME", help="restore a compressed session")
+    parser.add_argument("--hide", metavar="ID_OR_SLUG", help="hide a session from the normal view")
+    parser.add_argument("--unhide", metavar="ID_OR_SLUG", help="restore a hidden session")
+    parser.add_argument("--compress", metavar="ID_OR_SLUG", help="compress a session on disk")
+    parser.add_argument("--decompress", metavar="ID_OR_SLUG", help="restore a compressed session")
     parser.add_argument(
         "--compress-idle",
         action="store_true",
@@ -6553,14 +6593,23 @@ def main(argv: list[str] | None = None) -> int:
     """Run ``sessions``, reopening the session for as long as ``--restart`` asks."""
     global _restart_into
     _restart_into = None
-    code = _main(argv)
+    from .references import SlugRegistryError
+
+    def invoke(arguments):
+        try:
+            return _main(arguments)
+        except SlugRegistryError as error:
+            print(f"sessions: {error}", file=sys.stderr)
+            return 2
+
+    code = invoke(argv)
     if _restart_into is not None:
         # Keep a launch mode chosen on the command line; everything else is read afresh.
         mode = build_parser().parse_known_args(argv)[0].launch_mode
         kept = ["--launch-mode", mode] if mode else []
         while _restart_into is not None:
             into, _restart_into = _restart_into, None
-            code = _main(["--reopen", *kept, *(["--launch-tool", into] if into else [])])
+            code = invoke(["--reopen", *kept, *(["--launch-tool", into] if into else [])])
     return code
 
 
@@ -6633,6 +6682,7 @@ def _main(argv: list[str] | None = None) -> int:
             or args.reattach
             or args.reopen
             or args.rename
+            or args.set_slug
             or args.hide
             or args.unhide
             or args.compress
@@ -6674,23 +6724,29 @@ def _main(argv: list[str] | None = None) -> int:
             print(f"sessions: {note}", file=sys.stderr)
 
     def resolve(target: str) -> Session | None:
-        exact = [
-            item
-            for item in sessions
-            if item.session_id == target
-            or (item.named and item.title.casefold() == target.casefold())
-        ]
-        if not exact:
-            print(f"sessions: no session with ID or name {target!r}", file=sys.stderr)
+        from .references import resolve_session
+
+        try:
+            return resolve_session(target, sessions, store=state.slugs)
+        except ValueError as error:
+            print(f"sessions: {error}", file=sys.stderr)
             return None
-        if len(exact) > 1:
-            print(
-                f"sessions: {target!r} matches more than one record; use the exact session ID "
-                "shown in the browser detail or by --json",
-                file=sys.stderr,
-            )
-            return None
-        return exact[0]
+
+    if args.set_slug:
+        from .references import native_key
+
+        target, new_slug = args.set_slug
+        item = resolve(target)
+        if item is None:
+            return 2
+        try:
+            slug = state.slugs.set_slug(native_key(item.tool, item.session_id), new_slug)
+        except ValueError as error:
+            print(f"sessions: {error}", file=sys.stderr)
+            return 2
+        item.slug = slug
+        print(f"Session slug: {slug}")
+        return 0
 
     for operation, target in (("hide", args.hide), ("unhide", args.unhide)):
         if target:

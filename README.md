@@ -10,6 +10,42 @@ described below.
 
 It runs as `sessions` on Linux and native Windows PowerShell.
 
+## Session slugs
+
+Every native session copy has a unique, persistent slug, independent of its display
+name. Names can repeat; IDs and slugs both work in session commands:
+
+```powershell
+sessions --resume elevate-futures
+sessions --rename elevate-futures "Elevate futures research"
+sessions --set-slug elevate-futures futures-research
+sessions --supervise futures-research
+sessions --target-log futures-research
+sessions send futures-research --message "The build passed."
+```
+
+The same references work with `--hide`, `--unhide`, `--compress`, `--decompress`,
+and messaging `--from`. Message IDs for `reply` and receipts stay unchanged.
+Existing unique display names remain accepted for compatibility; ambiguous names
+fail without selecting a session.
+
+Slugs are generated once from the session name in lowercase kebab-case. Duplicate
+names get numeric suffixes. Renaming a session leaves its slug unchanged;
+`--set-slug ID_OR_SLUG NEW_SLUG` changes it explicitly. Custom slugs contain 1-64
+ASCII letters/digits separated by single hyphens. Retired slugs stay reserved and
+stop resolving, preventing old commands from targeting a different session.
+
+Find slugs with `sessions --list`, `--json`, the browser's selected-session details
+or `i` view, and `sessions messaging status`. Linked copies and forks have separate
+slugs, including copies in different harness homes. Qualified `tool:ID` and
+`tool:slug` references also work; ambiguous references fail without acting.
+
+Assignments live beside `state.json` in `state.slugs.sqlite3` (following
+`AI_SESSIONS_STATE_FILE` when overridden). They survive catalog rebuilds and older
+launchers saving their state. The registry is updated during loading, never during
+table rendering or navigation. Messaging resolves only reachable sessions; a slug
+does not wake an offline session.
+
 ## Features
 
 - One conversation-centered list for Codex, Claude Code, and OpenCode sessions

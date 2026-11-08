@@ -162,16 +162,68 @@ def create_supervisor(
     return record_id
 
 
-def _resolve_record(state: Any, ident: str) -> str:
-    if ident in state.supervisors:
-        return ident
-    conversation_ids = {ident}
-    for key, cid in state.session_conversations.items():
-        if key == ident or key.split(":", 1)[-1] == ident:
-            conversation_ids.add(cid)
+def _resolve_record(state: Any, ident: str, *, root: Path | None = None) -> str:
+    from ..references import guard_reference, native_key
+
+    # Build a small identity index from persisted state, without discovering sessions.
+    identities: dict[tuple[str, str], set[str]] = {}
+    for member, cid in state.session_conversations.items():
+        tool, sep, session_id = member.partition(":")
+        if sep:
+            identities.setdefault((tool, session_id), set()).add(cid)
+    own: dict[tuple[str, str], set[str]] = {}
     for record_id, record in state.supervisors.items():
-        if record.get("target_conversation") in conversation_ids and not record.get("archived"):
-            return record_id
+        hook = load_hook_state(record_id, root)
+        tool = record.get("tool")
+        if hook and hook.native_session_id and isinstance(tool, str) and tool:
+            own.setdefault((tool, hook.native_session_id), set()).add(record_id)
+
+    tool, sep, reference = ident.partition(":")
+    qualified = bool(sep)
+    keys = set(identities) | set(own)
+    matches = {key for key in keys if (key == (tool, reference) if qualified else key[1] == ident)}
+    try:
+        owner = guard_reference(
+            ident,
+            (native_key(name, session_id) for name, session_id in matches if name in REGISTRY),
+            state.slugs,
+        )
+    except ValueError as error:
+        raise SupervisorError(str(error)) from None
+    if owner is not None:
+        if qualified and owner.tool != tool:
+            raise SupervisorError(f"no supervisor found for {ident!r}")
+        if owner.tool not in REGISTRY or owner != native_key(owner.tool, owner.session_id):
+            raise SupervisorError(f"session reference {ident!r} belongs to another harness home")
+        matches = {(owner.tool, owner.session_id)}
+    if len(matches) > 1:
+        raise SupervisorError(f"ambiguous session reference {ident!r}")
+    if matches:
+        key = next(iter(matches))
+        conversations = identities.get(key, set())
+        records = set(own.get(key, set()))
+        records.update(
+            rid
+            for rid, record in state.supervisors.items()
+            if record.get("target_conversation") in conversations and not record.get("archived")
+        )
+        if len(conversations) > 1 or len(records) > 1:
+            raise SupervisorError(f"ambiguous session reference {ident!r}")
+        if records:
+            return next(iter(records))
+    else:
+        # Preserve the historical supervisor-record and conversation identifiers.
+        if ident in state.supervisors:
+            return ident
+        records = {
+            rid
+            for rid, record in state.supervisors.items()
+            if record.get("target_conversation") == ident and not record.get("archived")
+        }
+        if len(records) > 1:
+            raise SupervisorError(f"ambiguous session reference {ident!r}")
+        if records:
+            return next(iter(records))
     raise SupervisorError(f"no supervisor found for {ident!r}")
 
 
@@ -202,7 +254,7 @@ def target_log(
             datetime.fromisoformat(since)
         except ValueError:
             raise SupervisorError(f"--since expects an ISO time, got {since!r}") from None
-    record_id = _resolve_record(state, ident)
+    record_id = _resolve_record(state, ident, root=root)
     hook_state = load_hook_state(record_id, root)
     if hook_state is None:
         raise SupervisorError(f"supervisor {record_id} has no stored state")

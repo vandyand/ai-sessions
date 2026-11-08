@@ -110,10 +110,40 @@ def stale_receivers() -> list[dict]:
     return [r for p in (ROOT / "receivers").glob("*.json") if (r := _read(p)) and not is_live(r)]
 
 
-def resolve(target: str, rows: list[dict]) -> dict:
+def resolve(target: str, rows: list[dict], *, slugs=None) -> dict:
+    def slug_matches(row: dict) -> bool:
+        slug = row.get("slug")
+        if not slug:
+            return False
+        slug_row = {**row, "session_id": slug}
+        return target.casefold() in (
+            slug.casefold(),
+            identity(slug_row).casefold(),
+            endpoint_id(slug_row).casefold(),
+        )
+
     exact = [
-        r for r in rows if target in (endpoint_id(r), identity(r), str(r.get("session_id", "")))
+        r
+        for r in rows
+        if target in (endpoint_id(r), identity(r), str(r.get("session_id", ""))) or slug_matches(r)
     ]
+    if slugs is not None:
+        from ..references import guard_reference, native_key
+
+        owner = guard_reference(
+            target,
+            [native_key(row["tool"], row["session_id"], row.get("home")) for row in exact],
+            slugs,
+        )
+        if owner is not None:
+            matches = [
+                row
+                for row in rows
+                if native_key(row["tool"], row["session_id"], row.get("home")) == owner
+            ]
+            if len(matches) != 1:
+                raise ValueError(f"receiver {target!r} is unavailable or ambiguous in this home")
+            return matches[0]
     matches = exact or [r for r in rows if target == r.get("name")]
     if len(matches) > 1:
         raise ValueError(
