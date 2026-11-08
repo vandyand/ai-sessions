@@ -7,7 +7,7 @@ import uuid
 from contextlib import redirect_stdout
 from dataclasses import replace
 from pathlib import Path
-from unittest.mock import ANY, patch
+from unittest.mock import ANY, MagicMock, patch
 
 from ai_sessions import app
 from ai_sessions.config import LaunchConfig
@@ -47,6 +47,9 @@ class Fixture(unittest.TestCase):
         self.addCleanup(tmp.cleanup)
         self.dir = Path(tmp.name)
         self.root = self.dir / "supervisors"
+        self.enterContext(
+            patch.dict(os.environ, {"AI_SESSIONS_MESSAGING_DIR": str(self.dir / "messaging")})
+        )
         self.state = app.UserState(path=self.dir / "state.json")
         # A launch may store the supervisor's session, so no harness may see a real home.
         for name in ("claude", "codex"):
@@ -217,6 +220,50 @@ class LaunchTests(Fixture):
             self.state.supervisors[record_id]["published_title"], "Supervisor: Fix the build"
         )
 
+    def test_remote_supervisor_uses_provider_folder_preparation_before_launch(self) -> None:
+        record_id = self.make("claude", "codex")
+        prepared = []
+
+        def prepare(command, **kwargs):
+            self.assertIn("--remote", command)
+            self.assertFalse(any(arg.startswith("--add-dir") for arg in command))
+            resources = kwargs.pop("resources")
+            resources.callback(lambda: prepared.append("closed"))
+            prepared.append(kwargs)
+            return command
+
+        adapter = replace(REGISTRY.get("codex"), supervisor_launch=prepare)
+        with (
+            REGISTRY.temporary(adapter),
+            patch("ai_sessions.messaging.install.settings", return_value={"enabled": True}),
+        ):
+            commands = self.launch(record_id)
+        self.assertEqual(len(commands), 1)
+        self.assertFalse(any(arg.startswith("--add-dir") for arg in commands[0]))
+        self.assertEqual(prepared[-1], "closed")
+        self.assertEqual(
+            prepared[:-1],
+            [
+                dict(
+                    session_id=load_hook_state(record_id, self.root).native_session_id,
+                    cwd=str(Path.cwd()),
+                    directory=str(self.root / record_id),
+                    dry_run=False,
+                )
+            ],
+        )
+
+    def test_folder_preparation_failure_prevents_terminal_launch(self) -> None:
+        record_id = self.make("claude", "codex")
+        from ai_sessions.conversion import BridgeError
+
+        def refuse(command, **kwargs):
+            raise BridgeError("supervisor folder unavailable")
+
+        adapter = replace(REGISTRY.get("codex"), supervisor_launch=refuse)
+        with REGISTRY.temporary(adapter), patch("sys.stderr", new_callable=io.StringIO):
+            self.assertEqual(self.launch(record_id), [])
+
     def test_older_supervisor_gets_its_name_published_once(self) -> None:
         record_id = self.make("codex", "claude")
         published: list[tuple[str, str]] = []
@@ -286,6 +333,27 @@ class CliTests(unittest.TestCase):
         claude_file, codex_file = app.supervisor_hook_files()
         self.assertEqual(claude_file.name, "settings.json")
         self.assertEqual(codex_file.name, "hooks.json")
+
+
+class SupervisorPosixTests(Fixture):
+    def test_ctrl_c_is_left_to_supervisor_child_while_resources_are_retained(self):
+        record_id = self.make("claude", "codex")
+        process = MagicMock()
+        process.__enter__.return_value = process
+        process.wait.side_effect = [KeyboardInterrupt, 7]
+        with (
+            patch.object(app, "IS_WINDOWS", False),
+            patch.object(app.subprocess, "Popen", return_value=process),
+            patch.object(app, "record_launch"),
+            patch.object(app, "note_opened"),
+            patch.object(app.shutil, "which", return_value="codex"),
+            patch.object(app.os, "chdir"),
+        ):
+            code = app.launch_supervisor(record_id, LaunchConfig(), self.state, root=self.root)
+        self.assertEqual(code, 7)
+        self.assertEqual(process.wait.call_count, 2)
+        process.kill.assert_not_called()
+        process.terminate.assert_not_called()
 
 
 if __name__ == "__main__":

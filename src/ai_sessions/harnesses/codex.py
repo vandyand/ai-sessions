@@ -16,7 +16,7 @@ import subprocess
 import threading
 import time
 import uuid
-from contextlib import closing
+from contextlib import ExitStack, closing
 from dataclasses import replace
 from pathlib import Path
 from typing import Any, Callable, Iterable, Mapping, Sequence
@@ -1843,6 +1843,157 @@ def extra_dir_args(directory: str) -> list[str]:
     return [f"--add-dir={directory}"]
 
 
+def supervisor_launch(
+    command: list[str],
+    *,
+    session_id: str,
+    cwd: str,
+    directory: str,
+    dry_run: bool = False,
+    resources: ExitStack,
+) -> list[str]:
+    """Keep shared-daemon attachment while granting only this supervisor's folder.
+
+    Native 0.166 rejects --add-dir with --remote. Loaded-thread resume ignores
+    config overrides, so use thread/settings/update and verify its effective policy.
+    Explicit launch-mode flags apply only to this idle thread. Without them its
+    sandbox and approval settings are retained; daemon defaults and cwd never change.
+    """
+    endpoint = None
+    for index, arg in enumerate(command):
+        if arg == "--remote":
+            endpoint = command[index + 1] if index + 1 < len(command) else ""
+        elif arg.startswith("--remote="):
+            endpoint = arg.partition("=")[2]
+    if endpoint is None:
+        return [*command, *extra_dir_args(directory)]
+    if endpoint != "unix://":
+        raise BridgeError(
+            "supervisor folder access requires the native local daemon (--remote unix://)"
+        )
+    # Remote rejoin preserves live thread permissions instead of applying CLI
+    # permission flags. Apply explicit selections through the same thread API.
+    selected_mode = None
+    selected_approval = None
+    for index, arg in enumerate(command):
+        value = command[index + 1] if index + 1 < len(command) else ""
+        if arg in ("--sandbox", "-s"):
+            selected_mode = value
+        elif arg.startswith("--sandbox="):
+            selected_mode = arg.partition("=")[2]
+        elif arg.startswith("-s") and not arg.startswith("--"):
+            selected_mode = arg[2:].lstrip("=")
+        elif arg in ("--dangerously-bypass-approvals-and-sandbox", "--yolo"):
+            selected_mode = "danger-full-access"
+            selected_approval = "never"
+        elif arg in ("--ask-for-approval", "-a"):
+            selected_approval = value
+        elif arg.startswith("--ask-for-approval="):
+            selected_approval = arg.partition("=")[2]
+        elif arg.startswith("-a") and not arg.startswith("--"):
+            selected_approval = arg[2:].lstrip("=")
+        elif arg in ("--approve-for-me", "--profile", "-p") or arg.startswith(("--profile=", "-p")):
+            raise BridgeError(
+                "remote supervisor permission profiles must be configured on the stored thread"
+            )
+        if arg in ("-c", "--config") or arg.startswith(("--config=", "-c")):
+            override = (
+                value
+                if arg in ("-c", "--config")
+                else arg.removeprefix("--config=").removeprefix("-c").lstrip("=")
+            )
+            key = override.partition("=")[0].strip().split(".")[0]
+            if key in (
+                "sandbox_mode",
+                "sandbox_workspace_write",
+                "permissions",
+                "default_permissions",
+                "approval_policy",
+                "approvals_reviewer",
+            ):
+                raise BridgeError(
+                    "remote supervisor permission overrides must be configured on the stored thread"
+                )
+    if selected_mode == "read-only":
+        raise BridgeError(
+            "a read-only supervisor cannot write its ledger; use workspace-write permissions"
+        )
+    if dry_run:
+        return list(command)
+    if not session_id:
+        raise BridgeError("the supervisor must have a stored native session before attachment")
+
+    from .messaging_codex import ensure_runtime
+    from .messaging_rpc import CodexRPC
+
+    home = REGISTRY.get("codex").home
+    if ensure_runtime(home).get("status") not in ("running", "started"):
+        raise BridgeError("the local daemon is unavailable; run sessions messaging install")
+
+    def same_path(left: str, right: str) -> bool:
+        return os.path.normcase(str(Path(left).resolve())) == os.path.normcase(
+            str(Path(right).resolve())
+        )
+
+    folder = str(Path(directory).resolve())
+    try:
+        client = resources.enter_context(CodexRPC(home))
+        params = {"threadId": session_id, "excludeTurns": True}
+        current = client.call("thread/resume", params)
+        if not same_path(current["cwd"], cwd):
+            raise BridgeError("the stored supervisor project differs from its launch directory")
+        policy = current["sandbox"]
+        updated = dict(policy)
+        if selected_mode == "danger-full-access":
+            updated = {"type": "dangerFullAccess"}
+        elif selected_mode == "workspace-write" and policy["type"] != "workspaceWrite":
+            updated = dict(
+                type="workspaceWrite",
+                writableRoots=[],
+                networkAccess=False,
+                excludeTmpdirEnvVar=False,
+                excludeSlashTmp=False,
+            )
+        elif selected_mode not in (None, "workspace-write"):
+            raise BridgeError("unsupported supervisor permission mode")
+        if updated["type"] == "workspaceWrite":
+            roots = list(updated["writableRoots"])
+            if not any(same_path(folder, value) for value in [cwd, *roots]):
+                updated["writableRoots"] = [*roots, folder]
+        elif updated["type"] != "dangerFullAccess":
+            raise BridgeError(
+                "supervisor ledger access requires a workspace-write permission profile"
+            )
+        changes = {"threadId": session_id}
+        if updated != policy:
+            changes["sandboxPolicy"] = updated
+        if selected_approval is not None and selected_approval != current["approvalPolicy"]:
+            changes["approvalPolicy"] = selected_approval
+        if len(changes) == 1:
+            client.drain_notifications()
+            return list(command)
+        if current["thread"]["status"]["type"] != "idle":
+            raise BridgeError("the supervisor is busy; wait for it to become idle before reopening")
+        client.call("thread/settings/update", changes)
+        verified = client.call("thread/resume", params)
+        expected_approval = selected_approval or current["approvalPolicy"]
+        if (
+            verified["sandbox"] != updated
+            or not same_path(verified["cwd"], cwd)
+            or verified["approvalPolicy"] != expected_approval
+        ):
+            raise BridgeError("the local daemon did not confirm supervisor folder access")
+        client.drain_notifications()
+    except BridgeError:
+        raise
+    except Exception:
+        # Protocol diagnostics can contain private config or history. Never display them.
+        raise BridgeError(
+            "could not establish supervisor folder access on the local daemon"
+        ) from None
+    return list(command)
+
+
 def messaging_home(home: Path | None = None) -> Path:
     return Path(home or os.environ.get("CODEX_HOME") or ADAPTER.home).expanduser()
 
@@ -1910,6 +2061,7 @@ ADAPTER = HarnessAdapter(
     new_session_args=new_session_args,
     create_session=create_session,
     extra_dir_args=extra_dir_args,
+    supervisor_launch=supervisor_launch,
     transcript_files=transcript_files,
     publish_name=publish_name,
     upgrade_storage=upgrade_storage,

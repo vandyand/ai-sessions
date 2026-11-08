@@ -80,6 +80,44 @@ class DisplayTests(unittest.TestCase):
             renamed=renamed,
         )
 
+    def test_session_titles_remain_visible_at_supported_widths(self) -> None:
+        class PositionedScreen(ScriptedScreen):
+            def __init__(self, height: int, width: int) -> None:
+                super().__init__(size=(height, width))
+                self.lines = [list(" " * width) for _ in range(height)]
+
+            def addnstr(self, y, x, value, length, style):
+                super().addnstr(y, x, value, length, style)
+                rendered = value[:length]
+                self.lines[y][x : x + len(rendered)] = rendered
+
+        with tempfile.TemporaryDirectory() as directory:
+            sizes = [(30, width) for width in (60, 65, 80, 100, 140, 200)] + [(12, 60)]
+            for height, width in sizes:
+                with self.subTest(height=height, width=width):
+                    screen = PositionedScreen(height, width)
+                    with (
+                        patch.dict(os.environ, {"TERM": "dumb"}, clear=False),
+                        patch.object(app.curses, "curs_set"),
+                    ):
+                        Browser(
+                            screen,
+                            [self.titled_session("native-id", title="elevate-futures-fork")],
+                            UserState(Path(directory) / "state.json"),
+                            LaunchConfig(path=Path(directory) / "config.toml"),
+                        ).draw()
+                    heading = "".join(screen.lines[3])
+                    row = "".join(screen.lines[4])
+                    self.assertIn("TITLE", heading)
+                    self.assertIn("elevate-futures-fork", row)
+                    self.assertLess(heading.index("TITLE"), heading.index("UPDATED"))
+                    self.assertEqual(len(row), width)
+                    self.assertIn("Launch:", "".join(screen.lines[0]))
+                    self.assertIn("q quit", "".join(screen.lines[-1]))
+                    if width <= 80:
+                        self.assertNotIn("HISTORY", heading)
+                        self.assertNotIn("CONNECTION", heading)
+
     def test_unique_title_is_byte_for_byte_unchanged(self) -> None:
         item = self.titled_session("081c1234567890")
         self.assertEqual(app.title_disambiguators([item]), {})
