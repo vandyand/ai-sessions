@@ -1931,7 +1931,9 @@ def supervisor_launch(
         raise BridgeError("the local daemon is unavailable; run sessions messaging install")
 
     def same_path(left: str, right: str) -> bool:
-        return os.path.normcase(os.path.abspath(left)) == os.path.normcase(os.path.abspath(right))
+        return os.path.normcase(str(Path(left).resolve())) == os.path.normcase(
+            str(Path(right).resolve())
+        )
 
     folder = str(Path(directory).resolve())
     try:

@@ -1,6 +1,7 @@
 """Scoped supervisor permissions on the native shared daemon."""
 
 import copy
+import os
 import tempfile
 import unittest
 from contextlib import ExitStack
@@ -57,9 +58,9 @@ class SupervisorPermissionsTests(unittest.TestCase):
     def setUp(self):
         tmp = tempfile.TemporaryDirectory()
         self.addCleanup(tmp.cleanup)
-        self.cwd = str(Path(tmp.name) / "project")
-        self.directory = str(Path(tmp.name) / "supervisor")
-        self.existing = str(Path(tmp.name) / "existing")
+        self.cwd = str(Path(tmp.name).resolve() / "project")
+        self.directory = str(Path(tmp.name).resolve() / "supervisor")
+        self.existing = str(Path(tmp.name).resolve() / "existing")
         self.resources = self.enterContext(ExitStack())
         self.command = ["codex", "--remote", "unix://", "resume", "supervisor"]
         self.policy = dict(
@@ -90,6 +91,21 @@ class SupervisorPermissionsTests(unittest.TestCase):
         return self.enterContext(
             patch("ai_sessions.harnesses.messaging_rpc.CodexRPC", return_value=fake)
         )
+
+    @unittest.skipUnless(os.name == "nt", "Windows short path aliases")
+    def test_short_project_path_matches_canonical_server_directory(self):
+        import ctypes
+
+        Path(self.cwd).mkdir(parents=True)
+        short = ctypes.create_unicode_buffer(32768)
+        length = ctypes.windll.kernel32.GetShortPathNameW(self.cwd, short, len(short))
+        if not length or short.value.casefold() == self.cwd.casefold():
+            self.skipTest("filesystem has no distinct short path alias")
+        fake = ThreadRPC(self.cwd, self.policy)
+        self.connect(fake)
+        self.cwd = short.value
+        self.assertEqual(self.prepare(), self.command)
+        self.assertIn(self.directory, fake.policy["writableRoots"])
 
     def test_adds_only_supervisor_root_and_preserves_every_policy_setting(self):
         fake = ThreadRPC(self.cwd, self.policy)
