@@ -29,11 +29,17 @@ and messaging `--from`. Message IDs for `reply` and receipts stay unchanged.
 Existing unique display names remain accepted for compatibility; ambiguous names
 fail without selecting a session.
 
-Slugs are generated once from the session name in lowercase kebab-case. Duplicate
-names get numeric suffixes. Renaming a session leaves its slug unchanged;
-`--set-slug ID_OR_SLUG NEW_SLUG` changes it explicitly. Custom slugs contain 1-64
-ASCII letters/digits separated by single hyphens. Retired slugs stay reserved and
-stop resolving, preventing old commands from targeting a different session.
+New slugs default to the full session title, preserving capitalization. Characters
+outside ASCII letters/digits become hyphens; repeated separators are collapsed and
+leading/trailing separators removed. If the title yields no valid characters, the
+base is `session`. Conflicts append `-v2`, then `-v3`, and so on. The first assigned
+slug stays unchanged; each later allocation gets the next available version.
+
+Renaming a session leaves its slug unchanged; `--set-slug ID_OR_SLUG NEW_SLUG`
+changes it explicitly. Custom slugs use ASCII letters/digits separated by single
+hyphens. Lookups and uniqueness checks ignore case. Slugs assigned by older versions
+remain unchanged. Retired slugs stay reserved, preventing old commands from
+silently targeting a different session.
 
 Find slugs with `sessions --list`, `--json`, the browser's selected-session details
 or `i` view, and `sessions messaging status`. Linked copies and forks have separate

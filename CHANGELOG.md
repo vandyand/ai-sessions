@@ -1,5 +1,15 @@
 # Changelog
 
+## 3.12.1 — 2026-11-08
+
+### Fixed
+
+- Newly generated slugs preserve the session title's capitalization and full
+  length, coercing invalid characters to hyphens. Conflicts use `-v2`, `-v3`,
+  and later versions; later allocations never rename earlier assignments.
+- Case-insensitive uniqueness also covers title-derived slugs. Existing assigned
+  slugs remain stable, including custom slugs and older numeric-suffix defaults.
+
 ## 3.12.0 — 2026-11-08
 
 ### Added

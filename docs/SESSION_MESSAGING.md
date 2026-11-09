@@ -75,6 +75,9 @@ and receipts retain their original native identity, home and generation.
 Find all indexed slugs through `sessions --list` or `--json`, or inspect a row with
 `i`. Change one with `sessions --set-slug ID_OR_SLUG NEW_SLUG`. Display-name changes
 do not change slugs, and retired slugs cannot be reassigned to another session.
+New defaults preserve the full title's valid characters and capitalization, replace
+invalid characters with hyphens, and append `-v2`, `-v3`, etc. for later conflicts.
+Existing slugs remain stable; lookups and uniqueness ignore case.
 The same slugs work in resume, rename, hide, compression, supervision and target-log
 commands. Reply/receipt message IDs remain message IDs. A slug for an offline
 session remains unavailable for messaging; resolving one never resumes a saved copy.

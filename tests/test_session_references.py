@@ -21,11 +21,68 @@ class SlugStoreTests(unittest.TestCase):
     def test_duplicate_names_get_distinct_persistent_slugs(self):
         first, second = self.key("one"), self.key("two")
         assigned = self.store.ensure([(first, "Elevate Futures"), (second, "Elevate Futures")])
-        self.assertEqual(set(assigned.values()), {"elevate-futures", "elevate-futures-2"})
+        self.assertEqual(set(assigned.values()), {"Elevate-Futures", "Elevate-Futures-v2"})
         self.assertEqual(
             SlugStore(self.path).ensure([(first, "Changed title")])[first], assigned[first]
         )
         self.assertEqual(self.store.lookup(assigned[second]), second)
+
+    def test_title_defaults_preserve_valid_characters_and_full_length(self):
+        title = "My Project " + "LongTitle" * 10
+        key = self.key("one")
+        self.assertEqual(self.store.ensure([(key, title)])[key], title.replace(" ", "-"))
+
+    def test_later_allocations_get_version_suffixes_without_changing_earlier_ones(self):
+        first, second, third = [self.key(str(index)) for index in range(3)]
+        self.assertEqual(self.store.ensure([(first, "My Project")])[first], "My-Project")
+        self.assertEqual(self.store.ensure([(second, "My Project")])[second], "My-Project-v2")
+        self.assertEqual(self.store.ensure([(third, "My Project")])[third], "My-Project-v3")
+        self.assertEqual(self.store.slug_for(first), "My-Project")
+        self.assertEqual(self.store.slug_for(second), "My-Project-v2")
+        self.assertEqual(self.store.ensure([(first, "A new title")])[first], "My-Project")
+
+    def test_case_insensitive_conflicts_keep_the_new_titles_capitalization(self):
+        first, second = self.key("one"), self.key("two")
+        self.store.ensure([(first, "My Project")])
+        slug = self.store.ensure([(second, "my project")])[second]
+        self.assertEqual(slug, "my-project-v2")
+        self.assertEqual(self.store.lookup("MY-PROJECT-V2"), second)
+
+    def test_existing_legacy_and_custom_assignments_are_not_regenerated(self):
+        first, second = self.key("one"), self.key("two")
+        self.store.set_slug(first, "my-project-2")
+        self.store.set_slug(second, "Custom-Choice")
+        self.assertEqual(
+            self.store.ensure([(first, "My Project"), (second, "My Project")]),
+            {first: "my-project-2", second: "Custom-Choice"},
+        )
+
+    def test_older_lowercase_allocator_sees_retired_title_case_claims(self):
+        import sqlite3
+        from contextlib import closing
+
+        first, second = self.key("one"), self.key("two")
+        self.store.ensure([(first, "My Project")])
+        self.store.set_slug(first, "Different")
+        # 3.12.0 read claim strings without folding them before allocating.
+        with closing(sqlite3.connect(self.path)) as legacy:
+            reserved = {row[0] for row in legacy.execute("SELECT slug FROM claims")}
+            slug, number = "my-project", 1
+            while slug in reserved:
+                number += 1
+                slug = f"my-project-{number}"
+            legacy.execute(
+                "INSERT OR IGNORE INTO claims VALUES (?, ?, ?, ?)",
+                (slug, second.tool, second.session_id, second.home),
+            )
+            legacy.execute(
+                "INSERT INTO sessions VALUES (?, ?, ?, ?)",
+                (second.tool, second.session_id, second.home, slug),
+            )
+            legacy.commit()
+        self.assertEqual(slug, "my-project-2")
+        self.assertIsNone(self.store.lookup("My-Project"))
+        self.assertEqual(self.store.claim_owner(slug), second)
 
     def test_concurrent_allocators_cannot_claim_the_same_slug(self):
         def allocate(index):
@@ -35,7 +92,7 @@ class SlugStoreTests(unittest.TestCase):
         with ThreadPoolExecutor(max_workers=8) as pool:
             result = list(pool.map(allocate, range(24)))
         self.assertEqual(len(set(result)), 24)
-        self.assertIn("same-title", result)
+        self.assertIn("Same-title", result)
 
     def test_same_native_session_has_one_slug_under_concurrent_allocation(self):
         key = self.key("one")
@@ -61,9 +118,9 @@ class SlugStoreTests(unittest.TestCase):
     def test_slug_change_is_independent_and_retired_slug_cannot_target_someone_else(self):
         first, second = self.key("one"), self.key("two")
         self.store.ensure([(first, "Original"), (second, "Other")])
-        self.assertEqual(self.store.set_slug(first, "NEW-SLUG"), "new-slug")
+        self.assertEqual(self.store.set_slug(first, "NEW-SLUG"), "NEW-SLUG")
         self.assertIsNone(self.store.lookup("original"))
-        self.assertEqual(self.store.ensure([(first, "Renamed display")])[first], "new-slug")
+        self.assertEqual(self.store.ensure([(first, "Renamed display")])[first], "NEW-SLUG")
         with self.assertRaises(ValueError):
             self.store.set_slug(second, "original")
         with self.assertRaises(ValueError):
@@ -80,12 +137,11 @@ class SlugStoreTests(unittest.TestCase):
             "trailing-",
             "double--dash",
             "with_underscore",
-            "a" * 65,
             "../escape",
         ):
             with self.subTest(slug=slug), self.assertRaises(ValueError):
                 self.store.set_slug(key, slug)
-        self.assertEqual(self.store.slug_for(key), "original")
+        self.assertEqual(self.store.slug_for(key), "Original")
 
     def test_slug_cannot_hide_an_existing_native_id(self):
         first, second = self.key("reserved-native-id"), self.key("two")
@@ -94,7 +150,7 @@ class SlugStoreTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             self.store.set_slug(second, first.session_id)
 
-    def test_unicode_long_and_empty_titles_have_valid_bounded_slugs(self):
+    def test_unicode_long_and_empty_titles_have_valid_slugs(self):
         import re
 
         titles = ["Café / futures", "界", "", "very long " * 30]
@@ -102,9 +158,8 @@ class SlugStoreTests(unittest.TestCase):
             [(self.key(str(index)), title) for index, title in enumerate(titles)]
         )
         for slug in assigned.values():
-            self.assertLessEqual(len(slug), 64)
-            self.assertIsNotNone(re.fullmatch(r"[a-z0-9]+(?:-[a-z0-9]+)*", slug))
-        self.assertIn("cafe-futures", assigned.values())
+            self.assertIsNotNone(re.fullmatch(r"[A-Za-z0-9]+(?:-[A-Za-z0-9]+)*", slug))
+        self.assertIn("Caf-futures", assigned.values())
 
     def test_unavailable_registry_fails_clearly_without_resetting_it(self):
         bad = SlugStore(self.root)
@@ -185,7 +240,7 @@ class StateSlugTests(unittest.TestCase):
                 "codex", "native", "My title", str(root), 1700000000, 1700000000, "", True, ""
             )
             state.apply([item], check_copies=False)
-            self.assertEqual(item.slug, "my-title")
+            self.assertEqual(item.slug, "My-title")
             from ai_sessions.references import native_key
 
             state.slugs.set_slug(native_key(item.tool, item.session_id), "chosen-slug")

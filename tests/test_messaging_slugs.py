@@ -259,7 +259,7 @@ class MessagingSlugTests(unittest.TestCase):
             patch.object(store, "receivers", return_value=rows),
             patch("ai_sessions.registry.REGISTRY.adapters", return_value=()),
         ):
-            self.assertEqual({r["slug"] for r in cli.reachable()}, {"session", "session-2"})
+            self.assertEqual({r["slug"] for r in cli.reachable()}, {"session", "session-v2"})
 
     def test_status_human_and_json_expose_slugs(self):
         with (
