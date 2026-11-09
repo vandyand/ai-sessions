@@ -6,7 +6,6 @@ import hashlib
 import os
 import re
 import sqlite3
-import unicodedata
 from contextlib import contextmanager
 from dataclasses import dataclass
 from functools import lru_cache
@@ -43,14 +42,12 @@ def native_key(tool: str, session_id: str, home: str | Path | None = None) -> Na
 
 
 def _base_slug(title: str) -> str:
-    plain = unicodedata.normalize("NFKD", title).encode("ascii", "ignore").decode().lower()
-    return re.sub(r"[^a-z0-9]+", "-", plain).strip("-")[:48].rstrip("-") or "session"
+    return re.sub(r"[^A-Za-z0-9]+", "-", title).strip("-") or "session"
 
 
 def _validate_slug(value: str) -> str:
-    value = value.lower()
-    if len(value) > 64 or re.fullmatch(r"[a-z0-9]+(?:-[a-z0-9]+)*", value) is None:
-        raise ValueError("slug must be 1-64 ASCII letters/digits separated by single hyphens")
+    if re.fullmatch(r"[A-Za-z0-9]+(?:-[A-Za-z0-9]+)*", value) is None:
+        raise ValueError("slug must contain ASCII letters/digits separated by single hyphens")
     return value
 
 
@@ -113,7 +110,7 @@ class SlugStore:
     def _claim(connection, key, slug):
         connection.execute(
             "INSERT OR IGNORE INTO claims VALUES (?, ?, ?, ?)",
-            (slug, key.tool, key.session_id, key.home),
+            (slug.casefold(), key.tool, key.session_id, key.home),
         )
         connection.execute(
             "INSERT INTO sessions VALUES (?, ?, ?, ?) "
@@ -132,22 +129,24 @@ class SlugStore:
             connection.execute("BEGIN IMMEDIATE")
             try:
                 assigned = self._assignments(connection)
-                reserved = {row[0] for row in connection.execute("SELECT slug FROM claims")}
+                reserved = {
+                    row[0].casefold() for row in connection.execute("SELECT slug FROM claims")
+                }
                 native_ids = {key.session_id.casefold() for key in assigned.keys() | entries.keys()}
                 next_suffix: dict[str, int] = {}
                 for key in sorted(entries, key=lambda key: (key.tool, key.home, key.session_id)):
                     if key in assigned:
                         continue
                     base = _base_slug(entries[key])
-                    suffix = next_suffix.get(base, 1)
-                    slug = base if suffix == 1 else f"{base}-{suffix}"
-                    while slug in reserved or slug in native_ids:
+                    suffix = next_suffix.get(base.casefold(), 1)
+                    slug = base if suffix == 1 else f"{base}-v{suffix}"
+                    while slug.casefold() in reserved or slug.casefold() in native_ids:
                         suffix += 1
-                        slug = f"{base}-{suffix}"
-                    next_suffix[base] = suffix + 1
+                        slug = f"{base}-v{suffix}"
+                    next_suffix[base.casefold()] = suffix + 1
                     self._claim(connection, key, slug)
                     assigned[key] = slug
-                    reserved.add(slug)
+                    reserved.add(slug.casefold())
                 connection.commit()
             except BaseException:
                 connection.rollback()
@@ -194,7 +193,8 @@ class SlugStore:
                 if owner and NativeKey(*owner) != key:
                     raise ValueError(f"slug {slug!r} is already assigned or reserved")
                 conflicts = connection.execute(
-                    "SELECT tool, session_id, home FROM sessions WHERE lower(session_id)=?", (slug,)
+                    "SELECT tool, session_id, home FROM sessions WHERE lower(session_id)=?",
+                    (slug.casefold(),),
                 ).fetchall()
                 if any(NativeKey(*row) != key for row in conflicts):
                     raise ValueError(f"slug {slug!r} conflicts with a native session ID")
@@ -233,7 +233,7 @@ def guard_reference(
         if expected != home_hash.casefold():
             raise ValueError(f"session slug {token!r} belongs to another harness home")
     current = store.slug_for(owner)
-    if current != token.casefold():
+    if current is None or current.casefold() != token.casefold():
         # A native ID stays valid even if the user once chose it as its own slug.
         if token == owner.session_id and exact == {owner}:
             return None

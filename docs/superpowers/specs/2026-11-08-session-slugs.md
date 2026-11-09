@@ -5,7 +5,7 @@ The user requests a globally unique session slug, separate from its display name
 ## Identity and behavior
 
 - Default (implementation choice): each native copy/fork has its own slug, identified by harness, native ID and canonical harness home. Linked conversation copies do not share a slug.
-- Automatically generate lowercase ASCII kebab-case slugs from the first known display name (bounded to 48 characters). Missing/non-ASCII-only names use `session`. Resolve collisions with numeric suffixes. Allocation occurs once; changing the display name does not change the slug.
+- Generate slugs from the full first known display name, preserving ASCII letters/digits and capitalization and coercing other characters to hyphens. Missing/non-ASCII-only names use `session`. Resolve collisions with `-v2`, `-v3`, and later version suffixes, preserving earlier assignments. Allocation occurs once; changing the display name does not change the slug.
 - `sessions --set-slug ID_OR_SLUG NEW_SLUG` changes a slug independently of the name. Reject invalid, duplicate or native-ID-conflicting slugs. Retired slugs remain reserved so an old script cannot accidentally target a different session later; using a retired slug produces no match.
 - Persist assignments in a small SQLite registry alongside the state file, independent of state.json, with transactionally enforced unique active/reserved slugs. Existing app processes cannot overwrite this registry by saving old state.json. Batch allocation must remain fast and never occur during draw/navigation.
 - Native IDs, qualified native identities and slugs resolve exactly before the legacy unique-title fallback. Ambiguity fails without acting. No fuzzy matching or arbitrary first match.
@@ -22,3 +22,5 @@ The user requests a globally unique session slug, separate from its display name
 ## Validation
 
 Prove persistence, concurrent allocation, duplicate names, names changing, explicit slug changes, reserved retired slugs, ID conflicts, canonical homes and duplicate IDs across harnesses/homes. Test all user-facing reference entry points, ambiguity without side effects, offline messaging refusal and unchanged reply correlation. Run startup/navigation tests and benchmark registry allocation at real catalog scale. Run full unit suite, lint, formatting, Windows/Linux CI and release/install flow.
+
+2026-11-08 correction in 3.12.1: preserve full title/capitalization; custom slugs have the same valid-character rules without an arbitrary length limit. Older assigned slugs remain stable.
