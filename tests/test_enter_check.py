@@ -234,13 +234,16 @@ class OutlivingRefreshTests(unittest.TestCase):
             def wait(self) -> None:
                 seen["waited_after"] = "launched" in seen
 
-        def fake_open_again(selected, _config, launched_state, _others, _dry_run):
+        def fake_open_again(
+            selected, _config, launched_state, _others, _dry_run, *, exact_native=False
+        ):
             probe = threading.Thread(
                 target=lambda: seen.update(free=launched_state.lock.acquire(timeout=0.1))
             )
             probe.start()
             probe.join()
             seen["launched"] = selected is chosen
+            seen["exact_native"] = exact_native
             return 0
 
         with (
@@ -259,6 +262,7 @@ class OutlivingRefreshTests(unittest.TestCase):
         self.assertEqual(seen["launched"], True)
         self.assertEqual(seen["free"], False)
         self.assertTrue(seen["waited_after"])
+        self.assertTrue(seen["exact_native"])
         self.assertFalse(seen["refresh"].cleanup)
 
 

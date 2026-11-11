@@ -1,5 +1,15 @@
 # Changelog
 
+## 3.12.2 — 2026-11-11
+
+### Fixed
+
+- Conversation rows now continue their most recently updated current copy instead
+  of rejecting divergent heads. Other branch histories remain intact.
+- Expanded native-copy selection is carried through the browser-to-launcher
+  handoff, so Enter opens the selected copy rather than resolving its conversation
+  again. This also works when background refresh has not finished.
+
 ## 3.12.1 — 2026-11-08
 
 ### Fixed

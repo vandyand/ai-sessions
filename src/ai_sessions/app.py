@@ -823,12 +823,6 @@ class UserState:
                 f"conversation {conversation_id[:8]} has unavailable newest materialization(s) "
                 f"({labels}); refusing to resume an older generation"
             )
-        if status["conflict"]:
-            labels = ", ".join(key for key, _ in status["heads"])
-            raise BridgeError(
-                f"conversation {conversation_id[:8]} has divergent heads ({labels}); "
-                "choose a branch explicitly before resuming"
-            )
         heads: list[tuple[str, dict[str, Any]]] = status["heads"]
         if not heads:
             return item, item if item.tool == target_tool else None, conversation_id
@@ -836,7 +830,20 @@ class UserState:
         # the requested harness, then the selected row, then a stable key order.
         requested = next((pair for pair in heads if pair[1].get("tool") == target_tool), None)
         selected = next((pair for pair in heads if pair[0] == item.key), None)
-        _, source_member = requested or selected or sorted(heads, key=lambda pair: pair[0])[0]
+        if status["conflict"]:
+            # Separate histories stay separate. Recency selects which one to
+            # continue; it does not merge or discard the other branches.
+            def recency(pair):
+                key, member = pair
+                current = self._sessions_by_key.get(key)
+                updated = (
+                    current.updated if current is not None else float(member.get("updated", 0) or 0)
+                )
+                return updated, key == item.key, key
+
+            _, source_member = max(heads, key=recency)
+        else:
+            _, source_member = requested or selected or sorted(heads, key=lambda pair: pair[0])[0]
         source = self._session_for_member(source_member, item)
         frontier = source_member.get("frontier")
         generation = int(source_member.get("generation", 0))
@@ -1637,9 +1644,7 @@ def _view_row_id(items: tuple[Session, ...], *, kind: str, key: str) -> str:
 
 def _view_representative(items: tuple[Session, ...]) -> Session:
     """Choose from state-provided lineage flags, never from title/path heuristics."""
-    heads = [item for item in items if not item.superseded and not item.diverged]
-    if not heads:
-        heads = [item for item in items if not item.superseded]
+    heads = [item for item in items if not item.superseded]
     if not heads:
         heads = list(items)
     return sorted(heads, key=lambda item: (-item.updated, item.tool, item.session_id))[0]
@@ -1651,16 +1656,10 @@ def blocks_actions(item: Session) -> bool:
 
 
 def _tracked_target(items: tuple[Session, ...]) -> Session | None:
-    """Return a deterministic native representative for a validated head set.
-
-    Equivalent heads are safe to present as one actionable row: UserState still
-    performs the authoritative materialization and target validation at launch
-    time.  Divergence is different and must remain both non-actionable here and
-    refused by UserState.resolve_launch().
-    """
-    if any(item.diverged or blocks_actions(item) for item in items):
+    """Default to the most recently updated current copy, including divergent ones."""
+    if any(blocks_actions(item) for item in items):
         return None
-    heads = tuple(item for item in items if not item.superseded and not item.diverged)
+    heads = tuple(item for item in items if not item.superseded)
     return _view_representative(heads) if heads else None
 
 
@@ -3292,9 +3291,7 @@ def blocked_row_message(row: ViewRow) -> str:
             "but its latest copy cannot be verified. Enter to recover this copy; i for details."
         )
     if row.representative.diverged:
-        return (
-            "Linked copies diverged; their separate changes need review. Press i for copy details."
-        )
+        return "Copies have separate histories. Expand this group to choose a native session."
     return "Expand this group and choose a native session first."
 
 
@@ -3584,6 +3581,7 @@ class Browser:
         self.use_cache = use_cache
         self.refresh = refresh
         self.quick: QuickReread | None = None
+        self.exact_native_selection = False
         self._quick_list: int | None = None
         self._quick_started = False
         # Rows are cached only while the key loop says nothing can have changed them.
@@ -3693,6 +3691,15 @@ class Browser:
         the full refresh instead.
         """
         checked = check_before_open(self.sessions, row.all_members, self.state)
+        if checked and len(row.all_members) > 1 and any(item.diverged for item in row.all_members):
+            # Head validation alone does not refresh cached recency. Before
+            # choosing among separate histories, reread just these copies.
+            fresh = reread_sessions(list(row.all_members), self.state, self.launch_config)
+            if any(item.key not in fresh.fields for item in row.all_members):
+                checked = False
+            else:
+                for item in row.all_members:
+                    item.updated = fresh.fields[item.key]["updated"]
         self.invalidate_rows()
         return checked
 
@@ -5337,6 +5344,10 @@ class Browser:
                     if chosen.cwd and not Path(chosen.cwd).is_dir():
                         chosen = self.confirm_missing(chosen)
                     if chosen:
+                        self.exact_native_selection = (
+                            len(chosen_row.all_members) == 1
+                            and active_launch_tool(chosen) == chosen.tool
+                        )
                         return chosen
             elif key == "\t":
                 self.cycle_tool()
@@ -6157,9 +6168,9 @@ def open_again(
     """Resume ``item`` in this tab, the way it was first opened.
 
     A supervisor goes through its own launch, which gives it its folder and
-    its name, in the harness chosen for it. Only an explicit lifecycle reopen
-    pins the native branch this tab ran. Ordinary resumes and harness switches
-    still resolve the conversation and refuse divergent heads.
+    its name, in the harness chosen for it. Lifecycle reopen and explicit native
+    copy selections pin that branch; conversation defaults continue the latest
+    updated head.
     """
     if not item.supervises:
         return launch(
@@ -6901,9 +6912,10 @@ def _main(argv: list[str] | None = None) -> int:
 
     loaded: list[Session] = sessions
     unfinished: SessionRefresh | None = None
+    exact_native_selection = False
 
     def wrapped(screen: Any) -> Session | None:
-        nonlocal loaded, unfinished
+        nonlocal loaded, unfinished, exact_native_selection
         browser = Browser(
             screen,
             sessions,
@@ -6927,6 +6939,7 @@ def _main(argv: list[str] | None = None) -> int:
         finally:
             loaded = browser.sessions
             unfinished = browser.refresh
+            exact_native_selection = getattr(browser, "exact_native_selection", False)
 
     if launch_config.compress_after_days and not args.dry_run:
         start_background_sweep()
@@ -6940,14 +6953,28 @@ def _main(argv: list[str] | None = None) -> int:
             return 0
         if unfinished is None:
             # Enter on a supervisor row must open it as a supervisor, with its folder and name.
-            return open_again(selected, launch_config, state, loaded, args.dry_run)
+            return open_again(
+                selected,
+                launch_config,
+                state,
+                loaded,
+                args.dry_run,
+                **({"exact_native": True} if exact_native_selection else {}),
+            )
         # Chosen before the refresh finished.  It carries on behind the launch, kept
         # off the shared state until the launch is done with it, and is waited for
         # so the next start in this tab does not race it.
         unfinished.outlive_browser()
         try:
             with state.lock:
-                return open_again(selected, launch_config, state, loaded, args.dry_run)
+                return open_again(
+                    selected,
+                    launch_config,
+                    state,
+                    loaded,
+                    args.dry_run,
+                    **({"exact_native": True} if exact_native_selection else {}),
+                )
         finally:
             unfinished.wait()
     finally:
