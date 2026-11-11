@@ -463,8 +463,8 @@ class ConversationViewTests(unittest.TestCase):
         first.diverged = True
         second.diverged = True
         rows = app.build_view_rows([first, second])
-        self.assertIsNone(rows[0].target)
-        self.assertFalse(rows[0].actionable)
+        self.assertIs(rows[0].target, second)
+        self.assertTrue(rows[0].actionable)
 
     def test_independent_group_is_presentation_only_and_projects_do_not_merge(self) -> None:
         first = self.item("one", title=" Topic ", cwd="/one")

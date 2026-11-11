@@ -54,6 +54,9 @@ tokens:
 - **System feedback:** Cached rows appear first with a visible `refreshing` status; refreshed rows
   retain the prior selection where possible.
 - **Completion and next action:** The open terminal is focused or the selected harness resumes.
+- **Copy selection:** A conversation defaults to its most recently updated current copy.
+  Expanded native-copy selection opens exactly that copy in its own harness. Divergence
+  remains visible but does not block resume or discard other histories.
 - **Recovery / exit:** `Esc` clears search, `Ctrl-R` retries refresh, and `q` exits.
 - **Evidence:** `tests/test_startup.py`, `tests/test_display.py`, and launch tests.
 

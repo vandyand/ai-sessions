@@ -1635,8 +1635,18 @@ class LaunchIntegrationTests(unittest.TestCase):
             state.apply([source, copy])
             copy.launch_tool = "codex"
 
-            with self.assertRaisesRegex(BridgeError, "divergent heads"):
-                prepare_launch(source, state=state)
+            source.updated = copy.updated + 10
+            source.launch_tool = source.tool
+            original_histories = (
+                Path(source.storage).read_bytes(),
+                Path(copy.storage).read_bytes(),
+            )
+            prepared, _ = prepare_launch(source, state=state)
+            self.assertEqual(prepared.key, source.key)
+            self.assertEqual(
+                (Path(source.storage).read_bytes(), Path(copy.storage).read_bytes()),
+                original_histories,
+            )
             self.assertTrue(source.diverged)
             self.assertTrue(copy.diverged)
 

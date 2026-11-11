@@ -575,8 +575,11 @@ class OpenCodeMatrixTests(unittest.TestCase):
         source_row = self.row("codex", source_ref, launch_tool="opencode")
         copy_row = self.row("opencode", copied_ref, launch_tool="codex")
         state.apply([source_row, copy_row])
-        with self.assertRaisesRegex(BridgeError, "divergent heads"):
-            prepare_launch(source_row, state=state, config=self.config)
+        source_row.updated = copy_row.updated + 10
+        source_row.launch_tool = source_row.tool
+        prepared, _ = prepare_launch(source_row, state=state, config=self.config)
+        self.assertEqual(prepared.key, source_row.key)
+        self.assertTrue(copy_row.diverged)
 
     def test_missing_newest_opencode_generation_never_promotes_an_older_session(self) -> None:
         source_ref = self.write_native("codex")

@@ -381,15 +381,17 @@ bookmarks on their transcripts reveal which copy received real work after that f
 New bookmarks retain ordered fingerprints of conversation records as well as a byte position.
 Formatting and instruction-metadata rewrites can therefore relocate the position without
 losing its meaning; edits or missing conversation records still block automatic routing.
-Timestamps are display data only and never decide which history wins.
+Timestamps choose the default copy to continue; they do not merge histories or
+claim that different branches contain equivalent work.
 
-Selecting an older row therefore does not resume an older history. `ai-sessions` follows
-the conversation head, reuses an equivalent copy in the requested harness when one exists,
-or creates a new native session from the head. Historical materializations remain available under
-expansion and in details as `superseded`. The validated current copy is labeled `latest`.
-If two copies advance independently, both are `diverged` and automatic
-resume stops instead of silently choosing one branch. Same-title sessions without recorded lineage
-are `independent thread` or `standalone`; their visual grouping never changes launch routing.
+A conversation row continues its most recently updated current copy. If two copies
+advance independently, both remain labeled `diverged`, but the latest one opens
+without a head-selection blocker. Expand a conversation and select a native copy
+to open exactly that copy in its own harness, including an older branch. Requesting
+a different harness continues to use validated conversation routing and can create
+a new copy of the newest branch. Other histories are preserved. Same-title sessions
+without recorded lineage remain `independent thread` or `standalone`; their visual
+grouping never creates lineage or merges histories.
 
 The CONNECTION column shows `standalone` or `linked`. STATUS separately shows
 `latest`, `superseded`, `diverged`, or a validation problem. Standalone sessions have no copy status.
