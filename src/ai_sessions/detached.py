@@ -77,6 +77,9 @@ def remember(
     path: Path = TERMINALS_FILE,
 ) -> None:
     """Note that this tab now runs ``session``; a session lives in one tab at a time."""
+    from .workspaces.launch import remember_launch
+
+    remember_launch(session, tool)
     terminal = terminal_id() if terminal is None else terminal
     document = {
         key: value

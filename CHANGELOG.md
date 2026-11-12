@@ -1,5 +1,16 @@
 # Changelog
 
+## 3.13.0 — 2026-11-12
+
+### Added
+
+- Saved Windows Terminal workspaces: import a tab's split layout, explicitly bind
+  sessions by slug or ID, and restore it into a new tab after a PC restart.
+- Layout-only cloning creates a separate workspace with empty session assignments
+  for another project. Managed panes remember their last successful session launch.
+- Durable SQLite pane assignments and live-launch leases prevent duplicate managed
+  restores. Existing running sessions are skipped; harness home changes are refused.
+
 ## 3.12.2 — 2026-11-11
 
 ### Fixed

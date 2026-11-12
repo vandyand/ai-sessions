@@ -1,0 +1,21 @@
+# Saved Workspaces Implementation Plan
+
+Goal: save Windows Terminal tab split layouts with durable named pane slots, bind native sessions, restore in new tabs, and clone layouts for other projects. The user approved this design and added layout-only cloning.
+
+Architecture: workspaces/store.py owns transactional durable workspace/layout/bindings and live-launch leases. workspaces/terminal.py imports one saved Terminal tab into sanitized actions and builds wt argv using managed PowerShell startup commands. workspaces/cli.py exposes save/list/show/bind/clone/restore/run. app dispatch and run_harness integrate without changing unrelated launch behavior.
+
+Contracts:
+- WorkspaceStore(path=None): AI_SESSIONS_WORKSPACE_FILE override, otherwise STATE_FILE.with_suffix('.workspaces.sqlite3'). get(name) -> {name,layout:[actions],panes:{slot:binding-or-None},updated}. names() -> list summaries. save(name,layout,replace=False), clone(source,destination), bind(name,slot,binding-or-None,move=False), acquire(name,slot,identity,pid,started)->token, release(token). Errors ValueError subclasses. Binding whitelist: tool,session_id,home,title,cwd,storage. No secrets/commands copied into bindings. Canonical home is part of identity.
+- Layout actions use Terminal action names newTab/splitPane/moveFocus/focusPane. Each newTab/splitPane action has slot='pane-N', cwd, profile(optional), title(optional), split(right/down), size. Ignore original shell commandlines. Reject unsupported structural actions rather than guessing. save picks a specific window/tab from persisted state (picker when ambiguous).
+- terminal.saved_tabs(path=None)->list[{window,tab,title,pane_count,layout}]; terminal.restore_argv(workspace, *, window='0', store_path=None, state_path=None)->list[str]. Native wt argv launches pwsh -NoExit -File bundled launch.ps1 with Workspace,Pane,WorkspaceFile,StateFile,Python parameters. Slots are validated identifiers, argv built as arrays. Managed script sets process-scoped AI_SESSIONS_WORKSPACE and AI_SESSIONS_WORKSPACE_PANE plus explicit workspace/state paths before Python starts; subsequent sessions commands in that shell inherit the slot. No permanent env changes.
+- CLI main(argv)->int handles args after 'workspace'. save NAME [--window-index N --tab-index N --state-file PATH --force] snapshots layout only; optional interactive binding prompts must not guess. bind NAME SLOT REF accepts IDs/slugs using existing lookup, stores exact native identity/home. clone SOURCE DEST clears ALL bindings. restore NAME [--dry-run --window ID --allow-unbound] default new tab, refuses missing bindings unless opted into empty shells. run NAME SLOT [--dry-run] opens exact last native session at latest saved turn, not newest other role's fork. Empty slots print instructions and return to shell. Never auto-stop an already-running session. Registry home mismatch refuses without switching auth.
+- run_harness context in managed slot acquires slot+native-identity lease before spawning, commits last successful binding via remember, releases in finally. Existing non-workspace launches unchanged. Existing runtime WT_SESSION cache stays separate and expiring; workspace bindings do not expire.
+
+Tasks:
+- [x] Parent: store, lease concurrency tests, app dispatch/launch tracking and documentation. Release tracked below.
+- [x] Layout worker: saved-tab parser, sanitized action validation and native argv, bundled PowerShell bootstrap, focused tests.
+- [x] CLI worker: workspace commands using store+terminal contracts, exact resume, live-session refusal, cloning/binding tests.
+- [x] Parent: combined suite/lint, independent review, disposable native Terminal test. Package/release checks tracked below. Do not touch running user panes, edit Terminal settings/state, restart shared daemons or kill processes by name.
+- [ ] Ship through PR/green CI/squash/release/PyPI/local install; update agent reference.
+
+One-time setup is explicit: persisted Terminal layouts here have no per-pane session IDs and all pane titles are PowerShell 7. Geometry can be imported, but session-to-pane assignments must be bound rather than guessed. Current screenshot corresponds to a ten-pane saved tab; do not auto-bind roles from cwd/title alone.

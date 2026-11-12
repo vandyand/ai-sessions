@@ -5733,11 +5733,17 @@ def make_room(session: Session, others: Iterable[Session]) -> bool:
 
     candidates = [item for item in others if item.key != session.key]
     candidates.append(session)
-    detect_open_sessions(candidates)
+    known = detect_open_sessions(candidates)
     here = set(console_pids())
     targets = [item for item in detached_sessions(candidates) if item.open_pid in here]
     if session.is_open and all(item.open_pid != session.open_pid for item in targets):
         targets.append(session)
+    if os.environ.get("AI_SESSIONS_WORKSPACE") and (targets or not known):
+        print(
+            "sessions: workspace launch skipped; a session is running or liveness is unknown.",
+            file=sys.stderr,
+        )
+        return False
     for item in targets:
         title = display_title(item)
         detached = is_detached(item.open_pid)
@@ -5768,6 +5774,17 @@ def make_room(session: Session, others: Iterable[Session]) -> bool:
 
 
 def run_harness(session: Session, command: list[str]) -> int:
+    from .workspaces.launch import launch_slot
+
+    try:
+        with launch_slot(session, active_launch_tool(session)):
+            return _run_harness(session, command)
+    except ValueError as error:
+        print(f"sessions: {error}", file=sys.stderr)
+        return 2
+
+
+def _run_harness(session: Session, command: list[str]) -> int:
     """Run the harness here and remember that this tab runs ``session``.
 
     A harness that declares ``contain_launch`` runs inside a kill-on-close
@@ -6433,6 +6450,12 @@ def build_parser() -> argparse.ArgumentParser:
               sessions reply <message-id> --message "Received"
               sesres  (shorthand for sessions --restart)
 
+            Workspaces:
+              sessions workspace save my-project
+              sessions workspace bind my-project pane-0 <session-slug-or-id>
+              sessions workspace restore my-project
+              sessions workspace clone my-project another-project
+
             Search examples:
               sessions --list --tool codex
               sessions --list --origin cross
@@ -6636,6 +6659,10 @@ def _main(argv: list[str] | None = None) -> int:
                     reconfigure(encoding="utf-8", errors="replace")
                 except (OSError, ValueError):
                     pass
+    if raw and raw[0] == "workspace":
+        from .workspaces.cli import main as workspace_main
+
+        return workspace_main(raw[1:])
     if raw and raw[0] in ("send", "reply", "messaging"):
         from .messaging.cli import main as messaging_main
 
