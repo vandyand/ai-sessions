@@ -81,13 +81,14 @@ def remember(
 
     remember_launch(session, tool)
     terminal = terminal_id() if terminal is None else terminal
+    native_id = session.launch_target(tool) or session.session_id
+    home = str(REGISTRY.get(tool).home) if tool in REGISTRY else ""
     document = {
-        key: value
-        for key, value in _read(path).items()
-        if value.get("session_id") != session.session_id
+        key: value for key, value in _read(path).items() if value.get("session_id") != native_id
     }
     document[terminal or f"pid:{pid}"] = {
-        "session_id": session.session_id,
+        "session_id": native_id,
+        "home": home,
         "tool": tool,
         "title": session.title,
         "cwd": session.cwd,

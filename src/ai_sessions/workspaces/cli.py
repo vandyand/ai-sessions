@@ -24,6 +24,9 @@ def _parser():
     save.add_argument("--tab-index", type=int)
     save.add_argument("--state-file", type=Path)
     save.add_argument("--force", action="store_true")
+    save.add_argument(
+        "--yes", action="store_true", help="save the preview without a final confirmation"
+    )
     listing = commands.add_parser("list")
     listing.add_argument("--json", action="store_true")
     show = commands.add_parser("show")
@@ -61,6 +64,44 @@ def _instruction(name, slot):
 
 
 def _save(args, store):
+    if args.state_file is None and args.window_index is None and args.tab_index is None:
+        from .. import app
+        from ..capabilities import Unsupported
+        from ..detached import TERMINALS_FILE, _read
+        from .capture import current_tab, terminal_key
+        from .setup import configure
+
+        snapshot = current_tab()
+        state = _state()
+        items = app.load_session_catalog(state=state)
+        if not items:
+            items = app.load_sessions(state=state)
+        remembered = {}
+        for key, entry in _read(TERMINALS_FILE).items():
+            saved = dict(entry)
+            # Older launchers did not record the harness home. Recover it
+            # only if the exact native ID resolves in the current home.
+            if not saved.get("home"):
+                try:
+                    adapter = app.REGISTRY.get(saved["tool"])
+                    hook = adapter.resolve
+                    ref = None if isinstance(hook, Unsupported) else hook(saved["session_id"])
+                    if ref is not None and ref.session_id == saved["session_id"] and adapter.home:
+                        saved["home"] = str(adapter.home)
+                except (ValueError, KeyError, OSError):
+                    pass
+            remembered[terminal_key(key)] = saved
+        configure(
+            args.name,
+            snapshot,
+            items,
+            remembered,
+            state,
+            store,
+            replace=args.force,
+            auto_confirm=args.yes,
+        )
+        return
     tabs = [
         tab
         for tab in terminal.saved_tabs(args.state_file)
@@ -156,10 +197,25 @@ def _run(args, store):
     workspace = store.get(args.name)
     if args.slot not in workspace["panes"]:
         raise ValueError(f"unknown workspace slot {args.slot!r}")
+    if not args.dry_run and os.environ.get("WT_SESSION"):
+        store.register_terminal(args.name, args.slot, os.environ["WT_SESSION"])
     binding = workspace["panes"][args.slot]
     if binding is None:
-        print(_instruction(args.name, args.slot))
-        return 0
+        if args.dry_run or not sys.stdin.isatty():
+            print(_instruction(args.name, args.slot))
+            return 0
+        from .setup import _binding, choose_session
+
+        print(f"Choose the session for this pane of workspace {args.name}.")
+        picker_state = _state()
+        items = app.load_session_catalog(state=picker_state)
+        if not items:
+            items = app.load_sessions(state=picker_state)
+        chosen = choose_session(items)
+        if chosen is None:
+            print("Leaving this pane as an empty shell.")
+            return 0
+        binding = _binding(chosen)
     adapter = app.REGISTRY.get(binding["tool"])
     if not adapter.home:
         raise ValueError("active harness does not expose its home; workspace run refused")
@@ -241,10 +297,8 @@ def main(argv=None):
         elif args.command == "restore":
             workspace = store.get(args.name)
             missing = [slot for slot, binding in workspace["panes"].items() if binding is None]
-            if missing and not args.allow_unbound:
-                raise ValueError(
-                    "unbound slots: " + ", ".join(missing) + "; bind them or use --allow-unbound"
-                )
+            if missing and not args.dry_run:
+                print("Unassigned panes will ask you to choose a session when they open.")
             command = terminal.restore_argv(
                 workspace,
                 window=args.window,

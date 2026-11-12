@@ -1,102 +1,142 @@
 # Saved terminal workspaces
 
-Updated November 12, 2026.
+Updated November 12, 2026. Version 3.14.0 replaces the manual setup in 3.13.0.
 
-Use a workspace to save a Windows Terminal tab's pane arrangement and the exact
-native session assigned to each pane. Restore opens a new tab; cloning copies the
-arrangement with empty session slots for another project. These commands do not
-grant permission to stop other sessions or change credentials.
+Use a workspace to save a Windows Terminal tab's pane arrangement and its agent
+sessions, restore it after a restart, or reuse its arrangement for another
+project. This guide does not authorize stopping other sessions or changing
+credentials.
 
-## Save and bind once
+## Save the tab you are using
 
-Windows Terminal must have **Settings → Startup → When Terminal starts → Open
-windows from a previous session** enabled. `workspace save` reads Terminal's
-persisted layout, which can lag the arrangement currently visible on screen.
-It never changes Terminal settings or its saved-state file.
+Run this **inside any pane of the tab you want saved**, in PowerShell:
 
 ```powershell
 sessions workspace save elevate
-sessions workspace show elevate
-sessions workspace bind elevate pane-0 manager-session-slug
-sessions workspace bind elevate pane-1 worker-session-slug
 ```
 
-When several saved tabs exist, save shows a numbered picker. For scripts, use
-`--window-index 0 --tab-index 5` to select explicitly. Indices are zero-based and
-can change as Terminal tabs change. `--state-file PATH` on **save** selects a
-Terminal saved-state input file, not ai-sessions' own state file.
+`elevate` is the workspace name you choose. The command captures the actual live
+tab, automatically assigns sessions it can identify, and shows a small spatial
+preview. Confirm the preview to save it. If a pane cannot be identified, the
+preview tells you its position and offers a searchable session picker. Type part
+of its title, a slug or an ID, then choose the result. Choose `empty` for a shell
+without an agent, or `cancel` to leave the saved workspace untouched.
 
-Save prints each pane's slot, split information, and working directory. Slots
-are numbered in pane-creation order, starting at `pane-0`; this may differ from
-screen reading order. Bind IDs, harness-qualified IDs, or unique session slugs.
-Titles alone are not unique references. Assign a native session only once per
-workspace; `bind ... --move` explicitly moves an existing assignment.
+You do not need to know tab indices or pane numbers for this flow. Saving does
+not open a duplicate tab, restart the agents, or send them messages. Existing
+captured panes are registered so later launches through the updated `sessions`
+CLI can update their assignments too; a child cannot change its parent shell's
+environment. Already-running launchers from older versions keep their old code.
 
-Existing layouts on this PC do not record the agent session in each pane, so
-the initial assignments must be explicit. Directory and title are not reliable
-enough to infer them. An existing workspace is protected from accidental
-overwrite; `save NAME --force` replaces its geometry and clears its bindings.
-
-## Restore after a restart
+For a noninteractive shell command where every pane is identifiable:
 
 ```powershell
-sessions workspace restore elevate --dry-run
+sessions workspace save elevate --yes
+```
+
+`--yes` skips final confirmation; unidentified panes still require explicit
+selection. It never guesses their assignments. To replace an existing saved
+workspace use `--force`; replacing one with active managed launch leases is
+refused. Use a new name while those agents are running.
+
+## Restore after a PC restart
+
+```powershell
 sessions workspace restore elevate
 ```
 
-Restore opens a new tab in the current or most recently active Terminal window.
-Use `--window -1` for a separate new window. It starts PowerShell in each pane,
-then resumes that slot's last successfully launched native session at its latest
-saved turn. It preserves the chosen session's role, including supervisors,
-rather than selecting a newer fork belonging to a different role.
+This opens a new tab with the saved arrangement and resumes each assigned native
+session at its latest saved turn. An empty assignment opens a searchable picker
+in that pane. Pick its session there, or choose `empty` to leave an ordinary shell.
+Successful launches are remembered automatically.
 
-Already-running sessions are skipped, leaving that pane at a shell prompt.
-Concurrent managed restores cannot launch the same slot or native session twice.
-Bindings include the harness home; a different active home is refused rather
-than silently switching accounts. No authentication tokens are copied.
+A running session is skipped and left alone. Restore does not move an active
+agent to another terminal or restart it. After quitting that agent normally,
+restore again to resume it in the saved layout. Native session identity and
+supervisor role are preserved, rather than picking a different fork with a newer
+turn. Account/home mismatches are refused instead of switching credentials.
 
-Every later `sessions` launch from one of these managed shells updates that
-slot's saved assignment after the native process starts successfully. Closing
-the agent leaves the shell usable. Bindings survive a restart and have no
-seven-day expiry. This restores saved conversations, not in-flight tool calls
-or unsaved terminal scrollback.
+```powershell
+sessions workspace restore elevate --dry-run
+sessions workspace restore elevate --window -1
+sessions workspace list
+sessions workspace show elevate
+```
 
-## Reuse the arrangement for another project
+`--dry-run` prints the launch arguments. `--window -1` opens a separate window;
+the default opens a tab in the current or most recently active Terminal window.
+PowerShell remains usable after an agent exits. This resumes conversations, not
+in-flight tool calls, unsaved terminal scrollback, or an entire running process.
+
+## Reuse the layout for another project
 
 ```powershell
 sessions workspace clone elevate another-project
-sessions workspace bind another-project pane-0 another-manager-slug
-sessions workspace bind another-project pane-1 another-worker-slug
 sessions workspace restore another-project
-sessions workspace list
 ```
 
-The original workspace keeps its assignments; the clone starts with every slot
-empty. Unbound panes block normal restore so a forgotten binding is visible.
-Use `restore NAME --allow-unbound` to open those slots as shells. Inside one,
-launch a session with `sessions` to save its assignment automatically, or bind
-it explicitly from any shell. Cloning retains the old layout's starting
-directories; a bound agent launches in its saved session's working directory.
+The clone has the same split arrangement and no session assignments. Its panes
+open with pickers: choose the other project's manager, workers or supervisor in
+the positions where you want them. Subsequent restore uses those assignments;
+the original workspace keeps its own sessions. Cloning retains shell starting
+directories; a chosen agent launches in its own saved session directory.
 
-## Storage and troubleshooting
+## How automatic assignment works
 
-Workspace metadata lives beside ai-sessions' state as `state.workspaces.sqlite3`.
-`AI_SESSIONS_WORKSPACE_FILE` overrides it; `AI_SESSIONS_STATE_FILE` selects the
-ordinary app state. Terminal startup commands pass these paths explicitly so
-subsequent pane launches use the same files. The managed PowerShell shell has
-process-scoped `AI_SESSIONS_WORKSPACE` and `AI_SESSIONS_WORKSPACE_PANE` values;
-no permanent Windows environment variables are changed.
+Live capture uses Windows console APIs and UI Automation. A separate helper
+briefly labels verified console clients with unique temporary titles. Pane bounds
+and those exact markers connect each visible pane to its recorded native session.
+Original titles are restored afterward, including capture failures. If an agent
+changes its title during capture, capture may need a retry. No conversation text,
+terminal buffer, screenshots, keystrokes, credentials or authentication files are
+read by this mechanism. Other tabs are excluded from the saved snapshot.
 
-If a slot is wrong, run `workspace show NAME`, then bind the correct native ID or
-slug. If an old session is unavailable, bind an existing session. If save reports
-an unsupported Terminal action, it refuses to guess the geometry. Only split
-layouts with supported focus actions are imported; original shell command lines
-are discarded and never replayed.
+Sessions launched through `sessions` have native identities recorded against
+Terminal's per-pane `WT_SESSION` value. Legacy records lacking a harness home are
+used only if the exact native session resolves in the active home. Sessions
+launched directly with a harness, missing runtime records, and panes that expose
+no identity may need a one-time picker selection. A title or shared directory is
+never sufficient evidence for automatic assignment.
 
-Windows Terminal 1.24.12741.0 and PowerShell 7 were used for the November 12 native
-test: two managed panes, split and focus actions, correct slot environment,
-shell survival after startup exit, and punctuation-bearing paths. Automated
-tests cover cloning, explicit binding, exact-native resume, home mismatch,
-supervisor metadata, live-session refusal, and durable launch tracking.
+## Storage and explicit controls
 
-For messaging between the restored sessions, see [SESSION_MESSAGING.md](SESSION_MESSAGING.md).
+Workspace geometry, assignments and existing-pane registrations live beside
+ai-sessions' state as `state.workspaces.sqlite3`. `AI_SESSIONS_WORKSPACE_FILE`
+overrides that path; `AI_SESSIONS_STATE_FILE` selects ordinary app state. Bindings
+have no seven-day expiry. SQLite launch leases prevent two managed launches from
+opening the same native session or pane simultaneously.
+
+For scripts, manual binding remains available:
+
+```powershell
+sessions workspace bind elevate pane-0 SESSION_SLUG_OR_ID
+```
+
+IDs, harness-qualified IDs and unique slugs work. `--move` explicitly moves an
+assignment already used in another slot of the same workspace. The old
+`restore --allow-unbound` flag remains accepted; it is no longer required.
+
+The older persisted-state importer remains available explicitly:
+
+```powershell
+sessions workspace save imported-layout --window-index 0 --tab-index 5
+sessions workspace save imported-layout --state-file C:\path\terminal-state.json
+```
+
+Those flags import saved geometry only; they do not identify the current tab or
+assign agents. The `--state-file` flag here selects Terminal's input, not the
+ai-sessions state. Terminal's saved geometry may lag the screen. Normal live save
+needs no Terminal settings change, never edits Terminal settings/state, and never
+replays original shell command lines.
+
+## Verified behavior
+
+On November 12, Windows Terminal 1.24.12741.0 and PowerShell 7 passed disposable
+native tests: cross-process identity markers, live bounds/splits, automatic
+assignment of both tracked panes, exclusion of an unrelated tab, restoration of
+original titles, atomic save and empty layout cloning. Paths included spaces,
+apostrophes and semicolons. Automated tests cover cancellation, unknown-pane
+selection, bounded narrow maps, profile/home refusal, exact-native and supervisor
+resume, durable existing-pane tracking, and duplicate managed launch guards.
+
+For messaging between sessions, see [SESSION_MESSAGING.md](SESSION_MESSAGING.md).

@@ -121,20 +121,54 @@ class WorkspaceCliTests(unittest.TestCase):
 
     def test_empty_slot_prints_binding_instruction(self):
         self.workspace["panes"]["pane-1"] = None
-        self.assertEqual(self.main("run", "desk", "pane-1"), 0)
+        with patch.object(cli.sys.stdin, "isatty", return_value=False):
+            self.assertEqual(self.main("run", "desk", "pane-1"), 0)
         self.assertIn("workspace bind desk pane-1", self.output.getvalue())
         self.open.assert_not_called()
 
     def test_dry_run_does_not_decompress(self):
-        self.assertEqual(self.main("run", "desk", "pane-1", "--dry-run"), 0)
+        with patch.dict(os.environ, {"WT_SESSION": "existing-pane"}):
+            self.assertEqual(self.main("run", "desk", "pane-1", "--dry-run"), 0)
         self.restore.assert_not_called()
+        self.store.register_terminal.assert_not_called()
         self.assertTrue(self.open.call_args.kwargs["dry_run"])
 
-    def test_restore_requires_bindings(self):
+    def test_restore_opens_unbound_panes_for_guided_selection(self):
         self.workspace["panes"]["pane-1"] = None
-        with patch.object(cli.subprocess, "Popen") as popen:
-            self.assertEqual(self.main("restore", "desk"), 2)
-            popen.assert_not_called()
+        with (
+            patch.object(cli.subprocess, "Popen") as popen,
+            patch.object(cli.terminal, "restore_argv", return_value=["wt"]),
+        ):
+            self.assertEqual(self.main("restore", "desk"), 0)
+            popen.assert_called_once()
+
+    def test_default_save_captures_this_tab_instead_of_asking_for_a_tab_index(self):
+        snapshot = dict(
+            layout=self.workspace["layout"],
+            panes={"pane-1": dict(terminal="abc", x=0, y=0, width=100, height=100)},
+        )
+        with (
+            patch("ai_sessions.workspaces.capture.current_tab", return_value=snapshot) as capture,
+            patch("ai_sessions.workspaces.setup.configure") as configure,
+            patch("ai_sessions.app.load_session_catalog", return_value=[]),
+            patch("ai_sessions.app.load_sessions", return_value=[]),
+            patch("ai_sessions.detached._read", return_value={}),
+        ):
+            self.assertEqual(self.main("save", "desk"), 0)
+            capture.assert_called_once()
+            self.assertEqual(configure.call_args.args[1], snapshot)
+
+    def test_empty_interactive_pane_offers_picker_and_opens_selected_session(self):
+        self.workspace["panes"]["pane-1"] = None
+        item = Session("fake", "original", "Worker", self.home, 0, 0, "", True, "native.jsonl")
+        with (
+            patch.object(cli.sys.stdin, "isatty", return_value=True),
+            patch("ai_sessions.app.load_session_catalog", return_value=[item]),
+            patch("ai_sessions.workspaces.setup.choose_session", return_value=item) as choose,
+        ):
+            self.assertEqual(self.main("run", "desk", "pane-1"), 0)
+            choose.assert_called_once()
+            self.assertEqual(self.open.call_args.args[0].session_id, "original")
 
     def test_restore_argv_array_and_dry_run(self):
         with (
@@ -232,7 +266,7 @@ class WorkspaceCliTests(unittest.TestCase):
             patch.object(cli.terminal, "saved_tabs", return_value=tabs),
             patch.object(cli.sys.stdin, "isatty", return_value=False),
         ):
-            self.assertEqual(self.main("save", "desk"), 2)
+            self.assertEqual(self.main("save", "desk", "--state-file", "terminal-state.json"), 2)
             self.store.save.assert_not_called()
 
     def test_save_picker_geometry_and_no_bind_guess(self):
@@ -245,7 +279,9 @@ class WorkspaceCliTests(unittest.TestCase):
             patch.object(cli.sys.stdin, "isatty", return_value=True),
             patch("builtins.input", return_value="2"),
         ):
-            self.assertEqual(self.main("save", "desk", "--force"), 0)
+            self.assertEqual(
+                self.main("save", "desk", "--state-file", "terminal-state.json", "--force"), 0
+            )
             self.store.save.assert_called_once_with("desk", tabs[1]["layout"], replace=True)
             self.store.bind.assert_not_called()
             self.assertIn("pane-1", self.output.getvalue())

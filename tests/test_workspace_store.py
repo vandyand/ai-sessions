@@ -11,6 +11,15 @@ from ai_sessions.workspaces.store import WorkspaceStore
 
 
 class WorkspaceStoreTests(unittest.TestCase):
+    def test_snapshot_is_atomic_and_remembers_existing_terminal(self):
+        with self.assertRaises(ValueError):
+            self.store.save_snapshot("invalid", self.layout, {"missing": self.binding}, {})
+        with self.assertRaises(ValueError):
+            self.store.get("invalid")
+        self.store.save_snapshot("live", self.layout, {"pane-1": self.binding}, {"pane-1": "{ABC}"})
+        self.assertEqual(self.store.terminal_slot("abc"), ("live", "pane-1"))
+        self.assertEqual(self.store.get("live")["panes"]["pane-1"]["session_id"], "id-1")
+
     def setUp(self):
         self.temp = tempfile.TemporaryDirectory()
         self.addCleanup(self.temp.cleanup)

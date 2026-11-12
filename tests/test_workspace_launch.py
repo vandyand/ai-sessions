@@ -11,6 +11,53 @@ from ai_sessions.workspaces.store import WorkspaceStore
 
 
 class WorkspaceLaunchTests(unittest.TestCase):
+    def test_resaved_terminal_assignment_overrides_inherited_workspace_name(self):
+        from ai_sessions.workspaces.launch import pane_assignment
+
+        with tempfile.TemporaryDirectory() as temp:
+            store = WorkspaceStore(Path(temp) / "workspaces.sqlite3")
+            store.save("old", [{"action": "newTab", "slot": "pane-0"}])
+            store.save_snapshot(
+                "new", [{"action": "newTab", "slot": "pane-0"}], {}, {"pane-0": "abc"}
+            )
+            with patch.dict(
+                os.environ,
+                {
+                    "AI_SESSIONS_WORKSPACE": "old",
+                    "AI_SESSIONS_WORKSPACE_PANE": "pane-0",
+                    "AI_SESSIONS_WORKSPACE_FILE": str(store.path),
+                    "WT_SESSION": "abc",
+                },
+            ):
+                self.assertEqual(pane_assignment()[1:], ("new", "pane-0"))
+
+    def test_saved_existing_pane_tracks_without_parent_shell_environment(self):
+        with tempfile.TemporaryDirectory() as temp:
+            store = WorkspaceStore(Path(temp) / "workspaces.sqlite3")
+            store.save_snapshot(
+                "desk", [{"action": "newTab", "slot": "pane-0"}], {}, {"pane-0": "abc"}
+            )
+            item = SimpleNamespace(
+                tool="test",
+                session_id="next",
+                title="Next",
+                cwd=temp,
+                storage="next.jsonl",
+                launch_target=lambda tool: "next",
+            )
+            with (
+                patch.dict(
+                    os.environ,
+                    {"WT_SESSION": "{ABC}", "AI_SESSIONS_WORKSPACE_FILE": str(store.path)},
+                    clear=True,
+                ),
+                patch("ai_sessions.workspaces.launch.REGISTRY") as registry,
+            ):
+                registry.get.return_value.home = Path(temp)
+                with launch_slot(item, "test"):
+                    remember_launch(item, "test")
+            self.assertEqual(store.get("desk")["panes"]["pane-0"]["session_id"], "next")
+
     def test_cross_harness_binding_uses_target_storage(self):
         from ai_sessions.model import NativeRef
         from ai_sessions.workspaces.launch import _binding

@@ -1,5 +1,19 @@
 # Changelog
 
+## 3.14.0 — 2026-11-12
+
+### Added
+
+- `workspace save NAME` now captures the live tab where it runs, automatically
+  assigning sessions tracked by ai-sessions. Temporary console identity markers
+  identify panes without reading terminal conversations or typing into agents.
+- A spatial preview and searchable session picker handle unidentified panes;
+  setup saves layout and bindings atomically after confirmation. `--yes` skips
+  final confirmation for an already identified layout.
+- Restoring a layout-only clone opens a session picker in each unassigned pane.
+  Existing captured panes can track later launches through a durable pane map.
+- Explicit window/tab indices and `--state-file` retain saved-state import mode.
+
 ## 3.13.0 — 2026-11-12
 
 ### Added

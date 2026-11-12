@@ -162,3 +162,20 @@ session and its subagents as one unit so that reopening a parent also protects i
 session's `storage` is the `.zst`, and `Availability.COMPRESSED` keeps it distinct from a missing
 file, so a compressed copy can never be mistaken for no copy and bridged again. Requirements are in
 `openspec/specs/session-compression/spec.md`.
+
+### Save And Reuse A Terminal Workspace
+
+- **Entry:** Run `sessions workspace save NAME` in the desired Terminal tab.
+- **Feedback:** Capture the live pane geometry; show a spatial map with names of
+  positively identified sessions. Do not make the user choose a tab index or
+  infer pane creation order for the normal flow.
+- **Decisions:** Automatically bind exact native sessions from verified pane
+  identities. For missing identities, offer a bounded searchable picker with an
+  explicit empty-shell choice. Titles alone never establish native identity.
+- **Completion:** Confirm one preview, then save geometry, assignments and pane
+  registrations in one transaction. Show the restore command.
+- **Cloning:** Copy geometry with empty bindings; restore opens session selection
+  inside each pane. Later successful launches remember those assignments.
+- **Recovery:** Cancel leaves the store intact; capture errors restore temporary
+  titles and never substitute an unrelated saved tab. Existing running agents
+  are not stopped or sent input during capture or restore.
