@@ -1,6 +1,6 @@
 # Saved terminal workspaces
 
-Updated November 12, 2026. Version 3.14.0 replaces the manual setup in 3.13.0.
+Updated November 12, 2026. Version 3.14.1 fixes missed live pane identities and the fallback picker; 3.14.0 replaced manual setup in 3.13.0.
 
 Use a workspace to save a Windows Terminal tab's pane arrangement and its agent
 sessions, restore it after a restart, or reuse its arrangement for another
@@ -18,7 +18,9 @@ sessions workspace save elevate
 `elevate` is the workspace name you choose. The command captures the actual live
 tab, automatically assigns sessions it can identify, and shows a small spatial
 preview. Confirm the preview to save it. If a pane cannot be identified, the
-preview tells you its position and offers a searchable session picker. Type part
+preview labels it **unidentified**, tells you its position and offers a searchable
+session picker. It is never assumed empty. Large histories show a search prompt
+without an unrelated initial list. Type part
 of its title, a slug or an ID, then choose the result. Choose `empty` for a shell
 without an agent, or `cancel` to leave the saved workspace untouched.
 
@@ -84,10 +86,12 @@ directories; a chosen agent launches in its own saved session directory.
 ## How automatic assignment works
 
 Live capture uses Windows console APIs and UI Automation. A separate helper
-briefly labels verified console clients with unique temporary titles. Pane bounds
+briefly refreshes unique temporary console-title markers while collecting multiple
+samples. Exact matches are accumulated against stable UIA pane identities. Pane bounds
 and those exact markers connect each visible pane to its recorded native session.
-Original titles are restored afterward, including capture failures. If an agent
-changes its title during capture, capture may need a retry. No conversation text,
+Original or newer application titles are preserved afterward, including capture
+failures. Active agent title updates no longer silently erase a one-shot identity
+read. Unregistered or otherwise unverifiable panes remain explicitly unidentified. No conversation text,
 terminal buffer, screenshots, keystrokes, credentials or authentication files are
 read by this mechanism. Other tabs are excluded from the saved snapshot.
 
@@ -140,3 +144,9 @@ selection, bounded narrow maps, profile/home refusal, exact-native and superviso
 resume, durable existing-pane tracking, and duplicate managed launch guards.
 
 For messaging between sessions, see [SESSION_MESSAGING.md](SESSION_MESSAGING.md).
+
+The November 12 follow-up reproduced lost identities in the real multi-pane tab:
+all console marks were set, but several were overwritten before the one-shot UIA
+read. Refreshing markers and collecting stable-pane samples recovered the missing
+known agents. A disposable native test also passed with both applications changing
+their titles every 10 ms. Missing identity is still distinct from an empty shell.

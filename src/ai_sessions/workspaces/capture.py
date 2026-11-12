@@ -78,6 +78,31 @@ def layout_from_panes(panes, *, current=""):
     return {"layout": actions, "panes": slots}
 
 
+def _pulse(kernel, changed, alternate):
+    """Keep identities observable while applications update their own titles."""
+    import ctypes
+
+    import psutil
+
+    for index, (item, old) in enumerate(changed):
+        try:
+            if abs(psutil.Process(item["pid"]).create_time() - item["started"]) >= 0.01:
+                continue
+            kernel.FreeConsole()
+            if not kernel.AttachConsole(item["pid"]):
+                continue
+            current = ctypes.create_unicode_buffer(32768)
+            kernel.GetConsoleTitleW(current, len(current))
+            if current.value not in (item["marker"], item["marker"] + "~"):
+                changed[index] = (item, current.value)
+            # Alternate exact tokens so ConPTY emits a title-change event even
+            # when its cached console title differs from the live UIA title.
+            kernel.SetConsoleTitleW(item["marker"] + ("~" if alternate else ""))
+        except psutil.Error:
+            continue
+    kernel.FreeConsole()
+
+
 def _marker_main():
     """Isolated helper: attach only to verified clients and restore titles on EOF."""
     import ctypes
@@ -105,8 +130,19 @@ def _marker_main():
                 continue
         kernel.FreeConsole()
         print(json.dumps([i[0]["marker"] for i in changed]), flush=True)
-        # Parent closes the pipe in finally, including on UIA timeout/failure.
-        sys.stdin.readline()
+        finished = threading.Event()
+
+        def wait_for_parent():
+            try:
+                sys.stdin.readline()
+            finally:
+                finished.set()
+
+        threading.Thread(target=wait_for_parent, daemon=True).start()
+        alternate = False
+        while not finished.wait(0.04):
+            alternate = not alternate
+            _pulse(kernel, changed, alternate)
     finally:
         for item, old in reversed(changed):
             try:
@@ -116,7 +152,7 @@ def _marker_main():
                 if kernel.AttachConsole(item["pid"]):
                     title = ctypes.create_unicode_buffer(32768)
                     kernel.GetConsoleTitleW(title, len(title))
-                    if title.value == item["marker"]:
+                    if title.value in (item["marker"], item["marker"] + "~"):
                         kernel.SetConsoleTitleW(old)
             except psutil.Error:
                 continue
@@ -234,7 +270,9 @@ def current_tab():
     own_marker = targets[list(by_terminal).index(caller)]["marker"]
     with _marked(targets):
         controls = _read_controls(prefix, own_marker)
-    panes = [{**p, "terminal": markers.get(p.get("marker"), "")} for p in controls]
+    panes = [
+        {**p, "terminal": markers.get(p.get("marker", "").removesuffix("~"), "")} for p in controls
+    ]
     return layout_from_panes(panes, current=caller)
 
 

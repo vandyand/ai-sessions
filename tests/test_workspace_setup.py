@@ -1,6 +1,7 @@
 import contextlib
 import io
 import unittest
+from dataclasses import replace
 from types import SimpleNamespace
 from unittest.mock import Mock, patch
 
@@ -15,6 +16,63 @@ def session(ident="one", title="Alpha"):
 
 
 class SetupTests(unittest.TestCase):
+    def test_splitter_gaps_do_not_expand_into_fake_rows(self):
+        panes = {
+            "pane-0": dict(x=0, y=0, width=300, height=300),
+            "pane-1": dict(x=304, y=0, width=300, height=148),
+            "pane-2": dict(x=304, y=152, width=300, height=148),
+        }
+        output = io.StringIO()
+        with contextlib.redirect_stdout(output):
+            setup._map(panes, {})
+        drawing = [line for line in output.getvalue().splitlines() if line.startswith(("+", "|"))]
+        self.assertEqual(len(drawing), 5)
+        self.assertNotIn("pane-", "\n".join(drawing))
+
+    def test_large_history_starts_with_search_only(self):
+        items = [session(str(i), "Unrelated history " + str(i)) for i in range(6726)]
+        output = io.StringIO()
+
+        def answer(prompt):
+            self.assertIn("search", prompt.lower())
+            self.assertIn("6726", output.getvalue())
+            self.assertNotIn("Unrelated history", output.getvalue())
+            return "cancel"
+
+        with contextlib.redirect_stdout(output), self.assertRaises(ValueError):
+            setup.choose_session(items, input_fn=answer)
+
+    def test_searched_matches_prioritize_running_then_recent(self):
+        old = session("old", "Project old")
+        recent = replace(session("recent", "Project recent"), updated=100)
+        running = replace(session("running", "Project running"), is_open=True)
+        selected, output = self.pick([old, recent, running], ["Project", "1"])
+        self.assertIs(selected, running)
+        searched = output.split("3. Project running", 1)[1]
+        self.assertLess(searched.index("Project running"), searched.index("Project recent"))
+        self.assertLess(searched.index("Project recent"), searched.index("Project old"))
+
+    def test_unknown_and_explicit_empty_have_distinct_legends(self):
+        _, output, _ = self.configure(["empty", "empty", "yes"])
+        before, after = output.split("Workspace demo preview:")
+        self.assertIn("unidentified", before.lower())
+        self.assertNotIn("empty shell", before.lower())
+        self.assertIn("could not identify", before.lower())
+        self.assertIn("cancel", before.lower())
+        self.assertIn("explicitly empty", after.lower())
+
+    def test_map_uses_slots_only_and_full_legend(self):
+        panes = {str(i): dict(x=i % 3, y=i // 3, width=1, height=1) for i in range(12)}
+        title = "A full session title that belongs in the legend"
+        output = io.StringIO()
+        with contextlib.redirect_stdout(output):
+            setup._map(panes, {"0": dict(title=title, tool="sample", session_id="one")})
+        drawing, legend = output.getvalue().split("0 (", 1)
+        self.assertNotIn("A full", drawing)
+        self.assertNotIn("unassigned", drawing)
+        self.assertIn(title, legend)
+        self.assertLessEqual(len(drawing.splitlines()), 14)
+
     def pick(self, items, answers):
         output = io.StringIO()
         with contextlib.redirect_stdout(output):
