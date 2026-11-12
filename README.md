@@ -575,19 +575,25 @@ states, home selection, and current Windows/desktop/private-server limits.
 
 ## Saved pane workspaces (Windows Terminal)
 
-Save a tab's split arrangement once, bind its panes to session slugs or IDs, then
-restore it after restarting your PC:
+Run this **inside a pane of the tab you want to save**:
 
 ```powershell
 sessions workspace save elevate
-sessions workspace bind elevate pane-0 manager-session-slug
-sessions workspace bind elevate pane-1 worker-session-slug
-sessions workspace restore elevate
 ```
 
-Reuse that arrangement for another project with
-`sessions workspace clone elevate another-project`. The clone starts with empty
-bindings; the original keeps its sessions. Managed panes remember later sessions
-launched through `sessions`. Running sessions are skipped rather than stopped.
-See [the workspace guide](docs/WORKSPACES.md) for setup, pane numbering, cloning,
-empty-shell restore, storage, and limitations.
+It captures that tab's current layout, automatically assigns tracked sessions,
+shows a spatial preview, and asks only about unidentified panes. Confirm to save.
+After a PC restart, `sessions workspace restore elevate` opens that workspace.
+Running sessions are skipped rather than stopped.
+
+For another project:
+
+```powershell
+sessions workspace clone elevate another-project
+sessions workspace restore another-project
+```
+
+The same layout opens with a session picker in each pane. Choose the project's
+sessions directly in place; successful launches save those assignments.
+See [the workspace guide](docs/WORKSPACES.md) for setup, automation limits,
+empty shells, storage, and explicit saved-state import.

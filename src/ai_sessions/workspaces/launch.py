@@ -7,10 +7,37 @@ import sys
 from contextlib import contextmanager
 from contextvars import ContextVar
 
+from ..paths import STATE_FILE, env_path
 from ..registry import REGISTRY
 from .store import WorkspaceStore
 
 _active = ContextVar("workspace_launch", default=None)
+
+
+def pane_assignment():
+    name = os.environ.get("AI_SESSIONS_WORKSPACE", "")
+    slot = os.environ.get("AI_SESSIONS_WORKSPACE_PANE", "")
+    terminal = os.environ.get("WT_SESSION", "")
+    path = env_path("AI_SESSIONS_WORKSPACE_FILE", STATE_FILE.with_suffix(".workspaces.sqlite3"))
+    if terminal and path.exists():
+        store = WorkspaceStore(path)
+        assigned = store.terminal_slot(terminal)
+        if assigned:
+            return store, *assigned
+    if name or slot:
+        if not name or not slot:
+            raise ValueError("Workspace and pane must both be set in this shell.")
+        return WorkspaceStore(), name, slot
+    return None
+
+
+def is_managed_pane():
+    return (
+        bool(
+            os.environ.get("AI_SESSIONS_WORKSPACE") or os.environ.get("AI_SESSIONS_WORKSPACE_PANE")
+        )
+        or pane_assignment() is not None
+    )
 
 
 def _binding(session, tool):
@@ -41,16 +68,13 @@ def _binding(session, tool):
 
 @contextmanager
 def launch_slot(session, tool):
-    name = os.environ.get("AI_SESSIONS_WORKSPACE", "")
-    slot = os.environ.get("AI_SESSIONS_WORKSPACE_PANE", "")
-    if not name and not slot:
+    assigned = pane_assignment()
+    if assigned is None:
         yield
         return
-    if not name or not slot:
-        raise ValueError("Workspace and pane must both be set in this shell.")
     import psutil
 
-    store = WorkspaceStore()
+    store, name, slot = assigned
     binding = _binding(session, tool)
     lease = store.acquire(name, slot, binding, os.getpid(), psutil.Process().create_time())
     context = _active.set((store, name, slot, binding))

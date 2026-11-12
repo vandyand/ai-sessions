@@ -5738,7 +5738,9 @@ def make_room(session: Session, others: Iterable[Session]) -> bool:
     targets = [item for item in detached_sessions(candidates) if item.open_pid in here]
     if session.is_open and all(item.open_pid != session.open_pid for item in targets):
         targets.append(session)
-    if os.environ.get("AI_SESSIONS_WORKSPACE") and (targets or not known):
+    from .workspaces.launch import is_managed_pane
+
+    if (targets or not known) and is_managed_pane():
         print(
             "sessions: workspace launch skipped; a session is running or liveness is unknown.",
             file=sys.stderr,

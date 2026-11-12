@@ -73,6 +73,11 @@ class WorkspaceStore:
                     slot TEXT NOT NULL, binding TEXT,
                     PRIMARY KEY (workspace, slot)
                 );
+                CREATE TABLE IF NOT EXISTS terminal_slots (
+                    terminal TEXT PRIMARY KEY, workspace TEXT NOT NULL,
+                    slot TEXT NOT NULL,
+                    FOREIGN KEY(workspace,slot) REFERENCES panes(workspace,slot) ON DELETE CASCADE
+                );
                 CREATE TABLE IF NOT EXISTS leases (
                     token TEXT PRIMARY KEY, workspace TEXT NOT NULL, slot TEXT NOT NULL,
                     identity TEXT NOT NULL UNIQUE, pid INTEGER NOT NULL, started REAL NOT NULL,
@@ -163,30 +168,72 @@ class WorkspaceStore:
         with self._db() as db:
             self._save(db, name, layout, replace)
 
+    def save_snapshot(self, name, layout, bindings, terminals, replace=False):
+        from .capture import terminal_key
+
+        with self._db() as db:
+            self._save(db, name, layout, replace)
+            slots = self._get(db, name)["panes"]
+            if set(bindings) - set(slots) or set(terminals) - set(slots):
+                raise ValueError("Snapshot refers to an unknown pane slot.")
+            for slot, binding in bindings.items():
+                self._bind(db, name, slot, binding)
+            for slot, terminal in terminals.items():
+                key = terminal_key(terminal)
+                if not key:
+                    continue
+                db.execute(
+                    "INSERT OR REPLACE INTO terminal_slots VALUES (?,?,?)", (key, name, slot)
+                )
+
+    def terminal_slot(self, terminal):
+        from .capture import terminal_key
+
+        with self._db() as db:
+            return db.execute(
+                "SELECT workspace,slot FROM terminal_slots WHERE terminal=?",
+                (terminal_key(terminal),),
+            ).fetchone()
+
+    def register_terminal(self, name, slot, terminal):
+        from .capture import terminal_key
+
+        with self._db() as db:
+            if slot not in self._get(db, name)["panes"]:
+                raise ValueError(f"Unknown pane slot: {slot}")
+            key = terminal_key(terminal)
+            if key:
+                db.execute(
+                    "INSERT OR REPLACE INTO terminal_slots VALUES (?,?,?)", (key, name, slot)
+                )
+
     def clone(self, source, destination):
         with self._db() as db:
             self._save(db, destination, self._get(db, source)["layout"])
 
     def bind(self, name, slot, binding, move=False):
-        binding = _binding(binding)
         with self._db() as db:
-            workspace = self._get(db, name)
-            if slot not in workspace["panes"]:
-                raise ValueError(f"Unknown pane slot: {slot}")
-            if binding:
-                for other, saved in workspace["panes"].items():
-                    if other != slot and saved and _identity(saved) == _identity(binding):
-                        if not move:
-                            raise ValueError(f"Session already assigned to {other}.")
-                        db.execute(
-                            "UPDATE panes SET binding=NULL WHERE workspace=? AND slot=?",
-                            (name, other),
-                        )
-            db.execute(
-                "UPDATE panes SET binding=? WHERE workspace=? AND slot=?",
-                (json.dumps(binding) if binding else None, name, slot),
-            )
-            db.execute("UPDATE workspaces SET updated=? WHERE name=?", (time.time(), name))
+            self._bind(db, name, slot, binding, move)
+
+    def _bind(self, db, name, slot, binding, move=False):
+        binding = _binding(binding)
+        workspace = self._get(db, name)
+        if slot not in workspace["panes"]:
+            raise ValueError(f"Unknown pane slot: {slot}")
+        if binding:
+            for other, saved in workspace["panes"].items():
+                if other != slot and saved and _identity(saved) == _identity(binding):
+                    if not move:
+                        raise ValueError(f"Session already assigned to {other}.")
+                    db.execute(
+                        "UPDATE panes SET binding=NULL WHERE workspace=? AND slot=?",
+                        (name, other),
+                    )
+        db.execute(
+            "UPDATE panes SET binding=? WHERE workspace=? AND slot=?",
+            (json.dumps(binding) if binding else None, name, slot),
+        )
+        db.execute("UPDATE workspaces SET updated=? WHERE name=?", (time.time(), name))
 
     def _prune(self, db):
         for token, pid, started in db.execute("SELECT token,pid,started FROM leases").fetchall():
