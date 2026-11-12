@@ -1,5 +1,18 @@
 # Changelog
 
+## 3.14.1 — 2026-11-12
+
+### Fixed
+
+- Live pane capture keeps identity markers observable while agents update their
+  titles and accumulates exact matches across stable UIA pane identities. The
+  former one-shot read could lose known running sessions during capture.
+- Unknown panes are labelled unidentified; only an explicit empty choice is
+  labelled empty. Large session histories start with search rather than printing
+  unrelated old sessions. Search results prioritize running and recent sessions.
+- The spatial preview uses short pane numbers and merges thin splitter gaps so
+  narrow terminals do not show clipped titles and misleading extra rows.
+
 ## 3.14.0 — 2026-11-12
 
 ### Added

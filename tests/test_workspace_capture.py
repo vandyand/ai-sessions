@@ -6,6 +6,35 @@ from ai_sessions.workspaces.capture import _marked, layout_from_panes
 
 
 class CaptureGeometryTests(unittest.TestCase):
+    def test_marker_pulse_recovers_from_application_title_updates(self):
+        from ai_sessions.workspaces.capture import _pulse
+
+        class Kernel:
+            title = "application changed title"
+
+            def FreeConsole(self):
+                pass
+
+            def AttachConsole(self, pid):
+                return True
+
+            def GetConsoleTitleW(self, buffer, size):
+                buffer.value = self.title
+
+            def SetConsoleTitleW(self, title):
+                self.title = title
+
+        kernel = Kernel()
+        changes = [(dict(pid=123, started=10, marker="capture-unique"), "original")]
+        with patch("psutil.Process") as process:
+            process.return_value.create_time.return_value = 10
+            _pulse(kernel, changes, True)
+            self.assertEqual(kernel.title, "capture-unique~")
+            self.assertEqual(changes[0][1], "application changed title")
+            _pulse(kernel, changes, False)
+            self.assertEqual(kernel.title, "capture-unique")
+            self.assertEqual(changes[0][1], "application changed title")
+
     def test_slow_cleanup_never_terminates_title_restoration(self):
         process = Mock()
         process.stdout.readline.return_value = "[]\n"

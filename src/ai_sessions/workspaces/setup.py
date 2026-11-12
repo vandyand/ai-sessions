@@ -24,13 +24,15 @@ def _ask(prompt, input_fn=None):
 def choose_session(items, input_fn=None) -> Session | None:
     """Choose from bounded search results; only an explicit empty choice unbinds."""
     items = list(items)
-    matches = items
+    matches = items if len(items) <= _LIMIT else None
     while True:
-        for number, item in enumerate(matches[:_LIMIT], 1):
+        if matches is None:
+            print(f"{len(items)} sessions available. Search to show candidates.")
+        for number, item in enumerate((matches or [])[:_LIMIT], 1):
             print(f"{number}. {item.title} | {item.tool} | {item.slug} | {item.session_id}")
-        if len(matches) > _LIMIT:
+        if matches is not None and len(matches) > _LIMIT:
             print(f"Showing {_LIMIT} of {len(matches)} sessions; narrow your search.")
-        elif not matches:
+        elif matches == []:
             print("No matching sessions.")
         answer = _ask("Number, ID, slug, search text, empty, or cancel: ", input_fn)
         if answer.casefold() in {"empty", "none", "0"}:
@@ -42,14 +44,17 @@ def choose_session(items, input_fn=None) -> Session | None:
             if "ambiguous" in str(error).lower():
                 print(str(error))
                 continue
-        if answer.isdecimal() and 1 <= int(answer) <= min(len(matches), _LIMIT):
+        if matches and answer.isdecimal() and 1 <= int(answer) <= min(len(matches), _LIMIT):
             return matches[int(answer) - 1]
+        if not answer:
+            continue
         folded = answer.casefold()
         matches = [
             item
             for item in items
             if folded in " ".join((item.title, item.tool, item.slug, item.session_id)).casefold()
         ]
+        matches.sort(key=lambda item: (bool(item.is_open), item.updated), reverse=True)
 
 
 def _binding(item):
@@ -89,8 +94,8 @@ def _position(slot, panes):
     return f"{slot} ({position}; {coords})"
 
 
-def _map(panes, bindings):
-    """Scale rectangle edges independently, keeping shared edges aligned."""
+def _map(panes, bindings, empty_slots=()):
+    """Draw a compact schematic with shared edges and a full status legend."""
     xs = sorted(
         {edge for pane in panes.values() for edge in (pane["x"], pane["x"] + pane["width"])}
     )
@@ -99,13 +104,27 @@ def _map(panes, bindings):
     )
     columns = max(30, shutil.get_terminal_size().columns - 1)
     width = min(max(60, 18 * (len(xs) - 1)), columns) - 1
-    height = max(4, 3 * (len(ys) - 1))
+
+    def edge_groups(edges):
+        groups = {}
+        index = 0
+        previous = None
+        for edge in edges:
+            if previous is not None and edge - previous > 5:
+                index += 1
+            groups[edge] = index
+            previous = edge
+        return groups
+
+    xgroups, ygroups = edge_groups(xs), edge_groups(ys)
+    height = 2 * max(ygroups.values())
 
     def scale(value, edges, size):
-        return round((value - edges[0]) / (edges[-1] - edges[0]) * size)
+        groups = xgroups if edges is xs else ygroups
+        return round(groups[value] / max(1, max(groups.values())) * size)
 
     canvas = [[" "] * (width + 1) for _ in range(height + 1)]
-    print("Pane layout:")
+    print("Pane layout (numbers match pane-N below):")
     for slot, pane in panes.items():
         x, r = (scale(v, xs, width) for v in (pane["x"], pane["x"] + pane["width"]))
         y, b = (scale(v, ys, height) for v in (pane["y"], pane["y"] + pane["height"]))
@@ -115,8 +134,7 @@ def _map(panes, bindings):
             canvas[row][x] = canvas[row][r] = "|"
         for row, col in ((y, x), (y, r), (b, x), (b, r)):
             canvas[row][col] = "+"
-        binding = bindings.get(slot)
-        label = f"{slot}: {binding['title'] if binding else 'unassigned / empty'}"
+        label = str(slot).removeprefix("pane-")
         if b > y + 1:
             for col, char in enumerate(label[: max(0, r - x - 2)], x + 1):
                 canvas[y + 1][col] = char if char.isprintable() else " "
@@ -129,7 +147,9 @@ def _map(panes, bindings):
             + (
                 f"{binding['title']} | {binding['tool']} | {binding['session_id']}"
                 if binding
-                else "empty shell"
+                else "explicitly empty"
+                if slot in empty_slots
+                else "unidentified"
             )
         )
 
@@ -165,18 +185,26 @@ def configure(name, snapshot, items, remembered, state, store, replace=False, au
         if len(matches) == 1:
             bindings[slot] = _binding(matches[0])
             used.add(key)
+    empty_slots = set()
     _map(panes, bindings)
     for slot in panes:
         if bindings[slot] is not None:
             continue
         print(f"Choose a session for pane {_position(slot, panes)}.")
+        print(
+            "Could not identify this pane from its captured terminal and an exact session binding. "
+            "This does not mean it is empty. Search for its session, choose empty explicitly, "
+            "or cancel and retry capture."
+        )
         available = [item for item in items if native_key(item.tool, item.session_id) not in used]
         item = choose_session(available)
         if item is not None:
             bindings[slot] = _binding(item)
             used.add(native_key(item.tool, item.session_id))
+        else:
+            empty_slots.add(slot)
     print(f"Workspace {name} preview:")
-    _map(panes, bindings)
+    _map(panes, bindings, empty_slots)
     if not auto_confirm and _ask("Save this workspace? [yes/no]: ").casefold() not in {"y", "yes"}:
         raise ValueError("Workspace setup cancelled; nothing saved.")
     result = store.save_snapshot(name, snapshot["layout"], bindings, terminals, replace=replace)
