@@ -5,6 +5,7 @@ from __future__ import annotations
 import datetime as dt
 import hashlib
 import json
+import math
 import os
 import queue
 import re
@@ -13,6 +14,7 @@ import shutil
 import sqlite3
 import stat
 import subprocess
+import sys
 import threading
 import time
 import uuid
@@ -1409,7 +1411,9 @@ def _is_app_server(process: ProcessInfo) -> bool:
     return any(argument.casefold() == "app-server" for argument in process.command[1:])
 
 
-def _windows_liveness(context: LivenessContext, home: Path, eligible: set[str]) -> dict[str, int]:
+def _windows_liveness(
+    context: LivenessContext, home: Path, eligible: set[str] | None
+) -> dict[str, int]:
     candidates = [
         process
         for process in context.process_snapshot
@@ -1470,11 +1474,45 @@ def _windows_liveness(context: LivenessContext, home: Path, eligible: set[str]) 
                 while session_id in parents and session_id not in seen:
                     seen.add(session_id)
                     session_id = parents[session_id]
-                if session_id in eligible:
+                if eligible is None or session_id in eligible:
                     result[session_id] = process.pid
     except (sqlite3.Error, OSError) as error:
         record_warning(f"could not read Codex activity log {database}: {error}")
     return result
+
+
+def native_executable() -> str:
+    """Resolve the installed native CLI without importing the RPC transport eagerly."""
+    from .messaging_rpc import native_executable as resolve_executable
+
+    return resolve_executable()
+
+
+def current_session(pid: int, started: float) -> NativeRef | None:
+    """Identify only this owned Windows UI process generation from native logs."""
+    import psutil
+
+    if sys.platform != "win32" or pid <= 0 or not math.isfinite(started) or started <= 0:
+        return None
+    try:
+        process = psutil.Process(pid)
+        if process.create_time() != started:
+            return None
+        name = process.name()
+        command = tuple(process.cmdline())
+        if name.casefold() not in ("codex", "codex.exe"):
+            return None
+        info = ProcessInfo(pid, name, command, "", started)
+        if _is_app_server(info) or any(arg.casefold() == "exec" for arg in command[1:]):
+            return None
+        context = LivenessContext("win32", (info,), {})
+        adapter = REGISTRY.get("codex")
+        identities = _windows_liveness(context, adapter.home, None)
+        session_id = next(iter(identities), "")
+        ref = adapter.resolve(session_id) if session_id else None
+        return ref if psutil.Process(pid).create_time() == started else None
+    except (psutil.Error, OSError):
+        return None
 
 
 def inspect_liveness(
@@ -2022,6 +2060,18 @@ def _message_prepare(home: Path | None = None) -> dict:
 
 ADAPTER = HarnessAdapter(
     name="codex",
+    native_executable=native_executable,
+    current_session=current_session,
+    restart_discard_options=(
+        "--last",
+        "--all",
+        "--include-non-interactive",
+        "--image",
+        "-i",
+        "--worktree",
+        "--cd",
+        "-C",
+    ),
     messaging=MessagingHooks(
         send=_message_send,
         receivers=_message_receivers,

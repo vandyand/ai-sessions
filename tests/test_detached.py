@@ -37,6 +37,18 @@ def session(
 
 
 class TerminalMemoryTests(unittest.TestCase):
+    def test_new_launcher_keeps_both_live_attachments_so_restart_is_ambiguous(self):
+        with patch.object(detached, "_live_remembered", return_value=True, create=True):
+            detached.remember(session(), "claude", 41, 5, "one", path=self.path, new_launcher=True)
+            detached.remember(session(), "claude", 42, 6, "two", path=self.path, new_launcher=True)
+        self.assertEqual(set(detached.remembered(path=self.path)), {"one", "two"})
+
+    def test_refreshing_same_native_client_keeps_pending_restart_request(self):
+        detached.remember(session(), "claude", 41, 5.0, "tab", path=self.path, new_launcher=True)
+        detached.request_restart("tab", "codex", path=self.path)
+        detached.remember(session(), "claude", 41, 5.0, "tab", path=self.path, new_launcher=True)
+        self.assertEqual(detached.mark_closed(41, path=self.path), "codex")
+
     def setUp(self) -> None:
         directory = tempfile.TemporaryDirectory()
         self.addCleanup(directory.cleanup)

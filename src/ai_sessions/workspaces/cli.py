@@ -91,6 +91,26 @@ def _save(args, store):
                 except (ValueError, KeyError, OSError):
                     pass
             remembered[terminal_key(key)] = saved
+        # A newly launched session may not be in the last browser catalog yet.
+        # Read only positively identified native sessions in the captured tab.
+        selected = {terminal_key(p.get("terminal", "")) for p in snapshot["panes"].values()}
+        known = {(item.tool, item.session_id) for item in items}
+        for terminal_id, entry in remembered.items():
+            identity = (entry.get("tool"), entry.get("session_id"))
+            if terminal_id not in selected or identity in known or not all(identity):
+                continue
+            adapter = app.REGISTRY.get(identity[0])
+            if isinstance(adapter.rediscover, Unsupported):
+                continue
+            ref = adapter.resolve(identity[1])
+            if ref is None or ref.session_id != identity[1]:
+                continue
+            from ..discovery import HarnessContext
+
+            for row in adapter.rediscover(HarnessContext.create(), [ref]):
+                if (row.tool, row.session_id) == identity:
+                    items.append(app.session_from_native(row))
+                    known.add(identity)
         configure(
             args.name,
             snapshot,

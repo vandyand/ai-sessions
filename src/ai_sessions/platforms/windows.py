@@ -117,14 +117,18 @@ class KillOnCloseJob:
         self.information = information
 
     @classmethod
-    def start(cls, argv: list[str]) -> tuple[subprocess.Popen[bytes], "KillOnCloseJob | None"]:
+    def start(
+        cls, argv: list[str], *, cwd: str | None = None
+    ) -> tuple[subprocess.Popen[bytes], "KillOnCloseJob | None"]:
         """Start ``argv`` suspended, place it in a job, then let it run.
 
         Starting suspended means the .cmd shim cannot launch the real CLI
         before the job exists.  Every failure still resumes the process: an
         uncontained harness is better than one that never starts.
         """
-        process = subprocess.Popen(argv, creationflags=CREATE_SUSPENDED)
+        process = subprocess.Popen(
+            argv, creationflags=CREATE_SUSPENDED, **({"cwd": cwd} if cwd is not None else {})
+        )
         job: KillOnCloseJob | None = None
         try:
             job = cls._assign(int(process._handle))  # type: ignore[attr-defined]
@@ -217,6 +221,12 @@ class KillOnCloseJob:
                 ctypes.sizeof(self.information),
             )
         finally:
+            self.kernel32.CloseHandle(self.handle)
+            self.handle = 0
+
+    def close(self) -> None:
+        """Close the owning job with containment enabled, stopping its children."""
+        if self.handle:
             self.kernel32.CloseHandle(self.handle)
             self.handle = 0
 

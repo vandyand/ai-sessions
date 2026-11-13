@@ -5868,6 +5868,58 @@ def restart_here(launch_tool: str = "") -> int:
             file=sys.stderr,
         )
         return 2
+    if entry.get("restart_error"):
+        print(f"sessions: {entry['restart_error']}", file=sys.stderr)
+        return 2
+    if entry.get("new_launcher"):
+        from .detached import remember
+        from .new_session import _identify
+        from .platforms.windows import process_started
+
+        if process_started(int(entry["pid"])) != float(entry["started"]):
+            print(
+                "sessions: the original client process is gone; nothing was stopped.",
+                file=sys.stderr,
+            )
+            return 2
+        try:
+            current = _identify(
+                REGISTRY.get(tool),
+                int(entry["pid"]),
+                float(entry["started"]),
+                str(entry.get("cwd") or os.getcwd()),
+            )
+        except (OSError, ValueError):
+            current = None
+        if current is None:
+            adapter = REGISTRY.get(tool)
+            hooks = adapter.messaging
+            sid = (
+                os.environ.get(hooks.sender_environment, "")
+                if hooks and hooks.sender_environment
+                else ""
+            )
+            if sid and sid == entry.get("session_id"):
+                from .new_session import _from_ref
+
+                ref = adapter.resolve(sid)
+                if ref is not None:
+                    current = _from_ref(adapter, ref, str(entry.get("cwd") or os.getcwd()))
+        if current is None:
+            print(
+                "sessions: could not verify the current session; retry shortly. Nothing was stopped.",
+                file=sys.stderr,
+            )
+            return 2
+        remember(
+            current,
+            tool,
+            int(entry["pid"]),
+            float(entry["started"]),
+            terminal=key,
+            new_launcher=True,
+        )
+        entry = {**entry, "session_id": current.session_id, "title": current.title}
     names = REGISTRY.get(tool).liveness_executables if tool in REGISTRY else frozenset()
     request_restart(key, launch_tool)
     where = f" in {tool_label(launch_tool, short=False)}" if launch_tool else ""
@@ -6452,6 +6504,11 @@ def build_parser() -> argparse.ArgumentParser:
               sessions reply <message-id> --message "Received"
               sesres  (shorthand for sessions --restart)
 
+            New native sessions:
+              sessions new codex
+              sessions new claude
+              sessions new codex -- --model MODEL
+
             Workspaces:
               sessions workspace save my-project
               sessions workspace bind my-project pane-0 <session-slug-or-id>
@@ -6661,6 +6718,10 @@ def _main(argv: list[str] | None = None) -> int:
                     reconfigure(encoding="utf-8", errors="replace")
                 except (OSError, ValueError):
                     pass
+    if raw and raw[0] == "new":
+        from .new_session import main as new_main
+
+        return new_main(raw[1:])
     if raw and raw[0] == "workspace":
         from .workspaces.cli import main as workspace_main
 

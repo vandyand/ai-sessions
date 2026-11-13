@@ -75,6 +75,8 @@ def remember(
     terminal: str | None = None,
     *,
     path: Path = TERMINALS_FILE,
+    restart_error: str = "",
+    new_launcher: bool = False,
 ) -> None:
     """Note that this tab now runs ``session``; a session lives in one tab at a time."""
     from .workspaces.launch import remember_launch
@@ -83,8 +85,23 @@ def remember(
     terminal = terminal_id() if terminal is None else terminal
     native_id = session.launch_target(tool) or session.session_id
     home = str(REGISTRY.get(tool).home) if tool in REGISTRY else ""
+    prior = _read(path)
+    pending = {}
+    for entry in prior.values():
+        if (
+            entry.get("pid") == pid
+            and entry.get("started") == started
+            and entry.get("tool") == tool
+            and entry.get("session_id") == native_id
+        ):
+            pending = {key: entry[key] for key in ("restart", "restart_tool") if key in entry}
+            break
     document = {
-        key: value for key, value in _read(path).items() if value.get("session_id") != native_id
+        key: value
+        for key, value in prior.items()
+        if value.get("session_id") != native_id
+        or value.get("tool") != tool
+        or (new_launcher and value.get("pid") != pid and _live_remembered(value))
     }
     document[terminal or f"pid:{pid}"] = {
         "session_id": native_id,
@@ -95,8 +112,21 @@ def remember(
         "pid": pid,
         "started": started,
         "at": time.time(),
+        **pending,
+        **({"new_launcher": True} if new_launcher else {}),
+        **({"restart_error": restart_error} if restart_error else {}),
     }
     _write(path, document)
+
+
+def _live_remembered(entry: dict) -> bool:
+    if entry.get("closed"):
+        return False
+    try:
+        process = psutil.Process(int(entry["pid"]))
+        return process.is_running() and process.create_time() == float(entry["started"])
+    except (KeyError, ValueError, TypeError, psutil.Error):
+        return False
 
 
 def mark_closed(pid: int, *, path: Path = TERMINALS_FILE) -> str | None:
@@ -217,7 +247,7 @@ def stop_for_restart(pid: int, started: float, harness_names: Iterable[str]) -> 
     names = {name.casefold() for name in harness_names}
     try:
         root = psutil.Process(pid)
-        if abs(root.create_time() - started) > 1:
+        if root.create_time() != started:
             return f"PID {pid} is now a different process; nothing was stopped."
         me = psutil.Process()
         keep = {me.pid}
