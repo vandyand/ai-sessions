@@ -1,5 +1,24 @@
 # Changelog
 
+## 3.15.0 — 2026-11-13
+
+### Added
+
+- `sessions new codex` and `sessions new claude` launch ordinary native sessions
+  with exact conversation tracking and `sesres` support. Native options follow `--`.
+- New Codex conversations receive a native ID before CLI launch, so shared-server
+  sessions do not depend on missing frontend log identity fields. Resume selection
+  can also be resolved before launch. Claude uses its native process registry.
+- A profile updater routes `cdba` and `cdsp` through the shared launch path while
+  keeping their existing permission flags and forwarding native arguments.
+
+### Fixed
+
+- Managed restart retains native options without replaying the original prompt,
+  images, fork/worktree creation, or session-picker selection. Process generations
+  are verified before stopping; shared native servers are spared.
+- Refreshing launcher metadata no longer loses a pending restart request.
+
 ## 3.14.1 — 2026-11-12
 
 ### Fixed

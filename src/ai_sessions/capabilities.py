@@ -286,6 +286,13 @@ class HarnessAdapter:
     transcript_files: TranscriptFilesHook | Unsupported = Unsupported(
         "sessions are not stored as transcript files"
     )
+    native_executable: Callable[[], str] | Unsupported = Unsupported(
+        "native executable resolution is not installed"
+    )
+    current_session: Callable[[int, float], NativeRef | None] | Unsupported = Unsupported(
+        "owned native process identity is not installed"
+    )
+    restart_discard_options: tuple[str, ...] = ()
     # The harness in a conversation's HISTORY column, such as C→A→C; "" uses
     # the first letter of its label.
     letter: str = ""
@@ -344,6 +351,11 @@ class HarnessAdapter:
             self.liveness_source_kinds.issubset(self.source_kinds)
         ):
             raise ValueError("harness liveness source kinds must be declared source kinds")
+        if not isinstance(self.restart_discard_options, tuple) or not all(
+            isinstance(value, str) and value.startswith("-") and len(value) > 1
+            for value in self.restart_discard_options
+        ):
+            raise ValueError("restart discard options must be a tuple of option names")
         required = (
             self.read,
             self.write,
@@ -368,6 +380,8 @@ class HarnessAdapter:
             self.extra_dir_args,
             self.supervisor_launch,
             self.transcript_files,
+            self.native_executable,
+            self.current_session,
         )
         if not all(callable(hook) or isinstance(hook, Unsupported) for hook in required + optional):
             raise ValueError("harness capabilities must be callable or Unsupported")

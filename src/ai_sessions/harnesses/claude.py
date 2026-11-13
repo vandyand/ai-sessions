@@ -4,10 +4,13 @@ from __future__ import annotations
 
 import hashlib
 import json
+import math
 import os
 import re
 import secrets
+import shutil
 import stat
+import sys
 import time
 import uuid
 from pathlib import Path
@@ -54,7 +57,12 @@ from ..discovery import (
     walk_files,
 )
 from ..jsonl_tracking import locate_checkpoint, protect_checkpoint
-from ..liveness import LivenessContext, ProcessInfo
+from ..liveness import (
+    WINDOWS_EPOCH_FILETIME,
+    LivenessContext,
+    ProcessInfo,
+    _windows_start_token,
+)
 from ..model import (
     Availability,
     BudgetPolicy,
@@ -957,6 +965,72 @@ def _claim_refreshed_at(record: dict[str, Any], path: Path) -> float:
         return 0.0
 
 
+def native_executable() -> str:
+    """Honor the installed native CLI, never executing a Windows command shim."""
+    candidate = shutil.which("claude.exe")
+    if candidate and Path(candidate).suffix.casefold() == ".exe" and Path(candidate).is_file():
+        return candidate
+    shim = shutil.which("claude")
+    if shim:
+        candidate_path = Path(shim).parent / "node_modules/@anthropic-ai/claude-code/bin/claude.exe"
+        if candidate_path.is_file():
+            return str(candidate_path)
+    raise OSError("Native Claude executable unavailable")
+
+
+def current_session(pid: int, started: float) -> NativeRef | None:
+    """Resolve the freshest verified native claim for one owned Windows PID."""
+    import psutil
+
+    if sys.platform != "win32" or pid <= 0 or not math.isfinite(started) or started <= 0:
+        return None
+    try:
+        process = psutil.Process(pid)
+        if process.create_time() != started:
+            return None
+        name = process.name()
+        command = tuple(process.cmdline())
+        if name.casefold() not in ("claude", "claude.exe"):
+            return None
+        token = _windows_start_token(started)
+        info = ProcessInfo(pid, name, command, token, started)
+        context = LivenessContext("win32", (info,), {})
+        adapter = REGISTRY.get("claude")
+        latest: tuple[float, str] | None = None
+        ambiguous = False
+        for path in (adapter.home / "sessions").glob("*.json"):
+            try:
+                record = json.loads(path.read_text(encoding="utf-8"))
+                if not isinstance(record, dict) or record.get("pid") != pid:
+                    continue
+                expected = str(record.get("procStart", ""))
+                if not expected:
+                    continue
+                # FILETIME carries 100 ns ticks that psutil's epoch float cannot
+                # always represent. Compare births at that float precision, not
+                # the one-second tolerance used by general liveness discovery.
+                claim_started = (int(expected) - WINDOWS_EPOCH_FILETIME) / 10_000_000
+                if claim_started != started:
+                    continue
+                if not _process_start_matches(context, info, expected):
+                    continue
+                if record.get("kind", "") not in ("", "interactive"):
+                    continue
+                sid = record.get("sessionId")
+                claim = (_claim_refreshed_at(record, path), sid if isinstance(sid, str) else "")
+                if latest is None or claim[0] > latest[0]:
+                    latest = claim
+                    ambiguous = False
+                elif claim[0] == latest[0] and claim[1] != latest[1]:
+                    ambiguous = True
+            except (OSError, UnicodeError, ValueError, TypeError):
+                continue
+        ref = adapter.resolve(latest[1]) if latest and latest[1] and not ambiguous else None
+        return ref if psutil.Process(pid).create_time() == started else None
+    except (psutil.Error, OSError):
+        return None
+
+
 def inspect_liveness(
     context: LivenessContext, home: Path, sessions: Iterable[LivenessSession]
 ) -> dict[str, int]:
@@ -1097,6 +1171,25 @@ def _message_forget(receiver: dict) -> dict:
 
 ADAPTER = HarnessAdapter(
     name="claude",
+    native_executable=native_executable,
+    current_session=current_session,
+    restart_discard_options=(
+        "--resume",
+        "-r",
+        "--continue",
+        "-c",
+        "--session-id",
+        "--fork-session",
+        "--resume-session-at",
+        "--from-pr",
+        "--file",
+        "--worktree",
+        "-w",
+        "--print",
+        "-p",
+        "--input-format",
+        "--replay-user-messages",
+    ),
     messaging=MessagingHooks(
         send=_message_send,
         register=_message_register,

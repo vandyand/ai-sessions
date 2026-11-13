@@ -12,6 +12,29 @@ from ai_sessions.workspaces import cli
 
 
 class WorkspaceCliTests(unittest.TestCase):
+    def test_live_save_rereads_identified_native_sessions_missing_from_catalog(self):
+        from ai_sessions.model import NativeSession
+
+        row = NativeSession(
+            "fake", "fresh", "New session", self.home, 0, 0, "", False, "fresh.jsonl"
+        )
+        self.adapter.rediscover = Mock(return_value=[row])
+        self.adapter.resolve.return_value = NativeRef("fresh", "fresh.jsonl")
+        snapshot = dict(
+            layout=self.workspace["layout"],
+            panes={"pane-1": dict(terminal="abc", x=0, y=0, width=100, height=100)},
+        )
+        remembered = {"abc": dict(tool="fake", session_id="fresh", home=self.home)}
+        with (
+            patch("ai_sessions.workspaces.capture.current_tab", return_value=snapshot),
+            patch("ai_sessions.workspaces.setup.configure") as configure,
+            patch("ai_sessions.app.load_session_catalog", return_value=[]),
+            patch("ai_sessions.app.load_sessions", return_value=[]),
+            patch("ai_sessions.detached._read", return_value=remembered),
+        ):
+            self.assertEqual(self.main("save", "desk"), 0)
+        self.assertEqual([item.session_id for item in configure.call_args.args[2]], ["fresh"])
+
     def test_restart_keeps_slot_context_for_same_or_other_harness(self):
         from ai_sessions import app
 

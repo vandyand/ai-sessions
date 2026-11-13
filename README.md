@@ -597,3 +597,36 @@ The same layout opens with a session picker in each pane. Choose the project's
 sessions directly in place; successful launches save those assignments.
 See [the workspace guide](docs/WORKSPACES.md) for setup, automation limits,
 empty shells, storage, and explicit saved-state import.
+
+## Start an ordinary native session
+
+```powershell
+sessions new codex
+sessions new claude
+sessions new codex -- --model MODEL "Initial task"
+```
+
+These use the genuine native CLI in your terminal, with inherited keyboard,
+color and console behavior. Run `! sesres` inside the session to restart the
+current conversation. Native flags follow `--`; the original prompt is sent only
+on initial launch. Settings and permission flags are retained on restart.
+
+On Andrew's Windows PC, `cdba` and `cdsp` use this shared path and retain their
+existing native permission-bypass flags. Reload the shared PowerShell profile
+with `sb` in already-open shells after installing the updated aliases. New shells
+load them automatically. Raw `codex` and `claude` launchers remain available.
+
+The updater for an existing profile with those aliases is:
+
+```powershell
+pwsh -NoProfile -File tools/Set-ManagedSessionAliases.ps1 -ProfilePath "$HOME/.config/powershell/profile.ps1"
+```
+
+An already-running direct native session needs one normal exit and relaunch to
+acquire the waiting launcher. New Codex conversations are created with a known
+native identity before launch; native resume picker requests go through the
+shared selector when needed. Nonlocal `--remote` endpoints require a remote-aware
+launcher and are not given locally created conversation IDs. In-session Codex UI
+switches without verifiable client identity are refused for restart rather than
+resuming a different conversation. Native subcommands such as help/version are
+forwarded without creating an empty conversation.
