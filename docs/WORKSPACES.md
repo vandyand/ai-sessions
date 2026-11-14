@@ -1,11 +1,72 @@
 # Saved terminal workspaces
 
-Updated November 12, 2026. Version 3.14.1 fixes missed live pane identities and the fallback picker; 3.14.0 replaced manual setup in 3.13.0.
+Updated November 13, 2026. Version 3.16.0 adds native Terminal workspace reopening;
+3.14.1 fixed missed live pane identities and the fallback picker.
 
 Use a workspace to save a Windows Terminal tab's pane arrangement and its agent
 sessions, restore it after a restart, or reuse its arrangement for another
 project. This guide does not authorize stopping other sessions or changing
 credentials.
+
+## Reopen from Terminal's workspace menu
+
+Windows Terminal 1.26 or newer can remember named windows. ai-sessions supplies
+the durable conversation assignment for each pane. Choose its executable once:
+
+```powershell
+sessions workspace terminal 'C:\path\WindowsTerminal.exe'
+```
+
+Portable mode is detected through its `.portable` marker. For a packaged
+installation, supply its own state path explicitly:
+
+```powershell
+sessions workspace terminal 'C:\path\WindowsTerminal.exe' --state-file 'C:\path\LocalState\state.json'
+```
+
+Then open an already-saved ai-sessions workspace:
+
+```powershell
+sessions workspace open elevate
+sessions workspace open elevate --dry-run
+```
+
+First use creates a separate named window with the saved pane arrangement. It
+resumes each assigned conversation through the normal managed launcher. A session
+already running elsewhere is skipped; quit it normally before trying to resume
+it here. Unassigned panes offer the existing searchable picker.
+
+Close the new window normally once so Terminal saves it. Thereafter reopen it
+using the same command or Terminal's workspace menu. Its name begins
+`sessions-elevate-` and ends with a database identifier. The suffix keeps separate
+workspace stores from targeting the same live window. Terminal retains subsequent
+split-size and position changes; ai-sessions retains the current pane assignments.
+This restores conversations at saved turns, not interrupted tool execution.
+
+The command checks that persisted pane launchers still belong to this workspace,
+Python installation, app state and workspace database. If panes were added,
+removed, or given unrelated shell commands, use a new workspace name. Rebinding
+a conversation in an existing slot does not change its durable launcher.
+
+Before the first successful close, a repeated open refuses to duplicate an
+unsaved window. If that first launch failed, retry in a separate new window:
+
+```powershell
+sessions workspace open elevate --recover
+```
+
+Recovery uses a new window name; an existing agent is still protected by the
+normal duplicate-launch checks. It does not close or append panes to the older
+window. No Terminal settings or state are edited. The chosen executable and
+native-window registrations live in the ai-sessions workspace SQLite database.
+Regular `workspace restore` continues to use its original Terminal behavior.
+
+On November 13, a portable Preview 1.26.3133.0 close/reopen probe restored one
+Codex 0.167.1 and one Claude Code 2.1.325 conversation to their original slots,
+with the same native IDs and new process generations. The probe sent no prompts
+and closed only its own test window. Actual reboot recovery and graphical flyout
+interaction remain unverified. `tools/verify_native_workspace.py` can repeat the
+probe with explicitly supplied disposable native session IDs.
 
 ## Save the tab you are using
 

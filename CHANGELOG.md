@@ -1,5 +1,18 @@
 # Changelog
 
+## 3.16.0 — 2026-11-13
+
+### Added
+
+- `sessions workspace terminal EXE` selects Windows Terminal 1.26+ without changing
+  the system default. Portable state is detected; packaged state can be explicit.
+- `sessions workspace open NAME` creates a native named window with durable pane
+  launchers, then reopens its saved layout or focuses it without adding tabs.
+- Saved launchers are checked against their workspace/store/state/Python identity.
+  Window names are scoped to the workspace database; `--recover` retries an
+  unsaved first launch in a separate window. Existing native launch leases guard
+  against opening a conversation twice.
+
 ## 3.15.0 — 2026-11-13
 
 ### Added

@@ -45,6 +45,15 @@ def _parser():
     restore.add_argument("--window", default="0")
     restore.add_argument("--allow-unbound", action="store_true")
     restore.add_argument("--dry-run", action="store_true")
+    native = commands.add_parser("open", help="open or focus a native named Terminal workspace")
+    native.add_argument("name")
+    native.add_argument("--dry-run", action="store_true")
+    native.add_argument(
+        "--recover", action="store_true", help="retry an unsaved launch in a separate new window"
+    )
+    preferred = commands.add_parser("terminal", help="choose Terminal 1.26+ for native workspaces")
+    preferred.add_argument("executable", type=Path)
+    preferred.add_argument("--state-file", type=Path)
     run = commands.add_parser("run")
     run.add_argument("name")
     run.add_argument("slot")
@@ -298,7 +307,29 @@ def main(argv=None):
     args = _parser().parse_args(argv)
     try:
         store = WorkspaceStore()
-        if args.command == "save":
+        if args.command in ("open", "terminal"):
+            from . import native
+
+            if args.command == "terminal":
+                selected = native.configure(store.path, args.executable, args.state_file)
+                print(f"Native workspace Terminal: {selected}")
+                print("Open a saved workspace with: sessions workspace open NAME")
+            else:
+                workspace = store.get(args.name)
+                state = os.environ.get("AI_SESSIONS_STATE_FILE") or terminal.STATE_FILE
+                if args.dry_run:
+                    print(
+                        json.dumps(
+                            native.open_argv(workspace, store.path, state, recover=args.recover),
+                            ensure_ascii=False,
+                        )
+                    )
+                else:
+                    name = native.launch(workspace, store.path, state, recover=args.recover)
+                    print(
+                        f"Opened {name}. Close normally to save; reopen here or from Terminal's workspace menu."
+                    )
+        elif args.command == "save":
             _save(args, store)
         elif args.command == "bind":
             _bind(args, store)
