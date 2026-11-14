@@ -13,7 +13,7 @@ class NativeWorkspaceTests(unittest.TestCase):
     def setUp(self):
         self.temp = tempfile.TemporaryDirectory()
         self.addCleanup(self.temp.cleanup)
-        self.root = Path(self.temp.name)
+        self.root = Path(self.temp.name).resolve()
         self.exe = self.root / "WindowsTerminal.exe"
         self.exe.touch()
         (self.root / ".portable").touch()
