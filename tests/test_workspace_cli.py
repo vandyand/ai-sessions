@@ -12,6 +12,35 @@ from ai_sessions.workspaces import cli
 
 
 class WorkspaceCliTests(unittest.TestCase):
+    def test_native_open_uses_configured_window_and_current_state(self):
+        with patch("ai_sessions.workspaces.native.launch", return_value="sessions-desk") as launch:
+            self.assertEqual(self.main("open", "desk"), 0)
+        launch.assert_called_once_with(
+            self.workspace, self.store.path, str(self.state.path), recover=False
+        )
+
+    def test_native_open_dry_run_does_not_launch(self):
+        with (
+            patch(
+                "ai_sessions.workspaces.native.open_argv", return_value=["preview", "-w", "desk"]
+            ) as argv,
+            patch("ai_sessions.workspaces.native.launch") as launch,
+        ):
+            self.assertEqual(self.main("open", "desk", "--recover", "--dry-run"), 0)
+        launch.assert_not_called()
+        self.assertTrue(argv.call_args.kwargs["recover"])
+
+    def test_native_terminal_selection_passes_explicit_state_path(self):
+        with patch(
+            "ai_sessions.workspaces.native.configure", return_value=Path("preview.exe")
+        ) as configure:
+            self.assertEqual(
+                self.main("terminal", "preview.exe", "--state-file", "terminal.json"), 0
+            )
+        configure.assert_called_once_with(
+            self.store.path, Path("preview.exe"), Path("terminal.json")
+        )
+
     def test_live_save_rereads_identified_native_sessions_missing_from_catalog(self):
         from ai_sessions.model import NativeSession
 

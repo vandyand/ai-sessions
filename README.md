@@ -584,6 +584,12 @@ sessions workspace save elevate
 It captures that tab's current layout, automatically assigns tracked sessions,
 shows a spatial preview, and asks only about unidentified panes. Confirm to save.
 After a PC restart, `sessions workspace restore elevate` opens that workspace.
+For native named-window persistence in Terminal 1.26+, select its executable once
+with `sessions workspace terminal PATH_TO_WindowsTerminal.exe`, then use
+`sessions workspace open elevate`. Close normally once; later opens also work
+from Terminal's workspace menu. Portable mode is detected automatically; packaged
+installs need `--state-file PATH_TO_TERMINAL_STATE_JSON` when selecting Terminal.
+
 Running sessions are skipped rather than stopped.
 
 For another project:

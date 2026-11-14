@@ -152,7 +152,6 @@ def restore_argv(workspace, *, window="0", store_path=None, state_path=None):
         .expanduser()
         .absolute()
     )
-    script = Path(__file__).with_name("launch.ps1").absolute()
     args = ["wt", "-w", window]
     for index, action in enumerate(layout):
         if index:
@@ -173,21 +172,29 @@ def restore_argv(workspace, *, window="0", store_path=None, state_path=None):
                 if key in action:
                     args.extend([flag, _wt_arg(action[key])])
             args.extend(
-                [
-                    "pwsh",
-                    "-NoExit",
-                    "-File",
-                    _wt_arg(script),
-                    "-Workspace",
-                    name,
-                    "-Pane",
-                    action["slot"],
-                    "-WorkspaceFile",
-                    _wt_arg(store_path),
-                    "-StateFile",
-                    _wt_arg(state_path),
-                    "-Python",
-                    _wt_arg(sys.executable),
-                ]
+                _wt_arg(value) for value in pane_argv(name, action["slot"], store_path, state_path)
             )
     return args
+
+
+def pane_argv(name, slot, store_path, state_path):
+    """The durable command Terminal must retain for one managed pane."""
+    _identifier(name, "workspace name")
+    if not re.fullmatch(r"pane-[0-9]+", slot):
+        raise ValueError("Invalid pane slot")
+    return [
+        "pwsh",
+        "-NoExit",
+        "-File",
+        str(Path(__file__).with_name("launch.ps1").absolute()),
+        "-Workspace",
+        name,
+        "-Pane",
+        slot,
+        "-WorkspaceFile",
+        str(Path(store_path).expanduser().absolute()),
+        "-StateFile",
+        str(Path(state_path).expanduser().absolute()),
+        "-Python",
+        sys.executable,
+    ]
