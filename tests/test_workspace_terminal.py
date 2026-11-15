@@ -17,6 +17,8 @@ class TerminalTests(unittest.TestCase):
         layout.extend(dict(action="splitPane", split="right", size=0.5) for _ in range(7))
         args = terminal.restore_argv(dict(name="layout", layout=layout), window="-1", empty=True)
         self.assertIn("--maximized", args[:5])
+        self.assertEqual(args[args.index("--size") + 1], "180,60")
+        self.assertLess(args.index("--size"), args.index("new-tab"))
         self.assertNotIn(
             "--maximized", terminal.restore_argv(dict(name="layout", layout=layout), empty=True)
         )

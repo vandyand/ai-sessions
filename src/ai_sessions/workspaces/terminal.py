@@ -129,7 +129,9 @@ def _wt_arg(value):
     return _text(str(value), "argument").replace(";", "\\;")
 
 
-def restore_argv(workspace, *, window="0", store_path=None, state_path=None, empty=False):
+def restore_argv(
+    workspace, *, window="0", store_path=None, state_path=None, empty=False, new_window=False
+):
     """Build argv only; never launch Terminal or execute saved commandlines."""
     if not isinstance(workspace, dict):
         raise ValueError("Workspace must be an object")
@@ -153,8 +155,10 @@ def restore_argv(workspace, *, window="0", store_path=None, state_path=None, emp
         .absolute()
     )
     args = ["wt", "-w", window]
-    if window == "-1" and sum("slot" in action for action in layout) >= 8:
-        args.append("--maximized")
+    if (window == "-1" or new_window) and sum("slot" in action for action in layout) >= 8:
+        # Terminal maximizes after its initial XAML layout pass. Give startup
+        # splits room before ShowWindow too, or minimum sizes can drop panes.
+        args.extend(["--maximized", "--size", "180,60"])
     for index, action in enumerate(layout):
         if index:
             args.append(";")

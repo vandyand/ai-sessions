@@ -52,6 +52,14 @@ class NativeWorkspaceTests(unittest.TestCase):
         self.assertIn("pane-0", args)
         self.assertIn(str(self.store), args)
 
+    def test_large_native_first_open_gets_startup_space_too(self):
+        self.workspace["layout"].extend(
+            dict(action="splitPane", split="right", size=0.5) for _ in range(7)
+        )
+        args = self.open()
+        self.assertIn("--maximized", args[:6])
+        self.assertEqual(args[args.index("--size") + 1], "180,60")
+
     def test_reopen_uses_native_geometry_without_extra_tabs(self):
         target = self.save()
         before = target.read_bytes()
