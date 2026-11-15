@@ -244,15 +244,20 @@ def _read_controls(prefix, caller):
 
 
 def current_tab():
-    if os.name != "nt" or not os.environ.get("WT_SESSION"):
+    if os.name != "nt":
         raise ValueError(
             "Run workspace save in a pane of the Windows Terminal tab you want to save."
         )
     import psutil
 
-    from ..detached import TERMINALS_FILE, _live_remembered, _read
+    from ..detached import TERMINALS_FILE, _live_remembered, _read, running_here
 
-    caller = terminal_key(os.environ["WT_SESSION"])
+    linked = running_here()
+    caller = terminal_key(linked[0] if linked else os.environ.get("WT_SESSION", ""))
+    try:
+        uuid.UUID(caller)
+    except ValueError:
+        raise ValueError("Current session is not linked to a Windows Terminal pane.") from None
     prefix = f"ai-sessions-{uuid.uuid4().hex}"
     by_terminal = {}
     for terminal, entry in _read(TERMINALS_FILE).items():
