@@ -131,7 +131,9 @@ def _command(db, workspace, store, state, recover=False):
     pending = db.execute("SELECT generation FROM native_windows WHERE name=?", (base,)).fetchone()
     generation = pending[0] if pending else 0
     name = window_name(workspace["name"], store, generation)
-    create = terminal.restore_argv(workspace, window=name, store_path=store, state_path=state)
+    create = terminal.restore_argv(
+        workspace, window=name, store_path=store, state_path=state, new_window=True
+    )
     create[0] = exe
     try:
         saved = json.loads(Path(state_file).read_text(encoding="utf-8-sig"))
