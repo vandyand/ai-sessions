@@ -1,11 +1,35 @@
 import subprocess
 import unittest
+from contextlib import nullcontext
+from types import SimpleNamespace
 from unittest.mock import Mock, patch
 
 from ai_sessions.workspaces.capture import _marked, layout_from_panes
 
 
 class CaptureGeometryTests(unittest.TestCase):
+    def test_redirected_agent_tool_uses_registered_client_console_not_tool_process(self):
+        from ai_sessions.workspaces import capture
+
+        key = "11111111-1111-4111-8111-111111111111"
+        entry = dict(pid=123, started=10)
+        fake_os = SimpleNamespace(name="nt", environ={"WT_SESSION": key}, getpid=lambda: 999)
+        with (
+            patch.object(capture, "os", fake_os),
+            patch("ai_sessions.detached._read", return_value={key: entry}),
+            patch("ai_sessions.detached._live_remembered", return_value=True),
+            patch.object(capture, "_marked", return_value=nullcontext()) as marked,
+            patch.object(
+                capture,
+                "_read_controls",
+                side_effect=lambda prefix, caller: [
+                    dict(marker=caller, x=0, y=0, width=100, height=100)
+                ],
+            ),
+        ):
+            capture.current_tab()
+        self.assertEqual(marked.call_args.args[0][0]["pid"], 123)
+
     def test_marker_pulse_recovers_from_application_title_updates(self):
         from ai_sessions.workspaces.capture import _pulse
 

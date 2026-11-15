@@ -1,5 +1,26 @@
 # Changelog
 
+## 3.17.0 — 2026-11-14
+
+### Changed
+
+- Default table/list view includes compressed and uncompressed sessions. The `z`
+  key cycles both, uncompressed, compressed; explicit filters still work.
+- Workspace saves are noninteractive by default. `--yes` never invokes a picker;
+  unresolved sessions fail before saving. `--interactive` enables manual setup.
+
+### Added
+
+- `workspace save NAME --layout-only` stores pane geometry without resolving any
+  sessions. `--check` inspects the current capture without saving or prompting.
+- `workspace restore NAME --empty` opens ordinary shells without agents/pickers.
+  New windows with eight or more panes open maximized to fit their splits.
+
+### Fixed
+
+- Live capture retains the verified client console when invoked from a redirected
+  agent tool, rather than replacing it with a tool process without that console.
+
 ## 3.16.0 — 2026-11-13
 
 ### Added

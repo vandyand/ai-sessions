@@ -250,7 +250,7 @@ def current_tab():
         )
     import psutil
 
-    from ..detached import TERMINALS_FILE, _read
+    from ..detached import TERMINALS_FILE, _live_remembered, _read
 
     caller = terminal_key(os.environ["WT_SESSION"])
     prefix = f"ai-sessions-{uuid.uuid4().hex}"
@@ -260,9 +260,12 @@ def current_tab():
             uuid.UUID(terminal_key(terminal))
         except ValueError:
             continue
-        if not entry.get("closed") and entry.get("pid") and entry.get("started"):
+        if _live_remembered(entry):
             by_terminal[terminal_key(terminal)] = dict(pid=entry["pid"], started=entry["started"])
-    by_terminal[caller] = dict(pid=os.getpid(), started=psutil.Process().create_time())
+    # Agent tools may run with redirected handles and no console of their own.
+    # Keep the verified native client's console when this pane is registered.
+    if caller not in by_terminal:
+        by_terminal[caller] = dict(pid=os.getpid(), started=psutil.Process().create_time())
     targets = [
         dict(**value, marker=f"{prefix}-{i}") for i, value in enumerate(by_terminal.values())
     ]

@@ -190,9 +190,10 @@ class SetupTests(unittest.TestCase):
         self.assertEqual(store.save_snapshot.call_count, 1)
         self.assertEqual(store.save_snapshot.call_args.args[2]["main"]["session_id"], "one")
 
-    def test_auto_confirm_still_selects_unknown_panes(self):
-        store, _, _ = self.configure(["empty", "empty"], auto_confirm=True)
-        self.assertEqual(store.save_snapshot.call_args.args[2], {"left": None, "right": None})
+    def test_auto_confirm_refuses_unknown_panes_without_prompting_or_saving(self):
+        with self.assertRaisesRegex(ValueError, "[Uu]nidentified"):
+            self.configure([AssertionError("must not prompt")], auto_confirm=True)
+        self.last_store.save_snapshot.assert_not_called()
 
     def test_preview_and_unknown_prompts_identify_positions(self):
         _, output, _ = self.configure(["empty", "empty", "yes"])

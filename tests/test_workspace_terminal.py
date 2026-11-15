@@ -12,6 +12,40 @@ from ai_sessions.workspaces import terminal
 
 
 class TerminalTests(unittest.TestCase):
+    def test_large_new_window_layout_is_maximized_to_fit_panes(self):
+        layout = [dict(action="newTab")]
+        layout.extend(dict(action="splitPane", split="right", size=0.5) for _ in range(7))
+        args = terminal.restore_argv(dict(name="layout", layout=layout), window="-1", empty=True)
+        self.assertIn("--maximized", args[:5])
+        self.assertNotIn(
+            "--maximized", terminal.restore_argv(dict(name="layout", layout=layout), empty=True)
+        )
+
+    @unittest.skipUnless(shutil.which("pwsh"), "PowerShell required")
+    def test_empty_shell_clears_inherited_assignment_without_launching_python(self):
+        script = Path(terminal.__file__).with_name("shell.ps1")
+        command = (
+            "& $env:PROBE_SHELL; "
+            "if (Test-Path Env:AI_SESSIONS_WORKSPACE) { exit 3 }; "
+            "if (Test-Path Env:AI_SESSIONS_WORKSPACE_PANE) { exit 4 }; "
+            "Write-Output 'PLAIN-SHELL'"
+        )
+        result = subprocess.run(
+            [shutil.which("pwsh"), "-NoProfile", "-Command", command],
+            env={
+                **os.environ,
+                "PROBE_SHELL": str(script),
+                "AI_SESSIONS_WORKSPACE": "parent",
+                "AI_SESSIONS_WORKSPACE_PANE": "pane-1",
+            },
+            stdin=subprocess.DEVNULL,
+            capture_output=True,
+            text=True,
+            timeout=20,
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("PLAIN-SHELL", result.stdout)
+
     def tabs(self, actions):
         with tempfile.TemporaryDirectory() as d:
             p = Path(d) / "state.json"

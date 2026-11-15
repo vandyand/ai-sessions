@@ -205,8 +205,8 @@ Nothing is deleted by age. Sessions idle for 30 days are compressed instead, and
   recorded in `retention.log` in the ai-sessions cache folder.
 - **The setting:** `[retention] compress_after_days` in `config.toml`. The default is 30; 0 turns it
   off.
-- **Finding them:** the default view shows uncompressed sessions. `z` or `--compression
-  compressed|both` shows the rest, and the header says how many matches are compressed.
+- **Finding them:** the default view includes compressed and uncompressed sessions. `z` cycles
+  both → uncompressed → compressed; `--compression` selects the same filters.
 - **By hand:** `Z`, or `sessions --compress ID` and `sessions --decompress ID`.
 - **Opening one:** Enter asks, decompresses it, then opens it. It then has a fresh 30 days.
   Decompressing gives back the exact original bytes.
@@ -582,7 +582,8 @@ sessions workspace save elevate
 ```
 
 It captures that tab's current layout, automatically assigns tracked sessions,
-shows a spatial preview, and asks only about unidentified panes. Confirm to save.
+and saves without prompting. Unidentified panes cause an error before saving;
+use `--interactive` explicitly for manual assignment. `--yes` also never prompts.
 After a PC restart, `sessions workspace restore elevate` opens that workspace.
 For native named-window persistence in Terminal 1.26+, select its executable once
 with `sessions workspace terminal PATH_TO_WindowsTerminal.exe`, then use
@@ -591,6 +592,17 @@ from Terminal's workspace menu. Portable mode is detected automatically; package
 installs need `--state-file PATH_TO_TERMINAL_STATE_JSON` when selecting Terminal.
 
 Running sessions are skipped rather than stopped.
+
+For geometry only, with no session matching or prompts:
+
+```powershell
+sessions workspace save elevate-layout --layout-only
+sessions workspace restore elevate-layout --empty --window -1
+```
+
+The new window contains ordinary shells, with no agents or pickers. Large new
+windows open maximized so their splits fit. `save NAME --check` checks the current
+capture without saving or requesting input.
 
 For another project:
 
