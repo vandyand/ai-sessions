@@ -1,7 +1,7 @@
 # Saved terminal workspaces
 
-Updated November 13, 2026. Version 3.16.0 adds native Terminal workspace reopening;
-3.14.1 fixed missed live pane identities and the fallback picker.
+Updated November 14, 2026. Version 3.17.0 adds prompt-free layout reuse and strict
+noninteractive saves; 3.16.0 added native Terminal workspace reopening.
 
 Use a workspace to save a Windows Terminal tab's pane arrangement and its agent
 sessions, restore it after a restart, or reuse its arrangement for another
@@ -68,39 +68,66 @@ and closed only its own test window. Actual reboot recovery and graphical flyout
 interaction remain unverified. `tools/verify_native_workspace.py` can repeat the
 probe with explicitly supplied disposable native session IDs.
 
-## Save the tab you are using
+## Save only the layout, then open blank panes elsewhere
 
-Run this **inside any pane of the tab you want saved**, in PowerShell:
+Run inside a pane of the tab whose arrangement you want to capture:
+
+```powershell
+sessions workspace save elevate-layout --layout-only
+```
+
+This never asks for input and does not resolve, assign or register the running
+sessions. It captures geometry and saves an assignment-free layout. Capture can
+still fail; failure reports an error instead of starting interactive setup. There
+is no measured field success percentage for capture from agent shell commands.
+A disposable 12-pane test with redirected stdin verified this path.
+
+Open that layout as plain shells in a new Windows Terminal window:
+
+```powershell
+sessions workspace restore elevate-layout --empty --window -1
+```
+
+There are no agent launches or session pickers. Large layouts (eight or more
+panes) open maximized in new windows so minimum pane sizes do not drop splits.
+Existing windows are not resized. To keep a separate reusable copy:
+
+```powershell
+sessions workspace clone elevate-layout another-project
+sessions workspace restore another-project --empty --window -1
+```
+
+The new shells clear inherited managed-pane assignments. They keep ordinary
+PowerShell profiles and remain usable for launching whichever sessions you want.
+
+## Save the layout and its identified sessions
 
 ```powershell
 sessions workspace save elevate
+sessions workspace save elevate --check
 ```
 
-`elevate` is the workspace name you choose. The command captures the actual live
-tab, automatically assigns sessions it can identify, and shows a small spatial
-preview. Confirm the preview to save it. If a pane cannot be identified, the
-preview labels it **unidentified**, tells you its position and offers a searchable
-session picker. It is never assumed empty. Large histories show a search prompt
-without an unrelated initial list. Type part
-of its title, a slug or an ID, then choose the result. Choose `empty` for a shell
-without an agent, or `cancel` to leave the saved workspace untouched.
+Default save never prompts. Every pane must have a verified session assignment;
+otherwise it lists unidentified panes, exits with code 2, and saves nothing.
+`--check` reports the current snapshot without saving; it is a preflight, not a
+promise that a later capture cannot change. `--yes` is retained for compatibility
+and also never prompts; it is unnecessary for ordinary noninteractive saves.
 
-You do not need to know tab indices or pane numbers for this flow. Saving does
-not open a duplicate tab, restart the agents, or send them messages. Existing
-captured panes are registered so later launches through the updated `sessions`
-CLI can update their assignments too; a child cannot change its parent shell's
-environment. Already-running launchers from older versions keep their old code.
-
-For a noninteractive shell command where every pane is identifiable:
+For manual assignment, run explicitly in an interactive PowerShell shell:
 
 ```powershell
-sessions workspace save elevate --yes
+sessions workspace save elevate --interactive
 ```
 
-`--yes` skips final confirmation; unidentified panes still require explicit
-selection. It never guesses their assignments. To replace an existing saved
-workspace use `--force`; replacing one with active managed launch leases is
-refused. Use a new name while those agents are running.
+Only this mode offers session pickers and a final confirmation. Unidentified
+panes are not silently treated as empty. Use `--layout-only` when you want only
+geometry. `--force` replaces an existing workspace, unless its managed agents are
+still running. Failures leave the saved workspace untouched.
+
+Saving neither opens extra panes nor restarts agents. The existing native
+session registrations supply exact identities; titles/directories are never
+used to guess a conversation. No 99% capture or identification success rate has
+been established. The guarantee is that ordinary saves never request input.
 
 ## Restore after a PC restart
 

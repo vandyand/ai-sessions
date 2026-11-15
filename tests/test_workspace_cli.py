@@ -12,6 +12,51 @@ from ai_sessions.workspaces import cli
 
 
 class WorkspaceCliTests(unittest.TestCase):
+    def test_layout_only_save_skips_catalog_and_assignments_and_input(self):
+        snapshot = dict(layout=self.workspace["layout"], panes={"pane-1": dict(terminal="")})
+        with (
+            patch("ai_sessions.workspaces.capture.current_tab", return_value=snapshot),
+            patch("ai_sessions.app.load_session_catalog") as catalog,
+            patch("ai_sessions.workspaces.setup.configure") as configure,
+            patch("builtins.input", side_effect=AssertionError("must not prompt")),
+        ):
+            self.assertEqual(self.main("save", "desk", "--layout-only"), 0)
+        catalog.assert_not_called()
+        configure.assert_not_called()
+        self.store.save.assert_called_once()
+        self.store.save_snapshot.assert_not_called()
+
+    def test_empty_restore_uses_no_session_picker_or_native_assignment(self):
+        with patch.object(cli.subprocess, "Popen") as popen:
+            self.assertEqual(self.main("restore", "desk", "--empty", "--window", "-1"), 0)
+        command = popen.call_args.args[0]
+        self.assertIn("shell.ps1", " ".join(command))
+        self.assertNotIn("-Workspace", command)
+        self.assertNotIn("choose a session", self.output.getvalue())
+
+    def test_default_save_explicitly_disables_interactive_setup(self):
+        snapshot = dict(layout=self.workspace["layout"], panes={})
+        with (
+            patch("ai_sessions.workspaces.capture.current_tab", return_value=snapshot),
+            patch("ai_sessions.app.load_session_catalog", return_value=[]),
+            patch("ai_sessions.app.load_sessions", return_value=[]),
+            patch("ai_sessions.detached._read", return_value={}),
+            patch("ai_sessions.workspaces.setup.configure") as configure,
+        ):
+            self.assertEqual(self.main("save", "desk"), 0)
+        self.assertFalse(configure.call_args.kwargs["interactive"])
+
+    def test_layout_only_check_does_not_save_or_resolve_sessions(self):
+        snapshot = dict(layout=self.workspace["layout"], panes={"pane-1": dict(terminal="")})
+        with (
+            patch("ai_sessions.workspaces.capture.current_tab", return_value=snapshot),
+            patch("ai_sessions.app.load_session_catalog") as catalog,
+            patch("builtins.input", side_effect=AssertionError("must not prompt")),
+        ):
+            self.assertEqual(self.main("save", "desk", "--layout-only", "--check"), 0)
+        self.store.save.assert_not_called()
+        catalog.assert_not_called()
+
     def test_native_open_uses_configured_window_and_current_state(self):
         with patch("ai_sessions.workspaces.native.launch", return_value="sessions-desk") as launch:
             self.assertEqual(self.main("open", "desk"), 0)
@@ -332,7 +377,15 @@ class WorkspaceCliTests(unittest.TestCase):
             patch("builtins.input", return_value="2"),
         ):
             self.assertEqual(
-                self.main("save", "desk", "--state-file", "terminal-state.json", "--force"), 0
+                self.main(
+                    "save",
+                    "desk",
+                    "--state-file",
+                    "terminal-state.json",
+                    "--force",
+                    "--interactive",
+                ),
+                0,
             )
             self.store.save.assert_called_once_with("desk", tabs[1]["layout"], replace=True)
             self.store.bind.assert_not_called()

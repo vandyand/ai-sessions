@@ -244,15 +244,20 @@ def _read_controls(prefix, caller):
 
 
 def current_tab():
-    if os.name != "nt" or not os.environ.get("WT_SESSION"):
+    if os.name != "nt":
         raise ValueError(
             "Run workspace save in a pane of the Windows Terminal tab you want to save."
         )
     import psutil
 
-    from ..detached import TERMINALS_FILE, _read
+    from ..detached import TERMINALS_FILE, _live_remembered, _read, running_here
 
-    caller = terminal_key(os.environ["WT_SESSION"])
+    linked = running_here()
+    caller = terminal_key(linked[0] if linked else os.environ.get("WT_SESSION", ""))
+    try:
+        uuid.UUID(caller)
+    except ValueError:
+        raise ValueError("Current session is not linked to a Windows Terminal pane.") from None
     prefix = f"ai-sessions-{uuid.uuid4().hex}"
     by_terminal = {}
     for terminal, entry in _read(TERMINALS_FILE).items():
@@ -260,9 +265,12 @@ def current_tab():
             uuid.UUID(terminal_key(terminal))
         except ValueError:
             continue
-        if not entry.get("closed") and entry.get("pid") and entry.get("started"):
+        if _live_remembered(entry):
             by_terminal[terminal_key(terminal)] = dict(pid=entry["pid"], started=entry["started"])
-    by_terminal[caller] = dict(pid=os.getpid(), started=psutil.Process().create_time())
+    # Agent tools may run with redirected handles and no console of their own.
+    # Keep the verified native client's console when this pane is registered.
+    if caller not in by_terminal:
+        by_terminal[caller] = dict(pid=os.getpid(), started=psutil.Process().create_time())
     targets = [
         dict(**value, marker=f"{prefix}-{i}") for i, value in enumerate(by_terminal.values())
     ]

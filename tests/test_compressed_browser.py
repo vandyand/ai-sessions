@@ -54,8 +54,8 @@ class FilterTests(Fixture):
     def names(self, **kwargs) -> list[str]:
         return [item.session_id for item in filtered_sessions(self.sessions, **kwargs)]
 
-    def test_default_hides_compressed_sessions(self) -> None:
-        self.assertEqual(self.names(), ["plain task"])
+    def test_default_includes_compressed_and_uncompressed_sessions(self) -> None:
+        self.assertCountEqual(self.names(), ["plain task", "packed task"])
 
     def test_each_value(self) -> None:
         self.assertEqual(self.names(compression="compressed"), ["packed task"])
@@ -73,8 +73,8 @@ class FilterTests(Fixture):
 class BrowserTests(Fixture):
     def test_z_cycles_and_the_header_says_so(self) -> None:
         browser = self.browser()
-        self.assertEqual(browser.compression, "uncompressed")
-        self.assertIn("Uncompressed", self.frame(browser))
+        self.assertEqual(browser.compression, "both")
+        self.assertIn("Uncompressed + compressed", self.frame(browser))
         expected = {
             "compressed": "Compressed",
             "both": "Uncompressed + compressed",
@@ -88,7 +88,7 @@ class BrowserTests(Fixture):
     def test_z_key_is_a_command_not_a_search(self) -> None:
         browser = self.browser("z", "q")
         browser.run()
-        self.assertEqual(browser.compression, "compressed")
+        self.assertEqual(browser.compression, "uncompressed")
         self.assertEqual(browser.query, "")
 
     def test_compressed_row_is_marked(self) -> None:
@@ -100,6 +100,7 @@ class BrowserTests(Fixture):
 
     def test_header_counts_only_what_the_filter_excludes(self) -> None:
         browser = self.browser()
+        browser.compression = "uncompressed"
         self.assertIn("1 compressed", self.frame(browser))
         browser.query = "packed"
         self.assertIn("1 compressed", self.frame(browser))
@@ -111,6 +112,7 @@ class BrowserTests(Fixture):
 
     def test_empty_search_points_at_the_filter(self) -> None:
         browser = self.browser()
+        browser.compression = "uncompressed"
         browser.query = "packed"
         self.assertIn("z shows", self.frame(browser))
 
@@ -244,10 +246,10 @@ class CommandLineTests(Fixture):
         self.assertIn(code, (0, None))
         return output.getvalue()
 
-    def test_list_defaults_to_uncompressed(self) -> None:
+    def test_list_defaults_to_both(self) -> None:
         text = self.run_list("--list")
         self.assertIn("plain task", text)
-        self.assertNotIn("packed task", text)
+        self.assertIn("packed task", text)
 
     def test_list_filters_and_marks(self) -> None:
         text = self.run_list("--list", "--compression", "compressed")

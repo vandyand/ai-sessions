@@ -154,8 +154,20 @@ def _map(panes, bindings, empty_slots=()):
         )
 
 
-def configure(name, snapshot, items, remembered, state, store, replace=False, auto_confirm=False):
-    """Preview and save atomically; auto_confirm skips only final confirmation."""
+def configure(
+    name,
+    snapshot,
+    items,
+    remembered,
+    state,
+    store,
+    replace=False,
+    auto_confirm=False,
+    *,
+    interactive=True,
+    check_only=False,
+):
+    """Resolve before saving; noninteractive calls either save completely or fail."""
     items = list(items)
     panes = snapshot["panes"]
     if not panes or any(p["width"] <= 0 or p["height"] <= 0 for p in panes.values()):
@@ -187,6 +199,16 @@ def configure(name, snapshot, items, remembered, state, store, replace=False, au
             used.add(key)
     empty_slots = set()
     _map(panes, bindings)
+    missing = [slot for slot in panes if bindings[slot] is None]
+    if missing and (auto_confirm or check_only or not interactive):
+        positions = ", ".join(missing)
+        raise ValueError(
+            f"Unidentified panes: {positions}. Nothing saved. "
+            "Use --layout-only for geometry, or --interactive in an interactive shell to assign sessions."
+        )
+    if check_only:
+        print(f"Ready: {len(panes)} panes identified; nothing saved.")
+        return
     for slot in panes:
         if bindings[slot] is not None:
             continue
@@ -205,7 +227,11 @@ def configure(name, snapshot, items, remembered, state, store, replace=False, au
             empty_slots.add(slot)
     print(f"Workspace {name} preview:")
     _map(panes, bindings, empty_slots)
-    if not auto_confirm and _ask("Save this workspace? [yes/no]: ").casefold() not in {"y", "yes"}:
+    if (
+        interactive
+        and not auto_confirm
+        and _ask("Save this workspace? [yes/no]: ").casefold() not in {"y", "yes"}
+    ):
         raise ValueError("Workspace setup cancelled; nothing saved.")
     result = store.save_snapshot(name, snapshot["layout"], bindings, terminals, replace=replace)
     print(f"Saved {name}. Next: sessions workspace restore {name}")

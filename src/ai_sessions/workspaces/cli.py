@@ -24,8 +24,18 @@ def _parser():
     save.add_argument("--tab-index", type=int)
     save.add_argument("--state-file", type=Path)
     save.add_argument("--force", action="store_true")
+    prompt_mode = save.add_mutually_exclusive_group()
+    prompt_mode.add_argument("--yes", action="store_true", help="never prompt (also the default)")
+    prompt_mode.add_argument(
+        "--interactive", action="store_true", help="allow manual session selection"
+    )
     save.add_argument(
-        "--yes", action="store_true", help="save the preview without a final confirmation"
+        "--layout-only",
+        action="store_true",
+        help="save pane geometry without session assignments or prompts",
+    )
+    save.add_argument(
+        "--check", action="store_true", help="check the current capture without saving or prompting"
     )
     listing = commands.add_parser("list")
     listing.add_argument("--json", action="store_true")
@@ -45,6 +55,9 @@ def _parser():
     restore.add_argument("--window", default="0")
     restore.add_argument("--allow-unbound", action="store_true")
     restore.add_argument("--dry-run", action="store_true")
+    restore.add_argument(
+        "--empty", action="store_true", help="open plain shells, with no agents or session pickers"
+    )
     native = commands.add_parser("open", help="open or focus a native named Terminal workspace")
     native.add_argument("name")
     native.add_argument("--dry-run", action="store_true")
@@ -81,6 +94,21 @@ def _save(args, store):
         from .setup import configure
 
         snapshot = current_tab()
+        if args.layout_only:
+            layout = [dict(action) for action in snapshot["layout"]]
+            for action in layout:
+                action.pop("title", None)
+            if args.check:
+                print(f"Layout ready: {len(snapshot['panes'])} panes; nothing saved.")
+            else:
+                store.save(args.name, layout, replace=args.force)
+                print(
+                    f"Saved layout {args.name}: {len(snapshot['panes'])} panes, no session assignments."
+                )
+                print(
+                    f"Open blank shells: sessions workspace restore {args.name} --empty --window -1"
+                )
+            return
         state = _state()
         items = app.load_session_catalog(state=state)
         if not items:
@@ -129,6 +157,8 @@ def _save(args, store):
             store,
             replace=args.force,
             auto_confirm=args.yes,
+            interactive=args.interactive,
+            check_only=args.check,
         )
         return
     tabs = [
@@ -140,7 +170,7 @@ def _save(args, store):
     if not tabs:
         raise ValueError("no saved Terminal tab matches the requested window/tab indices")
     if len(tabs) > 1:
-        if not sys.stdin.isatty():
+        if args.check or args.layout_only or not args.interactive or not sys.stdin.isatty():
             raise ValueError("ambiguous saved layout; specify --window-index and --tab-index")
         for number, tab in enumerate(tabs, 1):
             print(
@@ -156,7 +186,14 @@ def _save(args, store):
         tab = tabs[choice - 1]
     else:
         tab = tabs[0]
-    store.save(args.name, tab["layout"], replace=args.force)
+    if args.check:
+        print(f"Layout ready: {tab['pane_count']} panes; nothing saved.")
+        return
+    layout = [dict(action) for action in tab["layout"]]
+    if args.layout_only:
+        for action in layout:
+            action.pop("title", None)
+    store.save(args.name, layout, replace=args.force)
     print(f"Saved {args.name}: window {tab['window']} tab {tab['tab']}")
     for action in tab["layout"]:
         if "slot" in action:
@@ -348,13 +385,14 @@ def main(argv=None):
         elif args.command == "restore":
             workspace = store.get(args.name)
             missing = [slot for slot, binding in workspace["panes"].items() if binding is None]
-            if missing and not args.dry_run:
+            if missing and not args.dry_run and not args.empty:
                 print("Unassigned panes will ask you to choose a session when they open.")
             command = terminal.restore_argv(
                 workspace,
                 window=args.window,
                 store_path=store.path,
                 state_path=os.environ.get("AI_SESSIONS_STATE_FILE"),
+                empty=args.empty,
             )
             if args.dry_run:
                 print(json.dumps(command, ensure_ascii=False))

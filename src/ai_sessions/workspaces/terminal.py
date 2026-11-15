@@ -129,7 +129,7 @@ def _wt_arg(value):
     return _text(str(value), "argument").replace(";", "\\;")
 
 
-def restore_argv(workspace, *, window="0", store_path=None, state_path=None):
+def restore_argv(workspace, *, window="0", store_path=None, state_path=None, empty=False):
     """Build argv only; never launch Terminal or execute saved commandlines."""
     if not isinstance(workspace, dict):
         raise ValueError("Workspace must be an object")
@@ -153,6 +153,8 @@ def restore_argv(workspace, *, window="0", store_path=None, state_path=None):
         .absolute()
     )
     args = ["wt", "-w", window]
+    if window == "-1" and sum("slot" in action for action in layout) >= 8:
+        args.append("--maximized")
     for index, action in enumerate(layout):
         if index:
             args.append(";")
@@ -171,9 +173,20 @@ def restore_argv(workspace, *, window="0", store_path=None, state_path=None):
             for key, flag in (("profile", "--profile"), ("title", "--title")):
                 if key in action:
                     args.extend([flag, _wt_arg(action[key])])
-            args.extend(
-                _wt_arg(value) for value in pane_argv(name, action["slot"], store_path, state_path)
-            )
+            if empty:
+                args.extend(
+                    [
+                        "pwsh",
+                        "-NoExit",
+                        "-File",
+                        _wt_arg(Path(__file__).with_name("shell.ps1").absolute()),
+                    ]
+                )
+            else:
+                args.extend(
+                    _wt_arg(value)
+                    for value in pane_argv(name, action["slot"], store_path, state_path)
+                )
     return args
 
 

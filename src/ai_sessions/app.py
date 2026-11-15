@@ -85,7 +85,7 @@ SUPERVISED_GLYPH = "◉"
 SUPERVISOR_GLYPH = "◎"
 VISIBILITY_ORDER = ("visible", "hidden", "all")
 VISIBILITY_LABELS = {"visible": "Visible", "hidden": "Hidden", "all": "Visible + hidden"}
-COMPRESSION_ORDER = ("uncompressed", "compressed", "both")
+COMPRESSION_ORDER = ("both", "uncompressed", "compressed")
 COMPRESSION_LABELS = {
     "uncompressed": "Uncompressed",
     "compressed": "Compressed",
@@ -3147,7 +3147,7 @@ def filtered_sessions(
     visibility: str = "visible",
     include_auxiliary: bool | None = None,
     sort_mode: str = "recent",
-    compression: str = "uncompressed",
+    compression: str = "both",
 ) -> list[Session]:
     # Backward compatibility for scripts written against v1.
     if include_auxiliary:
@@ -3596,7 +3596,7 @@ class Browser:
         self._tools = set(REGISTRY.names())
         self.origin = "human"
         self.visibility = "visible"
-        self.compression = "uncompressed"
+        self.compression = "both"
         self.directory = ""
         self.query = ""
         self.sort_mode = "recent"
@@ -6542,7 +6542,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--compression",
         choices=COMPRESSION_ORDER,
-        default="uncompressed",
+        default="both",
         help="filter by whether sessions are compressed on disk",
     )
     parser.add_argument(
