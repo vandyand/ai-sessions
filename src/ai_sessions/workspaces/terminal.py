@@ -154,7 +154,9 @@ def restore_argv(workspace, *, window="0", store_path=None, state_path=None, emp
     )
     args = ["wt", "-w", window]
     if window == "-1" and sum("slot" in action for action in layout) >= 8:
-        args.append("--maximized")
+        # Terminal maximizes after its initial XAML layout pass. Give startup
+        # splits room before ShowWindow too, or minimum sizes can drop panes.
+        args.extend(["--maximized", "--size", "180,60"])
     for index, action in enumerate(layout):
         if index:
             args.append(";")

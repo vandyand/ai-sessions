@@ -1,5 +1,13 @@
 # Changelog
 
+## 3.17.1 — 2026-11-14
+
+### Fixed
+
+- Large new-window layouts specify an initial 180-column by 60-row size before
+  maximizing. Terminal applies maximization after its initial layout pass, so
+  maximization alone could still drop startup splits due to minimum pane sizes.
+
 ## 3.17.0 — 2026-11-14
 
 ### Changed
