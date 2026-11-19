@@ -149,6 +149,7 @@ class DeskLifetimeTests(unittest.TestCase):
 class DeskContextTests(unittest.TestCase):
     def test_new_agent_does_not_inherit_supervisor_or_sender_identity(self):
         import os
+
         from ai_sessions.desk.store import Store
 
         with tempfile.TemporaryDirectory() as root:
