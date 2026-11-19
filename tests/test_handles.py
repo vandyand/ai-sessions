@@ -29,9 +29,9 @@ def test_defaults_stable_and_aliases(store):
     assert a.handle == "elev-wrk-11"
     c = item("c", "ordinary title")
     store.ensure([c])
-    assert c.handle == "elev-session-1"
-    assert store.resolve("ELEV-session", [c]) is c
-    assert store.lookup_members(c.handle) == store.lookup_members("elev-session")
+    assert c.handle == "elev-ses-1"
+    assert store.resolve("ELEV-ses", [c]) is c
+    assert store.lookup_members(c.handle) == store.lookup_members("elev-ses")
 
 
 def test_rename_edits_and_reservations(store):
@@ -524,3 +524,269 @@ def test_bridge_members_cannot_capture_per_copy_slug_names(store):
     assert slugs.lookup("source-copy") == source
     assert slugs.lookup("target-copy") == target
     assert store.current_key(a.handle) == target
+
+
+def test_inherit_target_project_all_copies_and_retire_default(store, tmp_path):
+    target = item("target")
+    sup = item("supervisor", supervises="target", conversation_id="supervision")
+    copy = item("copy", supervises="target", conversation_id="supervision")
+    unrelated = item("unrelated", "Supervisor of target")
+    sup.cwd = copy.cwd = unrelated.cwd = str(tmp_path / "a123-uuid")
+    store.ensure([target, sup, copy, unrelated])
+    old, untouched = sup.handle, unrelated.handle
+    store.inherit_projects([(sup, target), (copy, target)])
+    assert sup.handle == copy.handle == "elev-sup-1"
+    assert sup.project_handle == "elev"
+    assert unrelated.handle == untouched
+    with pytest.raises(ValueError, match="retired"):
+        store.resolve(old, [sup, copy])
+    assert store.lookup_members("elev-sup") == store.lookup_members(old)
+
+
+def test_inherit_actual_manually_assigned_target_project(store, tmp_path):
+    target, sup = item("target"), item("supervisor", supervises="target")
+    sup.cwd = str(tmp_path / "uuid")
+    store.ensure([target, sup])
+    store.add_project("pick", tmp_path / "chosen")
+    store.assign(target, "pick")
+    store.inherit_projects([(sup, target)])
+    assert sup.handle == "pick-sup-1"
+
+
+def test_inherit_directory_fallback_uses_git_root_and_unique_alias(store, tmp_path):
+    root = tmp_path / "target"
+    (root / ".git").mkdir(parents=True)
+    sup, occupied = item("sup", supervises="missing"), item("occupied", "Supervisor")
+    occupied.cwd = str(root)
+    sup.cwd = str(tmp_path / "uuid")
+    store.ensure([sup, occupied])
+    store.inherit_projects([(sup, str(root / "subdirectory"))])
+    assert sup.handle == "targ-sup-2"
+    assert sup.project_handle == occupied.project_handle
+
+
+@pytest.mark.parametrize("manual", ["custom", "assign", "same_handle"])
+def test_inherit_preserves_durable_manual_choices(store, tmp_path, manual):
+    target, sup = item("target"), item("sup", supervises="target")
+    sup.cwd = str(tmp_path / "uuid")
+    store.ensure([target, sup])
+    if manual == "assign":
+        store.assign(sup, sup.project_handle, role="sup", number=1)
+    else:
+        store.set_session(sup, "custom" if manual == "custom" else sup.handle)
+    previous = sup.handle, sup.project_handle
+    reopened = HandleStore(store.path)
+    reopened.inherit_projects([(sup, target)])
+    assert (sup.handle, sup.project_handle) == previous
+
+
+def test_inherit_legacy_defaults_and_custom_handles(store, tmp_path):
+    import sqlite3
+
+    target = item("target")
+    sup, custom = item("sup", supervises="target"), item("custom", supervises="target")
+    sup.cwd = custom.cwd = str(tmp_path / "uuid")
+    store.ensure([target, sup, custom])
+    store.set_session(custom, "chosen")
+    with sqlite3.connect(store.path) as connection:
+        connection.execute("DROP TRIGGER IF EXISTS handle_project_assignment_explicit")
+        connection.execute("ALTER TABLE handle_logicals DROP COLUMN project_explicit")
+    reopened = HandleStore(store.path)
+    reopened.inherit_projects([(sup, target), (custom, target)])
+    assert sup.handle == "elev-sup-2"
+    assert custom.handle == "chosen"
+    assert custom.project_handle == "uuid"
+    # Migration must persist a safe classification for future calls.
+    with sqlite3.connect(store.path) as connection:
+        assert connection.execute(
+            'SELECT project_explicit FROM handle_logicals WHERE handle="chosen"'
+        ).fetchone() == (1,)
+
+
+def test_inherit_unchanged_is_readonly_and_restores_annotations(store, tmp_path, monkeypatch):
+    import sqlite3
+
+    import ai_sessions.handles as handles
+
+    target, sup = item("target"), item("sup", supervises="target")
+    sup.cwd = str(tmp_path / "uuid")
+    store.ensure([target, sup])
+    store.inherit_projects([(sup, target)])
+    queries = []
+    original = sqlite3.connect
+
+    def connect(*args, **kwargs):
+        connection = original(*args, **kwargs)
+        connection.set_trace_callback(queries.append)
+        return connection
+
+    monkeypatch.setattr(handles.sqlite3, "connect", connect)
+    sup.handle = ""
+    with original(store.path) as writer:
+        writer.execute("BEGIN IMMEDIATE")
+        store.inherit_projects([(sup, target)])
+    assert sup.handle == "elev-sup-1"
+    assert not any(
+        q.startswith(("INSERT", "UPDATE", "CREATE", "ALTER", "BEGIN IMMEDIATE")) for q in queries
+    )
+
+
+def test_inherit_new_fallback_project_and_follow_target_until_manual_override(store, tmp_path):
+    sup = item("sup", supervises="missing")
+    store.ensure([sup])
+    store.inherit_projects([(sup, str(tmp_path / "fallback"))])
+    assert sup.handle == "fall-sup-1"
+    target = item("target")
+    store.ensure([target])
+    store.inherit_projects([(sup, target)])
+    assert sup.handle == "elev-sup-1"
+    store.assign(sup, "fall", role="mgr", number=3)
+    store.inherit_projects([(sup, target)])
+    assert sup.handle == "fall-mgr-3"
+
+
+def test_inherit_preserves_native_and_slug_namespace(store, tmp_path):
+    target, sup = item("target"), item("sup", supervises="target")
+    native = item("elev-sup-1")
+    sup.cwd = str(tmp_path / "uuid")
+    slug_key = NativeKey("test", "foreign", store.path.parent)
+    SlugStore(store.path).set_slug(slug_key, "elev-sup-2")
+    store.ensure([target, sup, native])
+    store.inherit_projects([(sup, target)])
+    assert sup.handle == "elev-sup-3"
+    assert SlugStore(store.path).lookup("elev-sup-2") == slug_key
+
+
+def test_inherit_empty_batch_does_not_create_registry(store):
+    assert store.inherit_projects([]) == {}
+    assert not store.path.exists()
+
+
+def test_legacy_writer_project_assignment_survives_inheritance(store, tmp_path):
+    import sqlite3
+
+    target, sup = item("target"), item("sup", supervises="target")
+    sup.cwd = str(tmp_path / "uuid")
+    store.ensure([target, sup])
+    project = store.add_project("pick", tmp_path / "chosen")
+    # 3.19 assign updates these columns without knowing project_explicit exists.
+    with sqlite3.connect(store.path) as connection:
+        owner = connection.execute(
+            "SELECT logical_id FROM handle_members WHERE session_id='sup'"
+        ).fetchone()[0]
+        connection.execute("INSERT INTO handle_claims VALUES (?,?)", ("pick-sup-7", owner))
+        connection.execute(
+            "UPDATE handle_logicals SET project_id=?,role=?,number=?,handle=? WHERE id=?",
+            (project["id"], "sup", 7, "pick-sup-7", owner),
+        )
+    store.inherit_projects([(sup, target)])
+    assert sup.handle == "pick-sup-7"
+    assert sup.project_handle == "pick"
+
+
+@pytest.mark.parametrize("first_write", ["ensure", "add_project", "set_project"])
+def test_legacy_schema_preserves_assignment_away_from_native_project(store, tmp_path, first_write):
+    import sqlite3
+
+    target, sup = item("target"), item("sup", supervises="target")
+    sup.cwd = str(tmp_path / "uuid")
+    store.ensure([target, sup])
+    store.add_project("pick", tmp_path / "chosen")
+    store.assign(sup, "pick", role="sup", number=7)
+    with sqlite3.connect(store.path) as connection:
+        for (name,) in connection.execute("SELECT name FROM sqlite_master WHERE type='trigger'"):
+            connection.execute('DROP TRIGGER "' + name + '"')
+        connection.execute("ALTER TABLE handle_logicals DROP COLUMN project_explicit")
+    reopened = HandleStore(store.path)
+    if first_write == "add_project":
+        reopened.add_project("extra", tmp_path / "extra")
+    elif first_write == "set_project":
+        reopened.set_project("pick", "kept")
+    reopened.ensure([target, sup])
+    reopened.inherit_projects([(sup, target)])
+    assert sup.handle == ("kept-sup-7" if first_write == "set_project" else "pick-sup-7")
+
+
+def test_schema_writes_do_not_reclassify_already_inherited_supervisors(store, tmp_path):
+    target, sup = item("target"), item("sup", supervises="target")
+    sup.cwd = str(tmp_path / "uuid")
+    store.ensure([target, sup])
+    store.inherit_projects([(sup, target)])
+    reopened = HandleStore(store.path)
+    reopened.add_project("extra", tmp_path / "extra")
+    reopened.set_project(target.project_handle, "ren")
+    reopened.ensure([target, sup])
+    reopened.assign(target, "extra")
+    reopened.inherit_projects([(sup, target)])
+    assert sup.project_handle == "extra"
+
+
+def test_automatic_inheritance_follows_repeated_target_assignments(store, tmp_path):
+    import sqlite3
+
+    target, sup = item("target"), item("sup", supervises="target")
+    sup.cwd = str(tmp_path / "uuid")
+    store.ensure([target, sup])
+    for project in ("one", "two", "three"):
+        store.add_project(project, tmp_path / project)
+        store.assign(target, project)
+        store.inherit_projects([(sup, target)])
+        assert sup.project_handle == project
+        with sqlite3.connect(store.path) as connection:
+            assert connection.execute(
+                "SELECT project_explicit FROM handle_logicals WHERE handle=?", (sup.handle,)
+            ).fetchone() == (0,)
+
+
+def test_generic_role_uses_ses_for_assign_rename_and_inherit(store, tmp_path):
+    generic, target = item("generic", "ordinary title"), item("target")
+    generic.cwd = str(tmp_path / "uuid")
+    store.ensure([generic, target])
+    assert generic.handle == "uuid-ses-1"
+    assert generic.session_role == "session"
+    store.inherit_projects([(generic, target)])
+    assert generic.handle == "elev-ses-1"
+    store.set_project("elev", "el")
+    store.ensure([generic])
+    assert generic.handle == "el-ses-1"
+    store.assign(generic, "el", role="ses", number=4)
+    assert generic.handle == "el-ses-4"
+    assert generic.session_role == "session"
+
+
+@pytest.mark.parametrize("legacy_schema", [False, True])
+def test_migrate_generated_long_generic_handles_preserving_custom_and_claims(store, legacy_schema):
+    import sqlite3
+
+    generic = item("generic", "ordinary")
+    custom = item("custom", "ordinary")
+    explicit = item("explicit", "ordinary")
+    store.ensure([generic, custom, explicit])
+    store.set_session(custom, "chosen-session-9")
+    store.set_session(explicit, explicit.handle)
+    # Reconstruct old generated spellings and reservations without depending
+    # on the new allocator to manufacture the legacy database under test.
+    with sqlite3.connect(store.path) as connection:
+        for row in connection.execute(
+            "SELECT id,number FROM handle_logicals WHERE handle<>?", (custom.handle,)
+        ).fetchall():
+            name = f"elev-session-{row[1]}"
+            connection.execute("UPDATE handle_logicals SET handle=? WHERE id=?", (name, row[0]))
+            connection.execute("INSERT OR IGNORE INTO handle_claims VALUES (?,?)", (name, row[0]))
+            if row[1] == 1:
+                connection.execute(
+                    "INSERT INTO handle_claims VALUES (?,?)", ("elev-session", row[0])
+                )
+        if legacy_schema:
+            connection.execute("DROP TRIGGER IF EXISTS handle_project_assignment_explicit")
+            connection.execute("ALTER TABLE handle_logicals DROP COLUMN project_explicit")
+    reopened = HandleStore(store.path)
+    reopened.ensure([generic, custom, explicit])
+    assert generic.handle == "elev-ses-3"
+    assert custom.handle == "chosen-session-9"
+    assert explicit.handle == ("elev-ses-2" if legacy_schema else "elev-session-2")
+    assert reopened.claimed("elev-session-3")
+    with pytest.raises(ValueError, match="retired"):
+        reopened.resolve("elev-session-3", [generic])
+    with pytest.raises(ValueError, match="reserved"):
+        reopened.set_session(custom, "elev-session-3")

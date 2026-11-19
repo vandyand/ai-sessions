@@ -21,6 +21,12 @@ See [Project and session handles](docs/SESSION_HANDLES.md) for defaults, editing
 project assignment, messaging, and cross-harness behavior. Native IDs and existing
 slugs remain supported.
 
+In the menu, press `m` to read the selected conversation's full messages before
+opening it. Use `p`/`n` for older/newer messages, `u`/`a` for the latest user or
+assistant message, and arrows/Page Up/Page Down to scroll. Press `q` to return.
+Compressed histories can be previewed without restoring them permanently.
+Help (`?`) wraps and scrolls in narrow panes; expanded children have indented titles.
+
 ## Session slugs
 
 Every native session copy has a unique, persistent slug, independent of its display

@@ -2,7 +2,7 @@
 product: "ai-sessions terminal browser"
 owner: "vandyand"
 status: "active"
-last_reviewed: "2026-08-25"
+last_reviewed: "2026-11-19"
 implementation_roots:
   - "src/ai_sessions/app.py"
   - "src/ai_sessions/harnesses"
@@ -24,7 +24,7 @@ tokens:
 
 - **Primary user:** A developer with conversation history in two or more AI coding harnesses.
 - **Context and constraints:** Keyboard-first terminal use on Linux or Windows, sometimes over SSH,
-  with large local histories and terminals as narrow as 60 columns.
+  with large local histories and terminals as narrow as 40 columns.
 - **Primary job:** Find the right conversation, understand where it lives and whether it is open,
   then focus, resume, or bridge it with minimal delay.
 - **Success means:** The first useful list appears promptly; active filters and refresh status are
@@ -59,6 +59,17 @@ tokens:
   remains visible but does not block resume or discard other histories.
 - **Recovery / exit:** `Esc` clears search, `Ctrl-R` retries refresh, and `q` exits.
 - **Evidence:** `tests/test_startup.py`, `tests/test_display.py`, and launch tests.
+
+### Inspect Before Opening
+
+- **Entry:** Highlight a session and press `m`.
+- **Actions:** Read complete messages, scroll with arrows/page keys, move with
+  `p`/`n`, or jump to the latest user/assistant message with `u`/`a`.
+- **Feedback:** The message role, position, and visible line range stay above the
+  text; navigation controls wrap below it. History truncation is explicitly labeled.
+- **Exit:** `q` or Esc returns to the same menu. Compressed preview uses a bounded
+  temporary extraction and preserves native storage. No harness starts.
+- **Evidence:** `tests/test_conversation_view.py`, `tools/verify_session_browser.py`.
 
 ### Choose Visible Tools
 

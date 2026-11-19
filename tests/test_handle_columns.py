@@ -1,3 +1,4 @@
+import curses
 import io
 import os
 import tempfile
@@ -29,6 +30,70 @@ class PositionedScreen(display.ScriptedScreen):
 
 
 class HandleColumnsTests(unittest.TestCase):
+    def test_confirmation_retries_timeout_and_restores_menu_polling(self):
+        with tempfile.TemporaryDirectory() as directory:
+            browser = self.browser(directory, 40, [self.item()])
+            with patch.object(browser.screen, "get_wch", side_effect=[curses.error(), "\x1b"]):
+                self.assertEqual(browser.confirmation_key(), "\x1b")
+            self.assertEqual(browser.screen.timeouts[-2:], [-1, 1000])
+
+    def test_nested_rows_render_indented_titles_without_shifting_handles(self):
+        from dataclasses import replace
+
+        with tempfile.TemporaryDirectory() as directory:
+            browser = self.browser(directory, 80, [self.item()])
+            row = browser.view_rows()[0]
+            nested = [replace(row, row_id=str(n), depth=n) for n in range(3)]
+            with patch.object(browser, "view_rows", return_value=nested):
+                browser.draw()
+            painted = ["".join(browser.screen.lines[y]) for y in (4, 5, 6)]
+            self.assertLess(painted[0].index("elevate"), painted[1].index("elevate"))
+            self.assertLess(painted[1].index("elevate"), painted[2].index("elevate"))
+            self.assertEqual(len({line.index("elev-mgr") for line in painted}), 1)
+            self.assertIn("↳", painted[1])
+
+    def test_decompression_keys_are_visible_before_title_at_skinny_width(self):
+        with tempfile.TemporaryDirectory() as directory:
+            for width in (40, 60, 80):
+                item = self.item(handle="elev-mgr")
+                item.title = "A very long conversation name " * 5
+                item.compressed = True
+                browser = self.browser(directory, width, [item], "n")
+                row = browser.view_rows()[0]
+                with (
+                    patch("ai_sessions.retention.sync_storage"),
+                    patch("ai_sessions.retention.needs_restore", return_value=True),
+                ):
+                    self.assertIsNone(browser.restore_to_open(row, item))
+                prompt = "".join(browser.screen.lines[-1])
+                self.assertIn("Y", prompt)
+                self.assertIn("Decompress", prompt)
+                self.assertIn("Esc cancel", prompt)
+
+    def test_messages_key_previews_selected_copy_without_opening(self):
+        with (
+            tempfile.TemporaryDirectory() as directory,
+            patch("ai_sessions.conversation_view.run") as preview,
+        ):
+            item = self.item()
+            browser = self.browser(directory, 60, [item], "m", "q")
+            self.assertIsNone(browser.run())
+            preview.assert_called_once_with(browser.screen, item)
+
+    def test_footer_uses_handle_without_redundant_slug(self):
+        with (
+            tempfile.TemporaryDirectory() as directory,
+            patch.dict(os.environ, {"TERM": "dumb"}),
+            patch.object(app.curses, "curs_set"),
+        ):
+            item = self.item()
+            item.slug = "long-legacy-slug"
+            browser = self.browser(directory, 120, [item], "x")
+            browser.draw()
+            self.assertNotIn("Slug ", "\n".join("".join(line) for line in browser.screen.lines))
+            browser.details()
+            self.assertIn("long-legacy-slug", browser.screen.frames[-1])
+
     def browser(self, directory, width, items, *keys):
         return app.Browser(
             PositionedScreen(*keys, size=(30, width)),

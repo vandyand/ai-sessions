@@ -52,6 +52,7 @@ _ROLES = {
     "helper": "wrk",
     "wrk": "wrk",
     "session": "session",
+    "ses": "session",
 }
 
 
@@ -66,6 +67,11 @@ def _role(item):
         else None
     )
     return (_ROLES[match[1].lower()], max(1, int(match[2] or 1))) if match else ("session", 1)
+
+
+def _default_handle(project, role, number):
+    component = "ses" if role == "session" else role
+    return f"{project}-{component}-{number}"
 
 
 def _aliases(name):
@@ -89,7 +95,7 @@ class HandleStore:
         self.path = Path(path) if path is not None else STATE_FILE.with_suffix(".slugs.sqlite3")
 
     @contextmanager
-    def _connection(self, readonly=False):
+    def _connection(self, readonly=False, *, items=()):
         connection = None
         try:
             if readonly:
@@ -124,6 +130,51 @@ class HandleStore:
                 "CREATE INDEX IF NOT EXISTS handle_members_owner ON handle_members(logical_id)",
             ):
                 connection.execute(statement)
+            columns = {row[1] for row in connection.execute("PRAGMA table_info(handle_logicals)")}
+            if "project_explicit" not in columns:
+                connection.execute(
+                    "ALTER TABLE handle_logicals ADD COLUMN project_explicit INTEGER NOT NULL DEFAULT 0"
+                )
+                # -1 means a legacy generated-shaped handle still needs native
+                # roots. Project-only commands must not finalize it as automatic.
+                for row in connection.execute(
+                    "SELECT l.*,p.handle AS project_handle,p.directory FROM handle_logicals l "
+                    "JOIN handle_projects p ON p.id=l.project_id"
+                ).fetchall():
+                    generated = {
+                        _default_handle(row["project_handle"], row["role"], row["number"]),
+                        f"{row['project_handle']}-{row['role']}-{row['number']}",
+                    }
+                    connection.execute(
+                        "UPDATE handle_logicals SET project_explicit=? WHERE id=?",
+                        (1 if row["handle"] not in generated else -1, row["id"]),
+                    )
+            pending = connection.execute(
+                "SELECT l.id,p.directory FROM handle_logicals l "
+                "JOIN handle_projects p ON p.id=l.project_id WHERE l.project_explicit=-1"
+            ).fetchall()
+            if pending:
+                native_roots = {}
+                for item in items:
+                    owner = self._owner(connection, native_key(item.tool, item.session_id))
+                    if owner is not None:
+                        native_roots.setdefault(owner, set()).add(_project_root(item.cwd))
+                for row in pending:
+                    roots = native_roots.get(row["id"], set())
+                    if roots:
+                        connection.execute(
+                            "UPDATE handle_logicals SET project_explicit=? WHERE id=?",
+                            (int(row["directory"] not in roots), row["id"]),
+                        )
+            # Older assign writers do not know about project_explicit. Protect
+            # their project moves too; automatic inheritance clears it below in
+            # the same transaction, after this trigger has executed.
+            connection.execute(
+                "CREATE TRIGGER IF NOT EXISTS handle_project_assignment_explicit "
+                "AFTER UPDATE OF project_id ON handle_logicals "
+                "WHEN NEW.project_id <> OLD.project_id BEGIN "
+                "UPDATE handle_logicals SET project_explicit=1 WHERE id=NEW.id; END"
+            )
             connection.execute(
                 "INSERT OR IGNORE INTO handle_project_claims SELECT handle,id FROM handle_projects"
             )
@@ -244,9 +295,14 @@ class HandleStore:
         with self._connection(readonly=True) as connection:
             if connection is None:
                 return False
+            if not connection.execute(
+                "SELECT 1 FROM sqlite_master WHERE type='trigger' "
+                "AND name='handle_project_assignment_explicit'"
+            ).fetchone():
+                return False
             rows = {}
             for row in connection.execute(
-                "SELECT m.*,l.handle,l.role,p.handle AS project_handle,a.updated,a.superseded "
+                "SELECT m.*,l.*,p.handle AS project_handle,a.updated,a.superseded "
                 "FROM handle_members m JOIN handle_logicals l ON l.id=m.logical_id "
                 "JOIN handle_projects p ON p.id=l.project_id LEFT JOIN handle_activity a "
                 "ON a.tool=m.tool AND a.session_id=m.session_id AND a.home=m.home"
@@ -267,6 +323,14 @@ class HandleStore:
                     or row["superseded"] != int(item.superseded)
                 ):
                     return False
+                if row["project_explicit"] == -1:
+                    return False
+                if (
+                    row["role"] == "session"
+                    and row["handle"] == f"{row['project_handle']}-session-{row['number']}"
+                    and not ("project_explicit" in row.keys() and row["project_explicit"])
+                ):
+                    return False
                 if (
                     item.conversation_id
                     and (item.conversation_id, row["logical_id"]) not in conversations
@@ -276,6 +340,33 @@ class HandleStore:
             for item, values in zip(items, metadata):
                 item.handle, item.project_handle, item.session_role = values
             return True
+
+    def _migrate_generic_handles(self, connection, names):
+        """Shorten generated generic defaults, retaining all retired claims."""
+        for row in connection.execute(
+            "SELECT l.*,p.handle AS project_handle FROM handle_logicals l "
+            "JOIN handle_projects p ON p.id=l.project_id "
+            "WHERE l.role='session' AND l.project_explicit<=0"
+        ).fetchall():
+            if row["handle"] != f"{row['project_handle']}-session-{row['number']}":
+                continue
+            number = row["number"]
+            while not self._available(
+                connection,
+                _default_handle(row["project_handle"], row["role"], number),
+                row["id"],
+                names,
+            ):
+                number += 1
+            self._claim(
+                connection,
+                row["id"],
+                _default_handle(row["project_handle"], row["role"], number),
+                names,
+            )
+            connection.execute(
+                "UPDATE handle_logicals SET number=? WHERE id=?", (number, row["id"])
+            )
 
     def ensure(self, items):
         items = list(items)
@@ -298,8 +389,9 @@ class HandleStore:
                 previous = representatives.get(item.conversation_id)
                 if previous is None or rank > previous[0]:
                     representatives[item.conversation_id] = (rank, item)
-        with self._connection() as connection:
+        with self._connection(items=items) as connection:
             names = self._native_names(connection, keys)
+            self._migrate_generic_handles(connection, names)
             for item, key in sorted(
                 zip(items, keys), key=lambda pair: (pair[1].tool, pair[1].home, pair[1].session_id)
             ):
@@ -340,10 +432,12 @@ class HandleStore:
                     # Explicit role numbers still start at their requested number.
                     number = next_numbers.get(allocation, number)
                     while not self._available(
-                        connection, f"{project['handle']}-{role}-{number}", owner, names
+                        connection, _default_handle(project["handle"], role, number), owner, names
                     ):
                         number += 1
-                    self._claim(connection, owner, f"{project['handle']}-{role}-{number}", names)
+                    self._claim(
+                        connection, owner, _default_handle(project["handle"], role, number), names
+                    )
                     next_numbers[allocation] = number + 1
                     connection.execute(
                         "UPDATE handle_logicals SET number=? WHERE id=?", (number, owner)
@@ -355,6 +449,117 @@ class HandleStore:
                     )
                 self._annotate(connection, item, owner)
         return {item.key: item.handle for item in items}
+
+    def inherit_projects(self, pairs):
+        """Inherit default supervisors' projects from (supervisor, target) pairs.
+
+        Call ensure(all_items) first, then supply every supervisor copy. A target
+        is an ensured Session (its persisted logical project wins), or a directory
+        string when the target is missing. Manual handles/assignments are preserved.
+        Returns the supplied supervisors' key-to-handle mapping, like ensure().
+        """
+        pairs = list(pairs)
+        if not pairs:
+            return {}
+        roots = {}
+        prepared = []
+        for supervisor, target in pairs:
+            source_key = native_key(supervisor.tool, supervisor.session_id)
+            if isinstance(target, str):
+                if target not in roots:
+                    roots[target] = _project_root(target)
+                prepared.append((supervisor, source_key, None, roots[target]))
+            else:
+                prepared.append(
+                    (
+                        supervisor,
+                        source_key,
+                        native_key(target.tool, target.session_id),
+                        None,
+                    )
+                )
+
+        def inspect(connection):
+            pending = []
+            for supervisor, key, target_key, directory in prepared:
+                owner = self._owner(connection, key)
+                if owner is None:
+                    raise ValueError("ensure all sessions before inheriting projects")
+                row = connection.execute(
+                    "SELECT l.*,p.handle AS project_handle FROM handle_logicals l "
+                    "JOIN handle_projects p ON p.id=l.project_id WHERE l.id=?",
+                    (owner,),
+                ).fetchone()
+                explicit = "project_explicit" in row.keys() and row["project_explicit"]
+                generated = row["handle"] == _default_handle(
+                    row["project_handle"], row["role"], row["number"]
+                )
+                if explicit or not generated:
+                    continue
+                if target_key is not None:
+                    target_owner = self._owner(connection, target_key)
+                    if target_owner is None:
+                        raise ValueError("ensure all sessions before inheriting projects")
+                    project = connection.execute(
+                        "SELECT p.* FROM handle_projects p JOIN handle_logicals l "
+                        "ON l.project_id=p.id WHERE l.id=?",
+                        (target_owner,),
+                    ).fetchone()
+                else:
+                    project = connection.execute(
+                        "SELECT * FROM handle_projects WHERE directory=?", (directory,)
+                    ).fetchone()
+                if project is None or project["id"] != row["project_id"]:
+                    pending.append((owner, row, project, directory))
+            return pending
+
+        def annotate(connection):
+            for supervisor, key, _, _ in prepared:
+                self._annotate(connection, supervisor, self._owner(connection, key))
+
+        with self._connection(readonly=True) as connection:
+            if connection is None:
+                raise ValueError("ensure all sessions before inheriting projects")
+            if not inspect(connection):
+                annotate(connection)
+                return {supervisor.key: supervisor.handle for supervisor, _ in pairs}
+        with self._connection(items=[supervisor for supervisor, _ in pairs]) as connection:
+            # Recheck after taking the writer lock, including manual overrides
+            # made by another process since the read-only snapshot.
+            names = self._native_names(connection)
+            for owner, row, project, directory in inspect(connection):
+                if project is None:
+                    project = self._project(connection, directory)
+                # Copies may share an owner. Recheck its current project so a
+                # repeated pair cannot allocate another number for that owner.
+                current = connection.execute(
+                    "SELECT project_id FROM handle_logicals WHERE id=?", (owner,)
+                ).fetchone()
+                if current[0] == project["id"]:
+                    continue
+                number = row["number"]
+                while not self._available(
+                    connection,
+                    _default_handle(project["handle"], row["role"], number),
+                    owner,
+                    names,
+                ):
+                    number += 1
+                self._claim(
+                    connection,
+                    owner,
+                    _default_handle(project["handle"], row["role"], number),
+                    names,
+                )
+                connection.execute(
+                    "UPDATE handle_logicals SET project_id=?,number=? WHERE id=?",
+                    (project["id"], number, owner),
+                )
+                connection.execute(
+                    "UPDATE handle_logicals SET project_explicit=0 WHERE id=?", (owner,)
+                )
+            annotate(connection)
+        return {supervisor.key: supervisor.handle for supervisor, _ in pairs}
 
     def reserved_names(self, connection=None):
         if connection is None:
@@ -578,6 +783,7 @@ class HandleStore:
         with self._connection() as connection:
             owner = self._owner(connection, native_key(item.tool, item.session_id))
             self._claim(connection, owner, value)
+            connection.execute("UPDATE handle_logicals SET project_explicit=1 WHERE id=?", (owner,))
             self._annotate(connection, item, owner)
         return value
 
@@ -595,12 +801,19 @@ class HandleStore:
             ).fetchone():
                 raise ValueError("project handle already assigned")
             names = self._native_names(connection)
+            self._migrate_generic_handles(connection, names)
             for row in connection.execute(
                 "SELECT * FROM handle_logicals WHERE project_id=?", (project["id"],)
             ).fetchall():
-                if row["handle"] == f"{project['handle']}-{row['role']}-{row['number']}":
+                if (
+                    row["handle"] == _default_handle(project["handle"], row["role"], row["number"])
+                    and row["project_explicit"] <= 0
+                ):
                     self._claim(
-                        connection, row["id"], f"{new_handle}-{row['role']}-{row['number']}", names
+                        connection,
+                        row["id"],
+                        _default_handle(new_handle, row["role"], row["number"]),
+                        names,
                     )
             connection.execute(
                 "INSERT OR IGNORE INTO handle_project_claims VALUES (?,?)",
@@ -626,14 +839,14 @@ class HandleStore:
             chosen = number or 1
             names = self._native_names(connection)
             while not self._available(
-                connection, f"{project['handle']}-{role}-{chosen}", owner, names
+                connection, _default_handle(project["handle"], role, chosen), owner, names
             ):
                 if number is not None:
                     raise ValueError("handle is already reserved")
                 chosen += 1
-            self._claim(connection, owner, f"{project['handle']}-{role}-{chosen}", names)
+            self._claim(connection, owner, _default_handle(project["handle"], role, chosen), names)
             connection.execute(
-                "UPDATE handle_logicals SET project_id=?,role=?,number=? WHERE id=?",
+                "UPDATE handle_logicals SET project_id=?,role=?,number=?,project_explicit=1 WHERE id=?",
                 (project["id"], role, chosen, owner),
             )
             self._annotate(connection, item, owner)

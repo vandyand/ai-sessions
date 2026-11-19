@@ -133,7 +133,7 @@ class DisplayTests(unittest.TestCase):
                     LaunchConfig(path=Path(directory) / "config.toml"),
                 )
                 browser.draw()
-                self.assertIn("Slug market-anomaly", screen.frames[-1])
+                self.assertNotIn("Slug market-anomaly", screen.frames[-1])
                 browser.details()
                 self.assertIn("Slug       market-anomaly", screen.frames[-1])
         output = io.StringIO()
@@ -439,6 +439,7 @@ class ConversationViewTests(unittest.TestCase):
         self.assertIs(rows[0].target, head)
         expanded = app.build_view_rows([old, head], expanded={rows[0].row_id})
         self.assertEqual([row.target for row in expanded], [head, old, head])
+        self.assertEqual([row.depth for row in expanded], [0, 1, 1])
         self.assertEqual(
             [row.status for row in expanded],
             ["latest copy", "superseded copy", "latest copy"],
@@ -502,6 +503,7 @@ class ConversationViewTests(unittest.TestCase):
 
             expanded = app.build_view_rows([tracked, first, second], expanded={collapsed[0].row_id})
             self.assertEqual(len(expanded), 4)
+            self.assertEqual([row.depth for row in expanded], [0, 1, 1, 1])
             self.assertIsNone(expanded[0].target)
             self.assertEqual([row.target for row in expanded[1:]], [tracked, first, second])
             self.assertEqual(

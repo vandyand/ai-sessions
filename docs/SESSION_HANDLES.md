@@ -25,7 +25,7 @@ Project handles default to the first four alphanumeric characters of the Git
 repository name, or working-directory name outside Git. Conflicts get a numeric
 suffix. Git worktrees share their repository's project. Session roles are inferred
 from supervisor metadata or explicitly named supervisor/manager/worker/helper
-titles; other sessions use `session`. These labels confer no permissions. Explicit
+titles; other sessions use `ses` (an ordinary session with no team role assigned). These labels confer no permissions. Explicit
 worker numbers such as 11 and 12 are preserved when available; collisions advance
 to the next available number.
 
@@ -62,3 +62,30 @@ Assignments live alongside `state.json` in `state.slugs.sqlite3`. SQLite transac
 serialize concurrent allocation and reserve session handles against slug conflicts.
 Older processes can continue reading their existing state/catalog formats; restart
 them to use handles and the new commands.
+
+## Menu inspection and project defaults
+
+Press `m` on a highlighted row to read its native messages without opening an agent.
+`u` and `a` jump to the latest user/assistant messages; `p` and `n` select older/newer
+messages. Arrows, page keys and Home/End scroll the full selected message. `q` or
+Esc returns. The view retains at most 200 complete messages, keeping the latest
+user/assistant even when older than that tail. Native adapters can still read a
+whole transcript internally. Compressed input uses bounded temporary extraction
+(up to 128 MiB), leaves original storage compressed, and cleans up on exit.
+
+`?` shows Key / Action / Description with scrolling and wrapped descriptions.
+Confirmation keys appear before long names so narrow panes still show what to press.
+Expanded thread/copy rows have indented titles; handles and other columns stay aligned.
+The default footer shows handles; legacy slugs remain in Details and command support.
+
+Supervisors inherit the project assigned to their recorded target conversation,
+falling back to the target's saved working directory when it is missing. Their
+internal ledger directory is not a project name. Generated legacy supervisor and
+`-session-N` defaults are corrected; custom/manual choices are preserved. Generated
+generic handles use `-ses-N`; this does not assign a worker role.
+
+Working directory is only a fallback project hint. Generic names such as `output`,
+`saves`, and user home are often poor project names. Use `ses project set OLD NEW`
+and `ses handle assign SESSION --project PROJECT` for explicit persistent choices.
+Model-assisted classification can suggest among known projects, but is not enabled
+in this release; opening the menu makes no classification/model requests.

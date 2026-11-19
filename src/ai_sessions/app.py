@@ -1023,12 +1023,40 @@ class UserState:
 
         assign_sessions(items, self.slugs)
         self.handles.ensure(items)
+        self._inherit_supervisor_projects(items)
         # Capture each conversation's history while older copy names still record it.
         missing = [cid for cid, value in self.conversations.items() if "history" not in value]
         for conversation_id in missing:
             self.history(conversation_id)
         if missing:
             self.save()
+
+    def _inherit_supervisor_projects(self, items: list[Session]) -> None:
+        """Supervisor ledgers are working folders, never project identities."""
+        by_conversation: dict[str, list[Session]] = {}
+        for item in items:
+            if item.conversation_id:
+                by_conversation.setdefault(item.conversation_id, []).append(item)
+        pairs = []
+        for item in items:
+            if not item.supervises:
+                continue
+            record = self.supervisors.get(item.supervises, {})
+            candidates = by_conversation.get(str(record.get("target_conversation", "")), [])
+            target = (
+                max(
+                    candidates,
+                    key=lambda member: (not member.superseded, member.updated, member.key),
+                )
+                if candidates
+                else str(record.get("cwd", ""))
+            )
+            if not target:
+                continue
+            copies = by_conversation.get(item.conversation_id, [item])
+            pairs.extend((member, target) for member in copies)
+        if pairs:
+            self.handles.inherit_projects(pairs)
 
     def _apply_supervisors(self, items: list[Session]) -> None:
         """Mark supervised targets and the supervisor sessions that watch them."""
@@ -1630,6 +1658,7 @@ class ViewRow:
     expanded: bool = False
     actionable: bool = True
     collision_label: str = ""
+    depth: int = 0
 
     @property
     def is_group(self) -> bool:
@@ -1793,7 +1822,8 @@ def build_view_rows(
             )
         )
 
-    def add_logical_row(rows: list[ViewRow], logical: ViewRow) -> None:
+    def add_logical_row(rows: list[ViewRow], logical: ViewRow, depth: int = 0) -> None:
+        logical = replace(logical, depth=depth)
         expanded_here = logical.expandable and logical.row_id in expanded_ids
         rows.append(replace(logical, expanded=True) if expanded_here else logical)
         if not expanded_here:
@@ -1811,6 +1841,7 @@ def build_view_rows(
                 display_title(item),
                 project_identity(item.cwd),
                 actionable=not blocks_actions(item),
+                depth=depth + 1,
             )
             for item in logical.members
         )
@@ -1924,7 +1955,7 @@ def build_view_rows(
         )
         if expanded_here:
             for child in children:
-                add_logical_row(rows, child)
+                add_logical_row(rows, child, depth=1)
     labels = view_collision_labels(row for row in rows if "/member:" not in row.row_id)
     return tuple(
         replace(row, collision_label=label)
@@ -3604,6 +3635,7 @@ class Browser:
         self.screen = screen
         self.sessions = sessions
         self.state = state
+        self._handle_stamp = _file_stamp(state.slugs.path)
         self.launch_config = launch_config
         self.use_cache = use_cache
         self.refresh = refresh
@@ -3680,8 +3712,7 @@ class Browser:
         try:
             action()
         finally:
-            if self.refresh is not None:
-                self._set_input_timeout(100)
+            self._set_input_timeout(100 if self.refresh is not None else 1000)
 
     def apply_refresh(self, *, wait: bool = False) -> bool:
         if self.refresh is None:
@@ -3692,7 +3723,7 @@ class Browser:
         previous = self.selected_id()
         previous_parent = previous.split("/member:", 1)[0] if "/member:" in previous else ""
         self.refresh = None
-        self._set_input_timeout(-1)
+        self._set_input_timeout(1000)
         if error:
             self.message = error + "; press Ctrl-R to retry"
             return True
@@ -3710,6 +3741,37 @@ class Browser:
         self.expanded.intersection_update(row_id for row_id in live_ids if "/member:" not in row_id)
         self.message = "; ".join(warnings) or "Sessions refreshed."
         return True
+
+    def refresh_handles(self) -> bool:
+        """Read external registry edits without rediscovering native sessions."""
+        stamp = _file_stamp(self.state.slugs.path)
+        if stamp == self._handle_stamp:
+            return False
+        from .references import native_key
+
+        previous = self.selected_id()
+        before = [(item.handle, item.project_handle, item.session_role) for item in self.sessions]
+        try:
+            keys = [native_key(item.tool, item.session_id) for item in self.sessions]
+            self.state._inherit_supervisor_projects(self.sessions)
+            metadata = self.state.handles.metadata_for(keys)
+        except (OSError, ValueError) as error:
+            self._handle_stamp = stamp
+            self.message = f"Could not refresh handles: {error}"
+            return True
+        changed = before != [
+            (item.handle, item.project_handle, item.session_role) for item in self.sessions
+        ]
+        for item, key in zip(self.sessions, keys):
+            for field, value in metadata.get(key, {}).items():
+                if getattr(item, field) != value:
+                    setattr(item, field, value)
+                    changed = True
+        self._handle_stamp = _file_stamp(self.state.slugs.path)
+        if changed:
+            self.invalidate_rows()
+            self.keep_selection(previous)
+        return changed
 
     def check_before_open(self, row: ViewRow) -> bool:
         """Bring what opening ``row`` depends on up to date, without the full refresh.
@@ -4266,9 +4328,14 @@ class Browser:
                     title += " " + view_row.collision_label
                 if not item.named:
                     title = "*- " + title
+                title_prefix = "  " * min(view_row.depth, 4) + "↳ " if view_row.depth else ""
                 room = max(0, title_width)
                 title_color = "supervisor" if is_supervisor else "primary"
-                segment(column_cell(title, room), title_color, curses.A_BOLD)
+                segment(
+                    title_prefix + column_cell(title, max(0, room - len(title_prefix))),
+                    title_color,
+                    curses.A_BOLD,
+                )
                 segment(column_cell(updated_age(item.updated), updated_width), "timestamp")
                 status = view_row.status
                 if status_width:
@@ -4318,7 +4385,6 @@ class Browser:
                 detail_top + 1,
                 2,
                 (f"Handle {row_handle(selected_row)} · " if row_handle(selected_row) else "")
-                + (f"Slug {item.slug} · " if item.slug else "")
                 + f"{tool_label(item.tool)} · {ORIGIN_LABELS[item.origin]}"
                 f"{self.supervision_role(item)} · launch via {launch_tool} · "
                 f"{activity_label(item)}{name_badge}{source_badge}{hidden_badge}{open_badge}",
@@ -4379,11 +4445,15 @@ class Browser:
                 )
 
         footer = self.message or (
-            "Enter open  t tools  i details  f focus  Space/Right expand  Left collapse  "
+            "Enter open  m messages  t tools  i details  f focus  Space/Right expand  Left collapse  "
             "Ctrl-F search  r rename  h hide  Z compress  q quit  ? help"
         )
         if not self.message and len(footer) > width - 2:
-            footer = "Enter open  / search  t tools  i details  q quit  ? help"
+            footer = "Enter open  m messages  / search  t tools  i details  q quit  ? help"
+            if len(footer) > width - 2:
+                footer = "Enter open  m messages  t tools  ? help  q quit"
+            if len(footer) > width - 2:
+                footer = "Enter open m msgs t tools ? help q quit"
         self.add(footer_row, 1, footer, self.style("accent", curses.A_BOLD), width - 2)
         if self.searching:
             try:
@@ -4542,12 +4612,9 @@ class Browser:
             needed.append(chosen)
         if not needed:
             return chosen
-        self.message = (
-            f"Compressed. Decompress {ellipsize(display_title(chosen), 38)!r} and open it? "
-            "y=yes; other key=cancel."
-        )
+        self.message = f"Y Decompress/open · Esc cancel · {display_title(chosen)}"
         self.draw()
-        key = self.screen.get_wch()
+        key = self.confirmation_key()
         self.message = ""
         if not isinstance(key, str) or key.casefold() != "y":
             self.message = "Left compressed; nothing changed."
@@ -4884,8 +4951,7 @@ class Browser:
             key = self.screen.get_wch()
             if reset_id and key == "R":
                 confirm = (
-                    "Reset archives this supervisor and its ledger; the next S starts a new "
-                    "one. Press y to confirm."
+                    "Y reset supervisor · Esc cancel · Archives its ledger; S starts a new one."
                 )
                 self.add(height - 2, 2, confirm.ljust(max(0, width - 4)), self.style("warning"))
                 self.screen.refresh()
@@ -4894,8 +4960,7 @@ class Browser:
                 else:
                     self.message = "Reset cancelled."
         finally:
-            if self.refresh is not None:
-                self._set_input_timeout(100)
+            self._set_input_timeout(100 if self.refresh is not None else 1000)
 
     def supervised_target_name(self, supervisor: Session) -> str:
         """The current title of the session that ``supervisor`` watches."""
@@ -5113,9 +5178,9 @@ class Browser:
             self.keep_selection(previous)
             self.message = "Session restored to visible sessions."
             return
-        self.message = f"Hide {ellipsize(display_title(item), 38)!r}? Press y to confirm."
+        self.message = f"Y hide · Esc cancel · {display_title(item)}"
         self.draw()
-        key = self.screen.get_wch()
+        key = self.confirmation_key()
         if isinstance(key, str) and key.casefold() == "y":
             self.state.set_hidden(item, True)
             self.state.apply(self.sessions)
@@ -5125,78 +5190,151 @@ class Browser:
             self.message = "Hide cancelled."
 
     def help(self) -> None:
+        import textwrap
+
         lines = [
-            ("Enter", "Focus an open session; otherwise resume it"),
-            ("Space/Right", "Expand a conversation or independent thread group"),
-            ("Left", "Collapse the selected group"),
-            ("i", "Show project, status, activity, lineage, native IDs, and storage"),
-            ("f", "Focus the selected project; press again to show all projects"),
-            ("↑/↓ or j/k", "Move through sessions"),
-            ("PgUp/PgDn", "Move by a page; Home/End jump"),
-            ("ACTIVITY", "xt yc zp = turns, compactions, semantic user prompts"),
-            ("STARTED", "When the session began; UPDATED is its latest activity"),
-            ("OPEN", "● running or Ⅱ paused in a live terminal"),
-            ("Ctrl-F or /", "Enter search mode; command keys are then search text"),
-            ("is:open", "Search syntax also supports tool:, dir:, name:, and origin:"),
+            ("Enter", "Open", "Focus an open session; otherwise resume it"),
+            ("Space/Right", "Expand", "Expand a conversation or independent thread group"),
+            ("Left", "Collapse", "Collapse the selected group"),
+            ("i", "Details", "Show project, status, activity, lineage, native IDs, and storage"),
+            ("m", "Messages", "Preview messages from the selected session"),
+            ("f", "Project", "Focus the selected project; press again to show all projects"),
+            ("↑/↓ or j/k", "Move", "Move through sessions"),
+            ("PgUp/PgDn", "Jump", "Move by a page; Home/End jump"),
+            ("ACTIVITY", "Activity", "xt yc zp = turns, compactions, semantic user prompts"),
+            ("STARTED", "Started", "When the session began; UPDATED is its latest activity"),
+            ("OPEN", "Live status", "● running or Ⅱ paused in a live terminal"),
+            ("Ctrl-F or /", "Search", "Enter search mode; command keys are then search text"),
+            (
+                "is:open",
+                "Search filters",
+                "Search syntax also supports tool:, dir:, name:, and origin:",
+            ),
             (
                 "Tab",
+                "Tool preset",
                 "Cycle single-tool presets: All → "
                 + " → ".join(adapter.short_label for adapter in REGISTRY.adapters()),
             ),
-            ("t", "Choose any combination of tools to show"),
-            ("o", "Cycle Human → Cross → Agent → Super(visor) → All origins"),
+            ("t", "Tools", "Choose any combination of tools to show"),
+            ("o", "Origins", "Cycle Human → Cross → Agent → Super(visor) → All origins"),
             (
                 "S",
+                "Supervisor",
                 "Open or create the supervisor of the selected session; "
                 "on a supervisor, go to its target",
             ),
-            ("v", "Cycle Visible → Hidden → Visible + hidden"),
-            ("z", "Cycle Uncompressed → Compressed → both"),
-            ("Z", "Compress the selected session, or decompress it"),
-            ("A", "Show every session: all origins, visible and hidden, compressed or not"),
-            ("H", "Show every hidden session across all origins"),
-            ("r", "Rename; an empty name restores the vendor/original title"),
-            ("h", "Hide or unhide the selected native session (never deletes it)"),
-            ("d", "Choose a directory from a searchable list"),
-            ("s", "Sort by recent, title, directory, messages ↓, or open first"),
-            ("p", "Cycle Safe → Dangerous → Custom launch mode"),
-            ("Ctrl-R", "Refresh the session index"),
-            ("x", "Cycle launch harness; the other one gets a bridged copy"),
-            ("Esc", "Leave search mode, then clear an active search"),
-            ("q", "Quit"),
+            ("v", "Visibility", "Cycle Visible → Hidden → Visible + hidden"),
+            ("z", "Compression", "Cycle Uncompressed → Compressed → both"),
+            ("Z", "Compress", "Compress the selected session, or decompress it"),
+            (
+                "A",
+                "Show all",
+                "Show every session: all origins, visible and hidden, compressed or not",
+            ),
+            ("H", "Hidden", "Show every hidden session across all origins"),
+            ("r", "Rename", "Rename; an empty name restores the vendor/original title"),
+            ("h", "Hide", "Hide or unhide the selected native session (never deletes it)"),
+            ("d", "Directory", "Choose a directory from a searchable list"),
+            ("s", "Sort", "Sort by recent, title, directory, messages ↓, or open first"),
+            ("p", "Launch mode", "Cycle Safe → Dangerous → Custom launch mode"),
+            ("Ctrl-R", "Refresh", "Refresh the session index"),
+            ("x", "Harness", "Cycle launch harness; the other one gets a bridged copy"),
+            ("Esc", "Clear search", "Leave search mode, then clear an active search"),
+            ("Symbols", "Legend", "*- unnamed · › selected · ⊘ hidden · ● open · Ⅱ paused."),
+            ("y / other", "Confirmation", "Press y to confirm; any other key cancels"),
+            ("q", "Quit", "Quit"),
         ]
-        self.screen.erase()
-        height, width = self.screen.getmaxyx()
-        box_width = min(78, width - 4)
-        top = max(0, (height - len(lines) - 6) // 2)
-        left = max(0, (width - box_width) // 2)
-        self.add(top, left, "AI SESSIONS — HELP", self.style("accent", curses.A_BOLD), box_width)
-        self.add(
-            top + 1,
-            left,
-            "*- unnamed · › selected · ⊘ hidden · ● open · Ⅱ paused.",
-            self.style("muted"),
-            box_width,
-        )
-        for index, (key, description) in enumerate(lines):
-            self.add(top + 3 + index, left, f"{key:<16}", self.style("accent", curses.A_BOLD), 16)
-            self.add(top + 3 + index, left + 17, description, 0, box_width - 17)
-        self.add(
-            min(height - 1, top + len(lines) + 4),
-            left,
-            "Press any key to return",
-            self.style("muted"),
-            box_width,
-        )
-        self.screen.refresh()
-        self.screen.get_wch()
+        offset = 0
+        while True:
+            height, width = self.screen.getmaxyx()
+            # Reserve two header and two footer rows; leave the last column unused.
+            available = max(1, width - 2)
+            key_width = min(11, max(1, available // 3))
+            title_width = min(13, max(1, available // 4))
+            description_width = max(1, available - key_width - title_width - 2)
+            rows = []
+            for key, title, description in lines:
+                columns = [
+                    textwrap.wrap(value, column_width) or [""]
+                    for value, column_width in (
+                        (key, key_width),
+                        (title, title_width),
+                        (description, description_width),
+                    )
+                ]
+                for index in range(max(map(len, columns))):
+                    rows.append(
+                        tuple(column[index] if index < len(column) else "" for column in columns)
+                    )
+            page = max(1, height - 4)
+            maximum = max(0, len(rows) - page)
+            offset = max(0, min(offset, maximum))
+            self.screen.erase()
+            self.add(0, 0, "AI SESSIONS — HELP", self.style("accent", curses.A_BOLD), available)
+            self.add(
+                1,
+                0,
+                "Key".ljust(key_width + 1) + "Action".ljust(title_width + 1) + "Description",
+                self.style("muted"),
+                available,
+            )
+            for y, (key, title, description) in enumerate(rows[offset : offset + page], 2):
+                self.add(y, 0, key, self.style("accent", curses.A_BOLD), key_width)
+                self.add(y, key_width + 1, title, curses.A_BOLD, title_width)
+                self.add(y, key_width + title_width + 2, description, 0, description_width)
+            self.add(
+                height - 2, 0, "Up/Down PgUp/PgDn Home/End: scroll", self.style("muted"), available
+            )
+            self.add(
+                height - 1,
+                0,
+                f"q/Esc: back  {offset + 1}-{min(offset + page, len(rows))}/{len(rows)}",
+                self.style("muted"),
+                available,
+            )
+            self.screen.refresh()
+            try:
+                key = self.screen.get_wch()
+            except curses.error:
+                continue
+            if key in ("q", "\x1b"):
+                return
+            if key in (curses.KEY_DOWN, "j"):
+                offset += 1
+            elif key in (curses.KEY_UP, "k"):
+                offset -= 1
+            elif key == curses.KEY_NPAGE:
+                offset += page
+            elif key == curses.KEY_PPAGE:
+                offset -= page
+            elif key == curses.KEY_HOME:
+                offset = 0
+            elif key == curses.KEY_END:
+                offset = maximum
+
+    def confirmation_key(self):
+        self._set_input_timeout(-1)
+        try:
+            while True:
+                try:
+                    return self.screen.get_wch()
+                except curses.error:
+                    continue
+        finally:
+            self._set_input_timeout(100 if self.refresh is not None else 1000)
+
+    def preview_selected(self) -> None:
+        from .conversation_view import run
+
+        row = self.selected_row()
+        if row is not None:
+            run(self.screen, row.representative)
 
     def confirm_missing(self, item: Session) -> Session | None:
-        self.message = (
-            "Saved directory is missing. Press y to resume from ~, or any other key to cancel."
-        )
+        self.message = "Y open from ~ · Esc cancel · Saved directory is missing."
         self.draw()
-        key = self.screen.get_wch()
+        key = self.confirmation_key()
         self.message = ""
         if isinstance(key, str) and key.casefold() == "y":
             return replace(item, cwd=str(HOME))
@@ -5205,8 +5343,8 @@ class Browser:
     def confirm_recovery(self, row: ViewRow) -> Session | None:
         item = row.representative
         self.message = (
-            f"Recover selected {tool_label(item.tool)} copy in {tool_label(active_launch_tool(item))}? "
-            "y=yes; other key=cancel. Other copies kept."
+            "Y recover copy · Esc cancel · "
+            f"{tool_label(item.tool)} → {tool_label(active_launch_tool(item))}; other copies kept."
         )
         self.draw()
         while True:
@@ -5247,8 +5385,7 @@ class Browser:
                 else "is already running in another terminal"
             )
             self.message = (
-                f"This session {where} (PID {pid}, since {since}). "
-                "Press y to stop it and resume here, or any other key to cancel."
+                f"Y stop & resume · Esc cancel · This session {where} (PID {pid}, since {since})."
             )
             self.draw()
             while True:
@@ -5269,8 +5406,7 @@ class Browser:
         return replace(item, is_open=False, open_pid=0)
 
     def run(self) -> Session | None:
-        if self.refresh is not None:
-            self._set_input_timeout(100)
+        self._set_input_timeout(100 if self.refresh is not None else 1000)
         rows_changed = True
         idle = False
         while True:
@@ -5283,6 +5419,7 @@ class Browser:
             # refresh for the interpreter and made it several times slower.
             changed = self.apply_refresh()
             changed = self.apply_quick_reread() or changed
+            changed = self.refresh_handles() or changed
             if changed or not idle:
                 self.draw()
             if not self._quick_started:
@@ -5291,10 +5428,8 @@ class Browser:
             try:
                 key = self.screen.get_wch()
             except curses.error:
-                if self.refresh is not None:
-                    idle = True
-                    continue
-                raise
+                idle = True
+                continue
             self.message = ""
             if not self._keeps_rows(key):
                 self._rows_memo = False
@@ -5442,6 +5577,8 @@ class Browser:
                 self.cycle_launch_tool()
             elif not self.searching and key == "i":
                 self.run_modal(self.details)
+            elif not self.searching and key == "m":
+                self.run_modal(self.preview_selected)
             elif not self.searching and key == "S":
                 outcome = self.supervise_selected()
                 if outcome is not None:

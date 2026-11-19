@@ -49,7 +49,7 @@ def main(argv=None):
     assign = edits.add_parser("assign")
     assign.add_argument("session")
     assign.add_argument("--project", required=True)
-    assign.add_argument("--role", choices=("sup", "mgr", "wrk", "session"))
+    assign.add_argument("--role", choices=("sup", "mgr", "wrk", "ses", "session"))
     assign.add_argument("--number", type=int)
     args = parser.parse_args(argv)
     if args.action == "open":
