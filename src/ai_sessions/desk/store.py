@@ -73,14 +73,17 @@ def bounded_decisions(decisions):
 
 
 class Store:
-    def __init__(self, root=None):
+    def __init__(self, root=None, *, readonly=False):
         self.root = (
             Path(root)
             if root is not None
             else env_path("AI_SESSIONS_DESK_DIR", APP_CONFIG_DIR / "desk")
         )
-        self.root.mkdir(parents=True, exist_ok=True)
         self.path = self.root / "desk.sqlite3"
+        self.readonly = readonly
+        if readonly:
+            return
+        self.root.mkdir(parents=True, exist_ok=True)
         with self._connect() as db:
             db.execute(
                 "CREATE TABLE IF NOT EXISTS desks "
@@ -89,7 +92,11 @@ class Store:
 
     @contextmanager
     def _connect(self):
-        db = sqlite3.connect(self.path, timeout=15)
+        db = sqlite3.connect(
+            self.path.resolve().as_uri() + "?mode=ro" if self.readonly else self.path,
+            timeout=15,
+            uri=self.readonly,
+        )
         try:
             db.execute("PRAGMA busy_timeout=15000")
             with db:
@@ -136,13 +143,16 @@ class Store:
             ):
                 raise ValueError("sources require tool, session_id and storage")
             ref = {k: source[k] for k in ("tool", "session_id", "storage")}
-            for field in ("role", "title"):
+            for field in ("role", "title", "home"):
                 if field in source:
                     if not isinstance(source[field], str) or len(source[field]) > 2000:
                         raise ValueError(f"source {field} must be short text")
                     ref[field] = source[field]
+            if "home" in ref and not ref["home"].strip():
+                raise ValueError("source home must be nonempty text")
             if not any(
-                all(ref[k] == item[k] for k in ("tool", "session_id", "storage")) for item in chosen
+                all(ref.get(k) == item.get(k) for k in ("tool", "session_id", "storage", "home"))
+                for item in chosen
             ):
                 chosen.append(ref)
         snapshot = dict(
@@ -173,10 +183,49 @@ class Store:
             return self._get(db, name)
 
     def list(self):
+        if self.readonly and not self.path.exists():
+            return []
         with self._connect() as db:
             return [
                 json.loads(row[0]) for row in db.execute("SELECT data FROM desks ORDER BY name")
             ]
+
+    def update_primary_source(self, name, expected_revision, source):
+        """Replace the operational target without disturbing dialogue or team sources."""
+        if type(expected_revision) is not int or expected_revision < 0:
+            raise ValueError("expected_revision must be a nonnegative integer")
+        if not isinstance(source, dict) or any(
+            not isinstance(source.get(key), str) or not source[key].strip()
+            for key in ("tool", "session_id", "storage")
+        ):
+            raise ValueError("sources require tool, session_id and storage")
+        source = {
+            key: source[key]
+            for key in ("tool", "session_id", "storage", "title", "home")
+            if key in source
+        }
+        if "home" in source and (
+            not isinstance(source["home"], str)
+            or not source["home"].strip()
+            or len(source["home"]) > 2000
+        ):
+            raise ValueError("source home must be nonempty short text")
+        if "title" in source and (
+            not isinstance(source["title"], str) or len(source["title"]) > 2000
+        ):
+            raise ValueError("source title must be short text")
+        source["role"] = "supervisor"
+        with self._connect() as db:
+            db.execute("BEGIN IMMEDIATE")
+            snapshot = self._get(db, name)
+            if snapshot["revision"] != expected_revision:
+                raise ConflictError(f"desk {name} changed during target selection")
+            if snapshot["sources"][0] == source:
+                return snapshot
+            snapshot["sources"][0] = source
+            snapshot.update(revision=expected_revision + 1, updated_at=time.time())
+            self._write(db, snapshot)
+        return snapshot
 
     def publish(self, name, expected_revision, observation, review, decisions):
         if type(expected_revision) is not int or expected_revision < 0:

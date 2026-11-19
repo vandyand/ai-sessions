@@ -10,6 +10,17 @@ described below.
 
 It runs as `sessions` on Linux and native Windows PowerShell.
 
+## Project and session handles
+
+`ses` is a shorter name for `sessions`. Use `ses list elev` to list a project's
+sessions, `ses open elev-mgr` to resume its first manager, or `ses desk elev-sup`
+to open the quiet project conversation using the supervisor's current harness.
+`elev-mgr` and `elev-mgr-1` mean the same session. The menu includes a Handle column.
+
+See [Project and session handles](docs/SESSION_HANDLES.md) for defaults, editing,
+project assignment, messaging, and cross-harness behavior. Native IDs and existing
+slugs remain supported.
+
 ## Session slugs
 
 Every native session copy has a unique, persistent slug, independent of its display

@@ -292,6 +292,15 @@ class LaunchTests(Fixture):
 
 
 class TargetLogTests(Fixture):
+    def test_target_log_accepts_session_handle(self) -> None:
+        record_id = self.make()
+        item = target()
+        self.state.handles.ensure([item])
+        TargetIndex(self.root / record_id / "index.jsonl").append(
+            [Exchange(1, "m", "hello handle", "hello handle")]
+        )
+        self.assertIn("hello handle", target_log(self.state, item.handle, root=self.root))
+
     def test_target_log_does_not_move_checkpoint(self) -> None:
         record_id = self.make()
         index = TargetIndex(self.root / record_id / "index.jsonl")

@@ -39,6 +39,7 @@ Issues = "https://github.com/vandyand/ai-sessions/issues"
 
 [project.scripts]
 sessions = "ai_sessions.app:main"
+ses = "ai_sessions.app:main"
 sesres = "ai_sessions.restart:main"
 
 # The package itself is the one place the version is written.

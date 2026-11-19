@@ -144,6 +144,23 @@ def resolve(target: str, rows: list[dict], *, slugs=None) -> dict:
             if len(matches) != 1:
                 raise ValueError(f"receiver {target!r} is unavailable or ambiguous in this home")
             return matches[0]
+    if not exact:
+        from ..handles import HandleStore
+        from ..references import native_key
+
+        handles = HandleStore(slugs.path if slugs is not None else None)
+        if handles.claimed(target):
+            key = handles.current_key(target)
+            matches = [
+                row
+                for row in rows
+                if native_key(row["tool"], row["session_id"], row.get("home")) == key
+            ]
+            if len(matches) != 1:
+                raise ValueError(
+                    f"session handle {target!r} is unavailable or ambiguous; use messaging status"
+                )
+            return matches[0]
     matches = exact or [r for r in rows if target == r.get("name")]
     if len(matches) > 1:
         raise ValueError(

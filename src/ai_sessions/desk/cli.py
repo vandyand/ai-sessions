@@ -15,7 +15,7 @@ from .store import Store
 
 def resolve_sources(supervisor: str, additional: list[str]) -> tuple[list[dict], str]:
     from ..app import load_session_catalog, load_sessions
-    from ..references import SlugStore, resolve_session
+    from ..references import SlugStore, native_key, resolve_session
 
     items = load_session_catalog()
     if not items:
@@ -38,6 +38,7 @@ def resolve_sources(supervisor: str, additional: list[str]) -> tuple[list[dict],
             {
                 "tool": item.tool,
                 "session_id": item.session_id,
+                "home": native_key(item.tool, item.session_id).home,
                 "storage": str(Path(item.storage).resolve()),
                 "title": item.title,
                 "role": "supervisor" if i == 0 else "team",
@@ -72,7 +73,126 @@ def watch(store, name: str, interval: float, stop: threading.Event) -> None:
         stop.wait(max(1, delay - (time.monotonic() - started)))
 
 
+def source_matches_target(source, target, members):
+    """Match saved identity without guessing a legacy source's harness home."""
+    from ..references import NativeKey
+
+    if source.get("role", "supervisor") != "supervisor":
+        return False
+    if "home" in source:
+        return NativeKey(source["tool"], source["session_id"], source["home"]) in members
+    storage = Path(source["storage"]).expanduser().resolve()
+    if (source["tool"], source["session_id"]) == (target.tool, target.session_id):
+        if storage == Path(target.storage).expanduser().resolve():
+            return True
+    # Historical linked members may be absent from the current catalog. Only
+    # their persisted homes can establish which native identity owned this path.
+    if not Path(source["storage"]).expanduser().is_absolute():
+        return False
+    candidates = [
+        member
+        for member in members
+        if (member.tool, member.session_id) == (source["tool"], source["session_id"])
+        and storage.is_relative_to(Path(member.home).resolve())
+    ]
+    return len(candidates) == 1
+
+
+def open_target(argv) -> int:
+    from ..handles_cli import catalog
+    from ..references import native_key, resolve_session
+    from .launch import open_agent
+
+    parser = argparse.ArgumentParser(prog="ses desk")
+    parser.add_argument("target", help="Session handle, slug or native ID to observe")
+    tool = parser.add_mutually_exclusive_group()
+    tool.add_argument("--claude", dest="tool", action="store_const", const=TOOLS[0])
+    tool.add_argument("--codex", dest="tool", action="store_const", const=TOOLS[1])
+    parser.add_argument("--dry-run", action="store_true")
+    args = parser.parse_args(argv)
+    try:
+        items, state = catalog()
+        item = resolve_session(args.target, items, store=getattr(state, "slugs", None))
+        if item.compressed or not item.storage:
+            raise ValueError("Decompress the selected session before creating its desk")
+        store = Store(readonly=args.dry_run)
+        handles = getattr(state, "handles", None)
+        members = (
+            set(handles.lookup_members(item.handle) or ()) if handles and item.handle else set()
+        )
+        target_key = native_key(item.tool, item.session_id)
+        members.add(target_key)
+        matches = [
+            record
+            for record in store.list()
+            if any(source_matches_target(source, item, members) for source in record["sources"][:1])
+        ]
+        if len(matches) > 1:
+            raise ValueError("Multiple desks observe this logical session; open a desk by name")
+        existing = next(iter(matches), None)
+        name = existing["name"] if existing else item.handle or item.slug or item.session_id
+        if args.dry_run and existing is None:
+            print(
+                json.dumps(
+                    {
+                        "desk": name,
+                        "target": item.key,
+                        "tool": args.tool or item.tool,
+                        "create": True,
+                    },
+                    ensure_ascii=False,
+                )
+            )
+            return 0
+        if existing is None:
+            store.create(
+                name,
+                [
+                    {
+                        "tool": item.tool,
+                        "session_id": item.session_id,
+                        "storage": item.storage,
+                        "home": target_key.home,
+                        "role": "supervisor",
+                        "title": item.title,
+                    }
+                ],
+                str(Path(item.cwd or ".").resolve()),
+            )
+            store.export(name)
+        elif not args.dry_run and any(
+            existing["sources"][0].get(key) != value
+            for key, value in (
+                ("tool", item.tool),
+                ("session_id", item.session_id),
+                ("storage", item.storage),
+                ("home", target_key.home),
+            )
+        ):
+            store.update_primary_source(
+                name,
+                existing["revision"],
+                {
+                    "tool": item.tool,
+                    "session_id": item.session_id,
+                    "storage": item.storage,
+                    "home": target_key.home,
+                    "title": item.title,
+                },
+            )
+            store.export(name)
+        print(f"Briefing pane: ses desk view {name} --watch")
+        return open_agent(store, name, args.tool or item.tool, dry_run=args.dry_run)
+    except (OSError, RuntimeError, ValueError, KeyError) as error:
+        print(f"ses desk: {error}", file=sys.stderr)
+        return 2
+
+
 def main(argv=None) -> int:
+    raw = list(sys.argv[1:] if argv is None else argv)
+    actions = {"create", "show", "refresh", "watch", "view", "open", "list", "-h", "--help"}
+    if raw and raw[0] not in actions:
+        return open_target(raw)
     parser = argparse.ArgumentParser(
         prog="sessions desk", description="A quiet project conversation and live briefing."
     )

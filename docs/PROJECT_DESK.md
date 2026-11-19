@@ -61,7 +61,7 @@ Errors preserve the last good synthesis and display its age/error. Observation t
 
 Nonsecret local state lives under `AI_SESSIONS_DESK_DIR`, defaulting to the ai-sessions config directory's `desk` folder. `desk.sqlite3` is authoritative. Each named subfolder contains atomic Markdown projections `review.md` and `decisions.md`, and launcher instructions `project-agent.md`. Both projections carry the same revision; if a crash leaves mismatched revisions, use `show --json` and regenerate. Do not hand-edit the Markdown as a way to change state.
 
-Desk records pin exact source transcripts and native session IDs. Changing which sessions are observed currently means creating a new desk; it does not silently follow a fork or transpiled successor. The observer can read offline transcripts; it does not wake those sessions. Session names/slugs resolve at creation, while native identity remains fixed.
+Desk records pin exact source transcripts and native session IDs. Reopening with `ses desk HANDLE` reuses the desk through explicit handle membership and updates its primary source to the current bridged copy, preserving the human conversations and other selected sources. A fork is a separate conversation and does not reuse the old desk automatically. The observer can read offline transcripts; it does not wake those sessions. See [session handles](SESSION_HANDLES.md) for the shorthand and harness overrides.
 
 ## Validation
 

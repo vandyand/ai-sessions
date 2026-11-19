@@ -1,5 +1,18 @@
 # Changelog
 
+## 3.19.0 — 2026-11-19
+
+- Add `ses` as a short executable name for `sessions`.
+- Add stable project/session handles, editable project and role assignments, and
+  `ses list PROJECT`. Missing numeric suffixes mean 1; existing IDs/slugs keep working.
+- Show handles alongside titles in the menu and list output, including at 40 columns.
+- Resolve handles across explicitly bridged copies while keeping forks separate;
+  reserve retired handles and prevent slug collisions transactionally.
+- Add `ses open HANDLE` and `ses desk HANDLE [--claude|--codex]`. Desk shorthand
+  defaults to the target's harness and preserves existing conversations across bridges.
+- Include known handles in messaging status and refuse delivery to an unavailable
+  canonical copy rather than silently selecting an older reachable copy.
+
 ## 3.18.0 — 2026-11-19
 
 ### Added
