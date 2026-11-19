@@ -6705,6 +6705,11 @@ def build_parser() -> argparse.ArgumentParser:
               sessions workspace restore my-project
               sessions workspace clone my-project another-project
 
+            Permanent deletion (interactive typed confirmation):
+              ses delete HANDLE --dry-run
+              ses delete HANDLE
+              ses delete HANDLE --all-copies
+
             Search examples:
               sessions --list --tool codex
               sessions --list --origin cross
@@ -6920,6 +6925,10 @@ def _main(argv: list[str] | None = None) -> int:
         from .handles_cli import main as handles_main
 
         return handles_main(raw)
+    if raw and raw[0] == "delete":
+        from .deletion import main as deletion_main
+
+        return deletion_main(raw[1:])
     if raw and raw[0] == "workspace":
         from .workspaces.cli import main as workspace_main
 

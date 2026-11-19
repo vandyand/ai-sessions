@@ -2276,7 +2276,21 @@ def resume_args(
     return ["--session", session_id]
 
 
+def plan_delete(ref: NativeRef):
+    from .deletion_opencode import plan_delete as build
+
+    return build(ref)
+
+
+def resolve_delete(session_id: str):
+    from .deletion_opencode import resolve_delete as resolve
+
+    return resolve(session_id)
+
+
 ADAPTER = HarnessAdapter(
+    plan_delete=plan_delete,
+    resolve_delete=resolve_delete,
     name="opencode",
     label="OpenCode",
     short_label="OpenCode",
