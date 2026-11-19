@@ -1,5 +1,20 @@
 # Changelog
 
+## 3.18.0 — 2026-11-19
+
+### Added
+
+- Project Desk: a persistent human-facing native Claude/Codex conversation beside
+  an operational supervisor, with a live terminal Review / Needs you / Next action
+  briefing. Create explicit sources with `sessions desk create`, open the project
+  conversation with `desk open`, and observe with `desk view --watch`.
+- Bounded incremental Claude Haiku observation through the existing CLI login,
+  transactional synthesis and decision records, evidence/coverage timestamps,
+  stale-result protection, atomic Markdown projections, and owned cancellation.
+  The observer has no tools and sends no team messages. Initial history is partial.
+- Project-conversation skill and usage guide. Each harness retains its own native
+  human conversation while sharing the same briefing.
+
 ## 3.17.0 — 2026-11-14
 
 ### Changed

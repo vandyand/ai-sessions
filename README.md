@@ -648,3 +648,7 @@ launcher and are not given locally created conversation IDs. In-session Codex UI
 switches without verifiable client identity are refused for restart rather than
 resuming a different conversation. Native subcommands such as help/version are
 forwarded without creating an empty conversation.
+
+## Quiet project conversations
+
+[Project Desk](docs/PROJECT_DESK.md) pairs a human-facing native Claude/Codex conversation with a live terminal Review / Needs you / Next action view, while an observer watches explicitly selected operational sessions. Start with `sessions desk --help`.

@@ -1,0 +1,23 @@
+# Project Desk implementation plan
+
+Goal: a quiet human-facing native Claude/Codex conversation alongside a live terminal briefing of an operational supervisor and explicitly selected team sessions.
+
+Approved design: separate operational coordination from human conversation. A read-only observer summarizes new source activity into Review and Needs you; Next action is a view over Needs you. The observer never sends agent messages, assigns work, approves actions or changes operational transcripts. The human-facing agent reads the latest briefing on demand and can discuss ideas before forwarding settled direction. Native harnesses stay intact; no mods or forks in this first experiment.
+
+Architecture: Python package ai_sessions.desk, SQLite transactional desk state with observation revisions, atomic UTF-8 Markdown projections review.md/decisions.md, bounded incremental transcript observation through existing harness adapters, a configurable model subprocess (default Claude Haiku through its existing CLI login), curses viewer and native project-agent launch prompt. Separate desk records have stable names; explicit source membership avoids cwd-based guessing. Root is AI_SESSIONS_DESK_DIR or APP_CONFIG_DIR/desk.
+
+Contracts:
+- Store(root=None), create(name, sources, cwd), get(name), list(), publish(name, expected_revision, observation, review, decisions), fail(name, error), export(name), seen(name). Snapshot dict contains name,cwd,revision,sources,review,decisions,observed_at,updated_at,error. Sources contain tool,session_id,storage. Decisions contain key,question,context,recommendation,status (pending/resolved/superseded),evidence list. Stable keys internal only; no D7 vocabulary on screen. Do not store secrets or complete raw tool output.
+- observer.refresh(store,name,*, runner=None): reads registered sources, bounded source text, calls model, validates result, CAS publish. runner(prompt)->str injectable. Default noninteractive claude -p --model haiku --output-format json with tools disabled, bounded timeout/output, no new login. Errors preserve last good snapshot and expose stale/error state. No transcript sends to other sessions. Parallel observer refresh conflicts refuse rather than overwrite. Explicit evidence/source timestamps; new unresolved request reconciled against later resolution; partial observations labelled and no disappearance-as-resolution.
+- view.run(store,name): curses, 1 Review / 2 Needs you / 3 Next action, arrows/page scrolling, n/p next/previous, q exit. Poll store only; no model calls on redraw. Preserve selection/scroll across refresh; narrow width wrapping/control sanitization. show age/last observed/error and empty state. No typing or forwarding in first viewer; native conversation remains separate.
+- CLI sessions desk create NAME --supervisor ID_OR_SLUG [--source ID_OR_SLUG repeat]; list; refresh NAME; watch NAME [--interval 60]; view NAME; open NAME --tool claude|codex [--dry-run]; show NAME --json. Source resolution from existing catalog/slugs. open uses native session prompt and instructions, never auto-messages supervisor. Reopen same human-facing conversation if supported; don't quietly create a new agent every time. Need simplest reliable native launch; document behavior honestly.
+
+Tasks:
+- [x] Backend store/observer, bounded incremental reads, model validation, concurrent/stale/error regression tests.
+- [x] Live terminal view with pure render/key functions and focused UI tests.
+- [x] CLI source resolution, native launch instructions, exports, documentation and project-agent skill.
+- [ ] Integrate, focused/full isolated tests, Ruff, independent review, launch smoke tests and install reviewable working version. Preserve unrelated dirty main files and previous threads branch.
+
+Review focus: stale summary presented as fresh; source truncation hiding later answers; observer prompt injection/tool use; concurrent stale model completion; native launch routing/history persistence; narrow terminal input and draft separation. All tests use fictional sources/isolated config. No automatic operational messages or approvals. Model output is attributed synthesis, never independent verification or user consent.
+
+Rulings: each native open repeats onboarding so an interrupted first launch cannot lose the role. Explicit current cited resolutions may update a partial observation; absence never resolves a request. Keep pending state within80 requests/24k serialized chars before publication, and retain only20 terminal records in the current snapshot. Failed model observations back off to15min. No automatic operational sends.

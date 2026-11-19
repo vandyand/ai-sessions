@@ -6722,6 +6722,10 @@ def _main(argv: list[str] | None = None) -> int:
         from .new_session import main as new_main
 
         return new_main(raw[1:])
+    if raw and raw[0] == "desk":
+        from .desk.cli import main as desk_main
+
+        return desk_main(raw[1:])
     if raw and raw[0] == "workspace":
         from .workspaces.cli import main as workspace_main
 
