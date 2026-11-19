@@ -195,6 +195,8 @@ def search_fields(item: Session) -> tuple[str, str, str]:
         item.tool,
         item.session_id,
         item.slug,
+        item.handle,
+        item.project_handle,
         item.launch_tool,
         tuple(item.launch_targets),
         item.storage,
@@ -228,6 +230,8 @@ def _session_searchable(item: Session) -> str:
             tool_label(item.tool),
             item.session_id,
             item.slug,
+            item.handle,
+            item.project_handle,
             active_launch_tool(item),
             *available_launch_tools(item),
             item.title,
@@ -266,6 +270,9 @@ class UserState:
         from .references import SlugStore
 
         self.slugs = SlugStore(path.with_suffix(".slugs.sqlite3"))
+        from .handles import HandleStore
+
+        self.handles = HandleStore(self.slugs.path)
         self.names: dict[str, str] = {}
         # Names the harness could not record; they hold until it can.  Any other name
         # yields to whatever the harness shows, so a rename made there wins.
@@ -1015,6 +1022,7 @@ class UserState:
         from .references import assign_sessions
 
         assign_sessions(items, self.slugs)
+        self.handles.ensure(items)
         # Capture each conversation's history while older copy names still record it.
         missing = [cid for cid, value in self.conversations.items() if "history" not in value]
         for conversation_id in missing:
@@ -1282,6 +1290,7 @@ class UserState:
         self.session_conversations[target_key] = conversation_id
         self._sessions_by_key[item.key] = item
         self._sessions_by_key[target_key] = target
+        self.handles.link(item, target)
         if save:
             self.save()
 
@@ -2283,7 +2292,11 @@ def _catalog_signature() -> list[dict[str, Any]]:
     ]
 
 
-_SESSION_FIELDS = tuple(field.name for field in fields(Session) if field.name != "slug")
+_SESSION_FIELDS = tuple(
+    field.name
+    for field in fields(Session)
+    if field.name not in {"slug", "handle", "project_handle", "session_role"}
+)
 # Fields a catalog row leaves out when they only repeat the title.
 _TITLE_COPIES = ("original_title", "provider_title")
 
@@ -2349,6 +2362,9 @@ def load_session_catalog(
         "conversation_blocker",
         "provider_title",
         "slug",
+        "handle",
+        "project_handle",
+        "session_role",
     }
     result: list[Session] = []
     for payload in document["sessions"][:100_000]:
@@ -2374,6 +2390,9 @@ def load_session_catalog(
                 "conversation_blocker": "",
                 "provider_title": "",
                 "slug": "",
+                "handle": "",
+                "project_handle": "",
+                "session_role": "",
             }
             payload = {**payload, **{name: defaults[name] for name in missing}}
         try:
@@ -3322,6 +3341,14 @@ def column_cell(value: str, width: int) -> str:
     return ellipsize(value, max(0, width - 1)).ljust(width)
 
 
+def row_handle(row: ViewRow) -> str:
+    """Copies share their logical handle, including an unannotated representative."""
+    return getattr(row.representative, "handle", "") or next(
+        (getattr(item, "handle", "") for item in row.all_members if getattr(item, "handle", "")),
+        "",
+    )
+
+
 def ellipsize_with_suffix(value: str, suffix: str, width: int) -> str:
     """Clip a title while keeping its collision suffix visible when space permits."""
     if not suffix:
@@ -4041,9 +4068,9 @@ class Browser:
         self.screen.erase()
         height, width = self.screen.getmaxyx()
         rows = self.view_rows()
-        if height < 12 or width < 60:
+        if height < 12 or width < 40:
             self.add(0, 0, "Terminal too small", self.style("warning", curses.A_BOLD))
-            self.add(2, 0, "Resize to at least 60 columns × 12 rows.")
+            self.add(2, 0, "Resize to at least 40 columns × 12 rows.")
             self.screen.refresh()
             return
 
@@ -4110,11 +4137,21 @@ class Browser:
             self.offset = self.selected - visible_rows + 1
         self.offset = min(self.offset, max(0, len(rows) - visible_rows))
 
-        # Reserve at least half the table for its primary content. Metadata is
-        # admitted in priority order; it must never push titles off the screen.
-        tool_width = min(tool_column_width(8) + 1, max(9, width // 8))
-        open_width, updated_width = 5, 11
-        budget = width - 5 - tool_width - open_width - updated_width - max(30, width // 2)
+        # Keep the handle beside a useful title. Admit metadata only after
+        # reserving their space; exceptionally long handles are clipped.
+        handle_width = min(
+            19,
+            max(7, max((len(row_handle(row)) + 1 for row in rows), default=7)),
+            max(7, width // 3),
+        )
+        tool_width = min(tool_column_width(8) + 1, max(9, width // 8)) if width >= 60 else 0
+        open_width = 5 if width >= 80 else 0
+        updated_width = 11 if width >= 60 else 0
+        minimum_title = max(24, width // 2)
+        # Drop secondary metadata before shortening the title below a useful phrase.
+        if width - 5 - handle_width - tool_width - updated_width - open_width < 24:
+            tool_width = 0
+        budget = width - 5 - handle_width - tool_width - open_width - updated_width - minimum_title
         optional = []
         for preferred in (19, 18, 7, 10, 11, 10, min(34, width // 5)):
             allocated = preferred if budget >= preferred else 0
@@ -4132,12 +4169,15 @@ class Browser:
             history_width,
             directory_width,
         ) = optional
-        title_width = width - 5 - tool_width - open_width - updated_width - sum(optional)
+        title_width = (
+            width - 5 - handle_width - tool_width - open_width - updated_width - sum(optional)
+        )
         heading = "   " + "".join(
             column_cell(label, cell_width)
             for label, cell_width in (
                 ("TOOL", tool_width),
                 ("OPEN", open_width),
+                ("HANDLE", handle_width),
                 ("TITLE", title_width),
                 ("UPDATED", updated_width),
                 ("STATUS", status_width),
@@ -4208,6 +4248,7 @@ class Browser:
                     "warning" if paused else "success",
                     curses.A_BOLD,
                 )
+                segment(column_cell(row_handle(view_row) or "—", handle_width), "accent")
                 title = _normal_agent_tag(item) + view_row.title
                 is_supervisor = any(member.supervises for member in view_row.all_members)
                 if is_supervisor:
@@ -4276,7 +4317,8 @@ class Browser:
             self.add(
                 detail_top + 1,
                 2,
-                (f"Slug {item.slug} · " if item.slug else "")
+                (f"Handle {row_handle(selected_row)} · " if row_handle(selected_row) else "")
+                + (f"Slug {item.slug} · " if item.slug else "")
                 + f"{tool_label(item.tool)} · {ORIGIN_LABELS[item.origin]}"
                 f"{self.supervision_role(item)} · launch via {launch_tool} · "
                 f"{activity_label(item)}{name_badge}{source_badge}{hidden_badge}{open_badge}",
@@ -4781,6 +4823,9 @@ class Browser:
             "CONVERSATION DETAILS",
             f"Project    {row.project}",
             f"Thread     {row.title}",
+            f"Handle     {row_handle(row) or '(not assigned)'}",
+            f"Project handle  {getattr(row.representative, 'project_handle', '') or '(not assigned)'}",
+            f"Role       {getattr(row.representative, 'session_role', '') or '(not assigned)'}",
             f"Slug       {row.representative.slug or '(not assigned)'}",
             f"Status     {row.status}",
             f"Members    {len(members)} (shown {len(row.members)})",
@@ -4800,6 +4845,7 @@ class Browser:
                     f"{connection_label(item)} {copy_status(conversation_status(item))} · {tool_label(item.tool)} · "
                     f"{exact_time(item.updated)}{filtered}",
                     f"Slug       {item.slug or '(not assigned)'}",
+                    f"Handle     {getattr(item, 'handle', '') or row_handle(row) or '(not assigned)'}",
                     f"Harness    {item.tool} · Native ID {item.session_id}",
                     f"Storage    {item.storage or '(unknown)'}",
                     f"Dates      {exact_time(item.created)} → {exact_time(item.updated)}",
@@ -6421,13 +6467,14 @@ def list_output(items: list[Session], as_json: bool = False) -> None:
     activity_width = 18
     tool_width = tool_column_width(8)
     run_width = tool_column_width(6)
-    title_width = max(32, terminal_width - 141 - (tool_width - 8) - (run_width - 6))
+    handle_width = max(6, max(len(getattr(item, "handle", "")) for item in items))
+    title_width = max(32, terminal_width - 142 - handle_width - (tool_width - 8) - (run_width - 6))
     title_suffixes = title_disambiguators(items)
     print(
         f"{'TOOL':<{tool_width}} {'RUN':<{run_width}} {'ORIGIN':<7} "
         f"{'OPEN':<5} {'ACTIVITY':<{activity_width}} {'STATE':<8} "
         f"{'CONNECTION':<11} {'STATUS':<{conversation_width}} {'STARTED':<12} {'UPDATED':<17} "
-        f"{'TITLE':<{title_width}} DIRECTORY"
+        f"{'HANDLE':<{handle_width}} {'TITLE':<{title_width}} DIRECTORY"
     )
     for item in items:
         paused = item.is_open and process_state(item.open_pid) in ("T", "t")
@@ -6444,6 +6491,7 @@ def list_output(items: list[Session], as_json: bool = False) -> None:
             f"{connection_label(item):<11} "
             f"{status_label(item, conversation_status(item)):<{conversation_width}} "
             f"{relative_time(item.created):<12} {updated_age(item.updated):<17} "
+            f"{getattr(item, 'handle', '') or '—':<{handle_width}} "
             f"{rendered_title:<{title_width}} "
             f"{short_path(item.cwd)}"
         )
@@ -6508,6 +6556,11 @@ def build_parser() -> argparse.ArgumentParser:
               sessions new codex
               sessions new claude
               sessions new codex -- --model MODEL
+              ses list elev
+              ses open elev-mgr
+              ses desk elev-sup --codex
+              ses project list
+              ses handle assign SESSION --project elev --role wrk --number 11
 
             Workspaces:
               sessions workspace save my-project
@@ -6726,6 +6779,10 @@ def _main(argv: list[str] | None = None) -> int:
         from .desk.cli import main as desk_main
 
         return desk_main(raw[1:])
+    if raw and raw[0] in ("list", "open", "project", "handle"):
+        from .handles_cli import main as handles_main
+
+        return handles_main(raw)
     if raw and raw[0] == "workspace":
         from .workspaces.cli import main as workspace_main
 

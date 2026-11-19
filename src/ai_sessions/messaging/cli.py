@@ -35,8 +35,14 @@ def reachable() -> list[dict]:
             (key, (row.get("name") or "") if row.get("name") != row["session_id"] else "")
             for key, row in zip(keys, rows)
         ]
-        slugs = _slug_store().ensure(entries)
-        rows = [{**row, "slug": slugs[key]} for key, row in zip(keys, rows)]
+        registry = _slug_store()
+        slugs = registry.ensure(entries)
+        from ..handles import HandleStore
+
+        metadata = HandleStore(registry.path).metadata_for(keys)
+        rows = [
+            {**row, "slug": slugs[key], **metadata.get(key, {})} for key, row in zip(keys, rows)
+        ]
     return rows
 
 
@@ -197,7 +203,7 @@ def main(argv: list[str]) -> int:
             print("Messaging " + ("enabled" if result["enabled"] else "not installed"))
             for row in result["receivers"]:
                 print(
-                    f"{store.endpoint_id(row)}  {row.get('slug', '')}  "
+                    f"{store.endpoint_id(row)}  {row.get('handle', '')}  {row.get('slug', '')}  "
                     f"{row.get('name', '')}  {row.get('cwd', '')}"
                 )
             if not result["receivers"]:

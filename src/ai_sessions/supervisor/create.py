@@ -183,7 +183,10 @@ def _resolve_record(state: Any, ident: str, *, root: Path | None = None) -> str:
     keys = set(identities) | set(own)
     matches = {key for key in keys if (key == (tool, reference) if qualified else key[1] == ident)}
     try:
-        owner = guard_reference(
+        from ..handles import HandleStore
+
+        owner = HandleStore(state.slugs.path).current_key(ident)
+        owner = owner or guard_reference(
             ident,
             (native_key(name, session_id) for name, session_id in matches if name in REGISTRY),
             state.slugs,

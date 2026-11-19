@@ -132,6 +132,9 @@ class SlugStore:
                 reserved = {
                     row[0].casefold() for row in connection.execute("SELECT slug FROM claims")
                 }
+                from .handles import HandleStore
+
+                handles = HandleStore(self.path).reserved_names(connection)
                 native_ids = {key.session_id.casefold() for key in assigned.keys() | entries.keys()}
                 next_suffix: dict[str, int] = {}
                 for key in sorted(entries, key=lambda key: (key.tool, key.home, key.session_id)):
@@ -140,7 +143,11 @@ class SlugStore:
                     base = _base_slug(entries[key])
                     suffix = next_suffix.get(base.casefold(), 1)
                     slug = base if suffix == 1 else f"{base}-v{suffix}"
-                    while slug.casefold() in reserved or slug.casefold() in native_ids:
+                    while (
+                        slug.casefold() in reserved
+                        or slug.casefold() in native_ids
+                        or slug.casefold() in handles
+                    ):
                         suffix += 1
                         slug = f"{base}-v{suffix}"
                     next_suffix[base.casefold()] = suffix + 1
@@ -187,6 +194,11 @@ class SlugStore:
         with self._connection() as connection:
             connection.execute("BEGIN IMMEDIATE")
             try:
+                from .handles import HandleStore
+
+                members = HandleStore(self.path).reserved_names(connection).get(slug.casefold())
+                if members is not None:
+                    raise ValueError(f"slug {slug!r} conflicts with a reserved session handle")
                 owner = connection.execute(
                     "SELECT tool, session_id, home FROM claims WHERE slug=? COLLATE NOCASE", (slug,)
                 ).fetchone()
@@ -264,6 +276,12 @@ def resolve_session(
             exact = [item for item in items if native_key(item.tool, item.session_id) == owner]
             if not exact:
                 raise ValueError(f"session slug {reference!r} is unavailable in this harness home")
+    if not exact:
+        from .handles import HandleStore
+
+        handled = HandleStore(store.path if store is not None else None).resolve(reference, items)
+        if handled is not None:
+            return handled
     matches = exact or [item for item in items if item.named and item.title.casefold() == folded]
     if not matches:
         raise ValueError(f"no session with ID, slug or name {reference!r}")

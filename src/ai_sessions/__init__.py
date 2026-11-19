@@ -1,5 +1,5 @@
 """Browse, bridge, and resume Codex CLI, Claude Code, and OpenCode sessions."""
 
-__version__ = "3.18.0"
+__version__ = "3.19.0"
 
 # The built-in harnesses install themselves when the registry is first used.

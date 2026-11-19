@@ -237,6 +237,9 @@ class Session:
     # The name the harness itself shows, which ``title`` may override; "" when unknown.
     provider_title: str = ""
     slug: str = ""
+    handle: str = ""
+    project_handle: str = ""
+    session_role: str = ""
 
     def __post_init__(self) -> None:
         self.source = SourceKind(self.source)
