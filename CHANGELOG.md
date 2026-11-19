@@ -1,5 +1,16 @@
 # Changelog
 
+## 3.20.0 — 2026-11-19
+
+- Supervisors inherit their target project's handle instead of a ledger folder code.
+- Shorten generated generic handles to `ses`; preserve worker roles and reserved names.
+- Refresh externally edited handles in open menus without rescanning sessions.
+- Hide redundant slugs in the menu footer; keep Details and existing CLI references.
+- Add `m` Messages with full text, user/assistant jumps, scrolling, and read-only
+  compressed-history previews.
+- Give Help short action names, wrapped descriptions, scrolling, and visible controls.
+- Put confirmation keys before long names, and indent expanded child/copy titles.
+
 ## 3.19.0 — 2026-11-19
 
 - Add `ses` as a short executable name for `sessions`.

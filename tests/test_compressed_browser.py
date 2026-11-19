@@ -123,10 +123,10 @@ class BrowserTests(Fixture):
             self.assertEqual(browser.compression, "both")
 
     def test_help_lists_z(self) -> None:
-        browser = self.browser("?", "x", "q")
+        browser = self.browser("?", "q", "q")
         browser.run()
         help_frame = next(f for f in browser.screen.frames if "AI SESSIONS — HELP" in f)
-        self.assertTrue(any(line.startswith("z ") for line in help_frame.splitlines()))
+        self.assertTrue(any(line.strip() == "z" for line in help_frame.splitlines()))
 
 
 class ActionFixture(Fixture):

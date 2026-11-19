@@ -104,6 +104,25 @@ class Fixture(unittest.TestCase):
 
 
 class SupervisorBrowserTests(Fixture):
+    def test_supervisor_inherits_target_project_instead_of_internal_directory(self):
+        record_id = create_supervisor(self.state, self.target, "claude", save=False)
+        native = load_hook_state(record_id).native_session_id
+        supervisor = Session(
+            "claude",
+            native,
+            "generated",
+            str(self.root / record_id),
+            1_700_000_030,
+            1_700_000_011,
+            "q",
+            False,
+            "storage2",
+        )
+        self.sessions.append(supervisor)
+        self.state.apply(self.sessions)
+        self.assertEqual(supervisor.project_handle, self.target.project_handle)
+        self.assertEqual(supervisor.session_role, "sup")
+
     def test_supervisor_sessions_get_origin_supervisor_and_hidden_from_human_view(self) -> None:
         _record, supervisor = self.supervise()
         self.assertEqual(supervisor.origin, "supervisor")
@@ -350,11 +369,11 @@ class SupervisorBrowserTests(Fixture):
         self.assertEqual(self.state.supervisors[record_id]["tool"], "claude")
 
     def test_help_lists_S(self) -> None:
-        browser = self.browser("?", "x", "q")
+        browser = self.browser("?", "q", "q")
         browser.run()
         help_frame = next(f for f in browser.screen.frames if "AI SESSIONS — HELP" in f)
         self.assertIn("supervisor", help_frame)
-        self.assertTrue(any(line.startswith("S ") for line in help_frame.splitlines()))
+        self.assertTrue(any(line.strip() == "S" for line in help_frame.splitlines()))
 
 
 if __name__ == "__main__":
