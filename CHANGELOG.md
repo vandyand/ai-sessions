@@ -1,5 +1,14 @@
 # Changelog
 
+## 3.20.1 — 2026-11-19
+
+- Add provider-owned native deletion plans with `ses delete`, exact typed
+  confirmation, read-only `--dry-run`, and explicit `--all-copies` scope.
+- Revalidate native ownership, liveness, files, and scoped database rows before
+  committing; preserve other histories and report rollback/purge failures.
+- Use Codex's native hard-delete and writer/reference locks for modern homes,
+  including paginated history and its associated native data.
+
 ## 3.20.0 — 2026-11-19
 
 - Supervisors inherit their target project's handle instead of a ledger folder code.

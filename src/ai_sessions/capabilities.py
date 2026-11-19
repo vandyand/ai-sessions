@@ -6,7 +6,10 @@ from contextlib import ExitStack
 from dataclasses import dataclass, field
 from pathlib import Path
 from re import Pattern
-from typing import Any, Callable, Iterable, Mapping, Protocol, Sequence
+from typing import TYPE_CHECKING, Any, Callable, Iterable, Mapping, Protocol, Sequence
+
+if TYPE_CHECKING:
+    from .deletion import DeletePlan
 
 from .liveness import LivenessContext
 from .model import (
@@ -42,6 +45,14 @@ class WriteHook(Protocol):
 
 class ResolveHook(Protocol):
     def __call__(self, session_id: str) -> NativeRef | None: ...
+
+
+class DeletePlanHook(Protocol):
+    def __call__(self, ref: NativeRef) -> DeletePlan: ...
+
+
+class ExecuteDeleteHook(Protocol):
+    def __call__(self, plan: DeletePlan) -> None: ...
 
 
 class AvailabilityHook(Protocol):
@@ -300,6 +311,14 @@ class HarnessAdapter:
     # launcher.  False for a harness that can start a daemon other windows
     # share, which must outlive the window that happened to start it.
     contain_launch: bool = False
+    # Returns a structured, immutable plan; planning must never mutate native storage.
+    plan_delete: DeletePlanHook | Unsupported = Unsupported(
+        "permanent native deletion is not supported"
+    )
+    resolve_delete: ResolveHook | Unsupported = Unsupported(
+        "deletion uses the ordinary native resolver"
+    )
+    execute_delete: ExecuteDeleteHook | Unsupported = Unsupported("native deletion is unavailable")
 
     def __post_init__(self) -> None:
         if not self.label.strip() or not self.short_label.strip():
@@ -365,6 +384,9 @@ class HarnessAdapter:
             self.change_status,
         )
         optional = (
+            self.plan_delete,
+            self.resolve_delete,
+            self.execute_delete,
             self.discover,
             self.rediscover,
             self.resume_args,

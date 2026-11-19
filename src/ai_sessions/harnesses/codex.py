@@ -1481,6 +1481,11 @@ def _windows_liveness(
     return result
 
 
+def native_environment(home: Path) -> dict[str, str]:
+    """Child-only home selection for owned native lifecycle operations."""
+    return {**os.environ, "CODEX_HOME": str(home)}
+
+
 def native_executable() -> str:
     """Resolve the installed native CLI without importing the RPC transport eagerly."""
     from .messaging_rpc import native_executable as resolve_executable
@@ -2058,7 +2063,21 @@ def _message_prepare(home: Path | None = None) -> dict:
     return ensure_runtime(home)
 
 
+def plan_delete(ref: NativeRef):
+    from .deletion_codex import plan_delete as build
+
+    return build(ref)
+
+
+def execute_delete(plan):
+    from .deletion_codex_native import execute_delete as execute
+
+    execute(plan)
+
+
 ADAPTER = HarnessAdapter(
+    plan_delete=plan_delete,
+    execute_delete=execute_delete,
     name="codex",
     native_executable=native_executable,
     current_session=current_session,

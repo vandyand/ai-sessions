@@ -27,6 +27,22 @@ assistant message, and arrows/Page Up/Page Down to scroll. Press `q` to return.
 Compressed histories can be previewed without restoring them permanently.
 Help (`?`) wraps and scrolls in narrow panes; expanded children have indented titles.
 
+## Permanently delete a session
+
+Run from an ordinary interactive shell:
+
+```powershell
+ses delete mine-ses-2 --dry-run
+ses delete mine-ses-2
+ses delete mine-ses-2 --all-copies
+```
+
+The default scope is the selected native copy; `--all-copies` selects its explicitly
+linked copies. The command lists the exact resources, then requires typing the
+displayed handle. There is no `--yes` bypass. Running sessions, uncertain ownership,
+changed storage, unsupported schemas, and dependent children cause refusal.
+See [Deletion details](docs/SESSION_DELETION.md) for supported storage and limits.
+
 ## Session slugs
 
 Every native session copy has a unique, persistent slug, independent of its display

@@ -1169,7 +1169,14 @@ def _message_forget(receiver: dict) -> dict:
     return forget(receiver)
 
 
+def plan_delete(ref: NativeRef):
+    from .deletion_claude import plan_delete as build
+
+    return build(ref)
+
+
 ADAPTER = HarnessAdapter(
+    plan_delete=plan_delete,
     name="claude",
     native_executable=native_executable,
     current_session=current_session,
