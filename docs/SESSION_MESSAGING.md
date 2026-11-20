@@ -54,8 +54,10 @@ session can explicitly retry its own registration without stdin or a restart:
 
 This verifies the invoking native process and registers only that session. It
 cannot make another session reachable. A registered live owner skips repeat
-vault writes. UUID placeholder names use unique cached native-ID/home titles;
-a fresh native title not in the catalog still requires a catalog refresh.
+vault writes. UUID placeholder names use unique cached native-ID/home titles. Since 3.20.9,
+an unresolved send target gets one fresh native discovery pass, then must match
+an exact registered native home. Durable offline handles/slugs and ambiguous
+references never fall through to another session with the same title.
 
 ## Setup and restart
 
