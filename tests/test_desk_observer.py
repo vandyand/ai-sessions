@@ -545,6 +545,7 @@ def test_model_command_enforces_briefing_schema(monkeypatch):
             [sys.executable, "-c", f"import sys; sys.stdin.read(); print({envelope!r})"], **kwargs
         )
 
+    monkeypatch.setattr(observer.model_backend.shutil, "which", lambda name: sys.executable)
     monkeypatch.setattr(observer.model_backend.subprocess, "Popen", spawn)
     prompt = (
         observer.SYSTEM + "\n" + json.dumps({"evidence": [{"citation": "s0", "text": "Fiction"}]})
