@@ -1,7 +1,9 @@
 # Compact session messages
 
 Claude Code renders peer messages as `from HANDLE: message preview…` by default.
-In fullscreen rendering, click the row marked `[expand]` to read the full message, then `[collapse]` to close it.
+In fullscreen rendering, click `[expand]` to open the message inline at the top of the
+conversation viewport, then `[collapse]` to return it to one row. Scroll through long
+messages normally. The control folds the incoming message; Claude's reply is separate.
 In either renderer, **Ctrl+O** opens the full transcript; press it again to return.
 This mod renders `UserMessage` and loads read-only handle labels on `session.start`. It does not rewrite model input,
 transcripts, permissions, or message delivery. Normal user messages are unchanged.

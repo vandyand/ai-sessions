@@ -87,9 +87,12 @@ export function register(on) {
       expanded.set(peer.id, state)
     }
     const isOpen = state.open
-    const toggle = () => {
+    const toggle = async () => {
       state.open = !state.open
       $.ui.invalidate('ui.render')
+      // Keep the expanded body in the conversation; reveal its beginning.
+      await $.ui.scroll({ to: { requestId: e.requestId },
+        block: state.open ? 'start' : 'nearest' }).catch(() => {})
     }
     const summary = Button({
       key: `peer-${peer.id}`, plain: true,
