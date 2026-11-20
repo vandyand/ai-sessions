@@ -3,7 +3,7 @@ on:
   workflow_dispatch:
   push:
     branches:
-      - feature/compact-peer-messages
+      - feature/codex-compact-renderer
     paths:
       - 'patches/codex-compact-messages/**'
       - '.github/workflows/build-codex-compact.yml'
