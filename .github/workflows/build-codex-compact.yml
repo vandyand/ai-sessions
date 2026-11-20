@@ -55,6 +55,23 @@ jobs:
           if ($LASTEXITCODE) { exit $LASTEXITCODE }
           git -C upstream apply $patch
           if ($LASTEXITCODE) { exit $LASTEXITCODE }
+      - name: Apply reviewed workspace release lock metadata
+        shell: pwsh
+        run: |
+          $lock = Join-Path $env:GITHUB_WORKSPACE 'upstream/codex-rs/Cargo.lock'
+          if ((Get-FileHash -Algorithm SHA256 -LiteralPath $lock).Hash -ne 'e913b4fe3ff12121362c1f85ef360b32cba72305149c0cbe55e0a416337c1415') {
+            throw 'Pinned upstream Cargo.lock differs from reviewed diagnostic input'
+          }
+          $lockPatch = Join-Path $env:GITHUB_WORKSPACE 'patches/codex-compact-messages/workspace-release-lock.patch'
+          $patchText = [IO.File]::ReadAllText($lockPatch)
+          [IO.File]::WriteAllText($lockPatch, $patchText.Replace("`r`n", "`n"), [Text.UTF8Encoding]::new($false))
+          git -C upstream apply --check $lockPatch
+          if ($LASTEXITCODE) { exit $LASTEXITCODE }
+          git -C upstream apply $lockPatch
+          if ($LASTEXITCODE) { exit $LASTEXITCODE }
+          if ((Get-FileHash -Algorithm SHA256 -LiteralPath $lock).Hash -ne '11ed3c419dcb08d7d3921f20eb4980c7a0620234c1f7ed79a2d3ca3b98f39a3e') {
+            throw 'Corrected Cargo.lock differs from reviewed Windows proposal'
+          }
       - name: Install upstream Rust toolchain
         shell: pwsh
         working-directory: upstream/codex-rs
