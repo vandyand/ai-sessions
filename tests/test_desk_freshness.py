@@ -33,7 +33,7 @@ def test_old_briefing_is_current_when_source_is_unchanged(tmp_path):
     store = type("Store", (), {"get": lambda self, name: data})()
     checked, error = view.read_snapshot(store, "Garden", None)
     frame = view.render(
-        checked, view.State(), 80, 20, now=datetime.fromtimestamp(7201, timezone.utc)
+        checked, view.State(tab=2), 80, 20, now=datetime.fromtimestamp(7201, timezone.utc)
     )
     assert frame.lines[0].endswith("Up to date · 2h")
     assert "Stale" not in "\n".join(frame.lines)
@@ -49,10 +49,10 @@ def test_source_changes_and_removal_are_distinct_from_age(tmp_path):
     store = type("Store", (), {"get": lambda self, name: data})()
     path.write_text("{}\n{}\n")
     checked, _ = view.read_snapshot(store, "Garden", None)
-    assert "Supervisor has new content" in view.render(checked, view.State(), 80, 20).lines[0]
+    assert "Supervisor has new content" in view.render(checked, view.State(tab=2), 80, 20).lines[0]
     path.unlink()
     checked, _ = view.read_snapshot(store, "Garden", None)
-    assert "Source unavailable" in view.render(checked, view.State(), 80, 20).lines[0]
+    assert "Source unavailable" in view.render(checked, view.State(tab=2), 80, 20).lines[0]
 
 
 def test_source_rebinding_is_not_current(tmp_path):
@@ -62,7 +62,7 @@ def test_source_rebinding_is_not_current(tmp_path):
     data["sources"][0] = dict(data["sources"][0], session_id="different")
     store = type("Store", (), {"get": lambda self, name: data})()
     checked, _ = view.read_snapshot(store, "Garden", None)
-    assert "Supervisor has new content" in view.render(checked, view.State(), 80, 20).lines[0]
+    assert "Supervisor has new content" in view.render(checked, view.State(tab=2), 80, 20).lines[0]
 
 
 def test_narrow_tabs_help_and_scroll_are_discoverable():
@@ -73,11 +73,11 @@ def test_narrow_tabs_help_and_scroll_are_discoverable():
         observed_at=1,
         observation={},
     )
-    frame = view.render(data, view.State(), 40, 12)
+    frame = view.render(data, view.State(tab=2), 40, 12)
     assert "? Help" in frame.lines[-1] and "q Exit" in frame.lines[-1]
-    assert "1 Review" in frame.lines[1] and "2" in frame.lines[1] and "3" in frame.lines[1]
+    assert "2 Review" in frame.lines[1] and "2" in frame.lines[1] and "3" in frame.lines[1]
     assert "1-" in frame.lines[-1] and "/100" in frame.lines[-1]
-    state = view.handle_key(view.State(), "?", data, 40, 12)
+    state = view.handle_key(view.State(tab=2), "?", data, 40, 12)
     text = "\n".join(view.render(data, state, 40, 40).lines)
     assert "Shift+Tab" in text and "Up to date" in text
     assert view.handle_key(state, "?", data, 40, 12).help is False
@@ -92,7 +92,7 @@ def test_help_aliases_and_watched_sessions_are_explicit():
         sources=[dict(title="Garden supervisor", role="supervisor")],
     )
     for key in ("h", "H", "?"):
-        state = view.handle_key(view.State(), key, data, 80, 60)
+        state = view.handle_key(view.State(tab=2), key, data, 80, 60)
         text = "\n".join(view.render(data, state, 80, 60).lines)
         assert state.help and "Garden supervisor" in text
         assert "not included automatically" in " ".join(text.split())
@@ -108,11 +108,57 @@ def test_question_navigation_from_review_and_contextual_controls():
             dict(key="two", question="Which plant?", status="pending"),
         ],
     )
-    assert view.handle_key(view.State(), "n", data, 80, 20).selected_key == "one"
-    last = view.handle_key(view.State(), "p", data, 80, 20)
-    assert last.tab == 2 and last.selected_key == "two"
-    frame = view.render(data, view.State(), 100, 20)
+    assert view.handle_key(view.State(tab=2), "n", data, 80, 20).selected_key == "one"
+    last = view.handle_key(view.State(tab=2), "p", data, 80, 20)
+    assert last.tab == 3 and last.selected_key == "two"
+    frame = view.render(data, view.State(tab=2), 100, 20)
     assert "Scroll" not in frame.lines[-1] and "n Questions" in frame.lines[-1]
     data["decisions"] = data["decisions"][:1]
-    frame = view.render(data, view.State(tab=2), 100, 20)
+    frame = view.render(data, view.State(tab=3), 100, 20)
     assert "n/p" not in "\n".join(frame.lines)
+
+
+def test_overview_is_first_and_preserves_project_context():
+    data = dict(
+        name="Garden",
+        overview=dict(
+            background="We started with a bare courtyard.",
+            current="Planting beds are ready.",
+            direction="Choose plants, then schedule delivery.",
+            goal="A shaded garden for summer.",
+        ),
+        review="The paving was finished today.",
+        decisions=[],
+    )
+    text = "\n".join(view.render(data, view.State(), 80, 25).lines)
+    for value in data["overview"].values():
+        assert value in text
+    assert "[1 Overview]" in text
+    assert "paving" not in text
+    assert view.handle_key(view.State(), "4", data, 80, 25).tab == 4
+
+
+def test_first_failure_and_invalid_timestamp_stay_readable():
+    data = dict(name="Garden", error="Timed out", observed_at=None, decisions=[])
+    assert "Update failed" in view.render(data, view.State(), 80, 20).lines[0]
+    data["observed_at"] = "invalid"
+    text = "\n".join(view.render(data, view.State(help=True), 80, 80).lines)
+    assert "Summary changed: unavailable" in text
+
+
+def test_age_uses_summary_not_unchanged_poll_and_updating_is_explicit():
+    data = dict(
+        name="Garden",
+        error=None,
+        observed_at=7200,
+        observation=dict(synthesized_at=1),
+        _freshness="current",
+        sources=[{}],
+    )
+    now = datetime.fromtimestamp(7201, timezone.utc)
+    assert "Up to date · 2h" in view.render(data, view.State(), 80, 20, now=now).lines[0]
+    data["_freshness"] = "changed"
+    assert (
+        "Updating briefing · 2h"
+        in view.render(data, view.State(), 80, 20, now=now, updating=True).lines[0]
+    )

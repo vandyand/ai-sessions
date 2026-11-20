@@ -105,24 +105,36 @@ def _human_text(value: object) -> str:
     )
 
 
+def _review_text(value: object) -> str:
+    text = _human_text(value)
+    for _ in range(2):
+        for prefix in ("Partial source coverage. ", "Some selected sources unavailable. "):
+            text = text.removeprefix(prefix)
+    return text
+
+
 def _detail(snapshot: dict | None, state: State, width: int) -> list[str]:
     if state.help:
         return wrap(
             "Briefing help\n\n"
             "Left / Right or Tab / Shift+Tab: switch views\n"
-            "1 Review: progress and current outcome\n"
-            "2 Needs you: questions and their context\n"
-            "3 Next action: suggested response\n"
-            "n / p: next / previous question; opens Needs you from Review\n"
+            "1 Overview: background, position, direction and goal\n"
+            "2 Review: recent progress and current outcome\n"
+            "3 Needs you: questions and their context\n"
+            "4 Next action: suggested response\n"
+            "n / p: next / previous question; opens Needs you from Overview or Review\n"
             "Up / Down or PgUp / PgDn: scroll\n"
             "Home / End: top / bottom\n"
             "h / ? / Esc: return to briefing\nq: exit\n\n"
-            "Up to date: the briefing includes all content from the latest checked session files. "
+            "Up to date: no new session content was found since the last successful briefing check. "
             "Its age is time since the summary last changed, not time since the last check. "
             "An unchanged session needs no new summary.\n\n"
             "Supervisor has new content: a new briefing is needed.\n"
             "Updating briefing: the reviewer is checking new content.\n"
             "Saved: current source activity has not been verified.\n\n"
+            "Source unavailable: a watched session file cannot be read.\n"
+            "Update failed: showing the saved briefing while retrying.\n"
+            "Reconnecting: the saved briefing cannot be reloaded right now.\n\n"
             "Discuss questions and give answers in your Desk conversation."
             + "\n\nWatched sessions\n"
             + (
@@ -153,9 +165,31 @@ def _detail(snapshot: dict | None, state: State, width: int) -> list[str]:
     if snapshot is None:
         return wrap("Waiting for the briefing. It will appear here automatically.", width)
     if state.tab == 1:
+        overview = snapshot.get("overview") or {}
+        if not overview:
+            return wrap(
+                "Preparing the project overview. Recent progress is available in 2 Review.", width
+            )
+        parts = []
+        for key, title in (
+            ("background", "Where we started"),
+            ("current", "Where we are"),
+            ("direction", "Where we're going"),
+            ("goal", "What we're aiming for"),
+        ):
+            if parts:
+                parts.append("")
+            parts.extend(
+                [
+                    title,
+                    _human_text(overview.get(key))
+                    or "Not yet described in the watched conversations.",
+                ]
+            )
+        return wrap("\n".join(parts), width)
+    if state.tab == 2:
         return wrap(
-            _human_text(snapshot.get("review")).removeprefix("Partial source coverage. ")
-            or "Preparing the first briefing…",
+            _review_text(snapshot.get("review")) or "Preparing the first briefing…",
             width,
         )
     pending = _pending(snapshot)
@@ -176,7 +210,7 @@ def _detail(snapshot: dict | None, state: State, width: int) -> list[str]:
         "",
         selected.get("question") or "A decision needs your attention.",
     ]
-    if state.tab == 2 and selected.get("context"):
+    if state.tab == 3 and selected.get("context"):
         parts.extend(["", "Why it matters", str(selected["context"])])
     parts.extend(
         [
@@ -187,8 +221,8 @@ def _detail(snapshot: dict | None, state: State, width: int) -> list[str]:
             ),
         ]
     )
-    if state.tab == 3:
-        parts.extend(["", "2 Needs you: read the context."])
+    if state.tab == 4:
+        parts.extend(["", "3 Needs you: read the context."])
     # Evidence is deliberately not dumped: it can contain internal source IDs.
     return wrap(_human_text("\n".join(parts)), width)
 
@@ -236,29 +270,29 @@ def handle_key(
         return replace(state, quit=True)
     if key in ("?", "h", "H") or key == "\x1b" and state.help:
         return normalize(replace(state, help=not state.help, scroll=0), snapshot, width, height)
-    if key in ("1", "2", "3"):
+    if key in ("1", "2", "3", "4"):
         return normalize(
             replace(state, tab=int(key), help=False, scroll=0), snapshot, width, height
         )
     if key in (curses.KEY_RIGHT, "\t", curses.KEY_LEFT, curses.KEY_BTAB):
         step = 1 if key in (curses.KEY_RIGHT, "\t") else -1
         return normalize(
-            replace(state, tab=(state.tab - 1 + step) % 3 + 1, help=False, scroll=0),
+            replace(state, tab=(state.tab - 1 + step) % 4 + 1, help=False, scroll=0),
             snapshot,
             width,
             height,
         )
-    if key in ("n", "p") and state.tab == 1 and not state.help:
+    if key in ("n", "p") and state.tab in (1, 2) and not state.help:
         questions = _pending(snapshot)
         if questions:
             item = questions[0] if key == "n" else questions[-1]
             return normalize(
-                replace(state, tab=2, selected_key=item.get("key"), scroll=0),
+                replace(state, tab=3, selected_key=item.get("key"), scroll=0),
                 snapshot,
                 width,
                 height,
             )
-    if key in ("n", "p") and state.tab != 1:
+    if key in ("n", "p") and state.tab in (3, 4) and not state.help:
         keys = [item.get("key") for item in _pending(snapshot)]
         if keys:
             index = keys.index(state.selected_key)
@@ -363,17 +397,19 @@ def _header(title: str, status: str, width: int) -> str:
 
 
 def _tabs(state: State, width: int) -> str:
-    labels = ("Review", "Needs you", "Next action")
+    labels = ("Overview", "Review", "Needs you", "Next action")
 
-    def line(compact=False):
-        return "  ".join(
+    def line(labels, compact=False, gap="  "):
+        return gap.join(
             (f"[{n} {label}]" if state.tab == n else str(n) if compact else f"{n} {label}")
             for n, label in enumerate(labels, 1)
         )
 
-    text = line()
+    text = line(labels)
     if cell_width(text) > width:
-        text = line(True)
+        text = line(("Overview", "Review", "Needs", "Next"), gap=" ")
+    if cell_width(text) > width:
+        text = line(labels, True)
     return _clip(text, width)
 
 
@@ -398,7 +434,7 @@ def render(
         status = "Updating briefing" + (" · " + _age(snapshot, now or _now()) if snapshot else "")
     title = str((snapshot or {}).get("name") or "Briefing")
     header = _header(title, status, width)
-    tabs = _clip("Help · ? or Esc to return", width) if state.help else _tabs(state, width)
+    tabs = _clip("Help · h / ? / Esc to return", width) if state.help else _tabs(state, width)
     if height < 6:
         return Frame(tuple([header, tabs, _clip("? Help · q Exit", width)][:height]))
     body = _body(snapshot, state, width)
@@ -415,9 +451,9 @@ def render(
     extra = []
     available = width - (len(position) + 2 if position else 0)
     if position:
-        extra.append("↑↓ Scroll" if width >= 55 else "↑↓")
+        extra.append("↑↓ Scroll")
     if not state.help and _pending(snapshot):
-        if state.tab == 1:
+        if state.tab in (1, 2):
             extra.append("n Questions")
         elif len(_pending(snapshot)) > 1:
             extra.append("n/p Questions")

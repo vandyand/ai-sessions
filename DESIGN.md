@@ -190,3 +190,42 @@ file, so a compressed copy can never be mistaken for no copy and bridged again. 
 - **Recovery:** Cancel leaves the store intact; capture errors restore temporary
   titles and never substitute an unrelated saved tab. Existing running agents
   are not stopped or sent input during capture or restore.
+
+
+## Project Desk Briefing
+
+The human's job is to regain project context, understand current progress, and
+identify a question worth discussing in the adjacent Desk conversation. The
+briefing is a keyboard-first, read-only terminal pane, often only 40 columns wide.
+
+- Entry opens **1 Overview**, then **2 Review**, **3 Needs you**, **4 Next action**.
+  Overview preserves background, current position, direction and goal separately
+  from the rolling Review. Missing evidence is stated without inventing goals.
+- Left/Right and Tab/Shift+Tab cycle views. Numeric keys select directly. n/p
+  opens questions from the first two views and cycles them in the last two.
+- First row: desk identity left, freshness plus summary age right. Age alone never
+  implies staleness. `Up to date` requires a current bounded source-stat match;
+  changed, unavailable, unverified and failed states are distinguished in words.
+- Second row: all four view names, abbreviated when narrow, active view bracketed.
+  One blank row separates navigation from prose. Body scroll is independent.
+- Footer: Help and Exit always fit at supported widths. Scroll hint and line range
+  appear only on overflow. Question hints appear only when useful. No clipped
+  all-purpose shortcut paragraph. h/? opens scrollable help; Esc returns.
+- Help includes source scope, status meaning, complete keys, exact Eastern time,
+  partial-history context and recoverable update error details. No native IDs or
+  byte offsets are dumped into the routine view. Color is never required.
+- Last good content survives errors. Viewer checks source metadata at most once
+  per second (32 files maximum); render performs no filesystem or model I/O.
+- Source scope is explicit: supervisor by default, additional selected sessions
+  only. No automatic project-wide observation or messaging.
+
+Audit evidence and remedies: the previous five-minute age threshold falsely
+implied staleness (major); permanently reserved metadata rows crowded prose
+(minor); a clipped footer advertised inactive controls (major); Review lacked
+stable project context (major). Status/age separation, compact layout, contextual
+controls/help and persistent Overview address these respectively.
+
+Validation: fictional-source freshness/rebinding/failure tests, four-view keyboard
+and scroll tests, and actual Windows console input/capture at 40×18, 60×12 and
+100×25. Human feedback remains the measure of whether the project explanation is
+sufficient; source coverage is bounded and an overview is not an independent audit.

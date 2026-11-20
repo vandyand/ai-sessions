@@ -1,11 +1,24 @@
 # Changelog
 
+## 3.20.7 — 2026-11-20
+
+- Collapse peer messages in Claude Code with the optional local UI plugin while
+  preserving complete agent input; use session handles in the one-line previews.
+- Notify bound Desk conversations only when a new human request is added, with
+  durable deduplication and offline delivery; ordinary refreshes stay silent.
+- Include the pinned experimental native Codex renderer patch and Windows build
+  diagnostics. A verified custom binary is required before enabling that UI.
+
 ## 3.20.6 — 2026-11-20
 
-- Add a Claude UI mod that collapses peer input into an expandable
-  `from HANDLE: message preview` row while preserving full agent-visible input.
-- Include sender/recipient handles in display metadata and add read-only handle
-  labels for historical messages, without changing delivery addresses.
+- Add a persistent Overview with project background, current position, direction
+  and goal, grounded in bounded opening context and current conversation evidence.
+- Replace the timestamp row with a top-right freshness label and summary age;
+  unchanged sessions remain up to date without another model call.
+- Simplify narrow briefing layouts and request wording; show scroll position and
+  only applicable shortcuts. Add h/? help with watched sources and status meanings.
+- Switch views with Left/Right or Tab/Shift+Tab. n/p opens questions from Overview
+  or Review and cycles them in Needs you / Next action.
 
 ## 3.20.5 — 2026-11-20
 
