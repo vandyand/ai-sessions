@@ -619,20 +619,31 @@ class OpenCodeWriterIntegrationTests(unittest.TestCase):
         self.assertEqual(opencode._availability(written.native), opencode.Availability.AVAILABLE)
 
     def test_rejected_and_timed_out_imports_fail_and_remove_temporary_file(self) -> None:
-        with self.assertRaisesRegex(BridgeError, "fixture import rejected"):
-            opencode._write_opencode(
-                cwd=str(self.root), turns=self.turns(), prepared=self.prepared("reject")
-            )
-        with (
-            patch.object(opencode, "IMPORT_TIMEOUT_SECONDS", 0.05),
-            self.assertRaisesRegex(BridgeError, "timed out"),
-        ):
-            opencode._write_opencode(
-                cwd=str(self.root), turns=self.turns(), prepared=self.prepared("timeout")
-            )
-        recorded = Path(str(self.database) + ".import-path")
-        temporary = Path(recorded.read_text(encoding="utf-8"))
-        self.assertFalse(temporary.exists())
+        created = []
+        write_export = opencode._write_temporary_export
+
+        def capture_export(payload):
+            path = write_export(payload)
+            created.append(path)
+            return path
+
+        # A 50 ms timeout may kill the fixture while it writes its path marker.
+        # Observe the actual parent-created files instead of trusting that marker.
+        with patch.object(opencode, "_write_temporary_export", side_effect=capture_export):
+            with self.assertRaisesRegex(BridgeError, "fixture import rejected"):
+                opencode._write_opencode(
+                    cwd=str(self.root), turns=self.turns(), prepared=self.prepared("reject")
+                )
+            with (
+                patch.object(opencode, "IMPORT_TIMEOUT_SECONDS", 0.05),
+                self.assertRaisesRegex(BridgeError, "timed out"),
+            ):
+                opencode._write_opencode(
+                    cwd=str(self.root), turns=self.turns(), prepared=self.prepared("timeout")
+                )
+        self.assertEqual(len(created), 2)
+        for temporary in created:
+            self.assertFalse(temporary.exists())
 
     def test_preflight_session_conflict_prevents_writer_from_spawning_import(self) -> None:
         prepared = self.prepared()
