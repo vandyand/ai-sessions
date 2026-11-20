@@ -2075,7 +2075,14 @@ def execute_delete(plan):
     execute(plan)
 
 
+def interactive_command(argv: list[str]) -> list[str]:
+    from .codex_tui import command
+
+    return command(argv)
+
+
 ADAPTER = HarnessAdapter(
+    interactive_command=interactive_command,
     plan_delete=plan_delete,
     execute_delete=execute_delete,
     name="codex",

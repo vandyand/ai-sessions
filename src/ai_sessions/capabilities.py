@@ -311,6 +311,9 @@ class HarnessAdapter:
     # launcher.  False for a harness that can start a daemon other windows
     # share, which must outlive the window that happened to start it.
     contain_launch: bool = False
+    interactive_command: Callable[[list[str]], list[str]] | Unsupported = Unsupported(
+        "interactive launches use the configured command"
+    )
     # Returns a structured, immutable plan; planning must never mutate native storage.
     plan_delete: DeletePlanHook | Unsupported = Unsupported(
         "permanent native deletion is not supported"
@@ -404,6 +407,7 @@ class HarnessAdapter:
             self.transcript_files,
             self.native_executable,
             self.current_session,
+            self.interactive_command,
         )
         if not all(callable(hook) or isinstance(hook, Unsupported) for hook in required + optional):
             raise ValueError("harness capabilities must be callable or Unsupported")
