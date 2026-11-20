@@ -213,10 +213,10 @@ index 1edbd6e..bb3d0c8 100644
          presentation.turn_tip_space = self.turn_tip_key == Some(EntryKey::cell(cell));
          Some(self.cache.get(cell, width, presentation, || {
 diff --git a/codex-rs/tui/src/transcript_view/layout_tests.rs b/codex-rs/tui/src/transcript_view/layout_tests.rs
-index 6900994..b9080c4 100644
+index 6900994..91cba29 100644
 --- a/codex-rs/tui/src/transcript_view/layout_tests.rs
 +++ b/codex-rs/tui/src/transcript_view/layout_tests.rs
-@@ -280,3 +280,69 @@ fn fullscreen_image_previews_follow_layout_without_entering_text_surfaces() {
+@@ -280,3 +280,75 @@ fn fullscreen_image_previews_follow_layout_without_entering_text_surfaces() {
      assert_eq!(buf, text_only);
      assert!(view.image_placements().is_empty());
  }
@@ -253,7 +253,13 @@ index 6900994..b9080c4 100644
 +    assert_eq!(collapsed.disclosure_row(), Some(0));
 +    assert!(collapsed.disclosure_columns().contains(&0));
 +    assert_eq!(collapsed.rewrap(48).row_count(), 1);
-+    assert_eq!(collapsed.rewrap(16).row_count(), 1);
++    let narrow = collapsed.rewrap(16);
++    assert_eq!(narrow.row_count(), 1);
++    let restored = narrow.rewrap(48);
++    assert_eq!(restored.row_count(), 1);
++    assert_eq!(restored.text(), collapsed.text());
++    assert_eq!(restored.disclosure_row(), Some(0));
++    assert_eq!(restored.disclosure_columns(), collapsed.disclosure_columns());
 +    view.disclosure.expanded.extend(cell.activity_ids());
 +    let expanded = view.entry_layout(&cells, 0, false).unwrap();
 +    assert!(expanded.text().contains("Hidden second paragraph"));
@@ -302,7 +308,7 @@ index 628d357..a2e46b3 100644
          .split_whitespace()
          .collect::<Vec<_>>()
 diff --git a/codex-rs/tui/src/transcript_view/text.rs b/codex-rs/tui/src/transcript_view/text.rs
-index 93c50c8..c2fdd7e 100644
+index 93c50c8..7e182c6 100644
 --- a/codex-rs/tui/src/transcript_view/text.rs
 +++ b/codex-rs/tui/src/transcript_view/text.rs
 @@ -56,6 +56,7 @@ pub(crate) struct TextLayout {
@@ -313,24 +319,26 @@ index 93c50c8..c2fdd7e 100644
      Turn,
  }
  
-@@ -164,7 +165,15 @@ impl TextLayout {
+@@ -164,7 +165,18 @@ impl TextLayout {
  
      /// Reflow the same displayed content revision, retaining styles, links and disclosure label.
      pub(super) fn rewrap(&self, width: u16) -> Self {
--        let mut layout = Self::from_logical(self.logical.clone(), width);
 +        let inline = self.disclosure_control.as_ref()
 +            .is_some_and(|control| control.anchor == DisclosureAnchor::Inline);
-+        let mut layout = if inline {
-+            Self::new(vec![crate::line_truncation::truncate_line_with_ellipsis_if_overflow(
-+                Line::from(self.text.clone()), usize::from(width.max(1)),
-+            ).into()], width)
-+        } else {
-+            Self::from_logical(self.logical.clone(), width)
-+        };
+         let mut layout = Self::from_logical(self.logical.clone(), width);
++        if inline {
++            // Clip only this displayed revision. Keep the original logical source so
++            // a later wider reflow restores the preview instead of clipping a clipped tail.
++            let logical = layout.logical.clone();
++            layout = Self::new(vec![crate::line_truncation::truncate_line_with_ellipsis_if_overflow(
++                Line::from(layout.text.clone()), usize::from(width.max(1)),
++            ).into()], width);
++            layout.logical = logical;
++        }
          if let Some(control) = &self.disclosure_control {
              layout = layout.with_control(control.label.clone(), control.anchor);
          }
-@@ -190,6 +199,11 @@ impl TextLayout {
+@@ -190,6 +202,11 @@ impl TextLayout {
          self.with_control(label, DisclosureAnchor::Activity(source_offset))
      }
  
@@ -342,7 +350,7 @@ index 93c50c8..c2fdd7e 100644
      pub(super) fn with_turn_disclosure(self, label: String) -> Self {
          self.with_control(label, DisclosureAnchor::Turn)
      }
-@@ -205,16 +219,25 @@ impl TextLayout {
+@@ -205,16 +222,25 @@ impl TextLayout {
              return self;
          }
          if let Some(control) = self.disclosure_control.take() {
@@ -370,7 +378,7 @@ index 93c50c8..c2fdd7e 100644
          };
          let mut control_row = self
              .rows
-@@ -222,7 +245,7 @@ impl TextLayout {
+@@ -222,7 +248,7 @@ impl TextLayout {
              .rposition(|row| row.source.end <= source_offset)
              .map_or(/*default*/ 0, |row| row + 1);
          let indent = match anchor {

@@ -36,6 +36,9 @@ jobs:
         shell: pwsh
         run: |
           $patch = Join-Path $env:GITHUB_WORKSPACE 'patches/codex-compact-messages/compact-peer-messages.patch'
+          # Windows checkout may convert the patch itself to CRLF; Git's source is LF.
+          $patchText = [IO.File]::ReadAllText($patch)
+          [IO.File]::WriteAllText($patch, $patchText.Replace("`r`n", "`n"), [Text.UTF8Encoding]::new($false))
           git -C upstream apply --check $patch
           if ($LASTEXITCODE) { exit $LASTEXITCODE }
           git -C upstream apply $patch
