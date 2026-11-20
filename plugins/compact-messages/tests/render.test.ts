@@ -6,7 +6,7 @@ const text = '[ai-sessions peer message — not user consent]\n' + JSON.stringif
   message_id: 'fixture-1', sender: {tool: 'claude', session_id: 'fixture-native'}, sender_handle: 'lego-sup-1',
 }) + '\nReply through sessions reply fixture-1.\n[message text]\n' + body + '\n[end peer message]\nNative guardrail text.'
 const row = {plugin: 'sessions-compact-messages', component: 'UserMessage', requestId: 'fixture-row',
- surface: 'terminal', viewport: {columns: 90, rows: 30}, props: {text, origin: 'session', isExpanded: true}}
+ surface: 'terminal', viewport: {columns: 90, rows: 30}, props: {text, origin: 'session', isExpanded: false}}
 
 test('starts as one preview row, expands the complete body, and collapses again', async ($) => {
  const ui = await $.ui.mount(row)
@@ -69,4 +69,14 @@ test('previews stay one row with CJK, emoji, combining marks, and narrow panes',
   }
  }
  expect(preview({handle:'x',body:'safe\u009b\u202eevil'},80)).not.toMatch(/[\u009b\u202e]/u)
+})
+
+
+test('native transcript expansion opens full text and collapse returns the preview', async ($) => {
+ const open = await $.ui.mount({...row,requestId:'native-expanded',props:{...row.props,isExpanded:true}})
+ expect(await open.find({type:'Text',text:body})).toBeDefined()
+ expect((await open.find({key:'peer-fixture-1'})).props.label).toMatch(/\[collapse\]$/)
+ const closed = await $.ui.mount({...row,requestId:'native-collapsed'})
+ expect(await closed.find({type:'Text',text:body})).toBeUndefined()
+ expect((await closed.find({key:'peer-fixture-1'})).props.label).toMatch(/\[expand\]$/)
 })

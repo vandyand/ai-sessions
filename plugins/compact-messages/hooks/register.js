@@ -1,5 +1,5 @@
 // Rendering only: no prompt, transcript, delivery, or permission hooks.
-const expanded = new Set()
+const expanded = new Map()
 let handleLabels = {}
 let labelsPending
 
@@ -80,15 +80,21 @@ export function register(on) {
     await loadHandles($)
     peer = parsePeer(e.props.text)
     const { Box, Text, Button } = $.ui.resolve(e)
-    const isOpen = expanded.has(peer.id)
+    const nativeExpanded = e.props.isExpanded === true
+    let state = expanded.get(peer.id)
+    if (!state || state.native !== nativeExpanded) {
+      state = { native: nativeExpanded, open: nativeExpanded }
+      expanded.set(peer.id, state)
+    }
+    const isOpen = state.open
     const toggle = () => {
-      if (expanded.has(peer.id)) expanded.delete(peer.id)
-      else expanded.add(peer.id)
+      state.open = !state.open
       $.ui.invalidate('ui.render')
     }
     const summary = Button({
       key: `peer-${peer.id}`, plain: true,
-      label: preview(peer, e.viewport?.columns || 80), onPress: toggle,
+      label: preview(peer, Math.max(6, (e.viewport?.columns || 80) - (isOpen ? 11 : 9))) +
+        (isOpen ? ' [collapse]' : ' [expand]'), onPress: toggle,
     })
     return Box({ flexDirection: 'column', children: isOpen
       ? [summary, Text({ children: [clean(peer.body)] })] : [summary] })
