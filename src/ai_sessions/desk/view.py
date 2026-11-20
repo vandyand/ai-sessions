@@ -188,6 +188,14 @@ def handle_key(
         return replace(state, quit=True)
     if key in ("1", "2", "3"):
         return normalize(replace(state, tab=int(key), scroll=0), snapshot, width, height)
+    if key in (curses.KEY_RIGHT, "\t", curses.KEY_LEFT, curses.KEY_BTAB):
+        step = 1 if key in (curses.KEY_RIGHT, "\t") else -1
+        return normalize(
+            replace(state, tab=(state.tab - 1 + step) % 3 + 1, scroll=0),
+            snapshot,
+            width,
+            height,
+        )
     if key in ("n", "p") and state.tab != 1:
         keys = [item.get("key") for item in _pending(snapshot)]
         if keys:
@@ -278,7 +286,7 @@ def render(
     offset = min(state.scroll, limit)
     visible = body[offset : offset + _body_height(height)]
     visible += [""] * (_body_height(height) - len(visible))
-    footer = "1/2/3 Tabs | n/p Request | Arrows/PgUp/PgDn Scroll | q Exit"
+    footer = "Views: 1/2/3 Left/Right Tab/Shift+Tab | n/p Request | Up/Down/Pg Scroll | q Exit"
     return Frame(tuple(header_lines + visible + [wrap(footer, width)[0]]))
 
 

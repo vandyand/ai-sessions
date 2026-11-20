@@ -312,3 +312,14 @@ def test_eastern_timestamp_uses_daylight_saving_time():
     )
     assert "12:00 PM EDT" in text
     assert "UTC" not in text
+
+
+@pytest.mark.parametrize(
+    "key,delta", [(curses.KEY_RIGHT, 1), ("\t", 1), (curses.KEY_LEFT, -1), (curses.KEY_BTAB, -1)]
+)
+@pytest.mark.parametrize("tab", [1, 2, 3])
+def test_arrow_and_tab_keys_cycle_briefing_views(key, delta, tab):
+    data = snapshot()
+    state = view.handle_key(view.State(tab=tab, scroll=3), key, data, 80, 25)
+    assert state.tab == (tab - 1 + delta) % 3 + 1
+    assert state.scroll == 0
