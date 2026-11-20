@@ -19,6 +19,37 @@ from .time_format import eastern_time
 MAX_PENDING_COUNT = 80
 MAX_PENDING_CHARS = 24000
 MAX_TERMINAL_COUNT = 20
+OVERVIEW_FIELDS = ("background", "current", "direction", "goal")
+MAX_OVERVIEW_FIELD_CHARS = 6000
+
+
+def validate_overview(overview):
+    if not isinstance(overview, dict) or set(overview) != set(OVERVIEW_FIELDS):
+        raise ValueError("overview requires background, current, direction and goal")
+    if any(
+        not isinstance(value, str) or not value.strip() or len(value) > MAX_OVERVIEW_FIELD_CHARS
+        for value in overview.values()
+    ):
+        raise ValueError("overview values must be nonempty bounded strings")
+
+
+def _overview_projection(overview):
+    """Fixed Markdown headings and inert prose; never mutate the stored model response."""
+    if not isinstance(overview, dict) or not overview:
+        return ""
+    sections = ["## Overview"]
+    for field in OVERVIEW_FIELDS:
+        value = overview.get(field)
+        if not isinstance(value, str) or not value.strip():
+            continue
+        # Remove terminal CSI controls, flatten whitespace, and quote Markdown syntax
+        # so model-supplied headings/fences cannot reshape the exported document.
+        value = re.sub(r"\x1b\[[0-?]*[ -/]*[@-~]", "", value)
+        value = "".join(ch for ch in value if not ord(ch) < 32 or ch in "\n\r\t")
+        value = " ".join(value.split())
+        value = re.sub(r"([\\`*_\[\]<>#])", r"\\\1", value)
+        sections.append(f"### {field.title()}\n{value}")
+    return "\n\n".join(sections)
 
 
 class ConflictError(RuntimeError):
@@ -162,6 +193,7 @@ class Store:
             revision=0,
             sources=chosen,
             review="",
+            overview={},
             decisions=[],
             observed_at=None,
             updated_at=time.time(),
@@ -228,7 +260,7 @@ class Store:
             self._write(db, snapshot)
         return snapshot
 
-    def publish(self, name, expected_revision, observation, review, decisions):
+    def publish(self, name, expected_revision, observation, review, decisions, *, overview=None):
         if type(expected_revision) is not int or expected_revision < 0:
             raise ValueError("expected_revision must be a nonnegative integer")
         if not isinstance(review, str) or len(review) > 64000:
@@ -238,12 +270,17 @@ class Store:
             raise ValueError("observation must be an object")
         # Copy caller-owned objects and reject non-JSON metadata before acquiring a write lock.
         observation, decisions = json.loads(json.dumps([observation, decisions], allow_nan=False))
+        if overview is not None:
+            validate_overview(overview)
+            overview = json.loads(json.dumps(overview, allow_nan=False))
         with self._connect() as db:
             db.execute("BEGIN IMMEDIATE")
             snapshot = self._get(db, name)
             if snapshot["revision"] != expected_revision:
                 raise ConflictError(f"desk {name} changed during observation")
             now = time.time()
+            if overview is not None:
+                snapshot["overview"] = overview
             snapshot.update(
                 revision=expected_revision + 1,
                 observation=observation,
@@ -362,8 +399,12 @@ class Store:
                 )
                 or "No pending questions recorded."
             )
+            review = snapshot["review"] or "Not observed yet."
+            overview_text = _overview_projection(snapshot.get("overview"))
+            if overview_text:
+                review = overview_text + "\n\n## Review\n" + review
             for kind, content in (
-                ("review", snapshot["review"] or "Not observed yet."),
+                ("review", review),
                 ("decisions", text),
             ):
                 fd, temp = tempfile.mkstemp(dir=directory, suffix=".tmp")
