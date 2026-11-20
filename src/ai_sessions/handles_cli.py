@@ -22,8 +22,16 @@ def catalog():
 
 
 def main(argv=None):
+    raw = list(sys.argv[1:] if argv is None else argv)
+    if raw and (
+        raw[0] == "whoami" or (raw[0] == "handle" and (len(raw) == 1 or raw[1].startswith("--")))
+    ):
+        from .handle_lookup import main as whoami
+
+        return whoami(raw[1:])
     parser = argparse.ArgumentParser(prog="ses")
     commands = parser.add_subparsers(dest="action", required=True)
+    commands.add_parser("whoami", help="Show this agent session's handle; alias: ses handle")
     listing = commands.add_parser("list", help="Show session handles and current project activity")
     listing.add_argument("project", nargs="?")
     listing.add_argument("--json", action="store_true")

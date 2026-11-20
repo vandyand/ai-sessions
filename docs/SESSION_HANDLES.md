@@ -19,6 +19,17 @@ its quiet human-facing Project Desk conversation, using the target's harness by
 default. The harness override changes the human-facing conversation. The command
 prints how to open the adjacent live briefing view.
 
+## Identify the current session
+
+Inside Claude Code or Codex, run `! ses whoami` or `! ses handle`. Both print
+this session's handle, title, project handle, and harness. Use `--short` to print
+only the handle, or `--json` for structured output.
+
+Identity comes from the native thread or a verified running harness ancestor;
+it is never inferred from the working directory. If the session has not been
+indexed, open the sessions menu and let it refresh, then retry. An ordinary
+separate shell has no current agent identity; use `ses -q "session title"` there.
+
 ## Defaults and editing
 
 Project handles default to the first four alphanumeric characters of the Git

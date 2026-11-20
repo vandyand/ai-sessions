@@ -6688,6 +6688,7 @@ def build_parser() -> argparse.ArgumentParser:
               sessions send codex:<session-id> --message "Migration finished"
               sessions reply <message-id> --message "Received"
               sesres  (shorthand for sessions --restart)
+              ses whoami  (or ses handle: show this session's handle)
 
             New native sessions:
               sessions new codex
@@ -6921,7 +6922,7 @@ def _main(argv: list[str] | None = None) -> int:
         from .desk.cli import main as desk_main
 
         return desk_main(raw[1:])
-    if raw and raw[0] in ("list", "open", "project", "handle"):
+    if raw and raw[0] in ("list", "open", "project", "handle", "whoami"):
         from .handles_cli import main as handles_main
 
         return handles_main(raw)

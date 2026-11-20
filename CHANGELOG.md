@@ -1,5 +1,10 @@
 # Changelog
 
+## 3.20.2 — 2026-11-19
+
+- Add `ses whoami` and equivalent `ses handle` to identify the current agent
+  session from inside its shell, with `--short` and `--json` output.
+
 ## 3.20.1 — 2026-11-19
 
 - Add provider-owned native deletion plans with `ses delete`, exact typed

@@ -17,6 +17,11 @@ sessions, `ses open elev-mgr` to resume its first manager, or `ses desk elev-sup
 to open the quiet project conversation using the supervisor's current harness.
 `elev-mgr` and `elev-mgr-1` mean the same session. The menu includes a Handle column.
 
+Inside an agent session, run `! ses whoami` or `! ses handle` to print that
+session's handle and title. Add `--short` for just the handle, or `--json` for
+structured output. Lookup uses native thread or verified harness ancestry.
+If a new session is not indexed yet, open the sessions menu and let it refresh.
+
 See [Project and session handles](docs/SESSION_HANDLES.md) for defaults, editing,
 project assignment, messaging, and cross-harness behavior. Native IDs and existing
 slugs remain supported.
