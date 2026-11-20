@@ -40,7 +40,7 @@ def managed_session():
                         return adapter.name, ref.session_id
                     return adapter.name, ""
     except psutil.Error:
-        return None
+        pass
     if found is not None:
         _, entry = found
         adapter = REGISTRY.get(str(entry.get("tool", "")))

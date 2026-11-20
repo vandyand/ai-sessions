@@ -140,3 +140,22 @@ def test_native_claude_ancestor_takes_precedence_over_remembered_cmd_launcher(mo
     native = SimpleNamespace(pid=42, name=lambda: "claude.exe", create_time=lambda: 11)
     monkeypatch.setattr("psutil.Process", lambda: SimpleNamespace(parents=lambda: [native]))
     assert lookup.managed_session() == ("claude", "actual")
+
+
+def test_ancestor_inspection_failure_preserves_verified_managed_fallback(monkeypatch):
+    from unittest.mock import Mock
+
+    import psutil
+
+    from ai_sessions.capabilities import NativeRef
+
+    adapter = SimpleNamespace(
+        name="claude", current_session=lambda pid, started: NativeRef("verified", "verified.jsonl")
+    )
+    monkeypatch.setattr(lookup.REGISTRY, "get", lambda name: adapter)
+    monkeypatch.setattr(
+        "ai_sessions.detached.running_here",
+        lambda: ("terminal", {"tool": "claude", "pid": 42, "started": 10}),
+    )
+    monkeypatch.setattr("psutil.Process", Mock(side_effect=psutil.AccessDenied(42)))
+    assert lookup.managed_session() == ("claude", "verified")
