@@ -36,9 +36,10 @@ original agent input and raw output. Rendered copy/full transcript uses the deco
 body; raw mode intentionally retains the complete original wrapper. The display
 preview collapses whitespace and uses native Unicode-aware clipping.
 
-Limitations: local Rust compilation and native interaction were unavailable;
-CI must establish compilation and test success before using the binary. No mouse
-or keyboard end-to-end test has been run. Collapsed peer cells occupy exactly one row, including consecutive peer cells and narrower retained reflow. Click the preview row or use native activity keyboard expansion; expanded content has the ordinary native collapse control. Raw mode does not collapse. This patch targets only the exact
+Verification: fast Windows candidate run 44706087638 built Codex 0.170.0 and
+passed the targeted compact_peer Rust tests. The parent native-console fixture
+confirmed one-row collapse and F4/Enter expansion; scroll-tail and collapse
+checks remain separate runtime verification. Collapsed peer cells occupy exactly one row, including consecutive peer cells and narrower retained reflow. Click the preview row or use native activity keyboard expansion; expanded content has the ordinary native collapse control. Raw mode does not collapse. This patch targets only the exact
 pinned source/envelope; future upstream or envelope changes require review.
 
 Local checks: git diff --check passed in upstream scratch checkout; reverse application, clean forward git apply --check, and forward application all passed. No Rust tests or release build were run locally.
@@ -84,5 +85,21 @@ reviewable from the renderer patch. The workflow requires these SHA256 hashes:
 
 These are local workspace release labels, not external dependency upgrades.
 The upstream commit/tag pin, Rust toolchain, and --locked test/build commands
-remain unchanged. Compilation and runtime verification still require the next
-Windows CI build; applying this correction alone does not establish success.
+remain unchanged. The fast Windows build and targeted tests passed in run
+44706087638. Applying this correction alone does not establish runtime correctness.
+
+## Redistribution
+
+`redistribution/LICENSE` and `redistribution/NOTICE` are byte-for-byte copies
+from the pinned upstream commit. `MODIFICATIONS.txt` identifies this custom build.
+After verification, package an explicitly supplied executable with:
+
+```
+python patches/codex-compact-messages/package_binary.py --exe PATH/codex.exe --output PATH/codex-compact.zip --run BUILD_RUN_URL
+```
+
+The ZIP includes the executable, notices, both source patches, and BUILD.json
+with upstream identity and executable SHA256. The helper validates the ZIP and
+embedded binary and writes a neighboring `.zip.sha256` file. It never installs
+or publishes a binary. The fast candidate uses an unoptimized dev profile with
+debug information and LTO disabled; optimized release assets are separate.

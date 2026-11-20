@@ -183,9 +183,19 @@ class MessagingSlugTests(unittest.TestCase):
         self.assertEqual(receipt["recipient"], cli._address(self.b))
 
     def test_offline_slug_refuses_delivery(self):
+        from ai_sessions.references import native_key
+
+        # A real offline slug has a durable owner even while its receiver is gone.
+        self.slugs.ensure(
+            [(native_key(self.b["tool"], self.b["session_id"], self.b["home"]), "worker-2")]
+        )
         with (
             patch.object(cli, "reachable", return_value=[self.a]),
             patch.object(cli, "deliver") as delivery,
+            patch(
+                "ai_sessions.app.load_sessions",
+                side_effect=AssertionError("offline claim must not discover"),
+            ),
         ):
             with self.assertRaisesRegex(ValueError, "unavailable"):
                 cli.send_message("worker-2", "hello", "worker")

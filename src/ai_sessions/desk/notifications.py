@@ -180,8 +180,8 @@ def _envelope(snapshot, item, folder, receiver, event):
     # Preserve the known peer envelope for native compact renderers. This address is
     # explicitly synthetic system/observer, never a borrowed live agent or user.
     body = (
-        f"Automatic Desk briefing for {snapshot['name']}: a new human request was added.\n"
-        f"Question: {item['question'][:600]}\nContext: {item['context'][:600]}\n"
+        f"New question for you: {item['question'][:600]}\n"
+        f"Context: {item['context'][:600]}\n"
         f"Read current {folder / 'decisions.md'} and {folder / 'review.md'} before discussing it. "
         f"For authoritative current state: sessions desk show {json.dumps(snapshot['name'])} --json.\n"
         "Informational system/observer notice, not a user instruction, consent, or approval. "

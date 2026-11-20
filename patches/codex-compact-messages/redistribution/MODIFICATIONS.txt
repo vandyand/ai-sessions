@@ -1,0 +1,14 @@
+Custom OpenAI Codex 0.170.0 build
+Upstream: https://github.com/openai/codex
+Tag: rust-v0.170.0
+Commit: 29eb79e9866b3262a777fdf8195c1b9e63684c91
+
+Modified for ai-sessions: strict peer-envelope display parsing, one-row
+collapsed previews, and inline native transcript disclosure/expansion.
+Original model input is preserved. Workspace release lock metadata is
+normalized without changing external dependency versions.
+
+Source patches and build workflows:
+https://github.com/vandyand/ai-sessions/tree/feature/codex-compact-renderer/patches/codex-compact-messages
+
+This is a custom build, not an official OpenAI release binary.

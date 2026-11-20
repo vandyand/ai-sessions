@@ -1,9 +1,22 @@
 // Rendering only: no prompt, transcript, delivery, or permission hooks.
-const expanded = new Set()
+const expanded = new Map()
 let handleLabels = {}
+let labelsPending
+
+async function loadHandles($) {
+  // A hot reload need not replay session.start. Load once on the first peer row too.
+  if (!labelsPending) labelsPending = (async () => {
+    try {
+      const labels = await $.process.run(['ses', 'messaging', 'handles', '--json'])
+      handleLabels = JSON.parse(labels.stdout)
+    } catch { handleLabels = {} }
+  })()
+  await labelsPending
+}
 
 export function parsePeer(text) {
   const marker = '[ai-sessions peer message'
+  if (typeof text === 'string') text = text.replace(/^Another (?:Claude|Codex) session sent a message:\r?\n/, '')
   if (typeof text !== 'string' || !text.startsWith(marker)) return null
   const line = text.indexOf('\n')
   const endMeta = text.indexOf('\n', line + 1)
@@ -57,26 +70,34 @@ export function preview(peer, columns = 80) {
 
 export function register(on) {
   on('session.start', async ($, e, next) => {
-    try {
-      const labels = await $.process.run(['ses', 'messaging', 'handles', '--json'])
-      handleLabels = JSON.parse(labels.stdout)
-      $.ui.invalidate('ui.render')
-    } catch { handleLabels = {} }
+    await loadHandles($)
+    $.ui.invalidate('ui.render')
     return next(e)
   })
   on('ui.render', { component: 'UserMessage' }, async ($, e, next) => {
-    const peer = parsePeer(e.props.text)
+    let peer = parsePeer(e.props.text)
     if (!peer) return next(e)
+    await loadHandles($)
+    peer = parsePeer(e.props.text)
     const { Box, Text, Button } = $.ui.resolve(e)
-    const isOpen = expanded.has(peer.id)
-    const toggle = () => {
-      if (expanded.has(peer.id)) expanded.delete(peer.id)
-      else expanded.add(peer.id)
+    const nativeExpanded = e.props.isExpanded === true
+    let state = expanded.get(peer.id)
+    if (!state || state.native !== nativeExpanded) {
+      state = { native: nativeExpanded, open: nativeExpanded }
+      expanded.set(peer.id, state)
+    }
+    const isOpen = state.open
+    const toggle = async () => {
+      state.open = !state.open
       $.ui.invalidate('ui.render')
+      // Keep the expanded body in the conversation; reveal its beginning.
+      await $.ui.scroll({ to: { requestId: e.requestId },
+        block: state.open ? 'start' : 'nearest' }).catch(() => {})
     }
     const summary = Button({
       key: `peer-${peer.id}`, plain: true,
-      label: preview(peer, e.viewport?.columns || 80), onPress: toggle,
+      label: preview(peer, Math.max(6, (e.viewport?.columns || 80) - (isOpen ? 11 : 9))) +
+        (isOpen ? ' [collapse]' : ' [expand]'), onPress: toggle,
     })
     return Box({ flexDirection: 'column', children: isOpen
       ? [summary, Text({ children: [clean(peer.body)] })] : [summary] })

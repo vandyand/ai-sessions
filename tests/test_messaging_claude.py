@@ -1,5 +1,6 @@
 """Claude adapter contracts; no live sessions or vault writes in unit tests."""
 
+import concurrent.futures
 import json
 import subprocess
 import tempfile
@@ -87,6 +88,32 @@ class ClaudeMessagingTests(unittest.TestCase):
         self.assertIsNone(claude.register({"session_id": "s"}, {}))
         self.assertEqual(self.calls, [])
 
+    def test_late_native_endpoint_registration_retries_then_is_idempotent(self):
+        from ai_sessions.messaging import store
+
+        self.assertIsNone(self.register(CLAUDE_CODE_MESSAGING_SOCKET=""))
+        self.assertEqual(self.calls, [])
+        receiver = self.register()
+        self.assertIsNotNone(receiver)
+        path = store._path("receivers", store.identity(receiver))
+        before = path.read_bytes()
+        self.assertEqual(self.register(), receiver)
+        self.assertEqual(len(self.calls), 1)
+        self.assertEqual(path.read_bytes(), before)
+
+    def test_changed_endpoint_is_registered_again(self):
+        first = self.register()
+        second = self.register(CLAUDE_CODE_MESSAGING_SOCKET=r"\\.\pipe\replacement")
+        self.assertEqual(first["generation"], second["generation"])
+        self.assertNotEqual(first["address"], second["address"])
+        self.assertEqual(len(self.calls), 2)
+
+    def test_concurrent_late_hooks_store_own_token_once(self):
+        with concurrent.futures.ThreadPoolExecutor(max_workers=4) as pool:
+            rows = list(pool.map(lambda _: self.register(), range(4)))
+        self.assertTrue(all(row and row["session_id"] == "session-1" for row in rows))
+        self.assertEqual(len(self.calls), 1)
+
     def test_send_submits_text_as_data(self):
         receiver = self.register()
         sender = {"tool": "codex", "session_id": "source"}
@@ -110,7 +137,7 @@ class ClaudeMessagingTests(unittest.TestCase):
     def test_subprocess_errors_redacted(self):
         receiver = self.register()
         self.run.side_effect = OSError("secret-canary")
-        self.assertIsNone(self.register())
+        self.assertIsNone(self.register(CLAUDE_CODE_MESSAGING_SOCKET=r"\\.\pipe\replacement"))
         result = claude.send(receiver, "x", "m", {})
         self.assertEqual(result["status"], "unavailable")
         self.assertNotIn("secret-canary", repr(result))

@@ -1,5 +1,27 @@
 # Changelog
 
+## 3.20.9 — 2026-11-20
+
+- Find newly named messaging receivers through one fresh native discovery when
+  no receiver reference matches; retain exact native-home and ambiguity guards.
+- Explain when a known conversation lacks a registered messaging receiver and
+  direct registration to that session instead of treating it as missing.
+- Keep Claude peer-message expansion inline and bring the message's beginning
+  into view; preserve full-body scrolling and one-row contraction (plugin 0.1.4).
+
+## 3.20.8 — 2026-11-20
+
+- Select a separately verified compact-message Codex renderer for interactive
+  launches, while retaining stock executables for shared daemon and RPC work.
+- Validate the renderer before restarting a session; stage installations before
+  activation and provide an explicit return to stock Codex.
+- Retry late Claude receiver registration quietly on prompt/tool hooks and add
+  `ses messaging register` for the process-verified current session.
+- Show unique cached session titles for UUID-only receivers without changing
+  their address, home or generation; avoid repeated vault writes for live owners.
+- Clarify Claude message expansion: fullscreen click controls and Ctrl+O in either
+  renderer, with the locally installed compact-message plugin 0.1.3.
+
 ## 3.20.7 — 2026-11-20
 
 - Register the current process-verified session when whoami misses the catalog;
@@ -8,8 +30,6 @@
   preserving complete agent input; use session handles in the one-line previews.
 - Notify bound Desk conversations only when a new human request is added, with
   durable deduplication and offline delivery; ordinary refreshes stay silent.
-- Include the pinned experimental native Codex renderer patch and Windows build
-  diagnostics. A verified custom binary is required before enabling that UI.
 
 ## 3.20.6 — 2026-11-20
 

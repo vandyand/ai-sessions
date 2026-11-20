@@ -17,6 +17,36 @@ def _slug_store():
     return SlugStore()
 
 
+def _receiver_names(rows):
+    """Enrich UUID placeholders from the cache, never discover or create a peer."""
+    if not any(not row.get("name") or row.get("name") == row.get("session_id") for row in rows):
+        return rows
+    from ..app import load_session_catalog
+    from ..references import native_key
+
+    candidates = {}
+    for item in load_session_catalog():
+        try:
+            key = native_key(item.tool, item.session_id)
+        except (KeyError, ValueError):
+            continue
+        candidates.setdefault(key, []).append(item)
+    result = []
+    for row in rows:
+        matches = []
+        if row.get("home") and (not row.get("name") or row["name"] == row.get("session_id")):
+            try:
+                matches = candidates.get(
+                    native_key(row["tool"], row["session_id"], row["home"]), []
+                )
+            except (KeyError, ValueError):
+                pass
+        if len(matches) == 1 and matches[0].named and matches[0].title.strip():
+            row = {**row, "name": matches[0].title}
+        result.append(row)
+    return result
+
+
 def reachable() -> list[dict]:
     from ..references import native_key
     from ..registry import REGISTRY
@@ -30,6 +60,7 @@ def reachable() -> list[dict]:
                 except (OSError, RuntimeError, ValueError):
                     pass
     if rows:
+        rows = _receiver_names(rows)
         keys = [native_key(row["tool"], row["session_id"], row.get("home")) for row in rows]
         entries = [
             (key, (row.get("name") or "") if row.get("name") != row["session_id"] else "")
@@ -59,6 +90,31 @@ def deliver(row: dict, text: str, message_id: str, sender: dict) -> dict:
     return hooks.send(row, text, message_id, sender)
 
 
+def _fresh_receiver(target: str, slugs) -> tuple[dict, list[dict]]:
+    """Resolve once from fresh sessions, then require the same verified native home."""
+    from ..app import load_sessions
+    from ..references import native_key, resolve_session
+
+    # Do not apply utility state, write a catalog, or turn discovered sessions into
+    # receiver records. The shared resolver also rechecks durable claims.
+    try:
+        item = resolve_session(target, load_sessions(use_cache=False), store=slugs)
+    except ValueError as error:
+        raise ValueError(f"receiver {target!r} is unavailable: {error}") from error
+    owner = native_key(item.tool, item.session_id)
+    rows = reachable()  # Discovery can take time; discard stale receiver generations.
+    matches = [
+        row
+        for row in rows
+        if row.get("home") and native_key(row["tool"], row["session_id"], row["home"]) == owner
+    ]
+    if not matches:
+        raise ValueError(store.unregistered_reason(target))
+    if len(matches) != 1:
+        raise ValueError(f"ambiguous receiver {target!r}; use its qualified native address")
+    return matches[0], rows
+
+
 def send_message(
     target: str,
     text: str,
@@ -79,7 +135,11 @@ def send_message(
             )
         receiver = matches[0]
     else:
-        receiver = store.resolve(target, rows, slugs=_slug_store())
+        slugs = _slug_store()
+        try:
+            receiver = store.resolve(target, rows, slugs=slugs)
+        except store.ReceiverNotFound:
+            receiver, rows = _fresh_receiver(target, slugs)
     source = source or os.environ.get("AI_SESSIONS_MESSAGE_FROM")
     if not source:
         from ..registry import REGISTRY
@@ -177,7 +237,7 @@ def main(argv: list[str]) -> int:
         sub.add_argument("--json", action="store_true")
     messaging = commands.add_parser("messaging")
     messaging.add_argument(
-        "action", choices=("status", "install", "uninstall", "receipt", "handles")
+        "action", choices=("status", "install", "uninstall", "receipt", "handles", "register")
     )
     messaging.add_argument("message_id", nargs="?")
     messaging.add_argument("--codex-home", type=Path)
@@ -193,6 +253,15 @@ def main(argv: list[str]) -> int:
         elif args.action in ("install", "uninstall"):
             result = install.setup(args.action == "install", args.codex_home)
             code = 0
+        elif args.action == "register":
+            from .hook import register_current
+
+            if args.message_id or args.codex_home:
+                raise ValueError(
+                    "Self-registration accepts no target or home override; run it inside the intended session."
+                )
+            result = register_current()
+            code = 0 if result.get("status") == "registered" else 2
         elif args.action == "handles":
             from ..handles import HandleStore
 

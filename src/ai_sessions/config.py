@@ -175,6 +175,10 @@ class LaunchConfig:
         result = self.provider_command(provider)
         adapter = REGISTRY.get(provider)
         profile = self._profile(provider)
+        from .capabilities import Unsupported
+
+        if not isinstance(adapter.interactive_command, Unsupported):
+            result = adapter.interactive_command(result)
         if self.mode == "dangerous":
             result.extend(adapter.dangerous_args)
         elif self.mode == "custom":

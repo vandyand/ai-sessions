@@ -31,7 +31,13 @@ def edit_hooks(path: Path, add: bool, tool: str = "") -> None:
     if not isinstance(data, dict) or not isinstance(data.get("hooks", {}), dict):
         raise ValueError(f"invalid hook configuration at {path}")
     hooks = data.setdefault("hooks", {})
-    for event, action in (("SessionStart", "start"), ("SessionEnd", "end")):
+    events = [("SessionStart", "start"), ("SessionEnd", "end")]
+    from ..registry import REGISTRY
+
+    adapter = REGISTRY.get(tool) if tool else None
+    if adapter and adapter.messaging and adapter.messaging.register:
+        events.extend((("UserPromptSubmit", "ensure"), ("PreToolUse", "ensure")))
+    for event, action in events:
         groups = hooks.get(event, [])
         if not isinstance(groups, list):
             raise ValueError(f"invalid {event} hooks at {path}")
