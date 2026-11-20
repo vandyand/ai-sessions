@@ -115,3 +115,47 @@ def test_uncached_identity_never_selects_an_arbitrary_native_copy(sample, monkey
     result = capsys.readouterr()
     assert not result.out
     assert "not indexed yet" in result.err
+
+
+def test_native_claude_ancestor_takes_precedence_over_remembered_cmd_launcher(monkeypatch):
+    from unittest.mock import Mock
+
+    from ai_sessions.capabilities import NativeRef
+
+    adapter = SimpleNamespace(
+        name="claude",
+        liveness_executables={"claude.exe"},
+        current_session=Mock(
+            side_effect=lambda pid, started: (
+                NativeRef("actual", "actual.jsonl") if pid == 42 else None
+            )
+        ),
+    )
+    monkeypatch.setattr(lookup.REGISTRY, "get", lambda name: adapter)
+    monkeypatch.setattr(lookup.REGISTRY, "adapters", lambda: [adapter])
+    monkeypatch.setattr(
+        "ai_sessions.detached.running_here",
+        lambda: ("terminal", {"tool": "claude", "pid": 41, "started": 10}),
+    )
+    native = SimpleNamespace(pid=42, name=lambda: "claude.exe", create_time=lambda: 11)
+    monkeypatch.setattr("psutil.Process", lambda: SimpleNamespace(parents=lambda: [native]))
+    assert lookup.managed_session() == ("claude", "actual")
+
+
+def test_ancestor_inspection_failure_preserves_verified_managed_fallback(monkeypatch):
+    from unittest.mock import Mock
+
+    import psutil
+
+    from ai_sessions.capabilities import NativeRef
+
+    adapter = SimpleNamespace(
+        name="claude", current_session=lambda pid, started: NativeRef("verified", "verified.jsonl")
+    )
+    monkeypatch.setattr(lookup.REGISTRY, "get", lambda name: adapter)
+    monkeypatch.setattr(
+        "ai_sessions.detached.running_here",
+        lambda: ("terminal", {"tool": "claude", "pid": 42, "started": 10}),
+    )
+    monkeypatch.setattr("psutil.Process", Mock(side_effect=psutil.AccessDenied(42)))
+    assert lookup.managed_session() == ("claude", "verified")

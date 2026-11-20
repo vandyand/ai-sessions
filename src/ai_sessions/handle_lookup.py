@@ -23,18 +23,9 @@ def managed_session():
     from .detached import running_here
 
     found = running_here()
-    if found is not None:
-        _, entry = found
-        adapter = REGISTRY.get(str(entry.get("tool", "")))
-        if not isinstance(adapter.current_session, Unsupported):
-            ref = adapter.current_session(int(entry["pid"]), float(entry["started"]))
-            if ref is not None:
-                return adapter.name, ref.session_id
-        # A remembered launch is harness evidence, not proof of the current
-        # thread after an in-process session switch.
-        return adapter.name, ""
-    # Also support native sessions started outside a managed launcher, using
-    # only an actual ancestor's generation-checked native identity hook.
+    # The remembered launcher can be cmd.exe rather than the native harness.
+    # Prefer the nearest actual harness's generation-checked identity, including
+    # native sessions started outside a managed launcher.
     import psutil
 
     try:
@@ -49,7 +40,17 @@ def managed_session():
                         return adapter.name, ref.session_id
                     return adapter.name, ""
     except psutil.Error:
-        return None
+        pass
+    if found is not None:
+        _, entry = found
+        adapter = REGISTRY.get(str(entry.get("tool", "")))
+        if not isinstance(adapter.current_session, Unsupported):
+            ref = adapter.current_session(int(entry["pid"]), float(entry["started"]))
+            if ref is not None:
+                return adapter.name, ref.session_id
+        # A remembered launch is harness evidence, not proof of the current
+        # thread after an in-process session switch.
+        return adapter.name, ""
     return None
 
 

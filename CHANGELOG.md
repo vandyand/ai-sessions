@@ -1,5 +1,10 @@
 # Changelog
 
+## 3.20.4 — 2026-11-20
+
+- Fix current-session handle lookup in Claude sessions launched through a
+  command shim: verify the actual native ancestor before the remembered launcher.
+
 ## 3.20.3 — 2026-11-19
 
 - Accept session handles, IDs, and slugs when viewing an existing Project Desk,
