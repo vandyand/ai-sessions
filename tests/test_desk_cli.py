@@ -132,7 +132,7 @@ class DeskLifetimeTests(unittest.TestCase):
 
         stopped = threading.Event()
 
-        def watcher(store, name, interval, stop):
+        def watcher(store, name, interval, stop, activity=None):
             stop.wait(2)
             if stop.is_set():
                 stopped.set()

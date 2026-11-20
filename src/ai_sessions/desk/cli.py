@@ -57,18 +57,23 @@ def positive_seconds(value):
     return number
 
 
-def watch(store, name: str, interval: float, stop: threading.Event) -> None:
+def watch(store, name: str, interval: float, stop: threading.Event, activity=None) -> None:
     from .observer import refresh
 
     failures = 0
     while not stop.is_set():
         started = time.monotonic()
+        if activity is not None:
+            activity["busy"] = True
         try:
             result = refresh(store, name, stop=stop)
             failures = failures + 1 if result.get("error") else 0
         except (OSError, RuntimeError, ValueError) as error:
             failures += 1
             store.fail(name, f"Observer unavailable ({type(error).__name__}).")
+        finally:
+            if activity is not None:
+                activity["busy"] = False
         delay = min(900, interval * (2 ** min(failures, 4))) if failures else interval
         stop.wait(max(1, delay - (time.monotonic() - started)))
 
@@ -325,13 +330,19 @@ def main(argv=None) -> int:
             store.get(args.name)
             stop = threading.Event()
             thread = None
+            activity = {}
             if args.watch:
                 thread = threading.Thread(
-                    target=watch, args=(store, args.name, args.interval, stop), daemon=True
+                    target=watch,
+                    args=(store, args.name, args.interval, stop, activity),
+                    daemon=True,
                 )
                 thread.start()
             try:
-                run(store, args.name)
+                if thread:
+                    run(store, args.name, activity=activity)
+                else:
+                    run(store, args.name)
             finally:
                 stop.set()
                 if thread:

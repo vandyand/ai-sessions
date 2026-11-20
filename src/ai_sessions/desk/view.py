@@ -11,6 +11,7 @@ import time
 import unicodedata
 from dataclasses import dataclass, replace
 from datetime import datetime, timezone
+from pathlib import Path
 from typing import Protocol
 
 from .time_format import eastern_time
@@ -26,6 +27,7 @@ class State:
     selected_key: str | None = None
     scroll: int = 0
     quit: bool = False
+    help: bool = False
 
 
 @dataclass(frozen=True)
@@ -104,46 +106,89 @@ def _human_text(value: object) -> str:
 
 
 def _detail(snapshot: dict | None, state: State, width: int) -> list[str]:
+    if state.help:
+        return wrap(
+            "Briefing help\n\n"
+            "Left / Right or Tab / Shift+Tab: switch views\n"
+            "1 Review: progress and current outcome\n"
+            "2 Needs you: questions and their context\n"
+            "3 Next action: suggested response\n"
+            "n / p: next / previous question; opens Needs you from Review\n"
+            "Up / Down or PgUp / PgDn: scroll\n"
+            "Home / End: top / bottom\n"
+            "h / ? / Esc: return to briefing\nq: exit\n\n"
+            "Up to date: the briefing includes all content from the latest checked session files. "
+            "Its age is time since the summary last changed, not time since the last check. "
+            "An unchanged session needs no new summary.\n\n"
+            "Supervisor has new content: a new briefing is needed.\n"
+            "Updating briefing: the reviewer is checking new content.\n"
+            "Saved: current source activity has not been verified.\n\n"
+            "Discuss questions and give answers in your Desk conversation."
+            + "\n\nWatched sessions\n"
+            + (
+                "\n".join(
+                    f"- {source.get('title') or ('Supervisor' if source.get('role', 'supervisor') == 'supervisor' else 'Team session')}"
+                    for source in (snapshot or {}).get("sources", [])
+                )
+                or "No source details available."
+            )
+            + "\nOnly the listed sessions are read. Managers and workers are not included automatically."
+            + (
+                "\n\nSummary changed: " + _summary_time(snapshot)
+                if snapshot and snapshot.get("observed_at")
+                else ""
+            )
+            + (
+                "\n\nRecent history only: earlier conversation may be missing."
+                if _partial(snapshot)
+                else ""
+            )
+            + (
+                "\n\nUpdate problem: " + _human_text(snapshot["error"])
+                if snapshot and snapshot.get("error")
+                else ""
+            ),
+            width,
+        )
     if snapshot is None:
-        return wrap("Desk unavailable. Waiting for a saved briefing.", width)
+        return wrap("Waiting for the briefing. It will appear here automatically.", width)
     if state.tab == 1:
         return wrap(
             _human_text(snapshot.get("review")).removeprefix("Partial source coverage. ")
-            or "No review yet. Waiting for the first observation.",
+            or "Preparing the first briefing…",
             width,
         )
     pending = _pending(snapshot)
     if not pending:
         if not snapshot.get("observed_at"):
-            qualification = "Waiting for the first observation."
+            qualification = "The first briefing is still being prepared."
         elif snapshot.get("error"):
-            qualification = "The last observation failed; requests may be missing."
+            qualification = "The update failed; new questions may be missing."
         elif _partial(snapshot):
-            qualification = "Coverage is partial; other requests may be missing."
+            qualification = "Earlier conversation may contain other questions."
         else:
-            qualification = "Check the observation status above for freshness."
-        return wrap("No pending requests recorded. " + qualification, width)
+            qualification = "Discuss anything else in your Desk conversation."
+        return wrap("No open questions. " + qualification, width)
     selected = next((d for d in pending if d.get("key") == state.selected_key), pending[0])
     index = pending.index(selected) + 1
     parts = [
-        f"Request {index} of {len(pending)}",
+        f"Question {index} of {len(pending)}" + (" · n/p to browse" if len(pending) > 1 else ""),
         "",
         selected.get("question") or "A decision needs your attention.",
     ]
     if state.tab == 2 and selected.get("context"):
-        parts.extend(["", "Context: " + str(selected["context"])])
+        parts.extend(["", "Why it matters", str(selected["context"])])
     parts.extend(
         [
             "",
-            "Suggested next action: "
+            "Suggested response\n"
             + str(
-                selected.get("recommendation")
-                or "Discuss this question in your project conversation."
+                selected.get("recommendation") or "Discuss this question in your Desk conversation."
             ),
         ]
     )
     if state.tab == 3:
-        parts.extend(["", "Press 2 for context in Needs you."])
+        parts.extend(["", "2 Needs you: read the context."])
     # Evidence is deliberately not dumped: it can contain internal source IDs.
     return wrap(_human_text("\n".join(parts)), width)
 
@@ -162,13 +207,16 @@ def _body(snapshot: dict | None, state: State, width: int) -> list[str]:
     details = _detail(snapshot, state, width)
     if not snapshot:
         return details
-    if snapshot.get("error"):
-        return wrap("Observation error: " + _human_text(snapshot["error"]) + "\n", width) + details
+    if snapshot.get("error") and not state.help:
+        return (
+            wrap("Update failed. Showing the saved briefing; retrying. ? Details\n", width)
+            + details
+        )
     return details
 
 
 def _body_height(height: int) -> int:
-    return max(0, height - 5)
+    return max(0, height - 4)
 
 
 def normalize(state: State, snapshot: dict | None, width: int, height: int) -> State:
@@ -186,16 +234,30 @@ def handle_key(
     state = normalize(state, snapshot, width, height)
     if key in ("q", "Q"):
         return replace(state, quit=True)
+    if key in ("?", "h", "H") or key == "\x1b" and state.help:
+        return normalize(replace(state, help=not state.help, scroll=0), snapshot, width, height)
     if key in ("1", "2", "3"):
-        return normalize(replace(state, tab=int(key), scroll=0), snapshot, width, height)
+        return normalize(
+            replace(state, tab=int(key), help=False, scroll=0), snapshot, width, height
+        )
     if key in (curses.KEY_RIGHT, "\t", curses.KEY_LEFT, curses.KEY_BTAB):
         step = 1 if key in (curses.KEY_RIGHT, "\t") else -1
         return normalize(
-            replace(state, tab=(state.tab - 1 + step) % 3 + 1, scroll=0),
+            replace(state, tab=(state.tab - 1 + step) % 3 + 1, help=False, scroll=0),
             snapshot,
             width,
             height,
         )
+    if key in ("n", "p") and state.tab == 1 and not state.help:
+        questions = _pending(snapshot)
+        if questions:
+            item = questions[0] if key == "n" else questions[-1]
+            return normalize(
+                replace(state, tab=2, selected_key=item.get("key"), scroll=0),
+                snapshot,
+                width,
+                height,
+            )
     if key in ("n", "p") and state.tab != 1:
         keys = [item.get("key") for item in _pending(snapshot)]
         if keys:
@@ -227,23 +289,92 @@ def _timestamp(value: object) -> datetime:
     return stamp if stamp.tzinfo else stamp.replace(tzinfo=timezone.utc)
 
 
-def _observation_status(snapshot: dict | None, now: datetime | None) -> str:
-    observed = (snapshot or {}).get("observed_at")
-    if not observed:
-        return "Last observation: not observed yet"
+def _age(snapshot: dict | None, now: datetime) -> str:
+    observation = (snapshot or {}).get("observation", {})
+    stamp = observation.get("synthesized_at") or (snapshot or {}).get("observed_at")
+    if stamp is None:
+        return ""
     try:
-        stamp = _timestamp(observed)
-        if stamp.tzinfo is None:
-            stamp = stamp.replace(tzinfo=timezone.utc)
-        stamp = stamp.astimezone(timezone.utc)
-        if now is None:
-            return f"Last observation: {eastern_time(stamp)} (age unavailable)"
-        age = max(0, int((now - stamp).total_seconds()))
-        elapsed = "less than 1 min" if age < 60 else f"{age // 60} min"
-        freshness = "Stale" if age >= 300 or snapshot.get("error") else "Observed"
-        return f"{freshness} - last observation {eastern_time(stamp)} ({elapsed} ago)"
+        age = max(0, int((now - _timestamp(stamp)).total_seconds()))
     except (ValueError, TypeError, OverflowError, OSError):
-        return "Last observation: time unavailable"
+        return ""
+    return (
+        "now"
+        if age < 60
+        else f"{age // 60}m"
+        if age < 3600
+        else f"{age // 3600}h"
+        if age < 86400
+        else f"{age // 86400}d"
+    )
+
+
+def _summary_time(snapshot: dict) -> str:
+    try:
+        return eastern_time(
+            _timestamp(
+                snapshot.get("observation", {}).get("synthesized_at") or snapshot["observed_at"]
+            )
+        )
+    except (ValueError, TypeError, OverflowError, OSError):
+        return "unavailable"
+
+
+def _observation_status(snapshot: dict | None, now: datetime | None) -> str:
+    if not snapshot:
+        return "Preparing"
+    if snapshot.get("error"):
+        status = "Update failed"
+    elif not snapshot.get("observed_at"):
+        status = "Preparing"
+    else:
+        status = {
+            "current": "Up to date",
+            "changed": "Supervisor has new content"
+            if len(snapshot.get("sources", [])) == 1
+            else "Watched sessions have new content",
+            "unavailable": "Source unavailable",
+        }.get(snapshot.get("_freshness"), "Saved")
+    age = _age(snapshot, now if now is not None else _now())
+    return status + (" · " + age if age else "")
+
+
+def _clip(value: object, width: int) -> str:
+    text = sanitize(value).replace("\n", " ")
+    if width <= 0:
+        return ""
+    if cell_width(text) <= width:
+        return text
+    result = ""
+    for ch in text:
+        if cell_width(result + ch) > width - 1:
+            break
+        result += ch
+    return result + "…"
+
+
+def _header(title: str, status: str, width: int) -> str:
+    status = _clip(status, width)
+    space = width - cell_width(status) - 2
+    if space < 3:
+        return status.rjust(max(0, width - cell_width(status) + len(status)))
+    title = _clip(title, space)
+    return title + " " * (width - cell_width(title) - cell_width(status)) + status
+
+
+def _tabs(state: State, width: int) -> str:
+    labels = ("Review", "Needs you", "Next action")
+
+    def line(compact=False):
+        return "  ".join(
+            (f"[{n} {label}]" if state.tab == n else str(n) if compact else f"{n} {label}")
+            for n, label in enumerate(labels, 1)
+        )
+
+    text = line()
+    if cell_width(text) > width:
+        text = line(True)
+    return _clip(text, width)
 
 
 def render(
@@ -254,40 +385,73 @@ def render(
     *,
     now: datetime | None = None,
     read_error: str | None = None,
+    updating: bool = False,
 ) -> Frame:
-    """Create a bounded frame. Status rows stay visible while the body scrolls."""
+    """Pure bounded layout; source checking happens outside rendering."""
     if width <= 0 or height <= 0:
         return Frame(())
     state = normalize(state, snapshot, width, height)
-    title = "Project Desk" + (" - " + str(snapshot.get("name", "")) if snapshot else "")
-    tabs = "  ".join(
-        f"{'[' if state.tab == n else ''}{n} {label}{']' if state.tab == n else ''}"
-        for n, label in enumerate(("Review", "Needs you", "Next action"), 1)
-    )
     status = _observation_status(snapshot, now if now is not None else _now())
-    error = read_error or (snapshot or {}).get("error")
-    notice = "Observation failed - details below." if error else ""
     if read_error:
-        status = "Stale - " + status
-        notice = "Desk unavailable; showing last saved briefing. Retrying."
-    if _partial(snapshot):
-        notice = "Partial coverage - some earlier activity is not included." + (
-            " " + notice if notice else ""
-        )
-    # Fixed rows reserve body space even when there is no error.
-    headers = [title, tabs, status, notice]
+        status = "Reconnecting" + (" · " + _age(snapshot, now or _now()) if snapshot else "")
+    elif updating and (snapshot or {}).get("_freshness") == "changed":
+        status = "Updating briefing" + (" · " + _age(snapshot, now or _now()) if snapshot else "")
+    title = str((snapshot or {}).get("name") or "Briefing")
+    header = _header(title, status, width)
+    tabs = _clip("Help · ? or Esc to return", width) if state.help else _tabs(state, width)
     if height < 6:
-        compact = [title, "1 Review / 2 Needs you / 3 Next action", notice or status, "q Exit"]
-        return Frame(tuple(line for item in compact for line in wrap(item, width))[:height])
-    # Keep detailed errors scrollable without repeating header metadata.
-    header_lines = [wrap(item, width)[0] for item in headers]
+        return Frame(tuple([header, tabs, _clip("? Help · q Exit", width)][:height]))
     body = _body(snapshot, state, width)
-    limit = max(0, len(body) - _body_height(height))
-    offset = min(state.scroll, limit)
-    visible = body[offset : offset + _body_height(height)]
-    visible += [""] * (_body_height(height) - len(visible))
-    footer = "Views: 1/2/3 Left/Right Tab/Shift+Tab | n/p Request | Up/Down/Pg Scroll | q Exit"
-    return Frame(tuple(header_lines + visible + [wrap(footer, width)[0]]))
+    capacity = _body_height(height)
+    offset = min(state.scroll, max(0, len(body) - capacity))
+    visible = body[offset : offset + capacity]
+    visible += [""] * (capacity - len(visible))
+    position = (
+        f"{offset + 1}-{min(len(body), offset + capacity)}/{len(body)}"
+        if len(body) > capacity
+        else ""
+    )
+    controls = "? Help · q Exit"
+    extra = []
+    available = width - (len(position) + 2 if position else 0)
+    if position:
+        extra.append("↑↓ Scroll" if width >= 55 else "↑↓")
+    if not state.help and _pending(snapshot):
+        if state.tab == 1:
+            extra.append("n Questions")
+        elif len(_pending(snapshot)) > 1:
+            extra.append("n/p Questions")
+    if not state.help:
+        extra.append("←→ Views")
+    for hint in extra:
+        if cell_width(controls + " · " + hint) <= available:
+            controls += " · " + hint
+    footer = _header(controls, position, width) if position else _clip(controls, width)
+    return Frame(tuple([header, tabs, ""] + visible + [footer]))
+
+
+def _source_freshness(snapshot: dict) -> str:
+    """Check at most 32 file stats; no transcript reads, model calls or writes."""
+    sources = snapshot.get("sources", [])
+    if not sources or len(sources) > 32:
+        return "unknown"
+    previous = {
+        (s.get("tool"), s.get("session_id"), s.get("storage")): s
+        for s in snapshot.get("observation", {}).get("sources", [])
+    }
+    changed = False
+    for source in sources:
+        try:
+            stat = Path(source["storage"]).stat()
+        except (OSError, ValueError, KeyError, TypeError):
+            return "unavailable"
+        saved = previous.get(
+            (source.get("tool"), source.get("session_id"), source.get("storage")), {}
+        )
+        fingerprint = [stat.st_dev, stat.st_ino, stat.st_size, stat.st_mtime_ns]
+        if saved.get("status") != "available" or saved.get("fingerprint") != fingerprint:
+            changed = True
+    return "changed" if changed else "current"
 
 
 def read_snapshot(
@@ -298,12 +462,12 @@ def read_snapshot(
         snapshot = store.get(name)
         if not isinstance(snapshot, dict):
             return previous, "Desk unavailable"
-        return snapshot, None
+        return dict(snapshot, _freshness=_source_freshness(snapshot)), None
     except Exception:
         return previous, "Desk unavailable"
 
 
-def run(store: SnapshotStore, name: str) -> None:
+def run(store: SnapshotStore, name: str, *, activity: dict | None = None) -> None:
     """Poll saved state at most once per second; draw only changed frames."""
 
     def loop(screen):
@@ -332,17 +496,35 @@ def run(store: SnapshotStore, name: str) -> None:
                 snapshot,
                 read_error,
                 _observation_status(snapshot, now),
+                bool(activity and activity.get("busy")),
             )
             if current_input != previous_input:
                 state = normalize(state, snapshot, width, height)
                 current_input = current_input[:2] + (state,) + current_input[3:]
-                frame = render(snapshot, state, width, height, now=now, read_error=read_error)
+                frame = render(
+                    snapshot,
+                    state,
+                    width,
+                    height,
+                    now=now,
+                    read_error=read_error,
+                    updating=bool(activity and activity.get("busy")),
+                )
                 signature = (height, width, frame)
                 if signature != previous:
                     screen.erase()
                     for row, line in enumerate(frame.lines):
                         try:
-                            screen.addstr(row, 0, line)
+                            screen.addstr(
+                                row,
+                                0,
+                                line,
+                                curses.A_BOLD
+                                if row < 2
+                                else curses.A_DIM
+                                if row == len(frame.lines) - 1
+                                else 0,
+                            )
                         except curses.error:
                             pass  # A terminal resize may race this paint.
                     screen.refresh()
