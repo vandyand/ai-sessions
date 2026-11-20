@@ -7,7 +7,60 @@ import os
 import sys
 
 
+def _register(adapter, payload):
+    """Persist only changed nonsecret metadata after the adapter secured its token."""
+    from . import store
+
+    row = adapter.messaging.register(payload, os.environ)
+    if row:
+        old = store._read(store._path("receivers", store.identity(row)))
+        if any(old.get(key) != value for key, value in row.items()):
+            store.save_receiver(row)
+        intent = store._path("cleanup", store.identity(row) + ":" + row["generation"])
+        if intent.exists():
+            store.clear_cleanup(row)
+    return row
+
+
+def register_current(tool="") -> dict:
+    """Explicit self-registration; no stdin, credential lookup, or peer delivery."""
+    unavailable = {
+        "status": "unavailable",
+        "reason": "Own native receiver registration is not ready.",
+    }
+    try:
+        from ..handle_lookup import _managed_native_session
+        from ..registry import REGISTRY
+        from . import install
+
+        if not install.settings().get("enabled"):
+            return {"status": "unavailable", "reason": "Session messaging is not enabled."}
+        own = _managed_native_session()
+        if not own or own[1] is None or tool and own[0] != tool:
+            return unavailable
+        tool = tool or own[0]
+        adapter = REGISTRY.get(tool)
+        if not adapter.messaging or not adapter.messaging.register:
+            return unavailable
+        sid = own[1].session_id
+        row = _register(adapter, {"session_id": sid, "cwd": os.getcwd()})
+        if not row:
+            return unavailable
+        return {"status": "registered", "tool": tool, "session_id": sid}
+    except Exception:
+        # Never include payloads, environment values, or helper exceptions.
+        return unavailable
+
+
 def main() -> int:
+    event = sys.argv[1] if len(sys.argv) > 1 else "start"
+    tool = sys.argv[2] if len(sys.argv) > 2 else ""
+    if event == "register":
+        result = register_current(tool)
+        print(json.dumps(result))
+        return 0 if result["status"] == "registered" else 2
+    if event not in {"start", "ensure", "end"}:
+        return 0
     try:
         from ..registry import REGISTRY
         from . import install, store
@@ -17,7 +70,6 @@ def main() -> int:
         payload = json.loads(sys.stdin.read() or "{}")
         if not isinstance(payload, dict):
             return 0
-        tool = sys.argv[2] if len(sys.argv) > 2 else ""
         adapter = REGISTRY.get(tool)
         hooks = adapter.messaging
         if not hooks:
@@ -25,14 +77,13 @@ def main() -> int:
         sid = str(payload.get("session_id") or os.environ.get(hooks.sender_environment) or "")
         if not sid:
             return 0
-        event = sys.argv[1] if len(sys.argv) > 1 else "start"
         if hooks.register:
-            store.cleanup_pending(tool, hooks.forget)
             if event == "start":
-                row = hooks.register(payload, os.environ)
-                if row:
-                    store.save_receiver(row)
-                    store.clear_cleanup(row)
+                store.cleanup_pending(tool, hooks.forget)
+            if event in {"start", "ensure"}:
+                row = _register(adapter, dict(payload, session_id=sid))
+                if not row:
+                    return 0
             else:
                 import psutil
 

@@ -138,9 +138,26 @@ def register(payload: dict, env: Mapping[str, str]) -> dict | None:
     # registration fails or the hook dies, later cleanup can remove that entry.
     from ..messaging import store
 
-    if not store.secure_register(
-        receiver, lambda: _helper({"operation": "store", "vault_name": vault_name, "token": token})
-    ):
+    def already_registered():
+        old = store._read(store._path("receivers", store.identity(receiver)))
+        return _owned(old) and all(
+            old.get(key) == receiver[key]
+            for key in ("pid", "started", "home", "address", "generation", "vault_name")
+        )
+
+    # Later prompt/tool hooks run in separate processes. A nonsecret exact-owner
+    # record is sufficient to skip vault I/O; never fetch a token to compare it.
+    if already_registered():
+        return receiver
+
+    def put():
+        # secure_register holds the receiver lock here: concurrent hooks must
+        # not both launch the vault helper after observing an absent record.
+        if already_registered():
+            return {"status": "ok"}
+        return _helper({"operation": "store", "vault_name": vault_name, "token": token})
+
+    if not store.secure_register(receiver, put):
         return None
     return receiver
 
