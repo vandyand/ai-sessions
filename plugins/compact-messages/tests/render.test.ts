@@ -27,6 +27,17 @@ test('ordinary user messages pass through untouched', async ($) => {
  expect(await ui.keepsBeneath()).toBe(true)
 })
 
+test('native incoming-message wrapper collapses and keeps the original input intact', async ($) => {
+ const wrapped = 'Another Claude session sent a message:\n' + text
+ const ui = await $.ui.mount({...row, requestId:'native-wrapper', props:{...row.props,text:wrapped}})
+ expect(await ui.find({key:'peer-fixture-1'})).toBeDefined()
+ expect(await ui.keepsBeneath()).toBe(false)
+ expect(parsePeer(wrapped)?.body).toBe(body)
+ expect(wrapped).toContain('Native guardrail text.')
+ await ui.press({key:'peer-fixture-1'})
+ expect(await ui.find({type:'Text',text:body})).toBeDefined()
+})
+
 test('parser preserves full body and refuses malformed metadata', () => {
  expect(parsePeer(text)?.body).toBe(body)
  expect(parsePeer('[ai-sessions peer message]\nnot-json\n[message text]\nHello\n[end peer message]')).toBe(null)
@@ -40,6 +51,13 @@ test('legacy messages resolve their current handle from the read-only startup ma
  await $.session.start({surface:'terminal',isInteractive:true,cwd:'/fiction'})
  const old = text.replace(',"sender_handle":"lego-sup-1"','')
  const ui=await $.ui.mount({...row,props:{...row.props,text:old}})
+ expect((await ui.find({key:'peer-fixture-1'})).props.label).toMatch(/^from lego-sup-1:/)
+})
+
+test('hot-reloaded legacy rows load handles without session.start', async ($, on) => {
+ on('process.run', () => ({value: {stdout: JSON.stringify({'claude:fixture-native':'lego-sup-1'}), stderr:'',exitCode:0}}))
+ const old = 'Another Claude session sent a message:\n' + text.replace(',"sender_handle":"lego-sup-1"','')
+ const ui = await $.ui.mount({...row,requestId:'hot-reload',props:{...row.props,text:old}})
  expect((await ui.find({key:'peer-fixture-1'})).props.label).toMatch(/^from lego-sup-1:/)
 })
 
