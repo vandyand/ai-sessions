@@ -35,6 +35,9 @@ jobs:
         shell: pwsh
         run: |
           git init upstream
+          # Persist this for git apply too: runner defaults would rewrite patched files as CRLF.
+          git -C upstream config core.autocrlf false
+          if ($LASTEXITCODE) { exit $LASTEXITCODE }
           git -C upstream remote add origin https://github.com/openai/codex.git
           git -C upstream fetch --depth 1 origin refs/tags/rust-v0.170.0:refs/tags/rust-v0.170.0
           if ($LASTEXITCODE) { exit $LASTEXITCODE }
