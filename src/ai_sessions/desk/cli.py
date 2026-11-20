@@ -98,6 +98,74 @@ def source_matches_target(source, target, members):
     return len(candidates) == 1
 
 
+def target_desks(store, item, state):
+    from ..references import native_key
+
+    handles = getattr(state, "handles", None)
+    members = set(handles.lookup_members(item.handle) or ()) if handles and item.handle else set()
+    members.add(native_key(item.tool, item.session_id))
+    matches = [
+        record
+        for record in store.list()
+        if any(source_matches_target(source, item, members) for source in record["sources"][:1])
+    ]
+    if len(matches) > 1:
+        raise ValueError("Multiple desks observe this logical session; use a saved desk name")
+    return matches
+
+
+def update_target(store, record, item):
+    from ..references import native_key
+
+    source = dict(
+        tool=item.tool,
+        session_id=item.session_id,
+        storage=item.storage,
+        home=native_key(item.tool, item.session_id).home,
+        title=item.title,
+    )
+    if any(
+        record["sources"][0].get(key) != source[key]
+        for key in ("tool", "session_id", "storage", "home")
+    ):
+        store.update_primary_source(record["name"], record["revision"], source)
+        store.export(record["name"])
+
+
+def resolve_desk_name(store, reference, *, update=False):
+    from ..handles import HandleStore
+
+    try:
+        saved = store.get(reference)
+    except KeyError:
+        saved = None
+    # A saved name that is also a session handle must follow its linked copy.
+    if saved is not None:
+        try:
+            current = HandleStore().current_key(reference)
+        except ValueError:
+            # A retired/unavailable handle must not invalidate an existing desk name.
+            return reference
+        if current is None:
+            return reference
+    from ..handles_cli import catalog
+    from ..references import resolve_session
+
+    items, state = catalog()
+    item = resolve_session(reference, items, store=getattr(state, "slugs", None))
+    matches = target_desks(store, item, state)
+    if not matches:
+        raise ValueError(f"No desk for this session yet; run ses desk {reference} first")
+    record = matches[0]
+    if saved is not None and saved["name"] != record["name"]:
+        raise ValueError("Desk name conflicts with a session handle; use the qualified native ID")
+    if update:
+        if item.compressed or not item.storage:
+            raise ValueError("Decompress the selected session before observing its desk")
+        update_target(store, record, item)
+    return record["name"]
+
+
 def open_target(argv) -> int:
     from ..handles_cli import catalog
     from ..references import native_key, resolve_session
@@ -116,19 +184,8 @@ def open_target(argv) -> int:
         if item.compressed or not item.storage:
             raise ValueError("Decompress the selected session before creating its desk")
         store = Store(readonly=args.dry_run)
-        handles = getattr(state, "handles", None)
-        members = (
-            set(handles.lookup_members(item.handle) or ()) if handles and item.handle else set()
-        )
+        matches = target_desks(store, item, state)
         target_key = native_key(item.tool, item.session_id)
-        members.add(target_key)
-        matches = [
-            record
-            for record in store.list()
-            if any(source_matches_target(source, item, members) for source in record["sources"][:1])
-        ]
-        if len(matches) > 1:
-            raise ValueError("Multiple desks observe this logical session; open a desk by name")
         existing = next(iter(matches), None)
         name = existing["name"] if existing else item.handle or item.slug or item.session_id
         if args.dry_run and existing is None:
@@ -160,28 +217,9 @@ def open_target(argv) -> int:
                 str(Path(item.cwd or ".").resolve()),
             )
             store.export(name)
-        elif not args.dry_run and any(
-            existing["sources"][0].get(key) != value
-            for key, value in (
-                ("tool", item.tool),
-                ("session_id", item.session_id),
-                ("storage", item.storage),
-                ("home", target_key.home),
-            )
-        ):
-            store.update_primary_source(
-                name,
-                existing["revision"],
-                {
-                    "tool": item.tool,
-                    "session_id": item.session_id,
-                    "storage": item.storage,
-                    "home": target_key.home,
-                    "title": item.title,
-                },
-            )
-            store.export(name)
-        print(f"Briefing pane: ses desk view {name} --watch")
+        elif not args.dry_run:
+            update_target(store, existing, item)
+        print(f"Briefing pane: ses desk view {args.target}")
         return open_agent(store, name, args.tool or item.tool, dry_run=args.dry_run)
     except (OSError, RuntimeError, ValueError, KeyError) as error:
         print(f"ses desk: {error}", file=sys.stderr)
@@ -205,7 +243,7 @@ def main(argv=None) -> int:
     create.add_argument("--source", action="append", default=[])
     for action in ("show", "refresh", "watch", "view", "open"):
         sub = commands.add_parser(action)
-        sub.add_argument("name")
+        sub.add_argument("name", help="Session handle, native ID, slug, or saved desk name")
         if action == "show":
             sub.add_argument("--json", action="store_true")
         if action in ("watch", "view"):
@@ -213,8 +251,9 @@ def main(argv=None) -> int:
         if action == "view":
             sub.add_argument(
                 "--watch",
-                action="store_true",
-                help="Update the briefing with Haiku while this view is open",
+                action=argparse.BooleanOptionalAction,
+                default=True,
+                help="Update with Haiku while open (default); --no-watch reads saved briefings only",
             )
         if action == "open":
             sub.add_argument("--tool", choices=TOOLS, default=DEFAULT_TOOL)
@@ -224,6 +263,14 @@ def main(argv=None) -> int:
     args = parser.parse_args(argv)
     try:
         store = Store()
+        if args.action in ("show", "refresh", "watch", "view", "open"):
+            args.name = resolve_desk_name(
+                store,
+                args.name,
+                update=args.action in ("refresh", "watch")
+                or (args.action == "open" and not args.dry_run)
+                or (args.action == "view" and args.watch),
+            )
         if args.action == "list":
             rows = store.list()
             print(
@@ -236,7 +283,7 @@ def main(argv=None) -> int:
             store.create(args.name, sources, cwd)
             store.export(args.name)
             print(f"Created {args.name}. Open the conversation: sessions desk open {args.name}")
-            print(f"In the adjacent pane: sessions desk view {args.name} --watch")
+            print(f"In the adjacent pane: sessions desk view {args.name}")
         elif args.action == "show":
             row = store.get(args.name)
             if args.json:
@@ -245,7 +292,8 @@ def main(argv=None) -> int:
                 from .view import sanitize
 
                 print(
-                    sanitize(row.get("review")) or "No briefing yet. Run refresh or view --watch."
+                    sanitize(row.get("review"))
+                    or "No briefing yet. Run ses desk view to start live updates."
                 )
                 pending = [d for d in row.get("decisions", []) if d["status"] == "pending"]
                 for decision in pending:

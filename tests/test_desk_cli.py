@@ -217,3 +217,84 @@ class DeskRetryTests(unittest.TestCase):
         ):
             cli.watch(None, "fiction", 60, Stop())
         self.assertEqual(waits, [120, 240, 60])
+
+
+class DeskLiveHandleTests(unittest.TestCase):
+    def test_view_watches_by_default_and_readonly_opts_out(self):
+        for flags, expected in (([], 1), (["--watch"], 1), (["--no-watch"], 0)):
+            with (
+                patch("ai_sessions.desk.cli.Store"),
+                patch("ai_sessions.desk.cli.watch") as observer,
+                patch("ai_sessions.desk.view.run"),
+            ):
+                self.assertEqual(cli.main(["view", "demo", *flags]), 0)
+            self.assertEqual(observer.call_count, expected)
+
+    def test_view_resolves_session_handle_to_saved_desk(self):
+        item = Session("codex", "ops", "Supervisor", ".", 0, 0, "", True, "ops.jsonl")
+        with tempfile.TemporaryDirectory() as root:
+            from ai_sessions.desk.store import Store
+
+            store = Store(root)
+            store.create(
+                "old-desk-name",
+                [
+                    {
+                        "tool": "codex",
+                        "session_id": "ops",
+                        "storage": str(Path("ops.jsonl").resolve()),
+                    }
+                ],
+                root,
+            )
+            with (
+                patch("ai_sessions.desk.cli.Store", return_value=store),
+                patch("ai_sessions.handles_cli.catalog", return_value=([item], object())),
+                patch("ai_sessions.references.resolve_session", return_value=item),
+                patch("ai_sessions.desk.view.run") as view,
+            ):
+                self.assertEqual(cli.main(["view", "elev-sup", "--no-watch"]), 0)
+                view.assert_called_once_with(store, "old-desk-name")
+
+    def test_duplicate_desks_refuse_before_starting_observation(self):
+        item = Session("codex", "ops", "Supervisor", ".", 0, 0, "", True, "ops.jsonl")
+        with tempfile.TemporaryDirectory() as root:
+            from ai_sessions.desk.store import Store
+
+            store = Store(root)
+            for name in ("one", "two"):
+                store.create(
+                    name,
+                    [
+                        {
+                            "tool": "codex",
+                            "session_id": "ops",
+                            "storage": str(Path("ops.jsonl").resolve()),
+                        }
+                    ],
+                    root,
+                )
+            with (
+                patch("ai_sessions.desk.cli.Store", return_value=store),
+                patch("ai_sessions.handles_cli.catalog", return_value=([item], object())),
+                patch("ai_sessions.references.resolve_session", return_value=item),
+                patch("ai_sessions.desk.cli.watch") as observer,
+                contextlib.redirect_stderr(io.StringIO()) as error,
+            ):
+                self.assertEqual(cli.main(["view", "elev-sup"]), 2)
+            self.assertIn("Multiple desks", error.getvalue())
+            observer.assert_not_called()
+
+
+def test_saved_desk_name_remains_readable_after_handle_retirement():
+    with (
+        patch("ai_sessions.desk.cli.Store") as factory,
+        patch("ai_sessions.handles.HandleStore") as handles,
+        patch("ai_sessions.desk.view.run") as view,
+        patch("ai_sessions.desk.cli.watch") as watcher,
+    ):
+        factory.return_value.get.return_value = {"name": "old-handle"}
+        handles.return_value.current_key.side_effect = ValueError("handle retired; use new-handle")
+        assert cli.main(["view", "old-handle", "--no-watch"]) == 0
+        view.assert_called_once_with(factory.return_value, "old-handle")
+        watcher.assert_not_called()

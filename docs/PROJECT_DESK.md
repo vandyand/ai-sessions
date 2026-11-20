@@ -4,6 +4,27 @@ Updated November 19, 2026. First local experiment.
 
 Project Desk gives a busy project's human a quiet native Claude Code or Codex conversation, alongside a live terminal briefing. The operational supervisor continues coordinating workers and managers. The human-facing project agent discusses ideas, explains questions and conveys settled direction when asked; it does not receive a stream of team chat notifications.
 
+## Quick start with session handles
+
+Use the same supervisor handle in both panes:
+
+```powershell
+ses desk elev-sup
+```
+
+In the adjacent pane:
+
+```powershell
+ses desk view elev-sup
+```
+
+The first command creates or resumes the quiet conversation using the target's
+harness. The second resolves its saved desk and updates the briefing with Haiku
+while open. Add `--no-watch` to read saved briefings without model calls. Existing
+saved names such as `elevate` also work; no rename or migration is required.
+`show`, `refresh`, `watch`, and `open` also accept the session handle, native ID,
+or slug. If no desk exists yet, start it with `ses desk HANDLE` first.
+
 ## Start
 
 Choose the exact supervisor session ID or unique slug. Add other sessions only when their activity should contribute to the briefing. No project-name matching or automatic team membership is inferred.
@@ -16,7 +37,7 @@ sessions desk open my-project --tool codex
 In an adjacent terminal pane:
 
 ```powershell
-sessions desk view my-project --watch
+sessions desk view my-project
 ```
 
 `open` uses the current pane and preserves a native conversation per harness. Repeat the same command to resume it. Each open supplies the project-agent instructions again, including after an interrupted first startup. Claude and Codex have separate conversation histories; switching `--tool` starts/resumes the other history, while both read the same briefing. This first version does not automatically transpile the human conversation between harnesses. `sesres` uses the existing managed native-launch mechanism.
@@ -31,7 +52,7 @@ The project conversation runs in the desk folder so it can read the briefing. It
 - `n` / `p`: next / previous pending item.
 - Arrows and Page Up / Page Down: scroll. `q`: close the view.
 
-The viewer polls saved state once a second. `--watch` runs the observer alongside it, checking selected sources every 60 seconds by default. Model calls happen only when new conversation text is found. Change the interval with `--interval 120` (5–3600 seconds). Failed observations back off, up to 15 minutes, rather than repeatedly consuming usage each minute. Closing the view stops its observer and its owned model process. It does not stop the supervisor or workers. The last saved briefing remains available.
+The viewer polls saved state once a second. The view runs the observer alongside it by default, checking selected sources every 60 seconds by default. Model calls happen only when new conversation text is found. Change the interval with `--interval 120` (5–3600 seconds). Failed observations back off, up to 15 minutes, rather than repeatedly consuming usage each minute. Closing the view stops its observer and its owned model process. It does not stop the supervisor or workers. The last saved briefing remains available.
 
 Ask follow-up questions and type answers in the project conversation. This version does not share selection or drafts between the two panes. To avoid ambiguity, refer to a question by its words. The project agent reads current files before discussing current status; no observation is pushed into its chat automatically.
 
@@ -43,7 +64,7 @@ sessions desk watch my-project --interval 120
 sessions desk open my-project --tool claude --dry-run
 ```
 
-`view` without `--watch` is read-only and makes no model calls. `refresh` performs one observation. `watch` runs until interrupted. Do not run multiple watchers deliberately: stale concurrent results are discarded, but overlapping model calls still consume usage.
+`view --no-watch` reads saved briefings and makes no model calls. Legacy `--watch` remains accepted. `refresh` performs one observation. `watch` runs until interrupted. Do not run multiple watchers deliberately: stale concurrent results are discarded, but overlapping model calls still consume usage.
 
 ## Observation and costs
 
