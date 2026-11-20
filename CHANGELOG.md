@@ -1,5 +1,16 @@
 # Changelog
 
+## 3.20.6 — 2026-11-20
+
+- Add a persistent Overview with project background, current position, direction
+  and goal, grounded in bounded opening context and current conversation evidence.
+- Replace the timestamp row with a top-right freshness label and summary age;
+  unchanged sessions remain up to date without another model call.
+- Simplify narrow briefing layouts and request wording; show scroll position and
+  only applicable shortcuts. Add h/? help with watched sources and status meanings.
+- Switch views with Left/Right or Tab/Shift+Tab. n/p opens questions from Overview
+  or Review and cycles them in Needs you / Next action.
+
 ## 3.20.5 — 2026-11-20
 
 - Enforce structured observer responses and current evidence IDs; accept a

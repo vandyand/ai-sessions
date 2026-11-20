@@ -553,7 +553,7 @@ def test_model_command_enforces_briefing_schema(monkeypatch):
     assert json.loads(observer._run_model(prompt))["review"]
     command = commands[0]
     schema = json.loads(command[command.index("--json-schema") + 1])
-    assert schema["required"] == ["review", "decisions"]
+    assert schema["required"] == ["review", "decisions", "overview"]
     assert schema["additionalProperties"] is False
     assert schema["properties"]["decisions"]["items"]["properties"]["evidence"]["items"][
         "enum"

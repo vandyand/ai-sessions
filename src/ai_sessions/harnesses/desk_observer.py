@@ -17,9 +17,18 @@ from ..model import ReadSnapshot
 BRIEFING_SCHEMA = {
     "type": "object",
     "additionalProperties": False,
-    "required": ["review", "decisions"],
+    "required": ["review", "decisions", "overview"],
     "properties": {
         "review": {"type": "string", "minLength": 1, "maxLength": 64000},
+        "overview": {
+            "type": "object",
+            "additionalProperties": False,
+            "required": ["background", "current", "direction", "goal"],
+            "properties": {
+                key: {"type": "string", "minLength": 1, "maxLength": 6000}
+                for key in ("background", "current", "direction", "goal")
+            },
+        },
         "decisions": {
             "type": "array",
             "maxItems": 100,
@@ -86,6 +95,9 @@ def run_model(prompt, stop=None, *, max_output_bytes, timeout, system, citation_
         schema["properties"]["decisions"]["items"]["properties"]["evidence"]["items"]["enum"] = (
             citation_ids
         )
+    elif citation_ids is not None:
+        # Historical-prefix-only synthesis can describe Overview, not change decisions.
+        schema["properties"]["decisions"]["maxItems"] = 0
     command = [
         executable,
         "-p",

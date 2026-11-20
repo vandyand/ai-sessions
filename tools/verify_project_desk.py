@@ -7,10 +7,28 @@ import os
 import subprocess
 import sys
 import tempfile
+import time
 from pathlib import Path
 
 
 def child(result):
+    import ctypes
+    from ctypes import wintypes
+
+    kernel = ctypes.WinDLL("kernel32", use_last_error=True)
+    kernel.CreateFileW.restype = wintypes.HANDLE
+    kernel.CreateFileW.argtypes = [
+        wintypes.LPCWSTR,
+        wintypes.DWORD,
+        wintypes.DWORD,
+        ctypes.c_void_p,
+        wintypes.DWORD,
+        wintypes.DWORD,
+        wintypes.HANDLE,
+    ]
+    kernel.SetStdHandle.argtypes = [wintypes.DWORD, wintypes.HANDLE]
+    console_input = kernel.CreateFileW("CONIN$", 0xC0000000, 3, None, 3, 0, None)
+    kernel.SetStdHandle(-10, console_input)
     import curses
 
     from ai_sessions.desk import view
@@ -18,14 +36,32 @@ def child(result):
 
     with tempfile.TemporaryDirectory(prefix="desk-console-state-") as root:
         store = Store(root)
-        store.create(
-            "smoke", [{"tool": "claude", "session_id": "fiction", "storage": "fiction.jsonl"}], root
-        )
+        source = Path(root) / "fiction.jsonl"
+        source.write_text("{}\n", encoding="utf-8")
+        stat = source.stat()
+        source_ref = {
+            "tool": "claude",
+            "session_id": "fiction",
+            "storage": str(source),
+            "title": "Garden supervisor",
+        }
+        store.create("smoke", [source_ref], root)
         store.publish(
             "smoke",
             0,
-            {"observed_at": 1},
-            "Fictional console smoke test.",
+            {
+                "observed_at": time.time(),
+                "synthesized_at": time.time() - 7200,
+                "sources": [
+                    dict(
+                        source_ref,
+                        status="available",
+                        fingerprint=[stat.st_dev, stat.st_ino, stat.st_size, stat.st_mtime_ns],
+                    )
+                ],
+            },
+            "The review page is ready.\n\nThree plant choices still need your input.\n\nThe team has finished the layout and checked it on desktop and phone. Your previous answers are saved.\n\nNext: choose a delivery day in the Desk conversation.\n\n"
+            + "Additional project context.\n" * 18,
             [
                 {
                     "key": "internal",
@@ -36,27 +72,153 @@ def child(result):
                     "evidence": ["fixture"],
                 }
             ],
+            overview=dict(
+                background="We started with a bare courtyard.",
+                current="Planting beds and the review page are ready.",
+                direction="Choose plants, then schedule delivery.",
+                goal="A shaded garden for summer.",
+            ),
         )
         original_wrapper = curses.wrapper
         original_render = view.render
         tabs = []
+        captures = []
+        keys_seen = []
+        original_handle = view.handle_key
+
+        def handle(state, key, *args):
+            keys_seen.append([repr(key), type(key).__name__])
+            return original_handle(state, key, *args)
+
+        view.handle_key = handle
 
         def render(snapshot, state, *args, **kwargs):
             tabs.append(state.tab)
             return original_render(snapshot, state, *args, **kwargs)
 
-        def wrapper(function):
-            def enter(screen):
-                for key in reversed("123q"):
-                    curses.unget_wch(key)
-                return function(screen)
+        for columns, rows in ((100, 25), (60, 12), (40, 18)):
 
-            return original_wrapper(enter)
+            class Screen:
+                def __init__(self, screen):
+                    self.screen = screen
 
-        view.render = render
-        view.curses.wrapper = wrapper
-        view.run(store, "smoke")
-        Path(result).write_text(json.dumps({"tabs": tabs, "exited": True}), encoding="utf-8")
+                def __getattr__(self, name):
+                    return getattr(self.screen, name)
+
+                def refresh(self):
+                    self.screen.refresh()
+                    captures.append(
+                        dict(
+                            width=columns,
+                            height=rows,
+                            lines=[
+                                self.screen.instr(row, 0).decode("utf-8", errors="replace").rstrip()
+                                for row in range(rows)
+                            ],
+                        )
+                    )
+
+            def wrapper(function):
+                def enter(screen):
+                    curses.resize_term(rows, columns)
+                    import ctypes
+                    from ctypes import wintypes
+
+                    class KeyEvent(ctypes.Structure):
+                        _fields_ = [
+                            ("down", wintypes.BOOL),
+                            ("repeat", wintypes.WORD),
+                            ("virtual", wintypes.WORD),
+                            ("scan", wintypes.WORD),
+                            ("char", wintypes.WCHAR),
+                            ("control", wintypes.DWORD),
+                        ]
+
+                    class Event(ctypes.Union):
+                        _fields_ = [("key", KeyEvent), ("padding", ctypes.c_byte * 16)]
+
+                    class Input(ctypes.Structure):
+                        _fields_ = [("type", wintypes.WORD), ("event", Event)]
+
+                    kernel = ctypes.WinDLL("kernel32", use_last_error=True)
+                    kernel.CreateFileW.restype = wintypes.HANDLE
+                    kernel.CreateFileW.argtypes = [
+                        wintypes.LPCWSTR,
+                        wintypes.DWORD,
+                        wintypes.DWORD,
+                        ctypes.c_void_p,
+                        wintypes.DWORD,
+                        wintypes.DWORD,
+                        wintypes.HANDLE,
+                    ]
+                    kernel.CloseHandle.argtypes = [wintypes.HANDLE]
+                    kernel.WriteConsoleInputW.argtypes = [
+                        wintypes.HANDLE,
+                        ctypes.POINTER(Input),
+                        wintypes.DWORD,
+                        ctypes.POINTER(wintypes.DWORD),
+                    ]
+                    keys = [
+                        (0x27, "", 0),
+                        (0x27, "", 0),
+                        (0x27, "", 0),
+                        (0x25, "", 0),
+                        (9, "\t", 0),
+                        (9, "\t", 16),
+                        (78, "n", 0),
+                        (80, "p", 0),
+                        (72, "h", 0),
+                        (0x22, "", 0),
+                        (27, "\x1b", 0),
+                        (50, "2", 0),
+                        (0x23, "", 0),
+                        (81, "q", 0),
+                    ]
+                    records = []
+                    for virtual, char, control in keys:
+                        for down in (True, False):
+                            record = Input()
+                            record.type = 1
+                            record.event.key = KeyEvent(
+                                down,
+                                1,
+                                virtual,
+                                0,
+                                char or "\x00",
+                                control | (256 if virtual in (0x25, 0x27, 0x22, 0x23) else 0),
+                            )
+                            records.append(record)
+
+                    def feed():
+                        import time
+
+                        time.sleep(0.3)
+                        console = kernel.CreateFileW("CONIN$", 0xC0000000, 3, None, 3, 0, None)
+                        try:
+                            for record in records:
+                                written = wintypes.DWORD()
+                                if not kernel.WriteConsoleInputW(
+                                    console, ctypes.byref(record), 1, ctypes.byref(written)
+                                ):
+                                    raise ctypes.WinError(ctypes.get_last_error())
+                                time.sleep(0.03)
+                        finally:
+                            kernel.CloseHandle(console)
+
+                    import threading
+
+                    threading.Thread(target=feed, daemon=True).start()
+                    return function(Screen(screen))
+
+                return original_wrapper(enter)
+
+            view.render = render
+            view.curses.wrapper = wrapper
+            view.run(store, "smoke")
+        Path(result).write_text(
+            json.dumps({"tabs": tabs, "exited": True, "captures": captures, "keys": keys_seen}),
+            encoding="utf-8",
+        )
 
 
 def main():
@@ -86,9 +248,15 @@ def main():
         if code or not result.exists():
             raise RuntimeError((Path(root) / "error.log").read_text(encoding="utf-8"))
         data = json.loads(result.read_text(encoding="utf-8"))
-        if not data["exited"] or not {1, 2, 3}.issubset(data["tabs"]):
+        if not data["exited"] or not {1, 2, 3, 4}.issubset(data["tabs"]):
             raise RuntimeError(f"Console view did not visit all tabs: {data}")
-        print("Native Windows console: Review, Needs you, Next action and exit passed.")
+        capture_file = os.environ.get("AI_SESSIONS_DESK_SMOKE_CAPTURE")
+        if capture_file:
+            Path(capture_file).write_text(json.dumps(data), encoding="utf-8")
+        assert {frame["width"] for frame in data["captures"]} == {40, 60, 100}
+        assert any("Briefing help" in "\n".join(frame["lines"]) for frame in data["captures"])
+        assert all("? Help" in frame["lines"][-1] for frame in data["captures"])
+        print("Native Windows console: 40/60/100 columns, view keys, help, scroll and exit passed.")
 
 
 if __name__ == "__main__":

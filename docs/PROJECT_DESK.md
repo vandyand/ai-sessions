@@ -46,11 +46,29 @@ The project conversation runs in the desk folder so it can read the briefing. It
 
 ## Read the briefing
 
-- `1`: Review, a running synopsis of observed work.
-- `2`: Needs you, current questions and requested human actions with context.
-- `3`: Next action, a focused recommendation for one pending item.
-- `n` / `p`: next / previous pending item.
-- Arrows and Page Up / Page Down: scroll. `q`: close the view.
+- `1`: Overview — background, current position, direction and goal (the opening view).
+- `2`: Review — recent progress and outcomes.
+- `3`: Needs you — open questions with context.
+- `4`: Next action — a focused suggested response.
+- Left/Right and Tab/Shift+Tab switch views, wrapping at the ends.
+- `n` / `p` opens the first/last question from Overview or Review, or cycles questions
+  from Needs you / Next action. The shortcut appears only when it is useful.
+- Up/Down and Page Up/Page Down scroll when content exceeds the pane. A line range
+  appears at bottom right; no scroll hint is shown when everything fits.
+- `h` or `?` opens help, including the exact watched sessions and status meanings.
+  `h`, `?` or Esc returns. `q` closes the briefing.
+
+The top-right indicator separates summary age from source freshness:
+`Up to date · 2h` means the summary last changed two hours ago and the current
+session files still match it. `Supervisor has new content` means that source has
+changed; `Updating briefing` appears while the local reviewer is working on it.
+With multiple sources the label says `Watched sessions have new content` instead.
+`Saved` means current sources have not been verified. Read/update failures remain
+visible and preserve the saved briefing. Exact Eastern timestamps and history
+limitations are available in help rather than a permanent metadata row.
+
+Only the supervisor is watched by default. Managers and workers contribute only
+when explicitly added with `--source`; team membership is not inferred.
 
 The viewer polls saved state once a second. The view runs the observer alongside it by default, checking selected sources every 60 seconds by default. Model calls happen only when new conversation text is found. Change the interval with `--interval 120` (5–3600 seconds). Failed observations back off, up to 15 minutes, rather than repeatedly consuming usage each minute. Closing the view stops its observer and its owned model process. It does not stop the supervisor or workers. The last saved briefing remains available.
 
@@ -75,8 +93,8 @@ and source cursor; the live observer retries with backoff. A complete legacy JSO
 code fence is accepted, but surrounding commentary and malformed JSON are refused.
 
 Review leads with progress, outcomes, and the next human action. Source citation
-details remain in saved records rather than terminal prose. Partial-history status
-remains visible. Desk display and Markdown timestamps use US Eastern Time (EST/EDT).
+details remain in saved records rather than terminal prose. Partial-history details
+are available in help. Desk display and Markdown timestamps use US Eastern Time (EST/EDT).
 
 After upgrading, press `q` in an already-open briefing and rerun `ses desk view HANDLE`
 to load the updated observer. The operational agent need not restart.
@@ -102,3 +120,14 @@ Desk records pin exact source transcripts and native session IDs. Reopening with
 ## Validation
 
 Unit tests use fictional transcripts and injected model responses. A finite native Windows console smoke test exercises all three views and exit (`tools/verify_project_desk.py`). A real Haiku smoke request and an initial observation of the explicitly selected Elevate supervisor and two managers succeeded on November 19. The first real-data observation and native launcher checks are recorded in the local agent-docs guide. Operational team messages are not sent as a test. User feedback on reading, moving between panes, stale questions and draft ambiguity should determine whether native Claude Mods / a Codex TUI patch is worth adding next.
+
+## Project overview
+
+Overview is retained separately from the rolling Review. Its four fields use
+supplied evidence; unknown goals are identified as missing rather than invented.
+On an existing desk without an overview, the next observer pass can read the
+supervisor's first 16 KiB, stopping at a complete JSONL record and keeping at most
+6,000 characters of conversation text. This supplements the bounded recent tail
+once. It cannot resolve current human requests from old opening context.
+Subsequent unchanged checks make no model call. The overview is stored atomically
+with Review and the questions and included in the Markdown projection.
