@@ -6,6 +6,57 @@ and Claude Code 2.1.319+. Claude requires the Windows DevSecrets vault; Codex us
 its own shared daemon. Desktop-private servers, WSL/native cross-boundary routing,
 and offline automatic wakeup are not supported.
 
+## Compact message display
+
+The optional Claude plugin renders one `from HANDLE: message preview… [expand]`
+row. Run `/reload-plugins` after installing/updating it. In fullscreen rendering,
+click the row to expand and `[collapse]` to close it. In either renderer, Ctrl+O
+opens the full transcript with complete message bodies; press it again to return.
+See [the plugin guide](../plugins/compact-messages/README.md).
+
+Codex uses a separate native renderer, not the Claude plugin. Starting with
+ai-sessions 3.20.8, an installed renderer is selected for managed interactive
+launches (`cdba`, new sessions and resume). Daemon and RPC commands keep stock
+Codex. No renderer is bundled in the Python package. Without an installed
+renderer, launches use the configured stock command.
+
+Maintainers install a tested Windows artifact with its explicit version and SHA:
+
+```powershell
+python -m ai_sessions.harnesses.codex_tui install C:\path\codex.exe --version 0.170.0 --sha256 <verified-sha256>
+python -m ai_sessions.harnesses.codex_tui status
+```
+
+For the first activation, exit Codex normally and run `ses --reopen` from the
+shell. Older Python launcher processes retain their imported code; restarting
+only their child with `sesres` cannot load the new launcher. Later `sesres`
+restarts use the installed renderer. Direct stock `codex` commands remain stock.
+To return managed interactive launches to the configured stock executable:
+
+```powershell
+python -m ai_sessions.harnesses.codex_tui disable
+```
+
+## Registering a current receiver
+
+`ses messaging status` lists receivers that can currently accept messages. Its
+absence does not mean a session or saved conversation is absent. Search the
+session catalog with `ses --json -q "title"` for saved/native session discovery.
+
+Claude registration retries quietly on subsequent prompt/tool hooks if its native
+receiver was not ready at SessionStart. Install the updated hooks with
+`ses messaging install`; existing third-party hooks are preserved. A running
+session can explicitly retry its own registration without stdin or a restart:
+
+```text
+! ses messaging register --json
+```
+
+This verifies the invoking native process and registers only that session. It
+cannot make another session reachable. A registered live owner skips repeat
+vault writes. UUID placeholder names use unique cached native-ID/home titles;
+a fresh native title not in the catalog still requires a catalog refresh.
+
 ## Setup and restart
 
 ```powershell
