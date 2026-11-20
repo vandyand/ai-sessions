@@ -8,8 +8,6 @@
   preserving complete agent input; use session handles in the one-line previews.
 - Notify bound Desk conversations only when a new human request is added, with
   durable deduplication and offline delivery; ordinary refreshes stay silent.
-- Include the pinned experimental native Codex renderer patch and Windows build
-  diagnostics. A verified custom binary is required before enabling that UI.
 
 ## 3.20.6 — 2026-11-20
 
