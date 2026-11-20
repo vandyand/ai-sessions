@@ -64,11 +64,28 @@ jobs:
           rustup override set 1.95.0
           if ($LASTEXITCODE) { exit $LASTEXITCODE }
       - name: Run compact peer regression tests
+        id: compact_tests
         shell: pwsh
         working-directory: upstream/codex-rs
         run: |
           cargo test --locked --release -p codex-tui --lib compact_peer -- --nocapture
           if ($LASTEXITCODE) { exit $LASTEXITCODE }
+      - name: Capture proposed lockfile change after test failure
+        if: failure() && steps.compact_tests.outcome == 'failure'
+        continue-on-error: true
+        shell: pwsh
+        run: |
+          # One offline metadata resolution for diagnosis only; original lock is restored.
+          python patches/codex-compact-messages/capture_lock_diagnostics.py --source upstream --output lock-diagnostics
+          if ($LASTEXITCODE) { exit $LASTEXITCODE }
+      - name: Upload lockfile diagnostics
+        if: failure() && steps.compact_tests.outcome == 'failure'
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: codex-0.170.0-windows-lock-diagnostics
+          path: lock-diagnostics/
+          if-no-files-found: error
+          retention-days: 14
       - name: Build Windows release CLI
         shell: pwsh
         working-directory: upstream/codex-rs

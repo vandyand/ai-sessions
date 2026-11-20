@@ -41,3 +41,23 @@ or keyboard end-to-end test has been run. Collapsed peer cells occupy exactly on
 pinned source/envelope; future upstream or envelope changes require review.
 
 Local checks: git diff --check passed in upstream scratch checkout; reverse application, clean forward git apply --check, and forward application all passed. No Rust tests or release build were run locally.
+
+
+## Windows lock diagnostics
+
+If the locked test step fails, the workflow performs exactly one diagnostic
+`cargo metadata --offline --format-version 1` resolution against the pinned
+checkout, then restores the original Cargo.lock byte for byte. It uploads
+`codex-0.170.0-windows-lock-diagnostics` with the original/proposed lockfiles,
+a unified Cargo.lock.diff, package inventory changes, metadata output/errors,
+and hash/restoration summary. The probe has a ten-minute timeout and performs
+no build. An offline cache miss may prevent full resolution; its error and any
+partial proposed lock change remain available for inspection.
+
+The workflow remains failed and never builds against an unreviewed dependency
+graph. Both the regression test and release build commands retain --locked.
+Review that artifact before adding a minimal pinned lockfile patch; no inferred
+lockfile change is bundled without the Windows resolution evidence.
+
+Fixture-only helper checks (no Cargo required):
+`python patches/codex-compact-messages/test_lock_diagnostics.py`

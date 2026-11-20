@@ -302,7 +302,7 @@ def _export_snapshot(store, name, snapshot):
         return failed
 
 
-def refresh(store, name, *, runner=None, stop=None):
+def _refresh(store, name, *, runner=None, stop=None):
     """Observe once, preserving last good synthesis on errors and rejecting stale work."""
     before = store.get(name)
     previous = before.get("observation", {}).get("sources", [])
@@ -382,3 +382,15 @@ def refresh(store, name, *, runner=None, stop=None):
             message += " " + str(exc)
         failed = store._fail(name, message, before["revision"], coverage=coverage)
         return _export_snapshot(store, name, failed)
+
+
+def refresh(store, name, *, runner=None, stop=None):
+    result = _refresh(store, name, runner=runner, stop=stop)
+    try:
+        from .notifications import drain
+
+        drain(store, name, stop=stop)
+    except Exception:
+        # Notification failure must never mark a successful synthesis failed.
+        pass
+    return result

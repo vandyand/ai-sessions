@@ -2,11 +2,11 @@
 
 Claude Code renders peer messages as `from HANDLE: message preview…` by default.
 Press/click the row to expand the full message body, and again to collapse it.
-This mod hooks only `ui.render` for `UserMessage`. It does not rewrite model input,
+This mod renders `UserMessage` and loads read-only handle labels on `session.start`. It does not rewrite model input,
 transcripts, permissions, or message delivery. Normal user messages are unchanged.
 
-New ai-sessions messages carry sender handles. Older messages without that field
-show a short native address. Unknown/malformed messages use Claude's normal rendering.
+New ai-sessions messages carry sender handles. Older messages use the startup handle map; unknown or ambiguous IDs
+fall back to a short native address. Unknown/malformed messages use Claude's normal rendering.
 
 Install the local marketplace, then the plugin:
 
