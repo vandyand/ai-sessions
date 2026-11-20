@@ -26,6 +26,7 @@ classifiers = [
 ]
 dependencies = [
   "psutil>=5.9",
+  "tzdata>=2024.1",
   "windows-curses>=2.4.1; sys_platform == 'win32'",
   "orjson>=3.9",
   "websocket-client>=1.8,<2",

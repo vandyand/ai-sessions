@@ -523,3 +523,50 @@ def test_excessive_synthesis_pending_preserves_last_safe_snapshot(tmp_path, monk
     result = observer.refresh(store, "demo", runner=lambda p: output(items))
     assert result["error"] and result["review"] == "" and result["decisions"] == []
     assert result["observation"] == {} and result["observed_at"] is None
+
+
+def test_fenced_legacy_json_is_validated_without_accepting_surrounding_prose(tmp_path, monkeypatch):
+    store, _ = setup_source(tmp_path, monkeypatch)
+    result = observer.refresh(store, "demo", runner=lambda p: "```json\n" + output() + "\n```")
+    assert result["error"] is None
+
+
+def test_model_command_enforces_briefing_schema(monkeypatch):
+    import subprocess
+    import sys
+
+    original = subprocess.Popen
+    commands = []
+    envelope = json.dumps({"structured_output": json.loads(output())})
+
+    def spawn(command, **kwargs):
+        commands.append(command)
+        return original(
+            [sys.executable, "-c", f"import sys; sys.stdin.read(); print({envelope!r})"], **kwargs
+        )
+
+    monkeypatch.setattr(observer.model_backend.shutil, "which", lambda name: sys.executable)
+    monkeypatch.setattr(observer.model_backend.subprocess, "Popen", spawn)
+    prompt = (
+        observer.SYSTEM + "\n" + json.dumps({"evidence": [{"citation": "s0", "text": "Fiction"}]})
+    )
+    assert json.loads(observer._run_model(prompt))["review"]
+    command = commands[0]
+    schema = json.loads(command[command.index("--json-schema") + 1])
+    assert schema["required"] == ["review", "decisions"]
+    assert schema["additionalProperties"] is False
+    assert schema["properties"]["decisions"]["items"]["properties"]["evidence"]["items"][
+        "enum"
+    ] == ["s0"]
+    assert schema["properties"]["decisions"]["items"]["properties"]["status"]["enum"] == [
+        "pending",
+        "resolved",
+        "superseded",
+    ]
+
+
+def test_prose_wrapped_json_is_not_silently_extracted(tmp_path, monkeypatch):
+    store, _ = setup_source(tmp_path, monkeypatch)
+    result = observer.refresh(store, "demo", runner=lambda p: "Here is the JSON: " + output())
+    assert result["error"] and "JSONDecodeError" not in result["error"]
+    assert result["observation"] == {}

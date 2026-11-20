@@ -1,5 +1,13 @@
 # Changelog
 
+## 3.20.5 — 2026-11-20
+
+- Enforce structured observer responses and current evidence IDs; accept a
+  complete legacy JSON fence while keeping all briefing/evidence validation.
+- Focus Review on progress and human actions; keep source citation metadata out
+  of terminal prose and preserve saved briefings on malformed model replies.
+- Display desk timestamps in US Eastern Time with daylight-saving support.
+
 ## 3.20.4 — 2026-11-20
 
 - Fix current-session handle lookup in Claude sessions launched through a

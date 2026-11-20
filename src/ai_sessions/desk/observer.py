@@ -33,15 +33,20 @@ SYSTEM = (
     "Carry forward existing decision keys. Resolve/supersede only from explicit later evidence, "
     "never absence. Explicit CURRENT cited answers can resolve a question even with partial "
     "coverage; missing history, unrelated unavailable sources or silence never resolve one. "
-    "Distinguish reports, proposals, requests and confirmed outcomes. State coverage limitations."
+    "Distinguish reports, proposals, requests and confirmed outcomes. Coverage limitations are already shown by the interface; do not narrate them in review."
     " Decisions are ONLY actions/questions needing the HUMAN user's judgment or action. "
     "Exclude routine worker/manager coordination and permissions the user already granted; "
     "never assume every question is addressed to the human. An existing irrelevant pending "
     "item can be superseded only with current cited evidence of its routine/nonhuman nature. "
     "Use primary_source's explicit project context/current objective in Review when present; "
     "do not invent an objective or add sources. OMIT unchanged decisions (the store retains them), "
-    "or copy their records EXACTLY including all historical evidence; do not paraphrase them. "
+    "and never copy unchanged historical records into the output. "
     "New/modified decisions require current supplied evidence."
+    " Write Review directly for the human: lead with what changed, the current outcome, "
+    "and what happens next. Summarize prior context when still relevant. Never write an "
+    "audit of the previous summary or lead with coverage, byte offsets, citation mechanics, "
+    "or repeated verification disclaimers. Keep technical source metadata out of the prose. "
+    "Use US Eastern Time (EST/EDT) for any human-facing times. "
     " Be concise: all pending records together must fit 24000 serialized JSON characters and "
     "at most 80 pending items, including carried pending records and expanded evidence citations. "
     "Use short questions/context/recommendations; avoid repeating review prose in each item."
@@ -61,8 +66,17 @@ def read_since(tool, ref, checkpoint, *, end):
 
 
 def _run_model(prompt, stop=None):
+    citation_ids = None
+    if prompt.startswith(SYSTEM + "\n"):
+        payload = json.loads(prompt[len(SYSTEM) + 1 :])
+        citation_ids = [entry["citation"] for entry in payload["evidence"]]
     return model_backend.run_model(
-        prompt, stop=stop, max_output_bytes=MAX_OUTPUT_BYTES, timeout=MODEL_TIMEOUT, system=SYSTEM
+        prompt,
+        stop=stop,
+        max_output_bytes=MAX_OUTPUT_BYTES,
+        timeout=MODEL_TIMEOUT,
+        system=SYSTEM,
+        citation_ids=citation_ids,
     )
 
 
@@ -219,7 +233,10 @@ def _build_prompt(before, coverage, evidence):
 def _validate(raw, coverage, previous=()):
     if not isinstance(raw, str) or len(raw.encode("utf-8")) > MAX_OUTPUT_BYTES:
         raise ValueError("model output empty or too large")
-    data = json.loads(raw)
+    # Older CLI versions may wrap an otherwise valid response in one JSON fence.
+    # Do not extract arbitrary objects from commentary or repair invalid JSON.
+    fenced = re.fullmatch(r"\s*```(?:json)?\s*\n(.*?)\n```\s*", raw, re.DOTALL)
+    data = json.loads(fenced[1] if fenced else raw)
     if not isinstance(data, dict) or set(data) != {"review", "decisions"}:
         raise ValueError("model requires exactly review and decisions")
     if not isinstance(data["review"], str) or not data["review"].strip():
@@ -358,7 +375,9 @@ def refresh(store, name, *, runner=None, stop=None):
         return store.get(name)
     except Exception as exc:
         # Do not leak model output, raw transcripts or subprocess stderr into state.
-        message = f"Observation failed ({type(exc).__name__}); last good briefing preserved."
+        message = "Briefing update failed; retrying automatically. Previous briefing preserved."
+        if isinstance(exc, json.JSONDecodeError):
+            message = "The summarizer returned an unreadable reply; retrying automatically. Previous briefing preserved."
         if isinstance(exc, PromptBudgetError):
             message += " " + str(exc)
         failed = store._fail(name, message, before["revision"], coverage=coverage)

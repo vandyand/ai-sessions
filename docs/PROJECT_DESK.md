@@ -1,6 +1,6 @@
 # Project Desk
 
-Updated November 19, 2026. First local experiment.
+Updated November 20, 2026.
 
 Project Desk gives a busy project's human a quiet native Claude Code or Codex conversation, alongside a live terminal briefing. The operational supervisor continues coordinating workers and managers. The human-facing project agent discusses ideas, explains questions and conveys settled direction when asked; it does not receive a stream of team chat notifications.
 
@@ -65,6 +65,21 @@ sessions desk open my-project --tool claude --dry-run
 ```
 
 `view --no-watch` reads saved briefings and makes no model calls. Legacy `--watch` remains accepted. `refresh` performs one observation. `watch` runs until interrupted. Do not run multiple watchers deliberately: stale concurrent results are discarded, but overlapping model calls still consume usage.
+
+## Briefing format and recovery
+
+The summarizer uses native structured output constrained to the briefing schema
+and currently supplied citation IDs. Semantic evidence validation still runs before
+publication. An unreadable reply preserves the previous review, pending requests,
+and source cursor; the live observer retries with backoff. A complete legacy JSON
+code fence is accepted, but surrounding commentary and malformed JSON are refused.
+
+Review leads with progress, outcomes, and the next human action. Source citation
+details remain in saved records rather than terminal prose. Partial-history status
+remains visible. Desk display and Markdown timestamps use US Eastern Time (EST/EDT).
+
+After upgrading, press `q` in an already-open briefing and rerun `ses desk view HANDLE`
+to load the updated observer. The operational agent need not restart.
 
 ## Observation and costs
 

@@ -14,6 +14,32 @@ from pathlib import Path
 
 from ..model import ReadSnapshot
 
+BRIEFING_SCHEMA = {
+    "type": "object",
+    "additionalProperties": False,
+    "required": ["review", "decisions"],
+    "properties": {
+        "review": {"type": "string", "minLength": 1, "maxLength": 64000},
+        "decisions": {
+            "type": "array",
+            "maxItems": 100,
+            "items": {
+                "type": "object",
+                "additionalProperties": False,
+                "required": ["key", "question", "context", "recommendation", "status", "evidence"],
+                "properties": {
+                    **{
+                        key: {"type": "string"}
+                        for key in ("key", "question", "context", "recommendation")
+                    },
+                    "status": {"type": "string", "enum": ["pending", "resolved", "superseded"]},
+                    "evidence": {"type": "array", "minItems": 1, "items": {"type": "string"}},
+                },
+            },
+        },
+    },
+}
+
 
 class ObservationCancelled(Exception):
     """The owning viewer stopped; do not alter the briefing or its error state."""
@@ -39,7 +65,7 @@ def read_since(tool, ref, checkpoint, *, end):
     return ReadSnapshot(transcript, end)
 
 
-def run_model(prompt, stop=None, *, max_output_bytes, timeout, system):
+def run_model(prompt, stop=None, *, max_output_bytes, timeout, system, citation_ids=None):
     """Existing CLI login only; bounded memory, execution time, and pipe writes.
 
     Safe mode disables custom instructions/plugins/hooks, while preserving normal
@@ -55,6 +81,11 @@ def run_model(prompt, stop=None, *, max_output_bytes, timeout, system):
         executable = native_executable()
     if not executable:
         raise RuntimeError("Claude CLI unavailable; install/sign in separately")
+    schema = json.loads(json.dumps(BRIEFING_SCHEMA))
+    if citation_ids:
+        schema["properties"]["decisions"]["items"]["properties"]["evidence"]["items"]["enum"] = (
+            citation_ids
+        )
     command = [
         executable,
         "-p",
@@ -62,6 +93,8 @@ def run_model(prompt, stop=None, *, max_output_bytes, timeout, system):
         os.environ.get("AI_SESSIONS_DESK_MODEL", "haiku"),
         "--output-format",
         "json",
+        "--json-schema",
+        json.dumps(schema, separators=(",", ":")),
         "--tools",
         "",
         "--safe-mode",
