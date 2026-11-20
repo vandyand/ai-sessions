@@ -1,0 +1,158 @@
+name: Build compact peer-message Codex
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - feature/codex-compact-renderer
+    paths:
+      - 'patches/codex-compact-messages/**'
+      - '.github/workflows/build-codex-compact.yml'
+permissions:
+  contents: read
+jobs:
+  windows:
+    runs-on: windows-2025
+    timeout-minutes: 180
+    env:
+      # Keep Cargo's recursive git/submodule checkouts below Windows path limits.
+      CARGO_HOME: 'C:\c'
+      CARGO_NET_GIT_FETCH_WITH_CLI: 'true'
+      CARGO_INCREMENTAL: '0'
+      CARGO_BUILD_JOBS: '2'
+      CARGO_PROFILE_RELEASE_DEBUG: '0'
+      INSTA_UPDATE: 'no'
+      # Match the pinned upstream Windows x64 release configuration.
+      LIBSQLITE3_FLAGS: SQLITE_DISABLE_INTRINSIC
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+      - name: Configure Windows dependency checkout paths
+        shell: pwsh
+        run: |
+          git config --global core.longpaths true
+          if ($LASTEXITCODE) { exit $LASTEXITCODE }
+          New-Item -ItemType Directory -Force -Path $env:CARGO_HOME | Out-Null
+          Write-Host "Cargo home: $env:CARGO_HOME"
+          git config --get core.longpaths
+          if ($LASTEXITCODE) { exit $LASTEXITCODE }
+      - name: Fetch and verify pinned upstream
+        shell: pwsh
+        run: |
+          git init upstream
+          # Persist this for git apply too: runner defaults would rewrite patched files as CRLF.
+          git -C upstream config core.autocrlf false
+          if ($LASTEXITCODE) { exit $LASTEXITCODE }
+          git -C upstream remote add origin https://github.com/openai/codex.git
+          git -C upstream fetch --depth 1 origin refs/tags/rust-v0.170.0:refs/tags/rust-v0.170.0
+          if ($LASTEXITCODE) { exit $LASTEXITCODE }
+          $tag = git -C upstream rev-parse refs/tags/rust-v0.170.0
+          if ($tag -ne '72f97c309fb0f78b6f35cce455adf416e6a51571') { throw 'Upstream tag changed' }
+          $commit = git -C upstream rev-parse 'refs/tags/rust-v0.170.0^{commit}'
+          if ($commit -ne '29eb79e9866b3262a777fdf8195c1b9e63684c91') { throw 'Upstream commit changed' }
+          git -C upstream -c core.autocrlf=false checkout --detach $commit
+          if ($LASTEXITCODE) { exit $LASTEXITCODE }
+      - name: Apply source patch
+        shell: pwsh
+        run: |
+          $patch = Join-Path $env:GITHUB_WORKSPACE 'patches/codex-compact-messages/compact-peer-messages.patch'
+          # Windows checkout may convert the patch itself to CRLF; Git's source is LF.
+          $patchText = [IO.File]::ReadAllText($patch)
+          [IO.File]::WriteAllText($patch, $patchText.Replace("`r`n", "`n"), [Text.UTF8Encoding]::new($false))
+          git -C upstream apply --check $patch
+          if ($LASTEXITCODE) { exit $LASTEXITCODE }
+          git -C upstream apply $patch
+          if ($LASTEXITCODE) { exit $LASTEXITCODE }
+      - name: Apply reviewed workspace release lock metadata
+        shell: pwsh
+        run: |
+          $lock = Join-Path $env:GITHUB_WORKSPACE 'upstream/codex-rs/Cargo.lock'
+          if ((Get-FileHash -Algorithm SHA256 -LiteralPath $lock).Hash -ne 'e913b4fe3ff12121362c1f85ef360b32cba72305149c0cbe55e0a416337c1415') {
+            throw 'Pinned upstream Cargo.lock differs from reviewed diagnostic input'
+          }
+          $lockPatch = Join-Path $env:GITHUB_WORKSPACE 'patches/codex-compact-messages/workspace-release-lock.patch'
+          $patchText = [IO.File]::ReadAllText($lockPatch)
+          [IO.File]::WriteAllText($lockPatch, $patchText.Replace("`r`n", "`n"), [Text.UTF8Encoding]::new($false))
+          git -C upstream apply --check $lockPatch
+          if ($LASTEXITCODE) { exit $LASTEXITCODE }
+          git -C upstream apply $lockPatch
+          if ($LASTEXITCODE) { exit $LASTEXITCODE }
+          if ((Get-FileHash -Algorithm SHA256 -LiteralPath $lock).Hash -ne '11ed3c419dcb08d7d3921f20eb4980c7a0620234c1f7ed79a2d3ca3b98f39a3e') {
+            throw 'Corrected Cargo.lock differs from reviewed Windows proposal'
+          }
+      - name: Install upstream Rust toolchain
+        shell: pwsh
+        working-directory: upstream/codex-rs
+        run: |
+          rustup toolchain install 1.95.0 --profile minimal
+          if ($LASTEXITCODE) { exit $LASTEXITCODE }
+          rustup override set 1.95.0
+          if ($LASTEXITCODE) { exit $LASTEXITCODE }
+      - name: Restore Cargo source and release target cache
+        id: cargo_cache
+        uses: actions/cache/restore@668228422ae6a00e4ad889ee87cd7109ec5666a7 # v5.0.4, pinned upstream action
+        with:
+          path: |
+            C:\c\registry
+            C:\c\git
+            upstream/codex-rs/target
+          key: windows-codex-29eb79e9866b-rust-1.95.0-release-nodebug-${{ hashFiles('patches/codex-compact-messages/*.patch', '.github/workflows/build-codex-compact.yml') }}
+          restore-keys: |
+            windows-codex-29eb79e9866b-rust-1.95.0-release-nodebug-
+      - name: Configure upstream MSVC environment
+        uses: ./upstream/.github/actions/setup-msvc-env
+        with:
+          target: x86_64-pc-windows-msvc
+      - name: Build Windows release CLI
+        id: cli_build
+        shell: pwsh
+        working-directory: upstream/codex-rs
+        run: |
+          cargo build --locked --release -p codex-cli --bin codex
+          if ($LASTEXITCODE) { exit $LASTEXITCODE }
+          ./target/release/codex.exe --version
+          if ($LASTEXITCODE) { exit $LASTEXITCODE }
+      - name: Upload candidate CLI before test linking
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: codex-0.170.0-compact-peer-windows-x64-candidate
+          path: upstream/codex-rs/target/release/codex.exe
+          if-no-files-found: error
+          retention-days: 14
+      - name: Run compact peer regression tests
+        id: compact_tests
+        shell: pwsh
+        working-directory: upstream/codex-rs
+        run: |
+          cargo test --locked --release -p codex-tui --lib compact_peer -- --nocapture
+          if ($LASTEXITCODE) { exit $LASTEXITCODE }
+      - name: Capture proposed lockfile change after test failure
+        if: failure() && (steps.cli_build.outcome == 'failure' || steps.compact_tests.outcome == 'failure')
+        continue-on-error: true
+        shell: pwsh
+        run: |
+          # One offline metadata resolution for diagnosis only; original lock is restored.
+          python patches/codex-compact-messages/capture_lock_diagnostics.py --source upstream --output lock-diagnostics
+          if ($LASTEXITCODE) { exit $LASTEXITCODE }
+      - name: Upload lockfile diagnostics
+        if: failure() && (steps.cli_build.outcome == 'failure' || steps.compact_tests.outcome == 'failure')
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: codex-0.170.0-windows-lock-diagnostics
+          path: lock-diagnostics/
+          if-no-files-found: error
+          retention-days: 14
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: codex-0.170.0-compact-peer-windows-x64
+          path: upstream/codex-rs/target/release/codex.exe
+          if-no-files-found: error
+          retention-days: 14
+      - name: Save Cargo source and release target cache
+        if: always() && (steps.cli_build.outcome == 'success' || steps.cli_build.outcome == 'failure') && steps.cargo_cache.outputs.cache-hit != 'true'
+        continue-on-error: true
+        uses: actions/cache/save@668228422ae6a00e4ad889ee87cd7109ec5666a7 # v5.0.4
+        with:
+          path: |
+            C:\c\registry
+            C:\c\git
+            upstream/codex-rs/target
+          key: ${{ steps.cargo_cache.outputs.cache-primary-key }}
