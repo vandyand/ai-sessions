@@ -14,11 +14,23 @@ jobs:
     runs-on: windows-2025
     timeout-minutes: 180
     env:
+      # Keep Cargo's recursive git/submodule checkouts below Windows path limits.
+      CARGO_HOME: 'C:\c'
+      CARGO_NET_GIT_FETCH_WITH_CLI: 'true'
       CARGO_INCREMENTAL: '0'
       CARGO_BUILD_JOBS: '2'
       INSTA_UPDATE: 'no'
     steps:
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+      - name: Configure Windows dependency checkout paths
+        shell: pwsh
+        run: |
+          git config --global core.longpaths true
+          if ($LASTEXITCODE) { exit $LASTEXITCODE }
+          New-Item -ItemType Directory -Force -Path $env:CARGO_HOME | Out-Null
+          Write-Host "Cargo home: $env:CARGO_HOME"
+          git config --get core.longpaths
+          if ($LASTEXITCODE) { exit $LASTEXITCODE }
       - name: Fetch and verify pinned upstream
         shell: pwsh
         run: |
