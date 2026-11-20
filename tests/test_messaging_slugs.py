@@ -167,6 +167,21 @@ class MessagingSlugTests(unittest.TestCase):
             with self.assertRaisesRegex(ValueError, "no live reply address"):
                 cli.reply_message("worker", "not a message ID", "worker-2")
 
+    def test_message_display_handles_do_not_change_native_reply_addresses(self):
+        sender = {**self.a, "handle": "lego-sup-1"}
+        receiver = {**self.b, "handle": "lego-ses-2"}
+        with (
+            patch.object(cli, "reachable", return_value=[sender, receiver]),
+            patch.object(cli, "deliver", return_value={"status": "accepted"}) as delivery,
+        ):
+            code, receipt = cli.send_message("worker-2", "hello", "worker")
+        self.assertEqual(code, 0)
+        metadata = json.loads(delivery.call_args.args[1].splitlines()[1])
+        self.assertEqual(metadata["sender_handle"], "lego-sup-1")
+        self.assertEqual(metadata["recipient_handle"], "lego-ses-2")
+        self.assertEqual(receipt["sender"], cli._address(self.a))
+        self.assertEqual(receipt["recipient"], cli._address(self.b))
+
     def test_offline_slug_refuses_delivery(self):
         with (
             patch.object(cli, "reachable", return_value=[self.a]),
@@ -276,3 +291,36 @@ class MessagingSlugTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+def test_display_handle_map_reads_existing_identity_without_discovery(tmp_path):
+    from ai_sessions.handles import HandleStore
+    from ai_sessions.model import Session
+
+    handles = HandleStore(tmp_path / "labels.sqlite3")
+    assert handles.display_handles() == {}
+    assert not handles.path.exists()
+    item = Session("claude", "known", "First", ".", 0, 0, "", True, "first")
+    handles.ensure([item])
+    assert handles.display_handles()["claude:known"] == item.handle
+
+
+def test_display_map_omits_same_native_id_with_different_home_owners(tmp_path):
+    from ai_sessions.handles import HandleStore
+    from ai_sessions.model import Session
+    from ai_sessions.references import native_key
+
+    handles = HandleStore(tmp_path / "labels.sqlite3")
+    first = Session("claude", "one", "First", ".", 0, 0, "", True, "first")
+    other = Session("claude", "shared", "Other", ".", 0, 0, "", True, "other")
+    handles.ensure([first, other])
+    with handles._connection() as db:
+        owner = db.execute(
+            "SELECT logical_id FROM handle_members WHERE session_id='one'"
+        ).fetchone()[0]
+        key = native_key("claude", "shared", tmp_path / "another-home")
+        db.execute(
+            "INSERT INTO handle_members(tool,session_id,home,logical_id) VALUES (?,?,?,?)",
+            (key.tool, key.session_id, key.home, owner),
+        )
+    assert "claude:shared" not in handles.display_handles()

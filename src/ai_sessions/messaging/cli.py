@@ -89,17 +89,18 @@ def send_message(
             if key and os.environ.get(key):
                 source = adapter.name + ":" + os.environ[key]
                 break
-    sender = (
-        _address(store.resolve(source, rows, slugs=_slug_store()))
-        if source
-        else {"tool": "user", "session_id": "terminal"}
-    )
+    sender_row = store.resolve(source, rows, slugs=_slug_store()) if source else None
+    sender = _address(sender_row) if sender_row else {"tool": "user", "session_id": "terminal"}
     if expected_sender is not None and sender != expected_sender:
         raise ValueError(
             "original recipient is unavailable; this session cannot acknowledge its message"
         )
     mid = str(uuid.uuid4())
     meta = {"message_id": mid, "sender": sender, "recipient": _address(receiver)}
+    if sender_row and sender_row.get("handle"):
+        meta["sender_handle"] = sender_row["handle"]
+    if receiver.get("handle"):
+        meta["recipient_handle"] = receiver["handle"]
     if reply_to:
         meta["reply_to"] = reply_to
     envelope = (
@@ -175,7 +176,9 @@ def main(argv: list[str]) -> int:
         sub.add_argument("--from", dest="source")
         sub.add_argument("--json", action="store_true")
     messaging = commands.add_parser("messaging")
-    messaging.add_argument("action", choices=("status", "install", "uninstall", "receipt"))
+    messaging.add_argument(
+        "action", choices=("status", "install", "uninstall", "receipt", "handles")
+    )
     messaging.add_argument("message_id", nargs="?")
     messaging.add_argument("--codex-home", type=Path)
     messaging.add_argument("--json", action="store_true")
@@ -189,6 +192,11 @@ def main(argv: list[str]) -> int:
             code, result = fn(args.target, text, args.source)
         elif args.action in ("install", "uninstall"):
             result = install.setup(args.action == "install", args.codex_home)
+            code = 0
+        elif args.action == "handles":
+            from ..handles import HandleStore
+
+            result = HandleStore().display_handles()
             code = 0
         elif args.action == "receipt":
             result = store.receipt(args.message_id or "")

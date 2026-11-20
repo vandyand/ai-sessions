@@ -715,6 +715,22 @@ class HandleStore:
                 result[row["handle"]] = key
             return result
 
+    def display_handles(self):
+        """Read UI labels for native IDs, omitting IDs ambiguous across homes."""
+        labels, ambiguous = {}, set()
+        with self._connection(readonly=True) as connection:
+            if connection is None:
+                return labels
+            for row in connection.execute(
+                "SELECT m.tool,m.session_id,l.handle FROM handle_members m "
+                "JOIN handle_logicals l ON l.id=m.logical_id"
+            ):
+                address = f"{row['tool']}:{row['session_id']}"
+                if address in labels and labels[address] != row["handle"]:
+                    ambiguous.add(address)
+                labels[address] = row["handle"]
+        return {key: value for key, value in labels.items() if key not in ambiguous}
+
     def metadata_for(self, keys):
         """Return persisted metadata for exact native keys, omitting unknown memberships."""
         keys = set(keys)

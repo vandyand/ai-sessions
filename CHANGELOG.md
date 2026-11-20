@@ -1,5 +1,12 @@
 # Changelog
 
+## 3.20.6 — 2026-11-20
+
+- Add a Claude UI mod that collapses peer input into an expandable
+  `from HANDLE: message preview` row while preserving full agent-visible input.
+- Include sender/recipient handles in display metadata and add read-only handle
+  labels for historical messages, without changing delivery addresses.
+
 ## 3.20.5 — 2026-11-20
 
 - Enforce structured observer responses and current evidence IDs; accept a

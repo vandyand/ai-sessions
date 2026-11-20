@@ -48,3 +48,14 @@ jobs:
       - run: python -m pip install ruff==0.16.3
       - run: ruff check .
       - run: ruff format --check .
+
+  claude-mod:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-node@v6
+        with:
+          node-version: "22"
+      - run: npm install --global @anthropic-ai/claude-code@2.1.329
+      - run: claude plugin validate plugins/compact-messages
+      - run: claude plugin test plugins/compact-messages
