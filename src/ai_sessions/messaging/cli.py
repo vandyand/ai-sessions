@@ -90,6 +90,31 @@ def deliver(row: dict, text: str, message_id: str, sender: dict) -> dict:
     return hooks.send(row, text, message_id, sender)
 
 
+def _fresh_receiver(target: str, slugs) -> tuple[dict, list[dict]]:
+    """Resolve once from fresh sessions, then require the same verified native home."""
+    from ..app import load_sessions
+    from ..references import native_key, resolve_session
+
+    # Do not apply utility state, write a catalog, or turn discovered sessions into
+    # receiver records. The shared resolver also rechecks durable claims.
+    try:
+        item = resolve_session(target, load_sessions(use_cache=False), store=slugs)
+    except ValueError as error:
+        raise ValueError(f"receiver {target!r} is unavailable: {error}") from error
+    owner = native_key(item.tool, item.session_id)
+    rows = reachable()  # Discovery can take time; discard stale receiver generations.
+    matches = [
+        row
+        for row in rows
+        if row.get("home") and native_key(row["tool"], row["session_id"], row["home"]) == owner
+    ]
+    if not matches:
+        raise ValueError(store.unregistered_reason(target))
+    if len(matches) != 1:
+        raise ValueError(f"ambiguous receiver {target!r}; use its qualified native address")
+    return matches[0], rows
+
+
 def send_message(
     target: str,
     text: str,
@@ -110,7 +135,11 @@ def send_message(
             )
         receiver = matches[0]
     else:
-        receiver = store.resolve(target, rows, slugs=_slug_store())
+        slugs = _slug_store()
+        try:
+            receiver = store.resolve(target, rows, slugs=slugs)
+        except store.ReceiverNotFound:
+            receiver, rows = _fresh_receiver(target, slugs)
     source = source or os.environ.get("AI_SESSIONS_MESSAGE_FROM")
     if not source:
         from ..registry import REGISTRY

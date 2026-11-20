@@ -22,6 +22,17 @@ MAX_RECEIPTS = 1000
 MAX_AGE = 7 * 86400
 
 
+class ReceiverNotFound(ValueError):
+    """No receiver or durable reference matched; fresh discovery may be attempted."""
+
+
+def unregistered_reason(reference: str) -> str:
+    return (
+        f"Known session {reference!r} is unavailable: no verified messaging receiver is registered "
+        "in that native home. Run `ses messaging register --json` inside that session, then retry."
+    )
+
+
 def _path(kind: str, identity: str) -> Path:
     return ROOT / kind / (hashlib.sha256(identity.encode()).hexdigest() + ".json")
 
@@ -142,6 +153,8 @@ def resolve(target: str, rows: list[dict], *, slugs=None) -> dict:
                 if native_key(row["tool"], row["session_id"], row.get("home")) == owner
             ]
             if len(matches) != 1:
+                if not matches:
+                    raise ValueError(unregistered_reason(target))
                 raise ValueError(f"receiver {target!r} is unavailable or ambiguous in this home")
             return matches[0]
     if not exact:
@@ -157,6 +170,8 @@ def resolve(target: str, rows: list[dict], *, slugs=None) -> dict:
                 if native_key(row["tool"], row["session_id"], row.get("home")) == key
             ]
             if len(matches) != 1:
+                if not matches:
+                    raise ValueError(unregistered_reason(target))
                 raise ValueError(
                     f"session handle {target!r} is unavailable or ambiguous; use messaging status"
                 )
@@ -167,7 +182,7 @@ def resolve(target: str, rows: list[dict], *, slugs=None) -> dict:
             f"ambiguous receiver {target!r}; use the qualified address from messaging status"
         )
     if not matches:
-        raise ValueError(f"receiver {target!r} is unavailable; reopen it after messaging setup")
+        raise ReceiverNotFound(f"receiver {target!r} is unavailable; no receiver reference matched")
     return matches[0]
 
 
