@@ -6054,6 +6054,14 @@ def restart_here(launch_tool: str = "") -> int:
     if entry.get("restart_error"):
         print(f"sessions: {entry['restart_error']}", file=sys.stderr)
         return 2
+    target_adapter = REGISTRY.get(launch_tool or tool)
+    interactive_override = getattr(target_adapter, "interactive_command", None)
+    if callable(interactive_override):
+        try:
+            interactive_override(list(target_adapter.default_command))
+        except (OSError, ValueError) as error:
+            print(f"sessions: {error} Nothing was stopped.", file=sys.stderr)
+            return 2
     if entry.get("new_launcher"):
         from .detached import remember
         from .new_session import _identify
@@ -6167,7 +6175,11 @@ def launch(
         for notice in upgrade_native_storage(session, config, state):
             print(f"sessions: {notice}", file=sys.stderr)
         tidy_launched_title(session)
-    argv = command_for(session, config)
+    try:
+        argv = command_for(session, config)
+    except (OSError, ValueError) as error:
+        print(f"sessions: {error}", file=sys.stderr)
+        return 2
     cwd = strip_extended_prefix(session.cwd) or str(HOME)
     if config.custom_args_missing(active_launch_tool(session)):
         print(custom_mode_notice(config, active_launch_tool(session)), file=sys.stderr)

@@ -346,13 +346,21 @@ def _workspace_context(item, tool):
         context.__exit__(None, None, None)
 
 
+def _interactive_executable(adapter):
+    executable = adapter.native_executable()
+    override = getattr(adapter, "interactive_command", None)
+    if callable(override):
+        return override([executable])[0]
+    return executable
+
+
 def run(tool, arguments):
     adapter = REGISTRY.get(tool)
     if isinstance(adapter.native_executable, Unsupported) or isinstance(
         adapter.current_session, Unsupported
     ):
         raise ValueError("This harness does not support managed new sessions yet.")
-    executable = adapter.native_executable()
+    executable = _interactive_executable(adapter)
     resume = adapter.resume_args(
         session_id="identity",
         source=SourceKind.INTERACTIVE,
@@ -375,6 +383,9 @@ def run(tool, arguments):
     if not restart_error:
         command, seeded = _prepare_initial(adapter, executable, arguments, specs, cwd, resume)
     while True:
+        # Re-resolve after a restart so installing/disabling a renderer affects
+        # the next client without ever changing the shared daemon executable.
+        command[0] = _interactive_executable(adapter)
         if adapter.contain_launch and os.name == "nt":
             from .platforms.windows import KillOnCloseJob
 
