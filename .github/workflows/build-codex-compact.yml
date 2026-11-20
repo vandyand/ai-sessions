@@ -19,7 +19,10 @@ jobs:
       CARGO_NET_GIT_FETCH_WITH_CLI: 'true'
       CARGO_INCREMENTAL: '0'
       CARGO_BUILD_JOBS: '2'
+      CARGO_PROFILE_RELEASE_DEBUG: '0'
       INSTA_UPDATE: 'no'
+      # Match the pinned upstream Windows x64 release configuration.
+      LIBSQLITE3_FLAGS: SQLITE_DISABLE_INTRINSIC
     steps:
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
       - name: Configure Windows dependency checkout paths
@@ -83,6 +86,37 @@ jobs:
           if ($LASTEXITCODE) { exit $LASTEXITCODE }
           rustup override set 1.95.0
           if ($LASTEXITCODE) { exit $LASTEXITCODE }
+      - name: Restore Cargo source and release target cache
+        id: cargo_cache
+        uses: actions/cache/restore@668228422ae6a00e4ad889ee87cd7109ec5666a7 # v5.0.4, pinned upstream action
+        with:
+          path: |
+            C:\c\registry
+            C:\c\git
+            upstream/codex-rs/target
+          key: windows-codex-29eb79e9866b-rust-1.95.0-release-nodebug-${{ hashFiles('patches/codex-compact-messages/*.patch', '.github/workflows/build-codex-compact.yml') }}
+          restore-keys: |
+            windows-codex-29eb79e9866b-rust-1.95.0-release-nodebug-
+      - name: Configure upstream MSVC environment
+        uses: ./upstream/.github/actions/setup-msvc-env
+        with:
+          target: x86_64-pc-windows-msvc
+      - name: Build Windows release CLI
+        id: cli_build
+        shell: pwsh
+        working-directory: upstream/codex-rs
+        run: |
+          cargo build --locked --release -p codex-cli --bin codex
+          if ($LASTEXITCODE) { exit $LASTEXITCODE }
+          ./target/release/codex.exe --version
+          if ($LASTEXITCODE) { exit $LASTEXITCODE }
+      - name: Upload candidate CLI before test linking
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: codex-0.170.0-compact-peer-windows-x64-candidate
+          path: upstream/codex-rs/target/release/codex.exe
+          if-no-files-found: error
+          retention-days: 14
       - name: Run compact peer regression tests
         id: compact_tests
         shell: pwsh
@@ -91,7 +125,7 @@ jobs:
           cargo test --locked --release -p codex-tui --lib compact_peer -- --nocapture
           if ($LASTEXITCODE) { exit $LASTEXITCODE }
       - name: Capture proposed lockfile change after test failure
-        if: failure() && steps.compact_tests.outcome == 'failure'
+        if: failure() && (steps.cli_build.outcome == 'failure' || steps.compact_tests.outcome == 'failure')
         continue-on-error: true
         shell: pwsh
         run: |
@@ -99,24 +133,26 @@ jobs:
           python patches/codex-compact-messages/capture_lock_diagnostics.py --source upstream --output lock-diagnostics
           if ($LASTEXITCODE) { exit $LASTEXITCODE }
       - name: Upload lockfile diagnostics
-        if: failure() && steps.compact_tests.outcome == 'failure'
+        if: failure() && (steps.cli_build.outcome == 'failure' || steps.compact_tests.outcome == 'failure')
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
           name: codex-0.170.0-windows-lock-diagnostics
           path: lock-diagnostics/
           if-no-files-found: error
           retention-days: 14
-      - name: Build Windows release CLI
-        shell: pwsh
-        working-directory: upstream/codex-rs
-        run: |
-          cargo build --locked --release -p codex-cli --bin codex
-          if ($LASTEXITCODE) { exit $LASTEXITCODE }
-          ./target/release/codex.exe --version
-          if ($LASTEXITCODE) { exit $LASTEXITCODE }
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
           name: codex-0.170.0-compact-peer-windows-x64
           path: upstream/codex-rs/target/release/codex.exe
           if-no-files-found: error
           retention-days: 14
+      - name: Save Cargo source and release target cache
+        if: always() && (steps.cli_build.outcome == 'success' || steps.cli_build.outcome == 'failure') && steps.cargo_cache.outputs.cache-hit != 'true'
+        continue-on-error: true
+        uses: actions/cache/save@668228422ae6a00e4ad889ee87cd7109ec5666a7 # v5.0.4
+        with:
+          path: |
+            C:\c\registry
+            C:\c\git
+            upstream/codex-rs/target
+          key: ${{ steps.cargo_cache.outputs.cache-primary-key }}
