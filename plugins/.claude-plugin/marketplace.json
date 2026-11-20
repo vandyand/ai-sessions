@@ -1,0 +1,13 @@
+{
+  "name": "ai-sessions-local",
+  "owner": {
+    "name": "Venture VD"
+  },
+  "plugins": [
+    {
+      "name": "sessions-compact-messages",
+      "source": "./compact-messages",
+      "description": "Expandable one-line peer messages."
+    }
+  ]
+}

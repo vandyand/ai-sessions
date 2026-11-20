@@ -100,3 +100,14 @@ Working directory is only a fallback project hint. Generic names such as `output
 and `ses handle assign SESSION --project PROJECT` for explicit persistent choices.
 Model-assisted classification can suggest among known projects, but is not enabled
 in this release; opening the menu makes no classification/model requests.
+
+
+## New-session lookup
+
+`! ses whoami` (or `! ses handle`) assigns a missing handle by rereading the
+current process-verified transcript and merging that session into the catalog.
+Opening the menu is unnecessary. Unknown or ambiguous native identities are
+refused. Project defaults follow the working directory; `/rename` alone does not
+change a persistent handle or move a home-directory session into another project.
+Use `ses handle assign SESSION_ID --project lego --role wrk --number 2` to assign
+explicit project/role metadata. Reserved numbers move to the next available one.

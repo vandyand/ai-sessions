@@ -259,7 +259,10 @@ def _claude_resolve(session_id: str) -> NativeRef | None:
         paths = _claude_session_files(session_id)
     except OSError:
         return None
-    return NativeRef(session_id, str(paths[0])) if paths else None
+    # Plain/compressed storage can represent one copy; distinct project paths
+    # cannot establish which native copy the caller meant from an ID alone.
+    unique = {plain_path(path).resolve() for path in paths}
+    return NativeRef(session_id, str(paths[0])) if len(unique) == 1 else None
 
 
 def _claude_availability(ref: NativeRef) -> Availability:

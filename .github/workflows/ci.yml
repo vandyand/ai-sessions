@@ -20,7 +20,7 @@ jobs:
       - run: python -m pip install --upgrade pip
       - run: python -m pip install . pytest
       - run: python -m unittest discover -s tests -v
-      - run: python -m pytest tests/test_desk_store.py tests/test_desk_observer.py tests/test_desk_view.py tests/test_desk_freshness.py tests/test_desk_overview.py tests/test_desk_cli.py tests/test_handles.py tests/test_handle_integration.py tests/test_handle_lookup.py tests/test_conversation_view.py tests/test_deletion.py tests/test_deletion_provider_schemas.py tests/test_deletion_current.py tests/test_deletion_native.py -q -p no:cacheprovider
+      - run: python -m pytest tests/test_desk_store.py tests/test_desk_observer.py tests/test_desk_view.py tests/test_desk_freshness.py tests/test_desk_overview.py tests/test_desk_cli.py tests/test_handles.py tests/test_handle_integration.py tests/test_handle_lookup.py tests/test_claude_resolve_ambiguity.py tests/test_desk_notifications.py tests/test_conversation_view.py tests/test_deletion.py tests/test_deletion_provider_schemas.py tests/test_deletion_current.py tests/test_deletion_native.py -q -p no:cacheprovider
       - run: sessions --version
       - run: ses --version
       - run: sessions --list
@@ -48,3 +48,14 @@ jobs:
       - run: python -m pip install ruff==0.16.3
       - run: ruff check .
       - run: ruff format --check .
+
+  claude-mod:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-node@v6
+        with:
+          node-version: "22"
+      - run: npm install --global @anthropic-ai/claude-code@2.1.329
+      - run: claude plugin validate plugins/compact-messages
+      - run: claude plugin test plugins/compact-messages

@@ -72,7 +72,7 @@ when explicitly added with `--source`; team membership is not inferred.
 
 The viewer polls saved state once a second. The view runs the observer alongside it by default, checking selected sources every 60 seconds by default. Model calls happen only when new conversation text is found. Change the interval with `--interval 120` (5–3600 seconds). Failed observations back off, up to 15 minutes, rather than repeatedly consuming usage each minute. Closing the view stops its observer and its owned model process. It does not stop the supervisor or workers. The last saved briefing remains available.
 
-Ask follow-up questions and type answers in the project conversation. This version does not share selection or drafts between the two panes. To avoid ambiguity, refer to a question by its words. The project agent reads current files before discussing current status; no observation is pushed into its chat automatically.
+Ask follow-up questions and type answers in the project conversation. This version does not share selection or drafts between the two panes. To avoid ambiguity, refer to a question by its words. The project agent reads current files before discussing current status; ordinary review refreshes stay silent. A newly added human request queues one compact informational notice for each explicitly bound Desk conversation. Edits, resolutions and reopened existing keys do not notify. Offline notices wait until the Desk is reachable; resolved questions are skipped and uncertain submissions are not retried.
 
 ```powershell
 sessions desk list
@@ -109,7 +109,7 @@ Pending requests are preserved if omitted from model output. Explicit current ci
 
 Pending state is limited to 80 requests and 24,000 serialized characters so it stays within the next synthesis budget. An oversized model result is refused before publication, preserving the last usable briefing and source cursor. The failure is visible; it never silently drops an unresolved request.
 
-Errors preserve the last good synthesis and display its age/error. Observation time and synthesis time are separate. Source material is untrusted data, and a generated recommendation is never user consent. The observer itself never sends any messages.
+Errors preserve the last good synthesis and display its age/error. Observation time and synthesis time are separate. Source material is untrusted data, and a generated recommendation is never user consent. The model cannot send messages. The host sends only the new-request notices described above, to bound human-facing Desk conversations.
 
 ## Storage
 

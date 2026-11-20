@@ -121,6 +121,9 @@ class Store:
                 "CREATE TABLE IF NOT EXISTS desks "
                 "(name TEXT PRIMARY KEY COLLATE NOCASE, data TEXT NOT NULL)"
             )
+            from .notifications import create_tables
+
+            create_tables(db)
 
     @contextmanager
     def _connect(self):
@@ -265,7 +268,15 @@ class Store:
             raise ValueError("expected_revision must be a nonnegative integer")
         if not isinstance(review, str) or len(review) > 64000:
             raise ValueError("review must be text of at most 64000 characters")
+        # Remember even terminal keys omitted from the bounded display projection.
+        all_keys = (
+            [item.get("key") for item in decisions if isinstance(item, dict)]
+            if isinstance(decisions, list)
+            else []
+        )
         decisions = bounded_decisions(decisions)
+        if any(not isinstance(key, str) or not key.strip() or len(key) > 8000 for key in all_keys):
+            raise ValueError("invalid decision key")
         if not isinstance(observation, dict):
             raise ValueError("observation must be an object")
         # Copy caller-owned objects and reject non-JSON metadata before acquiring a write lock.
@@ -278,6 +289,9 @@ class Store:
             snapshot = self._get(db, name)
             if snapshot["revision"] != expected_revision:
                 raise ConflictError(f"desk {name} changed during observation")
+            from .notifications import record_publication
+
+            record_publication(db, snapshot, decisions, all_keys)
             now = time.time()
             if overview is not None:
                 snapshot["overview"] = overview

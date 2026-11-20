@@ -1,5 +1,14 @@
 # Changelog
 
+## 3.20.7 — 2026-11-20
+
+- Register the current process-verified session when whoami misses the catalog;
+  preserve cached sessions and refuse ambiguous Claude transcript copies.
+- Collapse peer messages in Claude Code with the optional local UI plugin while
+  preserving complete agent input; use session handles in the one-line previews.
+- Notify bound Desk conversations only when a new human request is added, with
+  durable deduplication and offline delivery; ordinary refreshes stay silent.
+
 ## 3.20.6 — 2026-11-20
 
 - Add a persistent Overview with project background, current position, direction

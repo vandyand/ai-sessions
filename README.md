@@ -689,4 +689,4 @@ forwarded without creating an empty conversation.
 
 ## Quiet project conversations
 
-[Project Desk](docs/PROJECT_DESK.md) pairs a human-facing native Claude/Codex conversation with a live terminal Review / Needs you / Next action view, while an observer watches explicitly selected operational sessions. Start with `sessions desk --help`.
+[Project Desk](docs/PROJECT_DESK.md) pairs a human-facing native Claude/Codex conversation with a live terminal Overview / Review / Needs you / Next action view, while an observer watches explicitly selected operational sessions. Start with `sessions desk --help`.

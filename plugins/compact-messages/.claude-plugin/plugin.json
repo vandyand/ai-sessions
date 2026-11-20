@@ -1,0 +1,11 @@
+{
+  "name": "sessions-compact-messages",
+  "version": "0.1.2",
+  "description": "Collapse peer messages without changing agent-visible content.",
+  "author": {
+    "name": "Venture VD"
+  },
+  "network": {
+    "hosts": []
+  }
+}

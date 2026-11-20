@@ -40,6 +40,7 @@ def sample(tmp_path, monkeypatch):
     state.handles.ensure(items)
     monkeypatch.setattr(lookup, "catalog", lambda: (items, state))
     monkeypatch.setattr(lookup, "managed_session", lambda: None)
+    monkeypatch.setattr(lookup, "_managed_native_session", lambda: None)
     for adapter in REGISTRY.adapters():
         if adapter.messaging and adapter.messaging.sender_environment:
             monkeypatch.delenv(adapter.messaging.sender_environment, raising=False)
@@ -140,6 +141,7 @@ def test_native_claude_ancestor_takes_precedence_over_remembered_cmd_launcher(mo
     native = SimpleNamespace(pid=42, name=lambda: "claude.exe", create_time=lambda: 11)
     monkeypatch.setattr("psutil.Process", lambda: SimpleNamespace(parents=lambda: [native]))
     assert lookup.managed_session() == ("claude", "actual")
+    assert lookup._managed_native_session() == ("claude", NativeRef("actual", "actual.jsonl"))
 
 
 def test_ancestor_inspection_failure_preserves_verified_managed_fallback(monkeypatch):
@@ -159,3 +161,153 @@ def test_ancestor_inspection_failure_preserves_verified_managed_fallback(monkeyp
     )
     monkeypatch.setattr("psutil.Process", Mock(side_effect=psutil.AccessDenied(42)))
     assert lookup.managed_session() == ("claude", "verified")
+
+
+def test_uncached_verified_session_is_registered_and_saved_for_assignment(
+    sample, monkeypatch, tmp_path, capsys
+):
+    from dataclasses import replace
+
+    from ai_sessions import app, handles_cli
+    from ai_sessions.model import NativeRef, NativeSession
+
+    items, state = sample
+    native = NativeSession(
+        "claude",
+        "new-current",
+        "top-lego-pwa-implementation-worker-2",
+        str(tmp_path),
+        30,
+        20,
+        "",
+        True,
+        str(tmp_path / "current.jsonl"),
+    )
+    ref = NativeRef(native.session_id, native.storage)
+    monkeypatch.setattr(lookup, "current_identity", lambda: ("claude", "new-current"))
+    monkeypatch.setattr(lookup, "_managed_native_session", lambda: ("claude", ref), raising=False)
+    original_get = REGISTRY.get
+
+    def rediscover(context, refs):
+        assert refs == [ref]
+        assert context.use_cache is False
+        return [native]
+
+    adapter = replace(original_get("claude"), rediscover=rediscover)
+    monkeypatch.setattr(
+        REGISTRY, "get", lambda name: adapter if name == "claude" else original_get(name)
+    )
+    path = tmp_path / "catalog.json"
+    save = app.save_session_catalog
+    load = app.load_session_catalog
+    monkeypatch.setattr(app, "save_session_catalog", lambda rows: save(rows, path))
+    monkeypatch.setattr(
+        app, "load_session_catalog", lambda state=None, path=path: load(state, path)
+    )
+    assert main(["whoami", "--json"]) == 0
+    row = json.loads(capsys.readouterr().out)
+    assert row["session_id"] == "new-current"
+    assert row["handle"] and row["project"] != "lego"
+    saved = app.load_session_catalog(state, path)
+    assert {s.session_id for s in saved} == {"current", "other", "new-current"}
+    assert next(s for s in saved if s.session_id == "new-current").handle == row["handle"]
+    from ai_sessions.references import resolve_session
+
+    assert resolve_session(row["handle"], saved, store=state.slugs).session_id == "new-current"
+    state.handles.add_project("lego", str(tmp_path / "lego"))
+    monkeypatch.setattr(
+        handles_cli, "catalog", lambda: (app.load_session_catalog(state, path), state)
+    )
+    assert (
+        main(
+            [
+                "handle",
+                "assign",
+                "new-current",
+                "--project",
+                "lego",
+                "--role",
+                "wrk",
+                "--number",
+                "2",
+            ]
+        )
+        == 0
+    )
+    assigned_handle = capsys.readouterr().out.strip()
+    assert assigned_handle == "lego-wrk-2"
+    reloaded = app.load_session_catalog(state, path)
+    assert resolve_session(assigned_handle, reloaded, store=state.slugs).session_id == "new-current"
+
+
+@pytest.mark.parametrize("mismatch", ["identity", "storage", "duplicate", "catalog-home"])
+def test_uncached_verified_lookup_refuses_foreign_or_ambiguous_rows(
+    sample, monkeypatch, tmp_path, capsys, mismatch
+):
+    from dataclasses import replace
+
+    from ai_sessions import app
+    from ai_sessions.model import NativeRef, NativeSession
+
+    _, state = sample
+    ref = NativeRef("new", str(tmp_path / "current.jsonl"))
+    native = NativeSession("claude", "new", "Title", str(tmp_path), 30, 20, "", True, ref.storage)
+    rows = {
+        "identity": [replace(native, session_id="foreign")],
+        "storage": [replace(native, storage=str(tmp_path / "copy.jsonl"))],
+        "duplicate": [native, replace(native, storage=str(tmp_path / "copy.jsonl"))],
+        "catalog-home": [native],
+    }[mismatch]
+    monkeypatch.setattr(lookup, "current_identity", lambda: ("claude", "new"))
+    monkeypatch.setattr(lookup, "_managed_native_session", lambda: ("claude", ref), raising=False)
+    original_get = REGISTRY.get
+    adapter = replace(original_get("claude"), rediscover=lambda context, refs: rows)
+    monkeypatch.setattr(
+        REGISTRY, "get", lambda name: adapter if name == "claude" else original_get(name)
+    )
+    monkeypatch.setattr(
+        app, "save_session_catalog", lambda rows: pytest.fail("must not save ambiguous lookup")
+    )
+    competing = app.session_from_native(replace(native, storage=str(tmp_path / "copy.jsonl")))
+    monkeypatch.setattr(
+        app, "load_session_catalog", lambda: [competing] if mismatch == "catalog-home" else []
+    )
+    assert main(["whoami"]) == 2
+    assert not capsys.readouterr().out
+
+
+def test_registration_does_not_report_success_when_catalog_write_is_lost(
+    sample, monkeypatch, tmp_path, capsys
+):
+    from dataclasses import replace
+
+    from ai_sessions import app
+    from ai_sessions.model import NativeRef, NativeSession
+
+    ref = NativeRef("new", str(tmp_path / "current.jsonl"))
+    native = NativeSession("claude", "new", "Title", str(tmp_path), 30, 20, "", True, ref.storage)
+    monkeypatch.setattr(lookup, "current_identity", lambda: ("claude", "new"))
+    monkeypatch.setattr(lookup, "_managed_native_session", lambda: ("claude", ref))
+    original_get = REGISTRY.get
+    adapter = replace(original_get("claude"), rediscover=lambda context, refs: [native])
+    monkeypatch.setattr(
+        REGISTRY, "get", lambda name: adapter if name == "claude" else original_get(name)
+    )
+    monkeypatch.setattr(app, "save_session_catalog", lambda rows: None)
+    monkeypatch.setattr(app, "load_session_catalog", lambda: [])
+    assert main(["whoami"]) == 2
+    result = capsys.readouterr()
+    assert not result.out and "persist" in result.err
+
+
+def test_current_thread_change_during_registration_refuses_old_native_reference(
+    sample, monkeypatch, capsys
+):
+    from ai_sessions.model import NativeRef
+
+    monkeypatch.setattr(lookup, "current_identity", lambda: ("claude", "new"))
+    monkeypatch.setattr(
+        lookup, "_managed_native_session", lambda: ("claude", NativeRef("old", "old.jsonl"))
+    )
+    assert main(["whoami"]) == 2
+    assert "not indexed yet" in capsys.readouterr().err
