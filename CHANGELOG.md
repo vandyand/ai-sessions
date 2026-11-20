@@ -1,5 +1,12 @@
 # Changelog
 
+## 3.20.3 — 2026-11-19
+
+- Accept session handles, IDs, and slugs when viewing an existing Project Desk,
+  alongside saved desk names. Reuse the same logical-session matching as launch.
+- Make briefing views live by default; use `--no-watch` to read saved briefings
+  without model calls. Existing `--watch` remains supported.
+
 ## 3.20.2 — 2026-11-19
 
 - Add `ses whoami` and equivalent `ses handle` to identify the current agent

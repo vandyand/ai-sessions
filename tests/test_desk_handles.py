@@ -274,3 +274,54 @@ class DeskHomeBoundaryTests(unittest.TestCase):
             self.assertTrue(cli.source_matches_target(source, target, {member}))
             source["storage"] = str(Path(root) / "unrelated" / "old.jsonl")
             self.assertFalse(cli.source_matches_target(source, target, {member}))
+
+
+class DeskLiveBridgeTests(unittest.TestCase):
+    def test_live_handle_follows_bridge_but_readonly_view_preserves_source(self):
+        from types import SimpleNamespace
+
+        from ai_sessions.desk.store import Store
+        from ai_sessions.handles import HandleStore
+        from ai_sessions.references import native_key
+
+        for same_name in (False, True):
+            for live in (False, True):
+                with (
+                    self.subTest(same_name=same_name, live=live),
+                    tempfile.TemporaryDirectory() as root,
+                ):
+                    old = Session("codex", "old", "Supervisor", ".", 0, 0, "", True, "old.jsonl")
+                    new = Session("claude", "new", "Supervisor", ".", 1, 1, "", True, "new.jsonl")
+                    handles = HandleStore(root + "/handles.sqlite3")
+                    handles.link(old, new)
+                    name = new.handle if same_name else "legacy"
+                    store = Store(root + "/desk")
+                    store.create(
+                        name,
+                        [
+                            {
+                                "tool": old.tool,
+                                "session_id": old.session_id,
+                                "storage": old.storage,
+                                "home": native_key(old.tool, old.session_id).home,
+                            }
+                        ],
+                        root,
+                    )
+                    with (
+                        patch("ai_sessions.handles.HandleStore", return_value=handles),
+                        patch(
+                            "ai_sessions.handles_cli.catalog",
+                            return_value=([new], SimpleNamespace(handles=handles)),
+                        ),
+                        patch("ai_sessions.references.resolve_session", return_value=new),
+                        patch("ai_sessions.desk.cli.Store", return_value=store),
+                        patch("ai_sessions.desk.cli.watch") as watch,
+                        patch("ai_sessions.desk.view.run"),
+                    ):
+                        self.assertEqual(
+                            cli.main(["view", new.handle, *([] if live else ["--no-watch"])]), 0
+                        )
+                    source = store.get(name)["sources"][0]
+                    self.assertEqual(source["session_id"], "new" if live else "old")
+                    self.assertEqual(watch.call_count, int(live))
