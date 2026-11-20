@@ -12,6 +12,7 @@ import json
 import time
 import uuid
 
+from ..harnesses.desk_support import TOOLS
 from ..messaging import cli as messaging
 from ..messaging import store as receipts
 
@@ -45,7 +46,7 @@ def create_tables(db):
 def _targets(snapshot):
     targets = []
     for tool, binding in snapshot.get("agents", {}).items():
-        if tool not in {"claude", "codex"} or not isinstance(binding, dict):
+        if tool not in TOOLS or not isinstance(binding, dict):
             continue
         if any(
             not isinstance(binding.get(k), str) or not binding[k].strip()

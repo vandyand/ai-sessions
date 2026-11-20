@@ -7,6 +7,7 @@ import json
 import os
 import shutil
 import sys
+from pathlib import Path
 
 from .capabilities import Unsupported
 from .registry import REGISTRY
@@ -19,7 +20,7 @@ def catalog():
     return load_session_catalog(state) or [], state
 
 
-def managed_session():
+def _managed_native_session():
     from .detached import running_here
 
     found = running_here()
@@ -37,8 +38,8 @@ def managed_session():
                 ):
                     ref = adapter.current_session(process.pid, process.create_time())
                     if ref is not None:
-                        return adapter.name, ref.session_id
-                    return adapter.name, ""
+                        return adapter.name, ref
+                    return adapter.name, None
     except psutil.Error:
         pass
     if found is not None:
@@ -47,11 +48,58 @@ def managed_session():
         if not isinstance(adapter.current_session, Unsupported):
             ref = adapter.current_session(int(entry["pid"]), float(entry["started"]))
             if ref is not None:
-                return adapter.name, ref.session_id
+                return adapter.name, ref
         # A remembered launch is harness evidence, not proof of the current
         # thread after an in-process session switch.
-        return adapter.name, ""
+        return adapter.name, None
     return None
+
+
+def managed_session():
+    found = _managed_native_session()
+    return (found[0], found[1].session_id if found[1] else "") if found else None
+
+
+def register_current(tool, ident, items, state):
+    """Reread one process-verified native file; never pick a copy by title or age."""
+    from .app import load_session_catalog, save_session_catalog, session_from_native
+    from .discovery import HarnessContext
+
+    found = _managed_native_session()
+    if not found or found[0] != tool or found[1] is None or found[1].session_id != ident:
+        return []
+    ref = found[1]
+    adapter = REGISTRY.get(tool)
+    if isinstance(adapter.rediscover, Unsupported):
+        return []
+    context = HarnessContext.create(use_cache=False)
+    rows = [
+        row
+        for row in adapter.rediscover(context, [ref])
+        if row.tool == tool and row.session_id == ident
+    ]
+    if len(rows) > 1:
+        raise ValueError("More than one native home matches this identity; registration refused.")
+    if not rows or Path(rows[0].storage).resolve() != Path(ref.storage).resolve():
+        return []
+    item = session_from_native(rows[0])
+    # Recheck the catalog before merging; never discard other cached harnesses.
+    latest = load_session_catalog()
+    merged = {(row.tool, row.session_id, row.storage): row for row in [*items, *latest]}
+    conflicts = [row for row in merged.values() if row.tool == tool and row.session_id == ident]
+    if any(Path(row.storage).resolve() != Path(ref.storage).resolve() for row in conflicts):
+        raise ValueError("More than one native home matches this identity; registration refused.")
+    state.apply([item], check_copies=False)
+    merged[(item.tool, item.session_id, item.storage)] = item
+    save_session_catalog(merged.values())
+    # The menu's cache writer is best-effort; whoami must not claim registration
+    # succeeded if the next assign/open command still cannot find this session.
+    persisted = [
+        row for row in load_session_catalog() if row.tool == tool and row.session_id == ident
+    ]
+    if len(persisted) != 1 or Path(persisted[0].storage).resolve() != Path(ref.storage).resolve():
+        raise RuntimeError("Could not persist this session's catalog registration; retry whoami.")
+    return [item]
 
 
 def current_identity():
@@ -91,8 +139,10 @@ def main(argv=None):
         items, state = catalog()
         matches = [item for item in items if item.tool == tool and item.session_id == ident]
         if not matches:
+            matches = register_current(tool, ident, items, state)
+        if not matches:
             raise ValueError(
-                "This session is not indexed yet; open the sessions menu and let it refresh."
+                "This session is not indexed yet and its transcript could not be verified; retry after its first message."
             )
         elif len(matches) == 1:
             item = matches[0]
