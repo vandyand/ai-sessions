@@ -14,6 +14,7 @@ from pathlib import Path
 
 from ..harnesses.desk_support import TOOLS
 from ..paths import APP_CONFIG_DIR, env_path
+from .time_format import eastern_time
 
 MAX_PENDING_COUNT = 80
 MAX_PENDING_CHARS = 24000
@@ -26,7 +27,7 @@ class ConflictError(RuntimeError):
 
 def _when(value):
     return (
-        datetime.fromtimestamp(value, timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
+        eastern_time(datetime.fromtimestamp(value, timezone.utc), seconds=True)
         if isinstance(value, (int, float))
         else "not observed"
     )

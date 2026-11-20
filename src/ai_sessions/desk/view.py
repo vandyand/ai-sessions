@@ -13,6 +13,8 @@ from dataclasses import dataclass, replace
 from datetime import datetime, timezone
 from typing import Protocol
 
+from .time_format import eastern_time
+
 
 class SnapshotStore(Protocol):
     def get(self, name: str) -> dict: ...
@@ -94,8 +96,8 @@ def _pending(snapshot: dict | None) -> list[dict]:
 
 def _human_text(value: object) -> str:
     return re.sub(
-        r"\[(claude|codex|opencode):[^\]\n]*\bbytes [^\]\n]*\]",
-        lambda match: f"[{match[1].capitalize()} source observation]",
+        r"[ \t]*\[(claude|codex|opencode):[^\]\n]*\bbytes [^\]\n]*\]",
+        "",
         str(value or ""),
         flags=re.I,
     )
@@ -227,11 +229,11 @@ def _observation_status(snapshot: dict | None, now: datetime | None) -> str:
             stamp = stamp.replace(tzinfo=timezone.utc)
         stamp = stamp.astimezone(timezone.utc)
         if now is None:
-            return f"Last observation: {stamp:%Y-%m-%d %H:%M} UTC (age unavailable)"
+            return f"Last observation: {eastern_time(stamp)} (age unavailable)"
         age = max(0, int((now - stamp).total_seconds()))
         elapsed = "less than 1 min" if age < 60 else f"{age // 60} min"
         freshness = "Stale" if age >= 300 or snapshot.get("error") else "Observed"
-        return f"{freshness} - last observation {stamp:%Y-%m-%d %H:%M} UTC ({elapsed} ago)"
+        return f"{freshness} - last observation {eastern_time(stamp)} ({elapsed} ago)"
     except (ValueError, TypeError, OverflowError, OSError):
         return "Last observation: time unavailable"
 
@@ -261,7 +263,9 @@ def render(
         status = "Stale - " + status
         notice = "Desk unavailable; showing last saved briefing. Retrying."
     if _partial(snapshot):
-        notice = "Partial coverage - see Review." + (" " + notice if notice else "")
+        notice = "Partial coverage - some earlier activity is not included." + (
+            " " + notice if notice else ""
+        )
     # Fixed rows reserve body space even when there is no error.
     headers = [title, tabs, status, notice]
     if height < 6:

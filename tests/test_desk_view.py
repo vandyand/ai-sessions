@@ -55,7 +55,7 @@ def test_review_status_and_no_internal_metadata():
     frame = view.render(snapshot(error="Observer timed out."), view.State(), 90, 30, now=NOW)
     text = "\n".join(frame.lines)
     assert "Plants are ready." in text
-    assert "11:50" in text and "10 min" in text and "Stale" in text
+    assert "6:50 AM EST" in text and "10 min" in text and "Stale" in text
     assert "Observer timed out." in text
     assert "secret-a" not in text and "fictional" not in text
 
@@ -220,16 +220,16 @@ def test_partial_coverage_warning_remains_visible_in_decision_tab():
     assert "Partial coverage" in text
 
 
-def test_observation_time_is_converted_to_labeled_utc():
+def test_observation_time_is_converted_to_eastern():
     data = snapshot(observed_at="2026-11-19T06:50:00-05:00")
     text = "\n".join(view.render(data, view.State(), 100, 25, now=NOW).lines)
-    assert "2026-11-19 11:50 UTC" in text
+    assert "2026-11-19 6:50 AM EST" in text
 
 
 def test_backend_numeric_timestamp_and_structured_partial_coverage():
     data = snapshot(observed_at=1795089000.0, observation={"partial": True}, review="Plants ready.")
     text = "\n".join(view.render(data, view.State(tab=2), 100, 25, now=NOW).lines)
-    assert "11:50 UTC" in text and "10 min" in text
+    assert "6:50 AM EST" in text and "10 min" in text
     assert "Partial coverage" in text
 
 
@@ -245,7 +245,7 @@ def test_backend_source_citations_are_descriptive_without_internal_ids():
         sources=[dict(tool="claude", session_id="private-session", storage="hidden")],
     )
     text = "\n".join(view.render(data, view.State(), 100, 25, now=NOW).lines)
-    assert "Plants ready." in text and "Claude source observation" in text
+    assert "Plants ready." in text and "source observation" not in text
     assert "private-session" not in text and "bytes 10" not in text
 
 
@@ -255,7 +255,7 @@ def test_render_with_explicit_time_is_pure(monkeypatch):
 
     monkeypatch.setattr(view, "_now", forbidden_clock)
     frame = view.render(snapshot(), view.State(), 100, 25, now=NOW)
-    assert "11:50" in "\n".join(frame.lines)
+    assert "6:50 AM EST" in "\n".join(frame.lines)
 
 
 @pytest.mark.parametrize(
@@ -287,7 +287,7 @@ def test_compact_frame_starts_briefing_without_duplicate_metadata():
     frame = view.render(data, view.State(), 88, 23, now=NOW)
     text = "\n".join(frame.lines)
     assert frame.lines[4] == "Plants are ready."
-    assert text.count("11:50") == 1
+    assert text.count("6:50 AM EST") == 1
     assert text.lower().count("partial") == 1
     assert "n/p Request" in frame.lines[-1]
 
@@ -301,3 +301,14 @@ def test_default_render_uses_current_utc(monkeypatch):
     monkeypatch.setattr(view, "_now", lambda: NOW)
     text = "\n".join(view.render(snapshot(), view.State(), 88, 23).lines)
     assert "10 min" in text and "age unavailable" not in text
+
+
+def test_eastern_timestamp_uses_daylight_saving_time():
+    data = snapshot(observed_at="2026-07-01T16:00:00Z")
+    text = "\n".join(
+        view.render(
+            data, view.State(), 120, 25, now=datetime(2026, 7, 1, 16, 1, tzinfo=timezone.utc)
+        ).lines
+    )
+    assert "12:00 PM EDT" in text
+    assert "UTC" not in text
