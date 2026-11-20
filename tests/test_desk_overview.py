@@ -10,7 +10,7 @@ from ai_sessions.harnesses.desk_observer import BRIEFING_SCHEMA
 
 def overview(citation="s0"):
     return {
-        key: f"Reported {key} [{citation}]"
+        key: f"Reported {key} [{'s0' if key == 'current' and citation == 's32' else citation}]"
         for key in ("background", "current", "direction", "goal")
     }
 
@@ -162,6 +162,96 @@ def test_existing_desk_gets_one_bounded_context_generation_without_tail_changes(
     assert len(prompts) == 1 and result["error"] is None
     assert result["overview"]["goal"]
     observer.refresh(store, "demo", runner=lambda p: pytest.fail("unchanged model call"))
+
+
+def test_bootstrap_replays_current_bounded_tail_when_fingerprint_unchanged(tmp_path, monkeypatch):
+    store, path = setup(tmp_path)
+    with path.open("a", encoding="utf-8") as stream:
+        stream.write(
+            (json.dumps({"type": "user", "message": {"content": "routine " * 100}}) + "\n") * 500
+        )
+        stream.write(
+            json.dumps(
+                {
+                    "type": "user",
+                    "message": {
+                        "content": "Latest: preview has shipped; contrast checks are next."
+                    },
+                }
+            )
+            + "\n"
+        )
+    observer.refresh(store, "demo", runner=lambda p: output())
+    with store._connect() as db:
+        before = store._get(db, "demo")
+        before["observation"].pop("overview_context_attempted", None)
+        store._write(db, before)
+    reads, prompts = [], []
+    original = observer.read_since
+
+    def read(tool, ref, checkpoint, *, end):
+        reads.append((checkpoint, end))
+        return original(tool, ref, checkpoint, end=end)
+
+    monkeypatch.setattr(observer, "read_since", read)
+    result = observer.refresh(
+        store, "demo", runner=lambda p: prompts.append(p) or output(overview("s32"))
+    )
+    assert result["error"] is None
+    evidence = json.loads(prompts[0].split("\n", 1)[1])["evidence"]
+    assert "preview has shipped" in next(e["text"] for e in evidence if e["citation"] == "s0")
+    assert any(start > 0 and end - start <= observer.MAX_SOURCE_BYTES for start, end in reads)
+    assert "claude:fiction bytes" in result["overview"]["current"]
+    observer.refresh(store, "demo", runner=lambda p: pytest.fail("second bootstrap"))
+
+
+def test_historical_only_bootstrap_never_rolls_back_existing_review(tmp_path, monkeypatch):
+    store, _ = setup(tmp_path)
+    store.publish("demo", 0, {}, "Latest review: preview shipped.", [])
+    source = store.get("demo")["sources"][0]
+    coverage = dict(
+        source,
+        id="s0",
+        status="available",
+        changed=False,
+        partial=False,
+        start=0,
+        checkpoint=0,
+        source_modified_at=1,
+        observed_at=1,
+    )
+    monkeypatch.setattr(observer, "_source", lambda *a: (coverage.copy(), ""))
+    value = overview("s32")
+    value["current"] = observer.MISSING_OVERVIEW_INFO
+    result = observer.refresh(store, "demo", runner=lambda p: output(value, "s32"))
+    assert result["error"] is None
+    assert result["review"] == "Latest review: preview shipped."
+    assert result["overview"]["current"] == observer.MISSING_OVERVIEW_INFO
+    observer.refresh(store, "demo", runner=lambda p: pytest.fail("second bootstrap"))
+
+
+@pytest.mark.parametrize("refs, accepted", [("[s0] [s32]", True), ("[s32]", False)])
+def test_current_overview_accepts_mixed_but_rejects_only_historical_citations(refs, accepted):
+    source = {
+        "tool": "claude",
+        "session_id": "fixture",
+        "status": "available",
+        "changed": True,
+        "start": 0,
+        "checkpoint": 100,
+        "source_modified_at": 1,
+        "observed_at": 1,
+    }
+    coverage = [dict(source, id="s0"), dict(source, id="s32", context_only=True)]
+    value = overview()
+    value["current"] = f"Current work with background context {refs}"
+    if accepted:
+        result = observer._validate(output(value), coverage)
+        assert "Current work with background context" in result["overview"]["current"]
+        assert "[s0]" not in result["overview"]["current"]
+    else:
+        with pytest.raises(ValueError, match="current tail evidence"):
+            observer._validate(output(value), coverage)
 
 
 def test_legacy_missing_overview_does_not_cause_repeated_context_calls(tmp_path):

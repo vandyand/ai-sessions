@@ -451,7 +451,7 @@ def render(
     extra = []
     available = width - (len(position) + 2 if position else 0)
     if position:
-        extra.append("↑↓ Scroll" if width >= 55 else "↑↓")
+        extra.append("↑↓ Scroll")
     if not state.help and _pending(snapshot):
         if state.tab in (1, 2):
             extra.append("n Questions")
