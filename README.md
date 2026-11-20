@@ -17,11 +17,10 @@ sessions, `ses open elev-mgr` to resume its first manager, or `ses desk elev-sup
 to open the quiet project conversation using the supervisor's current harness.
 `elev-mgr` and `elev-mgr-1` mean the same session. The menu includes a Handle column.
 
-Inside any agent session, run `! ses whoami` or `! ses handle` to print that
+Inside an agent session, run `! ses whoami` or `! ses handle` to print that
 session's handle and title. Add `--short` for just the handle, or `--json` for
-structured output. The command uses the native session identity or verified
-launcher/ancestor identity, rather than guessing from the project directory. If a new session is not indexed
-yet, open the sessions menu and let it refresh before retrying.
+structured output. Lookup uses native thread or verified harness ancestry.
+If a new session is not indexed yet, open the sessions menu and let it refresh.
 
 See [Project and session handles](docs/SESSION_HANDLES.md) for defaults, editing,
 project assignment, messaging, and cross-harness behavior. Native IDs and existing
@@ -108,7 +107,7 @@ does not wake an offline session.
 
 Windows Terminal does not expose a stable session-ID-to-tab interface. On Windows, open sessions are identified, but exact tab focusing is intentionally not attempted. Pressing Enter on an open session instead offers to stop the running copy and resume it in the current terminal, so two processes never write to one session.
 
-On Windows `sessions` stays running underneath the harness it launches. Claude Code now runs in a job tied to that launcher, so if `sessions` is killed the harness stops with it instead of lingering in the tab and fighting the shell for keystrokes; the conversation is already saved and resumes normally. A harness left in that state by an older version â€” "detached" â€” is stopped automatically when `sessions` next starts, unless it is in the middle of a turn, in which case it is left to finish. Each Windows Terminal tab also remembers the session `sessions` launched in it, so after an interruption run:
+On Windows `sessions` stays running underneath the harness it launches. Claude Code now runs in a job tied to that launcher, so if `sessions` is killed the harness stops with it instead of lingering in the tab and fighting the shell for keystrokes; the conversation is already saved and resumes normally. A harness left in that state by an older version — "detached" — is stopped automatically when `sessions` next starts, unless it is in the middle of a turn, in which case it is left to finish. Each Windows Terminal tab also remembers the session `sessions` launched in it, so after an interruption run:
 
 ```powershell
 sessions --reattach
@@ -245,7 +244,7 @@ Nothing is deleted by age. Sessions idle for 30 days are compressed instead, and
 - **The setting:** `[retention] compress_after_days` in `config.toml`. The default is 30; 0 turns it
   off.
 - **Finding them:** the default view includes compressed and uncompressed sessions. `z` cycles
-  both â†’ uncompressed â†’ compressed; `--compression` selects the same filters.
+  both → uncompressed → compressed; `--compression` selects the same filters.
 - **By hand:** `Z`, or `sessions --compress ID` and `sessions --decompress ID`.
 - **Opening one:** Enter asks, decompresses it, then opens it. It then has a fresh 30 days.
   Decompressing gives back the exact original bytes.
@@ -276,9 +275,9 @@ answers and decide what to do.
   another tab it says so and does nothing else; it never offers to stop that session. If the
   target is closed, `S` resumes it as Enter would.
 - **How they look:** there are three states.
-  - `â—‰ <title>`: this session has a supervisor.
+  - `◉ <title>`: this session has a supervisor.
   - No mark: this session has no supervisor.
-  - `â—Ž Supervisor: <title>`: this row is the supervisor. It sits directly under its main session
+  - `◎ Supervisor: <title>`: this row is the supervisor. It sits directly under its main session
     in every view that shows that session, in its own colour, with `Super` in the ORIGIN column.
 
   The details pane names the selected row as `MAIN SESSION` or `SUPERVISOR of '<title>'`, and `o`
@@ -320,7 +319,7 @@ Only three actions write to provider storage:
 - **Bridging** creates a *new* native target session. Claude and Codex receive new session files;
   OpenCode receives export JSON through its official `import` command. The source remains read-only.
 
-Everything else â€” hiding, sort order, per-session harness preference â€” stays in this
+Everything else — hiding, sort order, per-session harness preference — stays in this
 utility's own `state.json`.
 
 ## Cross-harness resume
@@ -329,7 +328,7 @@ The three harnesses store sessions differently and do not recognise one another'
 conversation cannot simply be handed across by reference. Press
 `x` (or pass `--launch-tool`) and `ai-sessions` bridges it instead: it reads the source
 transcript, converts the conversation into the target harness's own on-disk format, and
-writes it there as a new native session. That copy is an ordinary session â€” the target CLI
+writes it there as a new native session. That copy is an ordinary session — the target CLI
 resumes it, appends to it, and lists it like any other.
 
 ```bash
@@ -343,15 +342,15 @@ The user/assistant conversation crosses over as messages. Tool calls cross over
 *summarised*, folded into the turn that made them:
 
 ```text
-âŸ¦BashâŸ§ python -m unittest discover -s tests
-   â†’ Ran 75 tests in 0.066s
+⟦Bash⟧ python -m unittest discover -s tests
+   → Ran 75 tests in 0.066s
      OK
 ```
 
 They are deliberately not replayed as live tool calls: a `tool_use` block would name tools
 the target harness does not have, and would need a matching result to stay a valid
-conversation. Summarising keeps what was run and what it returned â€” usually the part worth
-having â€” without inventing structure the target cannot honour. Arguments and output are
+conversation. Summarising keeps what was run and what it returned — usually the part worth
+having — without inventing structure the target cannot honour. Arguments and output are
 clipped, Codex's fixed result preamble is stripped, and a Codex `exec` snippet is reduced
 to the shell command it actually ran. Reasoning and attachments are dropped entirely.
 
@@ -368,14 +367,14 @@ out of room it summarises everything so far and carries on from the summary, so 
 transcript on disk holds every superseded window *and* a summary of each.
 
 Replaying all of that is both wasteful and untrue to where the session actually stands, so
-a bridged copy starts at the most recent summary â€” exactly where the source session itself
+a bridged copy starts at the most recent summary — exactly where the source session itself
 picks up. On a real 7-compaction session here that is the difference between 949,000
 characters with 739 messages silently dropped to fit, and 147,000 characters with nothing
 dropped at all. Set `latest_window = false` to replay the whole transcript instead.
 
 The harnesses record this differently, and all three are usable. Claude Code writes a
-plain-text summary. Codex seals its summary as `encrypted_content` â€” unreadable to anyone
-but the provider, including Codex itself â€” but records the messages it carries forward
+plain-text summary. Codex seals its summary as `encrypted_content` — unreadable to anyone
+but the provider, including Codex itself — but records the messages it carries forward
 beside it, so the copy resumes from those. What crosses is the conversation the source
 kept, not a paraphrase of it; what cannot cross is the sealed summary of the assistant's
 own work in that window. Only a compaction with no carried context falls back to replaying
@@ -562,11 +561,11 @@ through `AI_SESSIONS_CONFIG_FILE`, `AI_SESSIONS_STATE_FILE`, `AI_SESSIONS_CACHE_
 
 A tmux session outlives its terminal. When a window manager restart or a crash takes the
 terminal window but leaves the tmux server, the pane shells, and the harness process running,
-the session is still there â€” `sessions` just had no way back to it.
+the session is still there — `sessions` just had no way back to it.
 
 Pressing Enter on such a session now opens a terminal attached to it, on the exact window and
 pane. This happens only when tmux reports **no client** on the session. A session that already
-has a client but whose window cannot be raised â€” different display, Wayland, remote â€” is not
+has a client but whose window cannot be raised — different display, Wayland, remote — is not
 given a second one, because two clients share a session and tmux sizes both to the smaller
 window; the message explains that instead.
 
@@ -596,7 +595,7 @@ python -m unittest discover -s tests -v
 python -m build
 ```
 
-CI exercises Python 3.11â€“3.13 on Ubuntu and Windows.
+CI exercises Python 3.11–3.13 on Ubuntu and Windows.
 
 ## Messages between running sessions
 

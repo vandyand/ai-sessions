@@ -47,7 +47,7 @@ ses handle assign NATIVE_ID --project elev --role wrk --number 11
 ses handle set NATIVE_ID my-review
 ```
 
-Choose project handles with 1â€“5 ASCII letters or digits. Session handles allow
+Choose project handles with 1–5 ASCII letters or digits. Session handles allow
 ASCII letters and digits separated by single hyphens. They are case-insensitive.
 Session handles cannot reuse a native ID or slug, even for the same copy, because a bridge would make those two addresses mean different things. Existing assignments remain stable when a title or directory changes. Use
 `project set`, `handle assign`, or `handle set` to change them explicitly.
