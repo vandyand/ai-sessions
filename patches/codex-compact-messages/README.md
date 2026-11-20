@@ -38,8 +38,9 @@ preview collapses whitespace and uses native Unicode-aware clipping.
 
 Verification: fast Windows candidate run 44706087638 built Codex 0.170.0 and
 passed the targeted compact_peer Rust tests. The parent native-console fixture
-confirmed one-row collapse and F4/Enter expansion; scroll-tail and collapse
-checks remain separate runtime verification. Collapsed peer cells occupy exactly one row, including consecutive peer cells and narrower retained reflow. Click the preview row or use native activity keyboard expansion; expanded content has the ordinary native collapse control. Raw mode does not collapse. This patch targets only the exact
+passed all four actual-console assertions: initially collapsed, F4/Enter expansion,
+tail visible after scrolling, and Enter collapse again. The parent installed the
+verified custom interactive executable; stock RPC remains separate. Collapsed peer cells occupy exactly one row, including consecutive peer cells and narrower retained reflow. Click the preview row or use native activity keyboard expansion; expanded content has the ordinary native collapse control. Raw mode does not collapse. This patch targets only the exact
 pinned source/envelope; future upstream or envelope changes require review.
 
 Local checks: git diff --check passed in upstream scratch checkout; reverse application, clean forward git apply --check, and forward application all passed. No Rust tests or release build were run locally.
