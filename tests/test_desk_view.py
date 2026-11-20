@@ -55,8 +55,8 @@ def test_review_status_and_no_internal_metadata():
     frame = view.render(snapshot(error="Observer timed out."), view.State(), 90, 30, now=NOW)
     text = "\n".join(frame.lines)
     assert "Plants are ready." in text
-    assert "6:50 AM EST" in text and "10 min" in text and "Stale" in text
-    assert "Observer timed out." in text
+    assert "Update failed" in frame.lines[0] and "10m" in frame.lines[0]
+    assert "Update failed" in text and "? Details" in text
     assert "secret-a" not in text and "fictional" not in text
 
 
@@ -83,9 +83,7 @@ def test_refresh_preserves_key_and_clamps_scroll():
     data["decisions"] = []
     updated = view.normalize(updated, data, 80, 25)
     assert updated.selected_key is None
-    assert "No pending requests recorded" in "\n".join(
-        view.render(data, updated, 80, 25, now=NOW).lines
-    )
+    assert "No open questions" in "\n".join(view.render(data, updated, 80, 25, now=NOW).lines)
 
 
 @pytest.mark.parametrize("width", [1, 2, 10, 25, 80])
@@ -108,10 +106,10 @@ def test_scrolling_and_pages_reach_content_without_overflow():
 
 
 def test_unavailable_unobserved_and_partial_coverage():
-    assert "unavailable" in "\n".join(view.render(None, view.State(), 80, 25).lines).lower()
+    assert "Preparing" in view.render(None, view.State(), 80, 25).lines[0]
     data = snapshot(observed_at=None, review="Partial coverage: one source was truncated.")
     text = "\n".join(view.render(data, view.State(), 80, 25, now=NOW).lines)
-    assert "not observed" in text.lower() and "Partial coverage" in text
+    assert "Preparing" in text and "last observation" not in text.lower()
 
 
 def test_fake_store_loop_is_read_only_rate_limited_and_quiet(monkeypatch):
@@ -173,7 +171,7 @@ def test_store_error_keeps_last_good_content(monkeypatch):
     kept, error = view.read_snapshot(Broken(), "Garden", data)
     assert kept == data
     text = "\n".join(view.render(kept, view.State(), 80, 25, now=NOW, read_error=error).lines)
-    assert "Plants are ready." in text and "unavailable" in text.lower()
+    assert "Plants are ready." in text and "Reconnecting" in text
 
 
 def test_long_error_remains_scrollable_to_end():
@@ -185,7 +183,7 @@ def test_long_error_remains_scrollable_to_end():
 
 def test_long_error_can_be_read_in_needs_you():
     data = snapshot(error="Start " + "failure " * 100 + "END OF ERROR")
-    state = view.State(tab=2)
+    state = view.State(tab=2, help=True)
     found = ""
     for _ in range(200):
         found += "\n".join(view.render(data, state, 20, 12, now=NOW).lines) + "\n"
@@ -198,7 +196,7 @@ def test_read_failure_marks_recent_snapshot_stale():
     text = "\n".join(
         view.render(data, view.State(), 100, 25, now=NOW, read_error="Desk unavailable").lines
     )
-    assert "Stale" in text
+    assert "Reconnecting" in text
 
 
 def test_idle_loop_does_not_rebuild_frames(monkeypatch):
@@ -214,29 +212,29 @@ def test_idle_loop_does_not_rebuild_frames(monkeypatch):
     assert len(calls) == 1
 
 
-def test_partial_coverage_warning_remains_visible_in_decision_tab():
+def test_partial_history_detail_is_available_in_help():
     data = snapshot(review="Partial coverage: one source was truncated.")
-    text = "\n".join(view.render(data, view.State(tab=2), 80, 25, now=NOW).lines)
-    assert "Partial coverage" in text
+    text = "\n".join(view.render(data, view.State(tab=2, help=True), 80, 60, now=NOW).lines)
+    assert "Recent history only" in text
 
 
 def test_observation_time_is_converted_to_eastern():
     data = snapshot(observed_at="2026-11-19T06:50:00-05:00")
-    text = "\n".join(view.render(data, view.State(), 100, 25, now=NOW).lines)
+    text = "\n".join(view.render(data, view.State(help=True), 100, 60, now=NOW).lines)
     assert "2026-11-19 6:50 AM EST" in text
 
 
 def test_backend_numeric_timestamp_and_structured_partial_coverage():
     data = snapshot(observed_at=1795089000.0, observation={"partial": True}, review="Plants ready.")
-    text = "\n".join(view.render(data, view.State(tab=2), 100, 25, now=NOW).lines)
-    assert "6:50 AM EST" in text and "10 min" in text
-    assert "Partial coverage" in text
+    text = "\n".join(view.render(data, view.State(tab=2, help=True), 100, 70, now=NOW).lines)
+    assert "10m" in text and "Last observation" not in text
+    assert "Recent history only" in text
 
 
 def test_observer_partial_source_coverage_wording():
     data = snapshot(review="Partial source coverage. Plants ready.")
-    text = "\n".join(view.render(data, view.State(tab=3), 100, 25, now=NOW).lines)
-    assert "Partial coverage" in text
+    text = "\n".join(view.render(data, view.State(tab=3, help=True), 100, 70, now=NOW).lines)
+    assert "Recent history only" in text
 
 
 def test_backend_source_citations_are_descriptive_without_internal_ids():
@@ -255,29 +253,29 @@ def test_render_with_explicit_time_is_pure(monkeypatch):
 
     monkeypatch.setattr(view, "_now", forbidden_clock)
     frame = view.render(snapshot(), view.State(), 100, 25, now=NOW)
-    assert "6:50 AM EST" in "\n".join(frame.lines)
+    assert "Saved" in frame.lines[0] and "10m" in frame.lines[0]
 
 
 @pytest.mark.parametrize(
     "changes, qualification",
     [
-        ({"observed_at": None}, "first observation"),
+        ({"observed_at": None}, "first briefing"),
         ({"error": "Timeout"}, "failed"),
-        ({"observation": {"partial": True}}, "partial"),
-        ({}, "observation status"),
+        ({"observation": {"partial": True}}, "earlier conversation"),
+        ({}, "desk conversation"),
     ],
 )
 def test_empty_pending_state_does_not_claim_nothing_needs_attention(changes, qualification):
     data = snapshot(decisions=[], **changes)
     text = "\n".join(view.render(data, view.State(tab=2), 100, 25, now=NOW).lines)
-    assert "No pending requests recorded" in text
+    assert "No open questions" in text
     assert qualification in text.lower()
     assert "No decisions need your attention" not in text
 
 
 def test_next_action_makes_context_tab_obvious():
     text = "\n".join(view.render(snapshot(), view.State(tab=3), 100, 25, now=NOW).lines)
-    assert "Press 2 for context" in text
+    assert "2 Needs you: read the context" in text
 
 
 def test_compact_frame_starts_briefing_without_duplicate_metadata():
@@ -286,28 +284,34 @@ def test_compact_frame_starts_briefing_without_duplicate_metadata():
     )
     frame = view.render(data, view.State(), 88, 23, now=NOW)
     text = "\n".join(frame.lines)
-    assert frame.lines[4] == "Plants are ready."
-    assert text.count("6:50 AM EST") == 1
-    assert text.lower().count("partial") == 1
-    assert "n/p Request" in frame.lines[-1]
+    assert frame.lines[3] == "Plants are ready."
+    assert "6:50 AM EST" not in text and "10m" in frame.lines[0]
+    assert "partial" not in text.lower()
+    assert "? Help" in frame.lines[-1] and "q Exit" in frame.lines[-1]
 
 
 def test_observation_error_detail_appears_once():
-    frame = view.render(snapshot(error="Observer timed out."), view.State(), 88, 23, now=NOW)
+    frame = view.render(
+        snapshot(error="Observer timed out."), view.State(help=True), 88, 70, now=NOW
+    )
     assert "\n".join(frame.lines).count("Observer timed out.") == 1
 
 
 def test_default_render_uses_current_utc(monkeypatch):
     monkeypatch.setattr(view, "_now", lambda: NOW)
     text = "\n".join(view.render(snapshot(), view.State(), 88, 23).lines)
-    assert "10 min" in text and "age unavailable" not in text
+    assert "10m" in text and "age unavailable" not in text
 
 
 def test_eastern_timestamp_uses_daylight_saving_time():
     data = snapshot(observed_at="2026-07-01T16:00:00Z")
     text = "\n".join(
         view.render(
-            data, view.State(), 120, 25, now=datetime(2026, 7, 1, 16, 1, tzinfo=timezone.utc)
+            data,
+            view.State(help=True),
+            120,
+            60,
+            now=datetime(2026, 7, 1, 16, 1, tzinfo=timezone.utc),
         ).lines
     )
     assert "12:00 PM EDT" in text
