@@ -1,5 +1,14 @@
 # Changelog
 
+## 3.20.9 — 2026-11-20
+
+- Find newly named messaging receivers through one fresh native discovery when
+  no receiver reference matches; retain exact native-home and ambiguity guards.
+- Explain when a known conversation lacks a registered messaging receiver and
+  direct registration to that session instead of treating it as missing.
+- Keep Claude peer-message expansion inline and bring the message's beginning
+  into view; preserve full-body scrolling and one-row contraction (plugin 0.1.4).
+
 ## 3.20.8 — 2026-11-20
 
 - Select a separately verified compact-message Codex renderer for interactive
