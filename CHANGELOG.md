@@ -1,5 +1,16 @@
 # Changelog
 
+## 3.20.10 — 2026-11-21
+
+- Start either the Desk conversation or live briefing first; both initialize the
+  same Desk and ensure a single background observer is running.
+- Keep briefing updates running when the view closes, with explicit per-Desk
+  status and stop commands; unchanged sources still make no model call.
+- Serialize terminal-history changes and retain exact-terminal recovery records
+  so concurrent launchers cannot erase normal-exit reopen history.
+- Keep reopen pinned to the recorded native home and session; explain missing
+  history and offer a choice instead of silently opening another terminal's session.
+
 ## 3.20.9 — 2026-11-20
 
 - Find newly named messaging receivers through one fresh native discovery when
