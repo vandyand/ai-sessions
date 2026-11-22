@@ -4,8 +4,16 @@ import tempfile
 import unittest
 from unittest.mock import patch
 
+import pytest
+
 from ai_sessions.desk import cli
 from ai_sessions.model import Session
+
+
+@pytest.fixture(autouse=True)
+def offline_observer():
+    with patch("ai_sessions.desk.cli.ensure_observer"):
+        yield
 
 
 class DeskHandleTests(unittest.TestCase):
@@ -316,7 +324,7 @@ class DeskLiveBridgeTests(unittest.TestCase):
                         ),
                         patch("ai_sessions.references.resolve_session", return_value=new),
                         patch("ai_sessions.desk.cli.Store", return_value=store),
-                        patch("ai_sessions.desk.cli.watch") as watch,
+                        patch("ai_sessions.desk.cli.ensure_observer") as watch,
                         patch("ai_sessions.desk.view.run"),
                     ):
                         self.assertEqual(

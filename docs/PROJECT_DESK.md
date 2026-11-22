@@ -1,6 +1,6 @@
 # Project Desk
 
-Updated November 20, 2026.
+Updated November 21, 2026.
 
 Project Desk gives a busy project's human a quiet native Claude Code or Codex conversation, alongside a live terminal briefing. The operational supervisor continues coordinating workers and managers. The human-facing project agent discusses ideas, explains questions and conveys settled direction when asked; it does not receive a stream of team chat notifications.
 
@@ -18,12 +18,14 @@ In the adjacent pane:
 ses desk view elev-sup
 ```
 
-The first command creates or resumes the quiet conversation using the target's
-harness. The second resolves its saved desk and updates the briefing with Haiku
-while open. Add `--no-watch` to read saved briefings without model calls. Existing
-saved names such as `elevate` also work; no rename or migration is required.
-`show`, `refresh`, `watch`, and `open` also accept the session handle, native ID,
-or slug. If no desk exists yet, start it with `ses desk HANDLE` first.
+Either command can be first: each initializes the Desk and starts or attaches to
+one background observer. The conversation uses the target's harness; the briefing
+uses Haiku independently. The first briefing prepares in parallel, so opening the
+conversation does not wait for a model response. Closing either pane leaves the
+observer running. Add `--no-watch` to read an existing saved briefing without
+starting observation. Existing saved names such as `elevate` also work.
+`show`, `refresh`, `watch`, `open`, `status`, and `stop` also accept the session
+handle, native ID, or slug.
 
 ## Start
 
@@ -70,7 +72,36 @@ limitations are available in help rather than a permanent metadata row.
 Only the supervisor is watched by default. Managers and workers contribute only
 when explicitly added with `--source`; team membership is not inferred.
 
-The viewer polls saved state once a second. The view runs the observer alongside it by default, checking selected sources every 60 seconds by default. Model calls happen only when new conversation text is found. Change the interval with `--interval 120` (5–3600 seconds). Failed observations back off, up to 15 minutes, rather than repeatedly consuming usage each minute. Closing the view stops its observer and its owned model process. It does not stop the supervisor or workers. The last saved briefing remains available.
+The viewer polls saved state once a second and shows the detached observer's busy
+state as `Updating briefing` (or `Preparing` before the first briefing). The
+observer checks selected sources every 60 seconds by default. Model calls happen
+only when conversation evidence needs a new synthesis; unchanged sources do not
+cause unconditional model reruns. `--interval 120` (5–3600 seconds) selects the
+interval when starting a worker; attaching preserves its existing interval.
+Failed observations retain retry/backoff, up to 15 minutes. Closing the view does
+not stop the observer, supervisor, or workers. The saved briefing stays available.
+
+Manage only this Desk's observer with:
+
+```powershell
+ses desk status elev-sup
+ses desk stop elev-sup
+```
+
+`status` reports running/stopped state, busy state, exact Desk root/name, PID and
+process start identity when running. `stop` cooperatively cancels that observer
+and its owned model process; it never stops the operational sessions. Reopening a
+live view or conversation starts it again. No scheduled task, reboot autostart,
+or global watcher is installed. Each worker belongs to this Desk until explicitly
+stopped or its process exits. After reboot, open either pane to start it again.
+Cross-process OS locks prevent duplicate workers even with simultaneous opens;
+process exit releases ownership. Stale PID metadata alone cannot claim ownership.
+The worker and model child start without a console window on Windows. Session
+sender/parent identity is removed from the worker environment; configured provider
+homes and login remain unchanged. Diagnostics are bounded lifecycle messages in
+`DESK_ROOT/.observers/<desk-key>/observer.log`, alongside `status.json` and scoped
+`stop.json`. They contain no prompts, transcripts, model output, or credentials.
+The exact directory is included by `ses desk status`.
 
 Ask follow-up questions and type answers in the project conversation. This version does not share selection or drafts between the two panes. To avoid ambiguity, refer to a question by its words. The project agent reads current files before discussing current status; ordinary review refreshes stay silent. A newly added human request queues one compact informational notice for each explicitly bound Desk conversation. Edits, resolutions and reopened existing keys do not notify. Offline notices wait until the Desk is reachable; resolved questions are skipped and uncertain submissions are not retried.
 
@@ -82,7 +113,7 @@ sessions desk watch my-project --interval 120
 sessions desk open my-project --tool claude --dry-run
 ```
 
-`view --no-watch` reads saved briefings and makes no model calls. Legacy `--watch` remains accepted. `refresh` performs one observation. `watch` runs until interrupted. Do not run multiple watchers deliberately: stale concurrent results are discarded, but overlapping model calls still consume usage.
+`view --no-watch` and `open --dry-run` never start a worker or call a model. A previously running worker continues independently. Legacy `--watch` remains accepted. `watch` now ensures the same background worker and returns. `refresh` explicitly performs one observation; avoid invoking it concurrently with background work because it may duplicate a model call.
 
 ## Briefing format and recovery
 
@@ -96,8 +127,9 @@ Review leads with progress, outcomes, and the next human action. Source citation
 details remain in saved records rather than terminal prose. Partial-history details
 are available in help. Desk display and Markdown timestamps use US Eastern Time (EST/EDT).
 
-After upgrading, press `q` in an already-open briefing and rerun `ses desk view HANDLE`
-to load the updated observer. The operational agent need not restart.
+After upgrading, run `ses desk stop HANDLE`, close an old view with `q`, then reopen
+`ses desk view HANDLE` to load the updated worker and viewer. The operational agent
+need not restart.
 
 ## Observation and costs
 

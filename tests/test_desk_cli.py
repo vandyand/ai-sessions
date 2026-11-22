@@ -127,23 +127,16 @@ class DeskIntegrationTests(unittest.TestCase):
 
 
 class DeskLifetimeTests(unittest.TestCase):
-    def test_view_exit_stops_observer_thread(self):
-        import threading
-
-        stopped = threading.Event()
-
-        def watcher(store, name, interval, stop, activity=None):
-            stop.wait(2)
-            if stop.is_set():
-                stopped.set()
-
+    def test_view_exit_leaves_detached_observer_running(self):
         with (
             patch("ai_sessions.desk.cli.Store"),
-            patch("ai_sessions.desk.cli.watch", side_effect=watcher),
-            patch("ai_sessions.desk.view.run", return_value=None),
+            patch("ai_sessions.desk.cli.ensure_observer") as ensure,
+            patch("ai_sessions.desk.cli.stop_observer") as stop,
+            patch("ai_sessions.desk.view.run"),
         ):
             self.assertEqual(cli.main(["view", "demo", "--watch"]), 0)
-        self.assertTrue(stopped.is_set())
+        ensure.assert_called_once()
+        stop.assert_not_called()
 
 
 class DeskContextTests(unittest.TestCase):
@@ -224,7 +217,7 @@ class DeskLiveHandleTests(unittest.TestCase):
         for flags, expected in (([], 1), (["--watch"], 1), (["--no-watch"], 0)):
             with (
                 patch("ai_sessions.desk.cli.Store"),
-                patch("ai_sessions.desk.cli.watch") as observer,
+                patch("ai_sessions.desk.cli.ensure_observer") as observer,
                 patch("ai_sessions.desk.view.run"),
             ):
                 self.assertEqual(cli.main(["view", "demo", *flags]), 0)
@@ -278,7 +271,7 @@ class DeskLiveHandleTests(unittest.TestCase):
                 patch("ai_sessions.desk.cli.Store", return_value=store),
                 patch("ai_sessions.handles_cli.catalog", return_value=([item], object())),
                 patch("ai_sessions.references.resolve_session", return_value=item),
-                patch("ai_sessions.desk.cli.watch") as observer,
+                patch("ai_sessions.desk.cli.ensure_observer") as observer,
                 contextlib.redirect_stderr(io.StringIO()) as error,
             ):
                 self.assertEqual(cli.main(["view", "elev-sup"]), 2)
@@ -291,7 +284,7 @@ def test_saved_desk_name_remains_readable_after_handle_retirement():
         patch("ai_sessions.desk.cli.Store") as factory,
         patch("ai_sessions.handles.HandleStore") as handles,
         patch("ai_sessions.desk.view.run") as view,
-        patch("ai_sessions.desk.cli.watch") as watcher,
+        patch("ai_sessions.desk.cli.ensure_observer") as watcher,
     ):
         factory.return_value.get.return_value = {"name": "old-handle"}
         handles.return_value.current_key.side_effect = ValueError("handle retired; use new-handle")

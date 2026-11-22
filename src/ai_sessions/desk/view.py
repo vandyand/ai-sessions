@@ -135,6 +135,8 @@ def _detail(snapshot: dict | None, state: State, width: int) -> list[str]:
             "Source unavailable: a watched session file cannot be read.\n"
             "Update failed: showing the saved briefing while retrying.\n"
             "Reconnecting: the saved briefing cannot be reloaded right now.\n\n"
+            "Observer stopped: reopen a live view or Desk conversation to restart it. "
+            "Use ses desk status HANDLE or ses desk stop HANDLE to manage observation.\n\n"
             "Discuss questions and give answers in your Desk conversation."
             + "\n\nWatched sessions\n"
             + (
@@ -429,7 +431,8 @@ def render(
     state = normalize(state, snapshot, width, height)
     status = _observation_status(snapshot, now if now is not None else _now())
     if read_error:
-        status = "Reconnecting" + (" · " + _age(snapshot, now or _now()) if snapshot else "")
+        label = "Observer stopped" if read_error.startswith("Observer stopped;") else "Reconnecting"
+        status = label + (" · " + _age(snapshot, now or _now()) if snapshot else "")
     elif updating and (snapshot or {}).get("_freshness") == "changed":
         status = "Updating briefing" + (" · " + _age(snapshot, now or _now()) if snapshot else "")
     title = str((snapshot or {}).get("name") or "Briefing")
@@ -520,6 +523,8 @@ def run(store: SnapshotStore, name: str, *, activity: dict | None = None) -> Non
             tick = time.monotonic()
             if tick >= next_poll:
                 snapshot, read_error = read_snapshot(store, name, snapshot)
+                if activity and activity.get("error"):
+                    read_error = read_error or activity.get("error")
                 next_poll = tick + 1.0
             height, width = screen.getmaxyx()
             # Leave the final column free to avoid lower-right curses errors.
