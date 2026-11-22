@@ -74,7 +74,9 @@ def read_since(tool, ref, checkpoint, *, end):
     return ReadSnapshot(transcript, end)
 
 
-def run_model(prompt, stop=None, *, max_output_bytes, timeout, system, citation_ids=None):
+def run_model(
+    prompt, stop=None, *, max_output_bytes, timeout, system, citation_ids=None, output_schema=None
+):
     """Existing CLI login only; bounded memory, execution time, and pipe writes.
 
     Safe mode disables custom instructions/plugins/hooks, while preserving normal
@@ -90,8 +92,10 @@ def run_model(prompt, stop=None, *, max_output_bytes, timeout, system, citation_
         executable = native_executable()
     if not executable:
         raise RuntimeError("Claude CLI unavailable; install/sign in separately")
-    schema = json.loads(json.dumps(BRIEFING_SCHEMA))
-    if citation_ids:
+    schema = json.loads(json.dumps(output_schema if output_schema is not None else BRIEFING_SCHEMA))
+    if output_schema is not None:
+        pass  # A separately validated details schema cannot edit the legacy decision core.
+    elif citation_ids:
         schema["properties"]["decisions"]["items"]["properties"]["evidence"]["items"]["enum"] = (
             citation_ids
         )

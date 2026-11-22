@@ -1,0 +1,408 @@
+import copy
+import hashlib
+import json
+
+import pytest
+
+from ai_sessions.desk import decisions
+from ai_sessions.desk.store import ConflictError, Store
+
+
+def core(question="Should we run the October 16 test?"):
+    return dict(
+        key="oct16",
+        question=question,
+        context="Trading project",
+        recommendation="",
+        status="pending",
+        evidence=["original request"],
+    )
+
+
+def context():
+    text = "User asks whether to run the October 16 test. Its purpose is not described."
+    return dict(
+        fingerprint="context-1",
+        limitations=[],
+        evidence=[
+            dict(
+                id="d0",
+                title="Trading request",
+                tool="codex",
+                session_id="native",
+                home="home",
+                storage="/pinned/source.jsonl",
+                identity=[1, 2],
+                start=0,
+                end=100,
+                digest=hashlib.sha256(text.encode()).hexdigest(),
+                text=text,
+                context_only=True,
+            )
+        ],
+    )
+
+
+def details():
+    return dict(
+        schema_version=1,
+        kind="choice",
+        readiness="needs_context",
+        summary="Should we run the October 16 test?",
+        background=decisions.MISSING_INFO,
+        why_now=decisions.MISSING_INFO,
+        options=[],
+        recommendation=dict(option_id=None, reason="The test's purpose is missing."),
+        if_deferred=None,
+        deadline=None,
+        missing_information=["What the October 16 test measures and requires."],
+        citations=dict(
+            summary=["d0"],
+            background=[],
+            why_now=[],
+            recommendation=[],
+            if_deferred=[],
+            deadline=[],
+        ),
+    )
+
+
+@pytest.fixture
+def desk(tmp_path):
+    store = Store(tmp_path / "desk")
+    store.create(
+        "demo",
+        [dict(tool="codex", session_id="native", storage="/pinned/source.jsonl", home="home")],
+        "project",
+    )
+    store.publish("demo", 0, dict(sources=[]), "Current review", [core()])
+    return store
+
+
+def enrich(store, *, supplied=None, runner=None):
+    return decisions.enrich_pending(
+        store,
+        "demo",
+        context_runner=lambda *a: supplied or context(),
+        runner=runner or (lambda p: json.dumps(details())),
+    )
+
+
+def test_details_sidecar_survives_old_publish_and_does_not_enter_cores(desk):
+    before = desk.get("demo")
+    enriched = enrich(desk)
+    assert enriched["decisions"] == before["decisions"]
+    assert enriched["review"] == before["review"]
+    assert enriched["observation"] == before["observation"]
+    assert enriched["decision_details"]["oct16"]["evidence"] == context()["evidence"]
+    assert enriched["revision"] == before["revision"] + 1
+    # Simulate the old worker's publication with no details keyword at all.
+    result = desk.publish(
+        "demo", enriched["revision"], before["observation"], "Updated review", [core()]
+    )
+    assert result["decision_details"] == enriched["decision_details"]
+    assert set(result["decisions"][0]) == set(core())
+    assert Store(desk.root).get("demo")["decision_details"] == enriched["decision_details"]
+
+
+def test_old_worker_material_ask_change_hides_stale_details(desk):
+    enrich(desk)
+    with desk._connect() as db:
+        saved = json.loads(db.execute("SELECT data FROM desks WHERE name='demo'").fetchone()[0])
+        saved["decisions"] = [core("Should we delete the trading results?")]
+        db.execute("UPDATE desks SET data=? WHERE name='demo'", (json.dumps(saved),))
+    assert desk.get("demo")["decision_details"] == {}
+
+
+def test_unchanged_migration_and_reload_call_model_only_once(desk):
+    calls = []
+
+    def runner(p):
+        calls.append(p)
+        return json.dumps(details())
+
+    enrich(desk, runner=runner)
+    enrich(Store(desk.root), runner=runner)
+    assert len(calls) == 1
+    assert "previous_decisions" not in calls[0]
+    changed = context()
+    changed["fingerprint"] = "context-2"
+    enrich(desk, supplied=changed, runner=runner)
+    assert len(calls) == 2
+
+
+def test_invalid_enrichment_is_cached_without_failing_good_briefing(desk):
+    calls = []
+
+    def runner(p):
+        calls.append(p)
+        return "invalid output"
+
+    before = desk.get("demo")
+    assert enrich(desk, runner=runner) == before
+    assert enrich(desk, runner=runner) == before
+    assert len(calls) == 1
+    assert desk.get("demo")["error"] is None
+
+
+def test_enrichment_claim_prevents_concurrent_or_crashed_duplicate(desk):
+    fingerprint = decisions.core_fingerprint(core())
+    assert desk.claim_decision_enrichment("demo", "oct16", fingerprint, "context-1")
+    calls = []
+    enrich(desk, runner=lambda p: calls.append(p) or json.dumps(details()))
+    assert calls == []
+
+
+def test_stale_core_cannot_publish_enrichment(desk):
+    before = desk.get("demo")
+    fingerprint = decisions.core_fingerprint(core())
+    desk.publish("demo", before["revision"], before["observation"], "New", [core("Different ask?")])
+    with pytest.raises(ConflictError):
+        desk.publish_decision_details(
+            "demo",
+            before["revision"],
+            "oct16",
+            fingerprint,
+            "context-1",
+            {**details(), "evidence": context()["evidence"]},
+        )
+    assert desk.get("demo")["decision_details"] == {}
+
+
+@pytest.mark.parametrize(
+    "mutation", ["unknown_citation", "fake_path", "resolution", "false_ready", "option"]
+)
+def test_model_output_cannot_add_paths_status_or_unsupported_fields(desk, mutation):
+    output = details()
+    if mutation == "unknown_citation":
+        output["citations"]["summary"] = ["made-up"]
+    elif mutation == "fake_path":
+        output["evidence"] = [dict(storage="/secret")]
+    elif mutation == "resolution":
+        output["status"] = "resolved"
+    elif mutation == "false_ready":
+        output["readiness"] = "ready"
+    else:
+        output["recommendation"]["option_id"] = "nonexistent"
+    assert enrich(desk, runner=lambda p: json.dumps(output))["decision_details"] == {}
+    assert desk.get("demo")["decisions"][0]["status"] == "pending"
+
+
+def test_enrichment_never_creates_notification_or_resolves_historical_request(desk):
+
+    with desk._connect() as db:
+        before = db.execute("SELECT COUNT(*) FROM desk_notification_events").fetchone()[0]
+    result = enrich(desk)
+    assert result["decisions"][0]["status"] == "pending"
+    with desk._connect() as db:
+        assert db.execute("SELECT COUNT(*) FROM desk_notification_events").fetchone()[0] == before
+
+
+def test_markdown_export_has_same_revision_and_sanitized_details(desk):
+    output = details()
+    output["summary"] = "Run test?\n# injected heading"
+    result = enrich(desk, runner=lambda p: json.dumps(output))
+    paths = desk.export("demo")
+    projected = paths["decisions"].read_text(encoding="utf-8")
+    assert f"revision: {result['revision']}" in projected
+    assert "Trading request" in projected
+    assert "\n# injected heading" not in projected
+
+
+def test_manual_force_retries_cached_failure_once(desk):
+    calls = []
+    decisions.enrich_pending(
+        desk, "demo", context_runner=lambda *a: context(), runner=lambda p: calls.append(p) or "bad"
+    )
+    result = decisions.enrich_pending(
+        desk,
+        "demo",
+        context_runner=lambda *a: context(),
+        runner=lambda p: calls.append(p) or json.dumps(details()),
+        force=True,
+    )
+    assert len(calls) == 2
+    assert "oct16" in result["decision_details"]
+
+
+def test_ready_details_reuse_without_reading_context_until_ask_changes(desk):
+    supplied = context()
+    supplied["evidence"][0]["context_only"] = False
+    output = details()
+    output.update(
+        readiness="ready",
+        background="The trading project needs a test.",
+        why_now="The operator requested this test.",
+        missing_information=[],
+    )
+    output["citations"].update(background=["d0"], why_now=["d0"], recommendation=["d0"])
+    enrich(desk, supplied=supplied, runner=lambda p: json.dumps(output))
+    decisions.enrich_pending(
+        desk, "demo", context_runner=lambda *a: pytest.fail("ready rehydration")
+    )
+
+
+def test_cached_unknowns_do_not_starve_later_pending_items(desk, monkeypatch):
+    record = desk.get("demo")
+    cores = [dict(core(), key=f"q{i}", question=f"Question {i}?") for i in range(5)]
+    desk.publish("demo", record["revision"], record["observation"], "Review", cores)
+    calls = []
+    for _ in range(3):
+        decisions.enrich_pending(
+            desk,
+            "demo",
+            context_runner=lambda r, d: calls.append(d["key"]) or context(),
+            runner=lambda p: json.dumps(details()),
+        )
+    assert set(calls) == {f"q{i}" for i in range(5)}
+    assert len(calls) == 6
+
+
+def test_harmless_poll_revision_does_not_discard_matching_core_and_source(desk):
+    def model(prompt):
+        current = desk.get("demo")
+        observation = copy.deepcopy(current["observation"])
+        observation["observed_at"] = 123456
+        desk.publish(
+            "demo", current["revision"], observation, current["review"], current["decisions"]
+        )
+        return json.dumps(details())
+
+    assert "oct16" in enrich(desk, runner=model)["decision_details"]
+
+
+def test_source_change_during_model_cannot_publish_stale_context(desk):
+    def model(prompt):
+        current = desk.get("demo")
+        desk.publish(
+            "demo",
+            current["revision"],
+            dict(
+                sources=[
+                    dict(
+                        tool="codex",
+                        session_id="native",
+                        storage="/pinned/source.jsonl",
+                        fingerprint=[1, 2, 300, 900],
+                    )
+                ]
+            ),
+            "New evidence",
+            current["decisions"],
+        )
+        return json.dumps(details())
+
+    assert enrich(desk, runner=model)["decision_details"] == {}
+
+
+def test_unpinned_context_is_not_sent_to_model(desk):
+    supplied = context()
+    supplied["evidence"][0]["storage"] = "/unregistered/private.jsonl"
+    assert (
+        enrich(desk, supplied=supplied, runner=lambda p: pytest.fail("unpinned context"))[
+            "decision_details"
+        ]
+        == {}
+    )
+
+
+def test_context_error_negative_cache_ignores_observation_clock(desk):
+    def unavailable(*args):
+        raise OSError("private error")
+
+    decisions.enrich_pending(desk, "demo", context_runner=unavailable)
+    current = desk.get("demo")
+    desk.publish("demo", current["revision"], dict(sources=[], observed_at=123), "Review", [core()])
+    decisions.enrich_pending(desk, "demo", context_runner=unavailable)
+    with desk._connect() as db:
+        assert db.execute("SELECT COUNT(*) FROM decision_enrichment_attempts").fetchone()[0] == 1
+
+
+def test_observer_migrates_pending_details_even_when_core_sources_unchanged(desk, monkeypatch):
+    from ai_sessions.desk import observer
+
+    before = desk.get("demo")
+    monkeypatch.setattr(observer, "_refresh", lambda *a, **kw: before)
+    calls = []
+    result = observer.refresh(
+        desk,
+        "demo",
+        runner=lambda p: pytest.fail("core model call"),
+        context_runner=lambda *a: context(),
+        details_runner=lambda p: calls.append(p) or json.dumps(details()),
+    )
+    assert "oct16" in result["decision_details"]
+    observer.refresh(
+        desk,
+        "demo",
+        runner=lambda p: pytest.fail("core model call"),
+        context_runner=lambda *a: context(),
+        details_runner=lambda p: calls.append(p) or json.dumps(details()),
+    )
+    assert len(calls) == 1
+
+
+def test_original_information_request_can_correct_lossy_run_question_without_editing_core(desk):
+    supplied = context()
+    supplied["evidence"][0]["text"] = (
+        "Result files exist for October 16, but the log says NOT RUN awaiting approval. "
+        "Did you approve it then? If approved, read and record the result; otherwise record "
+        "that 2026 data was already viewed and is not a clean holdout."
+    )
+    corrected = details()
+    corrected.update(kind="information", summary="Was the October 16 test approved at the time?")
+    corrected["missing_information"] = ["Whether you approved the test then."]
+
+    def model(prompt):
+        assert "LOSSY" in prompt and "false premise" in prompt
+        assert "Existing result files do not prove prior approval" in prompt
+        assert supplied["evidence"][0]["text"] in prompt
+        return json.dumps(corrected)
+
+    result = enrich(desk, supplied=supplied, runner=model)
+    assert result["decisions"][0] == core()
+    assert result["decision_details"]["oct16"]["kind"] == "information"
+    assert result["decision_details"]["oct16"]["summary"].startswith("Was the October")
+
+
+def test_ready_means_context_understood_not_that_human_answer_is_known(desk):
+    output = details()
+    output.update(
+        kind="information",
+        readiness="ready",
+        missing_information=[],
+        summary="Did you previously approve the October 16 test?",
+    )
+    output["recommendation"]["reason"] = "Please say whether you approved it previously."
+    result = enrich(desk, runner=lambda p: json.dumps(output))
+    assert result["decision_details"]["oct16"]["readiness"] == "ready"
+    assert result["decisions"][0]["status"] == "pending"
+    assert all(e["context_only"] for e in result["decision_details"]["oct16"]["evidence"])
+
+
+def test_default_model_uses_details_schema_and_existing_tools_disabled_backend(monkeypatch):
+    import subprocess
+    import sys
+
+    from ai_sessions.harnesses import desk_observer
+
+    original = subprocess.Popen
+    commands = []
+    envelope = json.dumps({"structured_output": details()})
+
+    def spawn(command, **kwargs):
+        commands.append(command)
+        return original(
+            [sys.executable, "-c", f"import sys; sys.stdin.read(); print({envelope!r})"], **kwargs
+        )
+
+    monkeypatch.setattr(desk_observer.shutil, "which", lambda name: sys.executable)
+    monkeypatch.setattr(desk_observer.subprocess, "Popen", spawn)
+    assert json.loads(decisions._run_model("fixture only", ["d0"], None))["kind"] == "choice"
+    command = commands[0]
+    schema = json.loads(command[command.index("--json-schema") + 1])
+    assert schema["additionalProperties"] is False
+    assert "evidence" not in schema["properties"] and "status" not in schema["properties"]
+    assert schema["properties"]["citations"]["properties"]["summary"]["items"]["enum"] == ["d0"]
+    assert command[command.index("--tools") + 1] == ""
+    assert "--safe-mode" in command and "--strict-mcp-config" in command

@@ -512,8 +512,36 @@ def _refresh(store, name, *, runner=None, stop=None):
         return _export_snapshot(store, name, failed)
 
 
-def refresh(store, name, *, runner=None, stop=None):
+def refresh(
+    store,
+    name,
+    *,
+    runner=None,
+    stop=None,
+    details_runner=None,
+    context_runner=None,
+    force_details=False,
+):
     result = _refresh(store, name, runner=runner, stop=stop)
+    # Legacy runner fixtures replace core synthesis only. Enrichment is injectable
+    # separately so no existing unit fixture can accidentally call a live model.
+    if runner is None or details_runner is not None or context_runner is not None:
+        try:
+            from .decisions import enrich_pending
+
+            result = enrich_pending(
+                store,
+                name,
+                runner=details_runner,
+                context_runner=context_runner,
+                stop=stop,
+                force=force_details,
+            )
+        except ObservationCancelled:
+            return store.get(name)
+        except Exception:
+            # Context/model/detail failures never fail a valid main briefing.
+            result = store.get(name)
     try:
         from .notifications import drain
 
