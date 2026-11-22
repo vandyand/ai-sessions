@@ -50,15 +50,37 @@ The project conversation runs in the desk folder so it can read the briefing. It
 
 - `1`: Overview — background, current position, direction and goal (the opening view).
 - `2`: Review — recent progress and outcomes.
-- `3`: Needs you — open questions with context.
-- `4`: Next action — a focused suggested response.
+- `3`: Decisions — each ask, its context, options and recommendation together.
 - Left/Right and Tab/Shift+Tab switch views, wrapping at the ends.
-- `n` / `p` opens the first/last question from Overview or Review, or cycles questions
-  from Needs you / Next action. The shortcut appears only when it is useful.
+- `n` / `p` opens the first/last pending decision from Overview or Review, or cycles
+  pending decisions in Decisions. The shortcut appears only when useful.
+- `d` shows or hides deeper background/source excerpts inline. The whole decision
+  uses the same Up/Down/Page/Home/End scroll; there is no separate source reader.
 - Up/Down and Page Up/Page Down scroll when content exceeds the pane. A line range
   appears at bottom right; no scroll hint is shown when everything fits.
 - `h` or `?` opens help, including the exact watched sessions and status meanings.
   `h`, `?` or Esc returns. `q` closes the briefing.
+
+A decision shows **Ready** or **Needs context**, followed by a precise description
+of the ask or proposal. Its normal view includes project background/definitions,
+why the question matters now, explicit options with benefits/risks/consequences,
+and a recommendation with its reason. Missing definitions or numbers are listed
+as specific missing information. The briefing does not invent yes/no choices or
+recommend an option without support. Deferral consequences and deadlines appear
+when supplied. Action requests and requests for information do not need choices.
+
+Use `d Background` for human-titled source excerpts. Earlier context is labeled;
+explicit source timestamps appear in Eastern Time. Internal decision keys, native
+IDs, paths, byte ranges and digests are not source labels. Essential context and
+tradeoffs remain in the normal card. For older saved requests, meaningful context
+and earlier suggestions stay visible while the background/options prepare; the
+card says Needs context rather than claiming it is ready.
+
+Refresh preserves the viewed decision, disclosure fold and scroll when content
+is unchanged. If the selected item resolves, becomes superseded, or disappears,
+it remains visible with that status until you browse to another pending decision
+or leave the view. A new request never silently replaces the one being read.
+Answers belong in the Desk conversation; this pane has no send/approval buttons.
 
 The top-right indicator separates summary age from source freshness:
 `Up to date · 2h` means the summary last changed two hours ago and the current

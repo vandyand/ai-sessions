@@ -9,6 +9,7 @@ import curses
 import re
 import time
 import unicodedata
+from copy import deepcopy
 from dataclasses import dataclass, replace
 from datetime import datetime, timezone
 from pathlib import Path
@@ -28,6 +29,8 @@ class State:
     scroll: int = 0
     quit: bool = False
     help: bool = False
+    expanded: frozenset[str] = frozenset()
+    retained: dict | None = None
 
 
 @dataclass(frozen=True)
@@ -120,9 +123,11 @@ def _detail(snapshot: dict | None, state: State, width: int) -> list[str]:
             "Left / Right or Tab / Shift+Tab: switch views\n"
             "1 Overview: background, position, direction and goal\n"
             "2 Review: recent progress and current outcome\n"
-            "3 Needs you: questions and their context\n"
-            "4 Next action: suggested response\n"
-            "n / p: next / previous question; opens Needs you from Overview or Review\n"
+            "3 Decisions: ask, context, options and recommendation\n"
+            "n / p: next / previous decision; opens Decisions from Overview or Review\n"
+            "d: show / hide deeper background and source excerpts inline\n"
+            "Ready: the decision has the supplied context. Needs context: facts are still missing.\n"
+            "A resolved or removed decision stays visible until you browse away.\n"
             "Up / Down or PgUp / PgDn: scroll\n"
             "Home / End: top / bottom\n"
             "h / ? / Esc: return to briefing\nq: exit\n\n"
@@ -194,39 +199,142 @@ def _detail(snapshot: dict | None, state: State, width: int) -> list[str]:
             _review_text(snapshot.get("review")) or "Preparing the first briefing…",
             width,
         )
+    return _decision_body(snapshot, state, width)
+
+
+def _decision_details(snapshot, key):
+    details = (snapshot or {}).get("decision_details") or {}
+    row = details.get(key) if isinstance(details, dict) else None
+    return row if isinstance(row, dict) and row.get("schema_version") == 1 else None
+
+
+def _selected(snapshot, state):
+    rows = (snapshot or {}).get("decisions", [])
+    item = next((row for row in rows if row.get("key") == state.selected_key), None)
+    if item is not None:
+        return item, _decision_details(snapshot, state.selected_key), False
+    if state.retained and state.selected_key == state.retained["decision"].get("key"):
+        return state.retained["decision"], state.retained.get("details"), True
     pending = _pending(snapshot)
-    if not pending:
+    item = pending[0] if pending else None
+    return item, _decision_details(snapshot, item.get("key")) if item else None, False
+
+
+def _source_excerpt(entry):
+    title = _human_text(entry.get("title")) or "Watched conversation"
+    label = "Earlier context" if entry.get("context_only") else "Source conversation"
+    stamp = entry.get("timestamp") or entry.get("observed_at")
+    if stamp is not None:
+        try:
+            label += " · " + eastern_time(_timestamp(stamp))
+        except (ValueError, TypeError, OverflowError, OSError):
+            pass
+    return [title, label, _human_text(entry.get("text")) or "Excerpt unavailable."]
+
+
+def _deadline_text(value):
+    text = _human_text(value)
+    if re.fullmatch(r"\d{4}-\d{2}-\d{2}T.+(?:Z|[+-]\d{2}:\d{2})", text):
+        try:
+            return eastern_time(_timestamp(text))
+        except (ValueError, TypeError, OverflowError, OSError):
+            pass
+    return text
+
+
+def _decision_body(snapshot, state, width):
+    pending = _pending(snapshot)
+    selected, details, missing = _selected(snapshot, state)
+    if selected is None:
         if not snapshot.get("observed_at"):
             qualification = "The first briefing is still being prepared."
         elif snapshot.get("error"):
-            qualification = "The update failed; new questions may be missing."
+            qualification = "The update failed; new decisions may be missing."
         elif _partial(snapshot):
-            qualification = "Earlier conversation may contain other questions."
+            qualification = "Earlier conversation may contain other decisions."
         else:
             qualification = "Discuss anything else in your Desk conversation."
-        return wrap("No open questions. " + qualification, width)
-    selected = next((d for d in pending if d.get("key") == state.selected_key), pending[0])
-    index = pending.index(selected) + 1
+        return wrap("No open decisions. " + qualification, width)
+    key = selected.get("key")
+    index = next((i + 1 for i, row in enumerate(pending) if row.get("key") == key), None)
+    if missing:
+        position = "No longer listed · saved decision"
+    elif selected.get("status") != "pending":
+        position = "Resolved" if selected.get("status") == "resolved" else "Superseded"
+    else:
+        position = f"Decision {index} of {len(pending)}"
+    ready = bool(details and details.get("readiness") == "ready")
     parts = [
-        f"Question {index} of {len(pending)}" + (" · n/p to browse" if len(pending) > 1 else ""),
+        position + " · " + ("Ready" if ready else "Needs context"),
+        "d Background sources: " + ("hide" if key in state.expanded else "show"),
         "",
-        selected.get("question") or "A decision needs your attention.",
     ]
-    if state.tab == 3 and selected.get("context"):
-        parts.extend(["", "Why it matters", str(selected["context"])])
-    parts.extend(
-        [
-            "",
-            "Suggested response\n"
-            + str(
-                selected.get("recommendation") or "Discuss this question in your Desk conversation."
-            ),
-        ]
-    )
-    if state.tab == 4:
-        parts.extend(["", "3 Needs you: read the context."])
-    # Evidence is deliberately not dumped: it can contain internal source IDs.
-    return wrap(_human_text("\n".join(parts)), width)
+    if len(pending) > 1 or index is None and pending:
+        parts[0] += " · n/p to browse"
+
+    def section(title, value):
+        if value:
+            parts.extend(["", title, _human_text(value)])
+
+    if details:
+        parts.append(_human_text(details.get("summary")) or _human_text(selected.get("question")))
+        section("Context", details.get("background") or "Background is still being prepared.")
+        section("Why now", details.get("why_now"))
+        options = details.get("options") or []
+        if options:
+            parts.extend(["", "Options and tradeoffs"])
+            for number, option in enumerate(options, 1):
+                parts.append(f"{number}. " + _human_text(option.get("label")))
+                if option.get("description"):
+                    parts.append(_human_text(option["description"]))
+                for values, label in (("benefits", "Benefits"), ("risks", "Risks")):
+                    if option.get(values):
+                        parts.append(
+                            label + ": " + "; ".join(_human_text(v) for v in option[values])
+                        )
+                if option.get("consequences"):
+                    parts.append("Consequence: " + _human_text(option["consequences"]))
+                parts.append("")
+        recommendation = details.get("recommendation") or {}
+        recommended = next(
+            (o for o in options if o.get("id") == recommendation.get("option_id")), None
+        )
+        reason = _human_text(recommendation.get("reason"))
+        section(
+            "Recommendation",
+            ((_human_text(recommended.get("label")) + ". ") if recommended else "")
+            + (reason or "No supported recommendation yet."),
+        )
+        missing_facts = details.get("missing_information") or []
+        if missing_facts:
+            section(
+                "Missing information", "\n".join("- " + _human_text(fact) for fact in missing_facts)
+            )
+        elif not ready:
+            section("Missing information", "The background or options are not complete yet.")
+        section("If deferred", details.get("if_deferred"))
+        section("Deadline", _deadline_text(details.get("deadline")))
+    else:
+        parts.append(_human_text(selected.get("question")) or "A decision needs your attention.")
+        section("Saved context", selected.get("context"))
+        section(
+            "Background and options",
+            "Preparing the background, options and tradeoffs. Missing facts have not been identified yet.",
+        )
+        section("Earlier suggestion", selected.get("recommendation"))
+
+    if key in state.expanded:
+        parts.extend(["", "Background sources"])
+        evidence = (details or {}).get("evidence") or []
+        if evidence:
+            for entry in evidence:
+                parts.extend(["", *_source_excerpt(entry)])
+        else:
+            parts.append(
+                "Source excerpts are still being prepared. The saved context above is available now."
+            )
+    parts.extend(["", "Discuss your answer in the Desk conversation."])
+    return wrap("\n".join(parts), width)
 
 
 def _partial(snapshot: dict | None) -> bool:
@@ -256,10 +364,24 @@ def _body_height(height: int) -> int:
 
 
 def normalize(state: State, snapshot: dict | None, width: int, height: int) -> State:
-    """Retain stable selection through reorder; fall back when it disappears."""
+    """Preserve the viewed decision, including a resolved/removed selection."""
+    tab = min(3, max(1, state.tab))
     keys = [item.get("key") for item in _pending(snapshot)]
-    selected = state.selected_key if state.selected_key in keys else (keys[0] if keys else None)
-    state = replace(state, selected_key=selected)
+    selected = state.selected_key
+    if selected not in keys and not (
+        tab == 3
+        and (
+            selected is not None
+            and state.retained
+            and state.retained["decision"].get("key") == selected
+            or any(row.get("key") == selected for row in (snapshot or {}).get("decisions", []))
+        )
+    ):
+        selected = keys[0] if keys else None
+    state = replace(state, tab=tab, selected_key=selected)
+    item, details, missing = _selected(snapshot, state)
+    if item is not None and not missing:
+        state = replace(state, retained=deepcopy(dict(decision=item, details=details)))
     limit = max(0, len(_body(snapshot, state, max(1, width))) - _body_height(height))
     return replace(state, scroll=min(max(0, state.scroll), limit))
 
@@ -274,12 +396,12 @@ def handle_key(
         return normalize(replace(state, help=not state.help, scroll=0), snapshot, width, height)
     if key in ("1", "2", "3", "4"):
         return normalize(
-            replace(state, tab=int(key), help=False, scroll=0), snapshot, width, height
+            replace(state, tab=min(3, int(key)), help=False, scroll=0), snapshot, width, height
         )
     if key in (curses.KEY_RIGHT, "\t", curses.KEY_LEFT, curses.KEY_BTAB):
         step = 1 if key in (curses.KEY_RIGHT, "\t") else -1
         return normalize(
-            replace(state, tab=(state.tab - 1 + step) % 4 + 1, help=False, scroll=0),
+            replace(state, tab=(state.tab - 1 + step) % 3 + 1, help=False, scroll=0),
             snapshot,
             width,
             height,
@@ -294,12 +416,17 @@ def handle_key(
                 width,
                 height,
             )
-    if key in ("n", "p") and state.tab in (3, 4) and not state.help:
+    if key in ("n", "p") and state.tab == 3 and not state.help:
         keys = [item.get("key") for item in _pending(snapshot)]
         if keys:
-            index = keys.index(state.selected_key)
-            index = (index + (1 if key == "n" else -1)) % len(keys)
+            if state.selected_key in keys:
+                index = (keys.index(state.selected_key) + (1 if key == "n" else -1)) % len(keys)
+            else:
+                index = 0 if key == "n" else len(keys) - 1
             state = replace(state, selected_key=keys[index], scroll=0)
+    elif key in ("d", "D") and state.tab == 3 and not state.help and state.selected_key:
+        expanded = state.expanded ^ {state.selected_key}
+        state = replace(state, expanded=frozenset(expanded))
     elif key in (curses.KEY_DOWN, "j"):
         state = replace(state, scroll=state.scroll + 1)
     elif key in (curses.KEY_UP, "k"):
@@ -399,7 +526,7 @@ def _header(title: str, status: str, width: int) -> str:
 
 
 def _tabs(state: State, width: int) -> str:
-    labels = ("Overview", "Review", "Needs you", "Next action")
+    labels = ("Overview", "Review", "Decisions")
 
     def line(labels, compact=False, gap="  "):
         return gap.join(
@@ -409,7 +536,7 @@ def _tabs(state: State, width: int) -> str:
 
     text = line(labels)
     if cell_width(text) > width:
-        text = line(("Overview", "Review", "Needs", "Next"), gap=" ")
+        text = line(("Overview", "Review", "Decisions"), gap=" ")
     if cell_width(text) > width:
         text = line(labels, True)
     return _clip(text, width)
@@ -457,9 +584,9 @@ def render(
         extra.append("↑↓ Scroll")
     if not state.help and _pending(snapshot):
         if state.tab in (1, 2):
-            extra.append("n Questions")
+            extra.append("n Decisions")
         elif len(_pending(snapshot)) > 1:
-            extra.append("n/p Questions")
+            extra.append("n/p Decisions")
     if not state.help:
         extra.append("←→ Views")
     for hint in extra:
