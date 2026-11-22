@@ -194,3 +194,22 @@ def test_first_recent_passage_belongs_to_the_cited_primary_source(tmp_path):
     )
     result = context.gather_context(saved, question())
     assert result["evidence"][0]["session_id"] == "supervisor"
+
+
+def test_many_selected_sources_fit_the_shared_evidence_schema(tmp_path):
+    saved = {"sources": []}
+    for i in range(20):
+        path = tmp_path / f"source-{i}.jsonl"
+        path.write_bytes(line("claude", f"October 16 test source {i} explanation."))
+        saved["sources"].append(
+            dict(
+                tool="claude",
+                session_id=str(i),
+                home=str(tmp_path),
+                storage=str(path),
+                title=f"Source {i}",
+            )
+        )
+    result = context.gather_context(saved, question())
+    assert len(result["evidence"]) <= 16
+    assert result["limitations"]

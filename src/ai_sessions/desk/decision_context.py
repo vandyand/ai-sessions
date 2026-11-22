@@ -20,6 +20,7 @@ MAX_RECORD_BYTES = 512 * 1024
 MAX_CONTEXT_CHARS = 32000
 MAX_EXCERPT_CHARS = 3500
 MAX_HISTORICAL = 8
+MAX_EVIDENCE = 16
 RECENT_BYTES = 256 * 1024
 _COMMON = frozenset(
     "a an and are as at be been can could decision do does for from have how i if in is it "
@@ -292,6 +293,9 @@ def gather_context(record, decision, *, stop=None):
             continue
         if raw["context_only"] and history_count >= MAX_HISTORICAL:
             continue
+        if len(selected) >= MAX_EVIDENCE:
+            limitations.append("Additional passages exceed the 16-excerpt evidence limit.")
+            break
         room = MAX_CONTEXT_CHARS - chars
         if room < 80:
             limitations.append("Additional retrieved passages exceed the context text budget.")
