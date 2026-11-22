@@ -177,6 +177,105 @@ def test_claimed_attempt_exposes_in_progress_without_raw_internal_data(desk):
     assert set(progress) == {"status", "checked_at"}
 
 
+def test_interrupted_claim_expires_despite_polls_and_needs_manual_retry(desk, monkeypatch):
+    from ai_sessions.desk import store as storage
+
+    clock = [1000.0]
+    monkeypatch.setattr(storage.time, "time", lambda: clock[0])
+    fingerprint = decisions.core_fingerprint(core())
+    token = desk.claim_decision_enrichment("demo", "oct16", fingerprint, "context-1")
+    assert token
+    clock[0] += decisions.ENRICHMENT_LEASE_SECONDS - 1
+    assert not desk.claim_decision_enrichment("demo", "oct16", fingerprint, "context-1")
+    clock[0] += 2
+    assert desk.get("demo")["decision_enrichment"]["oct16"]["status"] == "failed"
+    assert not desk.claim_decision_enrichment("demo", "oct16", fingerprint, "context-1")
+    assert not desk.claim_decision_enrichment("demo", "oct16", fingerprint, "new-context")
+    retry = desk.claim_decision_enrichment("demo", "oct16", fingerprint, "context-1", force=True)
+    assert retry and retry != token
+
+
+def test_force_cannot_duplicate_active_model_even_for_a_different_context(desk):
+    fingerprint = decisions.core_fingerprint(core())
+    assert desk.claim_decision_enrichment("demo", "oct16", fingerprint, "context-1")
+    calls = []
+    result = decisions.enrich_pending(
+        desk,
+        "demo",
+        context_runner=lambda *a: dict(context(), fingerprint="new-context"),
+        runner=lambda p: calls.append(p) or json.dumps(details()),
+        force=True,
+    )
+    assert calls == []
+    assert result["decision_enrichment"]["oct16"]["status"] == "in_progress"
+
+
+def test_expired_owner_cannot_publish_or_finish_retried_claim(desk, monkeypatch):
+    from ai_sessions.desk import store as storage
+
+    clock = [1000.0]
+    monkeypatch.setattr(storage.time, "time", lambda: clock[0])
+    fingerprint = decisions.core_fingerprint(core())
+    first = desk.claim_decision_enrichment("demo", "oct16", fingerprint, "context-1")
+    clock[0] += decisions.ENRICHMENT_LEASE_SECONDS + 1
+    retry = desk.claim_decision_enrichment("demo", "oct16", fingerprint, "context-1", force=True)
+    assert retry != first
+    record = desk.get("demo")
+    value = {**details(), "evidence": context()["evidence"]}
+    with pytest.raises(ConflictError):
+        desk.publish_decision_details(
+            "demo",
+            record["revision"],
+            "oct16",
+            fingerprint,
+            "context-1",
+            value,
+            attempt_token=first,
+        )
+    desk.finish_decision_enrichment("demo", "oct16", fingerprint, "context-1", attempt_token=first)
+    assert desk.get("demo")["decision_enrichment"]["oct16"]["status"] == "in_progress"
+    result = desk.publish_decision_details(
+        "demo", record["revision"], "oct16", fingerprint, "context-1", value, attempt_token=retry
+    )
+    assert result["decision_enrichment"]["oct16"]["status"] == "success"
+
+
+def test_simultaneous_force_claims_have_only_one_owner(desk):
+    from concurrent.futures import ThreadPoolExecutor
+    from threading import Barrier
+
+    start = Barrier(2)
+    fingerprint = decisions.core_fingerprint(core())
+
+    def claim(index):
+        start.wait(timeout=5)
+        return desk.claim_decision_enrichment(
+            "demo", "oct16", fingerprint, f"context-{index}", force=True
+        )
+
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        results = list(pool.map(claim, (1, 2)))
+    assert sum(bool(token) for token in results) == 1
+
+
+def test_legacy_unowned_claim_reads_failed_and_migrates_for_manual_retry(desk):
+    fingerprint = decisions.core_fingerprint(core())
+    with desk._connect() as db:
+        db.execute("ALTER TABLE decision_enrichment_attempts DROP COLUMN started_at")
+        db.execute("ALTER TABLE decision_enrichment_attempts DROP COLUMN attempt_token")
+        db.execute(
+            "INSERT INTO decision_enrichment_attempts VALUES (?,?,?,?,?,?,?,?)",
+            ("demo", "oct16", fingerprint, "context-1", 1, "claimed", 9999999999, "old"),
+        )
+    assert (
+        Store(desk.root, readonly=True).get("demo")["decision_enrichment"]["oct16"]["status"]
+        == "failed"
+    )
+    migrated = Store(desk.root)
+    assert not migrated.claim_decision_enrichment("demo", "oct16", fingerprint, "context-1")
+    assert migrated.claim_decision_enrichment("demo", "oct16", fingerprint, "context-1", force=True)
+
+
 def test_cancelled_owned_model_attempt_exposes_failed_for_manual_retry(desk):
     from ai_sessions.harnesses.desk_observer import ObservationCancelled
 
@@ -198,11 +297,16 @@ def test_force_prioritizes_failed_attempt_even_if_previous_details_were_ready(de
         "demo", record["revision"], record["observation"], record["review"], [core(), other]
     )
     enrich(desk, runner=lambda p: json.dumps(ready))
-    assert desk.claim_decision_enrichment(
+    token = desk.claim_decision_enrichment(
         "demo", "other", decisions.core_fingerprint(other), "failed-new-context"
     )
+    assert token
     desk.finish_decision_enrichment(
-        "demo", "other", decisions.core_fingerprint(other), "failed-new-context"
+        "demo",
+        "other",
+        decisions.core_fingerprint(other),
+        "failed-new-context",
+        attempt_token=token,
     )
     monkeypatch.setattr(decisions, "MAX_PER_PASS", 1)
     selected = []

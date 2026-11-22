@@ -8,6 +8,7 @@ import re
 import sqlite3
 import tempfile
 import time
+import uuid
 from contextlib import contextmanager
 from datetime import datetime, timezone
 from pathlib import Path
@@ -117,6 +118,7 @@ class Store:
             return
         self.root.mkdir(parents=True, exist_ok=True)
         with self._connect() as db:
+            db.execute("BEGIN IMMEDIATE")  # Serialize additive schema migration across viewers.
             db.execute(
                 "CREATE TABLE IF NOT EXISTS desks "
                 "(name TEXT PRIMARY KEY COLLATE NOCASE, data TEXT NOT NULL)"
@@ -133,8 +135,17 @@ class Store:
                 "CREATE TABLE IF NOT EXISTS decision_enrichment_attempts "
                 "(desk TEXT COLLATE NOCASE, key TEXT, core_hash TEXT, context_hash TEXT, "
                 "version INTEGER, status TEXT, checked_at REAL, source_hash TEXT, "
+                "started_at REAL, attempt_token TEXT, "
                 "PRIMARY KEY(desk,key,core_hash,context_hash,version))"
             )
+            columns = {
+                row[1] for row in db.execute("PRAGMA table_info(decision_enrichment_attempts)")
+            }
+            for column, kind in (("started_at", "REAL"), ("attempt_token", "TEXT")):
+                if column not in columns:
+                    db.execute(
+                        f"ALTER TABLE decision_enrichment_attempts ADD COLUMN {column} {kind}"
+                    )
 
     @contextmanager
     def _connect(self):
@@ -190,10 +201,14 @@ class Store:
         if db.execute(
             "SELECT 1 FROM sqlite_master WHERE name='decision_enrichment_attempts'"
         ).fetchone():
-            from .decisions import SCHEMA_VERSION, core_fingerprint
+            from .decisions import ENRICHMENT_LEASE_SECONDS, SCHEMA_VERSION, core_fingerprint
 
-            for key, fingerprint, status, checked in db.execute(
-                "SELECT key,core_hash,status,checked_at FROM decision_enrichment_attempts "
+            columns = {
+                row[1] for row in db.execute("PRAGMA table_info(decision_enrichment_attempts)")
+            }
+            started_column = "started_at" if "started_at" in columns else "NULL"
+            for key, fingerprint, status, checked, started in db.execute(
+                f"SELECT key,core_hash,status,checked_at,{started_column} FROM decision_enrichment_attempts "
                 "WHERE desk=? AND version=? ORDER BY checked_at DESC,rowid DESC",
                 (name, SCHEMA_VERSION),
             ):
@@ -203,9 +218,16 @@ class Store:
                     or core_fingerprint(cores[key]) != fingerprint
                 ):
                     continue
-                state = {"claimed": "in_progress", "failed": "failed", "success": "success"}.get(
-                    status
-                )
+                if status == "claimed" and (
+                    started is None or started + ENRICHMENT_LEASE_SECONDS <= time.time()
+                ):
+                    status = "expired"
+                state = {
+                    "claimed": "in_progress",
+                    "expired": "failed",
+                    "failed": "failed",
+                    "success": "success",
+                }.get(status)
                 if state is not None:
                     snapshot["decision_enrichment"][key] = {"status": state, "checked_at": checked}
         return snapshot
@@ -374,7 +396,7 @@ class Store:
             # An older publisher omits details. The sidecar remains authoritative;
             # material ask changes are filtered rather than copied into core JSON.
             snapshot = self._get(db, name)
-            from .decisions import core_fingerprint
+            from .decisions import ENRICHMENT_LEASE_SECONDS, core_fingerprint
 
             hashes = {d["key"]: core_fingerprint(d) for d in decisions}
             for key, fingerprint in db.execute(
@@ -382,8 +404,9 @@ class Store:
             ).fetchall():
                 if hashes.get(key) != fingerprint:
                     db.execute(
-                        "DELETE FROM decision_enrichment_attempts WHERE desk=? AND key=? AND core_hash=?",
-                        (name, key, fingerprint),
+                        "DELETE FROM decision_enrichment_attempts WHERE desk=? AND key=? AND core_hash=? "
+                        "AND NOT(status='claimed' AND started_at>?)",
+                        (name, key, fingerprint, time.time() - ENRICHMENT_LEASE_SECONDS),
                     )
             for (key,) in db.execute(
                 "SELECT key FROM decision_details WHERE desk=?", (name,)
@@ -405,7 +428,12 @@ class Store:
         self, name, key, core_hash, context_hash, *, force=False, source_hash=None
     ):
         """Claim before calling the model; cached failures and interrupted claims stay cached."""
-        from .decisions import SCHEMA_VERSION, core_fingerprint, source_fingerprint
+        from .decisions import (
+            ENRICHMENT_LEASE_SECONDS,
+            SCHEMA_VERSION,
+            core_fingerprint,
+            source_fingerprint,
+        )
 
         if not isinstance(context_hash, str) or not context_hash or len(context_hash) > 200:
             raise ValueError("invalid context fingerprint")
@@ -417,6 +445,40 @@ class Store:
                 return False
             current_sources = source_fingerprint(snapshot)
             if source_hash is not None and source_hash != current_sources:
+                return False
+            now = time.time()
+            cutoff = now - ENRICHMENT_LEASE_SECONDS
+            # The lease start is immutable. Polls/force never extend or steal a
+            # live claim, including a claim for a different context/core of this key.
+            db.execute(
+                "UPDATE decision_enrichment_attempts SET status='expired' WHERE desk=? AND key=? "
+                "AND status='claimed' AND (started_at IS NULL OR started_at<=?)",
+                (name, key, cutoff),
+            )
+            if db.execute(
+                "SELECT 1 FROM decision_enrichment_attempts WHERE desk=? AND key=? "
+                "AND status='claimed' AND started_at>?",
+                (name, key, cutoff),
+            ).fetchone():
+                db.execute(
+                    "UPDATE decision_enrichment_attempts SET checked_at=? WHERE desk=? AND key=? "
+                    "AND status='claimed' AND started_at>?",
+                    (now, name, key, cutoff),
+                )
+                return False
+            if (
+                not force
+                and db.execute(
+                    "SELECT 1 FROM decision_enrichment_attempts WHERE desk=? AND key=? "
+                    "AND core_hash=? AND status='expired'",
+                    (name, key, core_hash),
+                ).fetchone()
+            ):
+                db.execute(
+                    "UPDATE decision_enrichment_attempts SET checked_at=? WHERE desk=? AND key=? "
+                    "AND core_hash=? AND status='expired'",
+                    (now, name, key, core_hash),
+                )
                 return False
             args = (name, key, core_hash, context_hash, SCHEMA_VERSION)
             existing = db.execute(
@@ -432,33 +494,42 @@ class Store:
                 )
                 return False
             db.execute(
-                "INSERT OR REPLACE INTO decision_enrichment_attempts VALUES (?,?,?,?,?,?,?,?)",
-                (*args, "claimed", time.time(), current_sources),
+                "INSERT OR REPLACE INTO decision_enrichment_attempts "
+                "(desk,key,core_hash,context_hash,version,status,checked_at,source_hash,started_at,attempt_token) "
+                "VALUES (?,?,?,?,?,?,?,?,?,?)",
+                (*args, "claimed", now, current_sources, now, token := uuid.uuid4().hex),
             )
+            if force:
+                db.execute(
+                    "UPDATE decision_enrichment_attempts SET status='failed' WHERE desk=? AND key=? "
+                    "AND core_hash=? AND status='expired'",
+                    (name, key, core_hash),
+                )
             # Bound changing context histories while preserving every pending core/detail.
             db.execute(
-                "DELETE FROM decision_enrichment_attempts WHERE desk=? AND key=? AND rowid NOT IN "
+                "DELETE FROM decision_enrichment_attempts WHERE desk=? AND key=? AND status!='claimed' AND rowid NOT IN "
                 "(SELECT rowid FROM decision_enrichment_attempts WHERE desk=? AND key=? "
                 "ORDER BY checked_at DESC LIMIT 16)",
                 (name, key, name, key),
             )
-            return True
+            return token
 
-    def finish_decision_enrichment(self, name, key, core_hash, context_hash):
+    def finish_decision_enrichment(self, name, key, core_hash, context_hash, *, attempt_token=None):
         from .decisions import SCHEMA_VERSION
 
         with self._connect() as db:
             db.execute(
                 "UPDATE decision_enrichment_attempts SET status='failed' WHERE desk=? AND key=? "
-                "AND core_hash=? AND context_hash=? AND version=? AND status!='success'",
-                (name, key, core_hash, context_hash, SCHEMA_VERSION),
+                "AND core_hash=? AND context_hash=? AND version=? AND status='claimed' AND attempt_token=?",
+                (name, key, core_hash, context_hash, SCHEMA_VERSION, attempt_token),
             )
 
     def publish_decision_details(
-        self, name, expected_revision, key, core_hash, context_hash, details
+        self, name, expected_revision, key, core_hash, context_hash, details, *, attempt_token=None
     ):
         """Commit details and revision together, without touching core status or notifications."""
         from .decisions import (
+            ENRICHMENT_LEASE_SECONDS,
             SCHEMA_VERSION,
             core_fingerprint,
             source_fingerprint,
@@ -484,11 +555,19 @@ class Store:
             validate_evidence(details["evidence"], snapshot["sources"])
             args = (name, key, core_hash, context_hash, SCHEMA_VERSION)
             claim = db.execute(
-                "SELECT status,source_hash FROM decision_enrichment_attempts WHERE desk=? AND key=? "
+                "SELECT status,source_hash,started_at,attempt_token FROM decision_enrichment_attempts WHERE desk=? AND key=? "
                 "AND core_hash=? AND context_hash=? AND version=?",
                 args,
             ).fetchone()
-            if not claim or claim[0] != "claimed" or claim[1] != source_fingerprint(snapshot):
+            if (
+                not claim
+                or claim[0] != "claimed"
+                or claim[1] != source_fingerprint(snapshot)
+                or claim[2] is None
+                or claim[2] + ENRICHMENT_LEASE_SECONDS <= time.time()
+                or not attempt_token
+                or claim[3] != attempt_token
+            ):
                 raise ConflictError("enrichment attempt is no longer claimed")
             db.execute(
                 "INSERT OR REPLACE INTO decision_details VALUES (?,?,?,?,?,?)",

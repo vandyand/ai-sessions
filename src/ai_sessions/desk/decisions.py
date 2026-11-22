@@ -11,6 +11,7 @@ from pathlib import Path
 
 SCHEMA_VERSION = 1
 MAX_PER_PASS = 2
+ENRICHMENT_LEASE_SECONDS = 180  # Model timeout is 120s; leave bounded cleanup/validation slack.
 MAX_DETAILS_BYTES = 128 * 1024
 MAX_PROMPT_CHARS = 64000
 MISSING_INFO = "This has not been described in the watched conversations yet."
@@ -389,12 +390,20 @@ def enrich_pending(store, name, *, context_runner=None, runner=None, stop=None, 
             value["evidence"] = evidence
             validate_details(value, evidence=evidence)
             store.publish_decision_details(
-                name, record["revision"], decision["key"], fingerprint, context_key, value
+                name,
+                record["revision"],
+                decision["key"],
+                fingerprint,
+                context_key,
+                value,
+                attempt_token=claimed,
             )
             store.export(name)
         except ObservationCancelled:
             if claimed:
-                store.finish_decision_enrichment(name, decision["key"], fingerprint, context_key)
+                store.finish_decision_enrichment(
+                    name, decision["key"], fingerprint, context_key, attempt_token=claimed
+                )
             raise
         except Exception:
             if not claimed:
@@ -407,7 +416,9 @@ def enrich_pending(store, name, *, context_runner=None, runner=None, stop=None, 
                     source_hash=source_hash,
                 )
             if claimed:
-                store.finish_decision_enrichment(name, decision["key"], fingerprint, context_key)
+                store.finish_decision_enrichment(
+                    name, decision["key"], fingerprint, context_key, attempt_token=claimed
+                )
     return store.get(name)
 
 
