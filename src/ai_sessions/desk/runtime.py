@@ -25,9 +25,8 @@ def claim(path):
     with path.open("a+b") as stream:
         # Windows mandatory byte locks prohibit reading the claimed byte too.
         # Append mode opens at EOF, so size inspection never touches that byte.
-        if stream.tell() == 0:
-            stream.write(b"\0")
-            stream.flush()
+        # Region locks work beyond EOF. Initializing a byte before locking can
+        # write into another owner's mandatory Windows lock during first use.
         stream.seek(0)
         try:
             if os.name == "nt":

@@ -118,9 +118,8 @@ def _valid_history(entry):
 def _locked(path):
     path.parent.mkdir(parents=True, exist_ok=True)
     with path.with_suffix(path.suffix + ".lock").open("a+b") as handle:
-        if handle.tell() == 0:
-            handle.write(b"0")
-            handle.flush()
+        # Region locks work beyond EOF. Initializing a byte before locking can
+        # write into another owner's mandatory Windows lock during first use.
         handle.seek(0)
         if os.name == "nt":
             import msvcrt
