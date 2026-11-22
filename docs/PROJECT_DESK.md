@@ -86,6 +86,16 @@ four can take roughly two minutes plus model time. Existing questions and saved
 context remain readable during preparation; a missing detail card stays marked
 Preparing background. Continue discussing the project while the remaining cards prepare.
 
+If the latest background lookup fails, a request without details says
+**Background unavailable**, retains its saved question/context, and offers a
+retry step. It does not stay labeled Preparing background forever. If valid
+details already exist, they remain readable with a small update-unavailable note.
+Help includes the explicit retry command:
+
+```powershell
+ses desk refresh HANDLE --retry-context
+```
+
 Refresh preserves the viewed decision, disclosure fold and scroll when content
 is unchanged. If the selected item resolves, becomes superseded, or disappears,
 it remains visible with that status until you browse to another pending decision

@@ -128,6 +128,9 @@ def _detail(snapshot: dict | None, state: State, width: int) -> list[str]:
             "d: show / hide deeper background and source excerpts inline\n"
             "Background ready: the supplied context is available. Background needed: facts are missing.\n"
             "Preparing background: the saved request is waiting for richer context.\n"
+            "Background unavailable: the last background lookup failed. Retry with:\n"
+            "ses desk refresh HANDLE --retry-context\n"
+            "Replace HANDLE with this Desk's handle or saved name.\n"
             "A resolved or removed decision stays visible until you browse away.\n"
             "Up / Down or PgUp / PgDn: scroll\n"
             "Home / End: top / bottom\n"
@@ -282,8 +285,17 @@ def _decision_body(snapshot, state, width):
     else:
         position = f"Decision {index}/{len(pending)}"
     ready = bool(details and details.get("readiness") == "ready")
+    enrichment = (snapshot or {}).get("decision_enrichment") or {}
+    attempt = enrichment.get(key) if isinstance(enrichment, dict) else None
+    failed = isinstance(attempt, dict) and attempt.get("status") == "failed"
     background = (
-        "Background ready" if ready else "Background needed" if details else "Preparing background"
+        "Background ready"
+        if ready
+        else "Background needed"
+        if details
+        else "Background unavailable"
+        if failed
+        else "Preparing background"
     )
     active = not missing and selected.get("status") == "pending"
     parts = [position + (" · " + background if active else ""), ""]
@@ -294,6 +306,16 @@ def _decision_body(snapshot, state, width):
         if value:
             parts.extend(["", title, _human_text(value)])
 
+    if failed:
+        parts.extend(
+            [
+                "Background update unavailable. Showing saved context."
+                if details
+                else "Background lookup failed. Saved request shown below.",
+                "Retry the background lookup; ? Help has the command.",
+                "",
+            ]
+        )
     if details:
         parts.append(_human_text(details.get("summary")) or _human_text(selected.get("question")))
         section("Context", details.get("background") or "Background is still being prepared.")
@@ -337,7 +359,9 @@ def _decision_body(snapshot, state, width):
         section("Saved context", selected.get("context"))
         section(
             "Background and options",
-            "Preparing the background, options and tradeoffs. Missing facts have not been identified yet.",
+            "Background is unavailable. Options and missing facts could not be established."
+            if failed
+            else "Preparing the background, options and tradeoffs. Missing facts have not been identified yet.",
         )
         section("Earlier suggestion", selected.get("recommendation"))
 
@@ -349,7 +373,9 @@ def _decision_body(snapshot, state, width):
                 parts.extend(["", *_source_excerpt(entry)])
         else:
             parts.append(
-                "Source excerpts are still being prepared. The saved context above is available now."
+                "Source excerpts are unavailable. Retry the background lookup; ? Help has the command."
+                if failed
+                else "Source excerpts are still being prepared. The saved context above is available now."
             )
     parts.extend(
         [

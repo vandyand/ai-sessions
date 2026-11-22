@@ -283,3 +283,10 @@ at most two canonical hydrated summaries (selected/first), and n/p to open them.
 The UI does not independently paraphrase questions. Resolved/removed retained
 cards show their closed/saved status without background-readiness or a new answer
 prompt. The d Sources / d Hide footer control replaces a permanent body row.
+
+Decision enrichment status is read from decision_enrichment[key] for the latest
+matching core. Failed enrichment without details says Background unavailable,
+keeps saved context and directs the reader to the retry command in help:
+`ses desk refresh HANDLE --retry-context`. Existing valid details survive a failed
+refresh with a small note. Pending/in-progress hydration says Preparing background.
+Raw exception messages are never presentation text.

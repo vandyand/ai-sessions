@@ -593,3 +593,32 @@ def test_background_labels_and_closed_cards_do_not_suggest_a_new_action():
     frame = view.render(data, state, 40, 18, now=NOW)
     assert "d Sources" in frame.lines[-1]
     assert "d Background" not in "\n".join(frame.lines)
+
+
+@pytest.mark.parametrize("status", ["in_progress", None])
+def test_missing_details_prepare_until_enrichment_reports_failure(status):
+    data = snapshot()
+    if status:
+        data["decision_enrichment"] = {"secret-a": {"status": status, "checked_at": 1}}
+    text = "\n".join(view._body(data, view.State(tab=3), 80))
+    assert "Preparing background" in text and "Background unavailable" not in text
+
+
+def test_failed_enrichment_is_unavailable_not_forever_preparing_and_help_has_retry():
+    data = snapshot(decision_enrichment={"secret-a": {"status": "failed", "checked_at": 1}})
+    state = view.handle_key(view.State(tab=3), "d", data, 80, 25)
+    text = "\n".join(view._body(data, state, 80))
+    assert "Background unavailable" in text and "Preparing" not in text
+    assert "Retry" in text and "Rain expected." in text
+    assert "Source excerpts are unavailable" in text
+    help_text = "\n".join(view._body(data, view.State(tab=3, help=True), 100))
+    assert "ses desk refresh HANDLE --retry-context" in help_text
+
+
+def test_failed_details_refresh_preserves_valid_content_with_small_note():
+    data = detailed_snapshot()
+    data["decision_enrichment"] = {"secret-a": {"status": "failed", "checked_at": 1}}
+    text = "\n".join(view._body(data, view.State(tab=3), 100))
+    assert "Background ready" in text and "Showing saved context" in text
+    assert "Choose whether the garden" in text and "protects the plants" in text
+    assert "Preparing background" not in text
