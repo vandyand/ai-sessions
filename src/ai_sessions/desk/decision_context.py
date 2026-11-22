@@ -12,8 +12,7 @@ import os
 import re
 from pathlib import Path
 
-from ..conversion import _block_text, scrub
-from ..harnesses.desk_observer import _check_stop
+from ..harnesses.desk_observer import _check_stop, context_message, supports_context_source
 
 MAX_SCAN_BYTES = 32 * 1024 * 1024
 MAX_RECORD_BYTES = 512 * 1024
@@ -65,33 +64,6 @@ def _query(decision):
                 )
             )
     return terms, dates
-
-
-def _message(raw, tool):
-    try:
-        value = json.loads(raw)
-        if not isinstance(value, dict):
-            return None
-        if tool == "claude":
-            if value.get("type") not in ("user", "assistant") or value.get("isMeta"):
-                return None
-            message = value.get("message")
-            role = value["type"]
-        else:
-            if value.get("type") != "response_item":
-                return None
-            message = value.get("payload")
-            if not isinstance(message, dict) or message.get("type") != "message":
-                return None
-            role = message.get("role")
-        if not isinstance(message, dict) or role not in ("user", "assistant"):
-            return None
-        text = scrub(_block_text(message.get("content")))
-        if text:
-            return role, text, bool(value.get("isSidechain"))
-    except (ValueError, TypeError, RecursionError):
-        pass
-    return None
 
 
 def _score(text, terms, dates):
@@ -159,7 +131,7 @@ def _scan_source(source, terms, dates, allowance, stop, counter):
                     partial = not complete
                     limitations.add("Oversized or incomplete JSONL records were omitted.")
                     continue
-                parsed = _message(raw, source["tool"])
+                parsed = context_message(raw, source["tool"])
                 if parsed is None:
                     continue
                 role, text, sidechain = parsed
@@ -245,9 +217,7 @@ def gather_context(record, decision, *, stop=None):
         if _identity(source) in seen_sources:
             continue
         seen_sources.add(_identity(source))
-        if source.get("tool") not in ("claude", "codex") or not str(
-            source.get("storage", "")
-        ).endswith(".jsonl"):
+        if not supports_context_source(source):
             limitations.append("A selected source is not supported plain Claude/Codex JSONL.")
             continue
         if counter[0] >= MAX_SCAN_BYTES:
