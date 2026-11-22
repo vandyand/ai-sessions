@@ -121,7 +121,7 @@ Neither Codex nor Claude Code can reload its settings, its login or a new sessio
 sessions --reopen
 ```
 
-It resumes the session that tab last ran, following its conversation if it has since moved to another harness, and reopens a supervisor as a supervisor. In a fresh tab it lists the sessions closed most recently. After a session closes, `sessions` prints this reminder.
+It resumes the exact native session that tab last ran, and reopens a supervisor as a supervisor. In a fresh tab it asks which recently closed session to use. Terminal history updates are serialized, with a separate seven-day recovery record for each terminal so older launchers cannot erase its close marker by overwriting the shared index. Direct native launches may have no recorded identity: open the exact name or handle instead, and use `sessions new codex` for tracked future launches. After a managed session closes, `sessions` prints this reminder.
 
 To do both in one step, type this inside the session, in Claude Code or Codex:
 

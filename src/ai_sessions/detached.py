@@ -16,15 +16,20 @@ bring back whatever a tab lost without searching for it, and ``sessions
 
 from __future__ import annotations
 
+import copy
+import hashlib
 import json
+import math
 import os
 import time
 from collections.abc import Iterable
+from contextlib import contextmanager
 from pathlib import Path
 from typing import Any
 
 import psutil
 
+from . import fastjson
 from .capabilities import Unsupported
 from .model import Session
 from .paths import APP_CACHE_DIR
@@ -46,23 +51,125 @@ def _read(path: Path) -> dict[str, dict[str, Any]]:
     try:
         document = json.loads(path.read_text(encoding="utf-8"))
     except (OSError, UnicodeError, json.JSONDecodeError):
-        return {}
+        document = {}
     if not isinstance(document, dict):
-        return {}
+        document = {}
     cutoff = time.time() - TERMINAL_MEMORY_SECONDS
-    return {
+    result = {
         str(key): value
         for key, value in document.items()
-        if isinstance(value, dict) and float(value.get("at", 0) or 0) >= cutoff
+        if isinstance(value, dict) and _recent(value.get("at"), cutoff)
     }
+    # These files are written only for the terminal actually changed by a new
+    # launcher. An old launcher can overwrite the index, but cannot overwrite
+    # this terminal's newer identity/close marker with its cached index entry.
+    for record in _history_files(path):
+        try:
+            saved = fastjson.read(record)
+            key, entry = saved["terminal"], saved["entry"]
+            if (
+                not isinstance(key, str)
+                or not key
+                or not _recent(saved.get("at"), cutoff)
+                or record != _history_path(path, key)
+            ):
+                continue
+            if entry is None:
+                result.pop(key, None)
+            elif _valid_history(entry):
+                result[key] = entry
+        except (OSError, ValueError, TypeError, KeyError):
+            continue
+    return result
+
+
+def _recent(value, cutoff):
+    try:
+        stamp = float(value)
+        return math.isfinite(stamp) and stamp >= cutoff
+    except (ValueError, TypeError):
+        return False
+
+
+def _history_path(path, terminal):
+    return path.with_name(path.stem + "-history") / (
+        hashlib.sha256(terminal.encode("utf-8")).hexdigest() + ".json"
+    )
+
+
+def _history_files(path):
+    try:
+        return list(path.with_name(path.stem + "-history").glob("*.json"))
+    except OSError:
+        return []
+
+
+def _valid_history(entry):
+    return (
+        isinstance(entry, dict)
+        and all(isinstance(entry.get(k), str) and entry[k] for k in ("home", "tool", "session_id"))
+        and isinstance(entry.get("pid"), int)
+        and entry["pid"] > 0
+        and _recent(entry.get("started"), 0.000001)
+    )
+
+
+@contextmanager
+def _locked(path):
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.with_suffix(path.suffix + ".lock").open("a+b") as handle:
+        if handle.tell() == 0:
+            handle.write(b"0")
+            handle.flush()
+        handle.seek(0)
+        if os.name == "nt":
+            import msvcrt
+
+            msvcrt.locking(handle.fileno(), msvcrt.LK_LOCK, 1)
+        else:
+            import fcntl
+
+            fcntl.flock(handle, fcntl.LOCK_EX)
+        try:
+            yield
+        finally:
+            handle.seek(0)
+            if os.name == "nt":
+                msvcrt.locking(handle.fileno(), msvcrt.LK_UNLCK, 1)
+            else:
+                fcntl.flock(handle, fcntl.LOCK_UN)
+
+
+def _mutate(path, update):
+    try:
+        with _locked(path):
+            document = _read(path)
+            before = copy.deepcopy(document)
+            result = update(document)
+            now = time.time()
+            for key in before.keys() | document.keys():
+                if before.get(key) != document.get(key):
+                    fastjson.write_atomic(
+                        _history_path(path, key),
+                        {"terminal": key, "entry": document.get(key), "at": now},
+                    )
+            # Retain seven days of exact-terminal history, including tombstones
+            # for a session moved elsewhere; never infer identity from recency.
+            for record in _history_files(path):
+                try:
+                    if not _recent(fastjson.read(record).get("at"), now - TERMINAL_MEMORY_SECONDS):
+                        record.unlink(missing_ok=True)
+                except (OSError, ValueError, AttributeError):
+                    continue
+            _write(path, document)
+            return result
+    except OSError:
+        return None
 
 
 def _write(path: Path, document: dict[str, dict[str, Any]]) -> None:
     try:
-        path.parent.mkdir(parents=True, exist_ok=True)
-        temporary = path.with_suffix(".tmp")
-        temporary.write_text(json.dumps(document, indent=1), encoding="utf-8")
-        temporary.replace(path)
+        fastjson.write_atomic(path, document, indent=True)
     except OSError:
         pass
 
@@ -85,38 +192,42 @@ def remember(
     terminal = terminal_id() if terminal is None else terminal
     native_id = session.launch_target(tool) or session.session_id
     home = str(REGISTRY.get(tool).home) if tool in REGISTRY else ""
-    prior = _read(path)
-    pending = {}
-    for entry in prior.values():
-        if (
-            entry.get("pid") == pid
-            and entry.get("started") == started
-            and entry.get("tool") == tool
-            and entry.get("session_id") == native_id
-        ):
-            pending = {key: entry[key] for key in ("restart", "restart_tool") if key in entry}
-            break
-    document = {
-        key: value
-        for key, value in prior.items()
-        if value.get("session_id") != native_id
-        or value.get("tool") != tool
-        or (new_launcher and value.get("pid") != pid and _live_remembered(value))
-    }
-    document[terminal or f"pid:{pid}"] = {
-        "session_id": native_id,
-        "home": home,
-        "tool": tool,
-        "title": session.title,
-        "cwd": session.cwd,
-        "pid": pid,
-        "started": started,
-        "at": time.time(),
-        **pending,
-        **({"new_launcher": True} if new_launcher else {}),
-        **({"restart_error": restart_error} if restart_error else {}),
-    }
-    _write(path, document)
+
+    def update(prior):
+        pending = {}
+        for entry in prior.values():
+            if (
+                entry.get("pid") == pid
+                and entry.get("started") == started
+                and entry.get("tool") == tool
+                and entry.get("session_id") == native_id
+            ):
+                pending = {key: entry[key] for key in ("restart", "restart_tool") if key in entry}
+                break
+        document = {
+            key: value
+            for key, value in prior.items()
+            if value.get("session_id") != native_id
+            or value.get("tool") != tool
+            or (new_launcher and value.get("pid") != pid and _live_remembered(value))
+        }
+        document[terminal or f"pid:{pid}"] = {
+            "session_id": native_id,
+            "home": home,
+            "tool": tool,
+            "title": session.title,
+            "cwd": session.cwd,
+            "pid": pid,
+            "started": started,
+            "at": time.time(),
+            **pending,
+            **({"new_launcher": True} if new_launcher else {}),
+            **({"restart_error": restart_error} if restart_error else {}),
+        }
+        prior.clear()
+        prior.update(document)
+
+    _mutate(path, update)
 
 
 def _live_remembered(entry: dict) -> bool:
@@ -137,18 +248,19 @@ def mark_closed(pid: int, *, path: Path = TERMINALS_FILE) -> str | None:
     Returns None unless ``sessions --restart`` asked for it to be reopened;
     then the harness to reopen it in, or "" for the one it ran in.
     """
-    document = _read(path)
-    restart: str | None = None
-    for entry in document.values():
-        if entry.get("pid") == pid and not entry.get("closed"):
-            if entry.pop("restart", False):
-                restart = str(entry.get("restart_tool", "") or "")
-            entry.pop("restart_tool", None)
-            entry["closed"] = True
-            entry["at"] = time.time()
-    if any(entry.get("pid") == pid for entry in document.values()):
-        _write(path, document)
-    return restart
+
+    def update(document):
+        restart: str | None = None
+        for entry in document.values():
+            if entry.get("pid") == pid and not entry.get("closed"):
+                if entry.pop("restart", False):
+                    restart = str(entry.get("restart_tool", "") or "")
+                entry.pop("restart_tool", None)
+                entry["closed"] = True
+                entry["at"] = time.time()
+        return restart
+
+    return _mutate(path, update)
 
 
 def running_here(*, path: Path = TERMINALS_FILE) -> tuple[str, dict[str, Any]] | None:
@@ -219,14 +331,16 @@ def request_restart(key: str, tool: str = "", *, path: Path = TERMINALS_FILE) ->
     ``tool`` names another harness to carry the conversation into; "" keeps it
     in the one it ran in.
     """
-    document = _read(path)
-    if key in document:
-        document[key]["restart"] = True
-        if tool:
-            document[key]["restart_tool"] = tool
-        else:
-            document[key].pop("restart_tool", None)
-        _write(path, document)
+
+    def update(document):
+        if key in document:
+            document[key]["restart"] = True
+            if tool:
+                document[key]["restart_tool"] = tool
+            else:
+                document[key].pop("restart_tool", None)
+
+    _mutate(path, update)
 
 
 def _shared_daemon(process: psutil.Process) -> bool:

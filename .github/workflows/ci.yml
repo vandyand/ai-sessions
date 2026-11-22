@@ -20,7 +20,7 @@ jobs:
       - run: python -m pip install --upgrade pip
       - run: python -m pip install . pytest
       - run: python -m unittest discover -s tests -v
-      - run: python -m pytest tests/test_desk_store.py tests/test_desk_observer.py tests/test_desk_view.py tests/test_desk_freshness.py tests/test_desk_overview.py tests/test_desk_cli.py tests/test_desk_runtime.py tests/test_handles.py tests/test_handle_integration.py tests/test_handle_lookup.py tests/test_claude_resolve_ambiguity.py tests/test_desk_notifications.py tests/test_conversation_view.py tests/test_deletion.py tests/test_deletion_provider_schemas.py tests/test_deletion_current.py tests/test_deletion_native.py -q -p no:cacheprovider
+      - run: python -m pytest tests/test_desk_store.py tests/test_desk_observer.py tests/test_desk_view.py tests/test_desk_freshness.py tests/test_desk_overview.py tests/test_desk_cli.py tests/test_desk_runtime.py tests/test_handles.py tests/test_handle_integration.py tests/test_handle_lookup.py tests/test_claude_resolve_ambiguity.py tests/test_desk_notifications.py tests/test_conversation_view.py tests/test_deletion.py tests/test_deletion_provider_schemas.py tests/test_deletion_current.py tests/test_deletion_native.py tests/test_reopen_memory.py -q -p no:cacheprovider
       - run: sessions --version
       - run: ses --version
       - run: sessions --list
