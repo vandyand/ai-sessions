@@ -384,7 +384,7 @@ def test_complete_decision_has_options_reasons_and_context_without_disclosure():
     data = detailed_snapshot()
     text = "\n".join(view.render(data, view.State(tab=3), 100, 65, now=NOW).lines)
     for expected in (
-        "Ready",
+        "Background ready",
         "shaded courtyard",
         "Friday delivery",
         "Reserve the covered bay",
@@ -394,7 +394,7 @@ def test_complete_decision_has_options_reasons_and_context_without_disclosure():
         "protects the plants",
         "another customer",
         "Desk conversation",
-        "d Background",
+        "d Sources",
     ):
         assert expected in text
     assert "covered bay is available" not in text
@@ -437,11 +437,13 @@ def test_missing_context_stays_explicit_and_legacy_never_claims_ready():
         recommendation=dict(option_id=None, reason="The refund terms have not been supplied."),
     )
     text = "\n".join(view._body(data, view.normalize(view.State(tab=3), data, 80, 25), 80))
-    assert "Needs context" in text and "refundable amount" in text and "not been supplied" in text
+    assert (
+        "Background needed" in text and "refundable amount" in text and "not been supplied" in text
+    )
     data.pop("decision_details")
     text = "\n".join(view._body(data, view.normalize(view.State(tab=3), data, 80, 25), 80))
-    assert "Needs context" in text and "Preparing" in text and "Rain expected." in text
-    assert "Ready" not in text
+    assert "Preparing background" in text and "Rain expected." in text
+    assert "Background ready" not in text
 
 
 @pytest.mark.parametrize("width", [40, 60, 100])
@@ -449,7 +451,7 @@ def test_rich_decision_scroll_reaches_every_section_and_disclosure_is_visible(wi
     data = detailed_snapshot()
     state = view.normalize(view.State(tab=3), data, width, 18)
     frame = view.render(data, state, width, 18, now=NOW)
-    assert "d Background" in "\n".join(frame.lines)
+    assert "d Sources" in "\n".join(frame.lines)
     assert "3 Decisions" in frame.lines[1]
     assert all(view.cell_width(line) <= width for line in frame.lines)
     state = view.handle_key(state, "d", data, width, 18)
@@ -466,7 +468,7 @@ def test_changed_core_without_details_does_not_reuse_old_context():
     data["decision_details"] = {}
     state = view.normalize(state, data, 80, 25)
     text = "\n".join(view._body(data, state, 80))
-    assert "Which supplier" in text and "Needs context" in text
+    assert "Which supplier" in text and "Preparing background" in text
     assert "covered bay protects" not in text
 
 
@@ -556,4 +558,38 @@ def test_reconstructed_summary_replaces_lossy_core_premise_without_approval_infe
     text = "\n".join(view._body(data, state, 100))
     assert "Did you previously approve" in text and "already ran?" in text
     assert "Should we run" not in text and "Approve the test now" not in text
-    assert "cannot be inferred" in text and "Needs context" in text
+    assert "cannot be inferred" in text and "Background needed" in text
+
+
+@pytest.mark.parametrize("tab", [1, 2])
+def test_overview_review_teasers_use_canonical_summary_and_bounded_count(tab):
+    from copy import deepcopy
+
+    data = detailed_snapshot(summary="Did you previously approve the test that already ran?")
+    data["decisions"][0]["question"] = "Should we run a new test?"
+    sample = deepcopy(data["decisions"][1])
+    data["decisions"].extend(
+        dict(sample, key=f"additional-{n}", question=f"Extra question {n}") for n in range(78)
+    )
+    state = view.normalize(view.State(tab=tab), data, 80, 25)
+    text = "\n".join(view._body(data, state, 80))
+    assert "Your decisions · 80 open" in text
+    assert "Did you previously approve the test that already ran?" in text
+    assert "Should we run a new test?" not in text and "Extra question 77" not in text
+    assert "n/p: open Decisions" in text
+    assert view.handle_key(state, "n", data, 80, 25).selected_key == "secret-a"
+
+
+def test_background_labels_and_closed_cards_do_not_suggest_a_new_action():
+    data = detailed_snapshot()
+    state = view.normalize(view.State(tab=3), data, 40, 18)
+    assert "Background ready" in "\n".join(view._body(data, state, 40))
+    data["decisions"][0]["status"] = "resolved"
+    state = view.normalize(state, data, 40, 18)
+    text = "\n".join(view._body(data, state, 40))
+    assert text.startswith("Resolved")
+    assert "Background ready" not in text and "Background needed" not in text
+    assert "Preparing background" not in text
+    frame = view.render(data, state, 40, 18, now=NOW)
+    assert "d Sources" in frame.lines[-1]
+    assert "d Background" not in "\n".join(frame.lines)

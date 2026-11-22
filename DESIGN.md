@@ -207,27 +207,27 @@ a separate source reader would add another selection and scrolling mode.
   the rolling progress report. Decisions presents one self-contained ask at a time.
 - Left/Right and Tab/Shift+Tab cycle three views; 1/2/3 select directly. n/p opens
   first/last pending decision from Overview/Review and browses pending decisions.
-- A decision starts with its position and plain **Ready** or **Needs context**.
+- A decision starts with its position and plain **Background ready** or **Background needed**.
   Summary explains the precise ask/proposal. Background carries the goal,
   definitions and prior story; Why now explains the trigger. Options include
   descriptions, benefits, risks and consequences. Recommendation identifies its
   option and reason, or explains why no option can be recommended yet. Specific
   missing facts, deferral consequences and deadlines appear when supplied.
 - d reveals deeper background/source excerpts inline, in the same body scroll.
-  The d hint remains visible at 40 columns. No nested reader or secondary scroll.
+  The d Sources footer hint remains visible at 40 columns. No nested reader or secondary scroll.
   Essential context and tradeoffs never require opening the fold.
 - Source excerpts use human titles and exact Eastern times when supplied as
   explicit timestamps. Byte start/end offsets are never treated as dates. Native
   IDs, paths, digests, citation IDs and decision keys are not presentation labels.
 - Legacy questions retain meaningful saved context/recommendation but explicitly
-  say Needs context / preparing background and options. Missing is never Ready.
+  say Preparing background. Missing details never mean Background ready.
 - Selection is keyed internally. Unchanged refreshes retain key, disclosure and
   scroll. A selected resolved or removed item stays visible, marked Resolved or
   No longer listed, until the user browses away; it never silently becomes a new ask.
 - Empty, initial-preparing, failed-update and partial-history states qualify the
   absence of open decisions. Last good content survives read/update failures.
   Rich details prepare for at most two pending decisions per observer pass;
-  remaining legacy cards retain saved context and say Needs context while waiting.
+  remaining legacy cards retain saved context and say Preparing background while waiting.
 - First row: Desk identity and source freshness plus summary age. Age alone never
   implies stale. Second row: three view names, active view bracketed. One blank
   row separates navigation from prose. The footer has contextual controls and an
@@ -268,12 +268,18 @@ Validation distinguishes deterministic keyboard/render evidence and native conso
 captures from human comprehension. Human use remains the measure of whether the
 project explanation provides enough context; bounded evidence is not an audit.
 
-Current validation: 217 isolated source Desk tests passed, 10 subtests passed,
+Current validation: 221 isolated source Desk tests passed, 10 subtests passed,
 1 skipped. The native Windows console fixture passes at 40/60/100 columns with
 real arrow/Tab/Shift+Tab/Page/Home/End, disclosure, help and exit input. Captured
 console frames were visually inspected at all three widths, including missing
 context and expanded sources. `AI_SESSIONS_DESK_SMOKE_CAPTURE` saves the finite
 fixture captures for integration review.
 
-The additional consent-reconstruction regression passes with the full UI file
-(58 tests), replacing a false legacy premise without inferring prior approval.
+The consent-reconstruction regression passes in the isolated Desk suite,
+replacing a false legacy premise without inferring prior approval.
+
+Overview and Review append a bounded Your decisions section: total pending count,
+at most two canonical hydrated summaries (selected/first), and n/p to open them.
+The UI does not independently paraphrase questions. Resolved/removed retained
+cards show their closed/saved status without background-readiness or a new answer
+prompt. The d Sources / d Hide footer control replaces a permanent body row.

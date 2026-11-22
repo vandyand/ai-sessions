@@ -61,7 +61,11 @@ The project conversation runs in the desk folder so it can read the briefing. It
 - `h` or `?` opens help, including the exact watched sessions and status meanings.
   `h`, `?` or Esc returns. `q` closes the briefing.
 
-A decision shows **Ready** or **Needs context**, followed by a precise description
+Overview and Review include a short **Your decisions** section with the pending
+count and at most two summaries from the same canonical decision records. `n` / `p`
+opens Decisions. These teasers do not generate separate versions of the questions.
+
+A decision shows **Background ready** or **Background needed**, followed by a precise description
 of the ask or proposal. Its normal view includes project background/definitions,
 why the question matters now, explicit options with benefits/risks/consequences,
 and a recommendation with its reason. Missing definitions or numbers are listed
@@ -69,18 +73,18 @@ as specific missing information. The briefing does not invent yes/no choices or
 recommend an option without support. Deferral consequences and deadlines appear
 when supplied. Action requests and requests for information do not need choices.
 
-Use `d Background` for human-titled source excerpts. Earlier context is labeled;
+Use `d Sources` for human-titled source excerpts. Earlier context is labeled;
 explicit source timestamps appear in Eastern Time. Internal decision keys, native
 IDs, paths, byte ranges and digests are not source labels. Essential context and
 tradeoffs remain in the normal card. For older saved requests, meaningful context
 and earlier suggestions stay visible while the background/options prepare; the
-card says Needs context rather than claiming it is ready.
+card says Preparing background rather than claiming it is ready.
 
 Richer details prepare in the background, up to two pending decisions per observer
 pass. With four older requests and the default 60-second interval, filling all
 four can take roughly two minutes plus model time. Existing questions and saved
 context remain readable during preparation; a missing detail card stays marked
-Needs context. Continue discussing the project while the remaining cards prepare.
+Preparing background. Continue discussing the project while the remaining cards prepare.
 
 Refresh preserves the viewed decision, disclosure fold and scroll when content
 is unchanged. If the selected item resolves, becomes superseded, or disappears,

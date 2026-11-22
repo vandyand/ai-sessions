@@ -126,7 +126,8 @@ def _detail(snapshot: dict | None, state: State, width: int) -> list[str]:
             "3 Decisions: ask, context, options and recommendation\n"
             "n / p: next / previous decision; opens Decisions from Overview or Review\n"
             "d: show / hide deeper background and source excerpts inline\n"
-            "Ready: the decision has the supplied context. Needs context: facts are still missing.\n"
+            "Background ready: the supplied context is available. Background needed: facts are missing.\n"
+            "Preparing background: the saved request is waiting for richer context.\n"
             "A resolved or removed decision stays visible until you browse away.\n"
             "Up / Down or PgUp / PgDn: scroll\n"
             "Home / End: top / bottom\n"
@@ -175,7 +176,9 @@ def _detail(snapshot: dict | None, state: State, width: int) -> list[str]:
         overview = snapshot.get("overview") or {}
         if not overview:
             return wrap(
-                "Preparing the project overview. Recent progress is available in 2 Review.", width
+                "Preparing the project overview. Recent progress is available in 2 Review."
+                + _decision_teasers(snapshot, state),
+                width,
             )
         parts = []
         for key, title in (
@@ -193,10 +196,11 @@ def _detail(snapshot: dict | None, state: State, width: int) -> list[str]:
                     or "Not yet described in the watched conversations.",
                 ]
             )
-        return wrap("\n".join(parts), width)
+        return wrap("\n".join(parts) + _decision_teasers(snapshot, state), width)
     if state.tab == 2:
         return wrap(
-            _review_text(snapshot.get("review")) or "Preparing the first briefing…",
+            (_review_text(snapshot.get("review")) or "Preparing the first briefing…")
+            + _decision_teasers(snapshot, state),
             width,
         )
     return _decision_body(snapshot, state, width)
@@ -206,6 +210,20 @@ def _decision_details(snapshot, key):
     details = (snapshot or {}).get("decision_details") or {}
     row = details.get(key) if isinstance(details, dict) else None
     return row if isinstance(row, dict) and row.get("schema_version") == 1 else None
+
+
+def _decision_teasers(snapshot, state):
+    pending = _pending(snapshot)
+    if not pending:
+        return ""
+    index = next((i for i, row in enumerate(pending) if row.get("key") == state.selected_key), 0)
+    shown = pending[index : index + 2]
+    lines = ["", "", f"Your decisions · {len(pending)} open", "n/p: open Decisions"]
+    for item in shown:
+        details = _decision_details(snapshot, item.get("key"))
+        summary = (details or {}).get("summary") or item.get("question")
+        lines.append("- " + _clip(_human_text(summary), 180))
+    return "\n".join(lines)
 
 
 def _selected(snapshot, state):
@@ -262,15 +280,15 @@ def _decision_body(snapshot, state, width):
     elif selected.get("status") != "pending":
         position = "Resolved" if selected.get("status") == "resolved" else "Superseded"
     else:
-        position = f"Decision {index} of {len(pending)}"
+        position = f"Decision {index}/{len(pending)}"
     ready = bool(details and details.get("readiness") == "ready")
-    parts = [
-        position + " · " + ("Ready" if ready else "Needs context"),
-        "d Background sources: " + ("hide" if key in state.expanded else "show"),
-        "",
-    ]
+    background = (
+        "Background ready" if ready else "Background needed" if details else "Preparing background"
+    )
+    active = not missing and selected.get("status") == "pending"
+    parts = [position + (" · " + background if active else ""), ""]
     if len(pending) > 1 or index is None and pending:
-        parts[0] += " · n/p to browse"
+        parts[0] += " · n/p"
 
     def section(title, value):
         if value:
@@ -333,7 +351,14 @@ def _decision_body(snapshot, state, width):
             parts.append(
                 "Source excerpts are still being prepared. The saved context above is available now."
             )
-    parts.extend(["", "Discuss your answer in the Desk conversation."])
+    parts.extend(
+        [
+            "",
+            "Discuss your answer in the Desk conversation."
+            if active
+            else "Saved context for the previously viewed decision.",
+        ]
+    )
     return wrap("\n".join(parts), width)
 
 
@@ -579,6 +604,8 @@ def render(
     )
     controls = "? Help · q Exit"
     extra = []
+    if not state.help and state.tab == 3 and state.selected_key:
+        extra.append("d Sources" if state.selected_key not in state.expanded else "d Hide")
     available = width - (len(position) + 2 if position else 0)
     if position:
         extra.append("↑↓ Scroll")

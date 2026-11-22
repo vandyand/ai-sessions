@@ -363,7 +363,7 @@ def main():
         assert any(
             "Garden delivery planning" in "\n".join(frame["lines"]) for frame in data["captures"]
         )
-        assert any("Needs context" in "\n".join(frame["lines"]) for frame in data["captures"])
+        assert any("Background needed" in "\n".join(frame["lines"]) for frame in data["captures"])
         import curses
 
         seen = {value for value, kind in data["keys"] if kind == "int"}
