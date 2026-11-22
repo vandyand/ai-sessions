@@ -25,6 +25,7 @@ MAX_OUTPUT_BYTES = 256 * 1024
 MAX_PROMPT_CHARS = 128000
 MAX_CONTEXT_BYTES = 16 * 1024
 MAX_CONTEXT_CHARS = 6000
+MAX_CANONICAL_REF_CHARS = 16000
 MISSING_OVERVIEW_INFO = "This has not been described in the watched conversations yet."
 MODEL_TIMEOUT = 120
 SYSTEM = (
@@ -46,6 +47,12 @@ SYSTEM = (
     "do not invent an objective or add sources. OMIT unchanged decisions (the store retains them), "
     "and never copy unchanged historical records into the output. "
     "New/modified decisions require current supplied evidence."
+    " canonical_decision_refs contains precise hydrated human asks for existing keys. When "
+    "mentioning those questions in Review or Overview, use their canonical summaries rather "
+    "than repeating a lossy legacy question or its false premise. These are prior presentation "
+    "references, NOT new evidence, answers, approval or grounds for resolution. Preserve legacy "
+    "pending cores unless current supplied evidence justifies a core change. Readiness here "
+    "means enough context for the human to respond, never operational permission."
     " Write Review directly for the human: lead with what changed, the current outcome, "
     "and what happens next. Summarize prior context when still relevant. Never write an "
     "audit of the previous summary or lead with coverage, byte offsets, citation mechanics, "
@@ -259,6 +266,7 @@ def _build_prompt(before, coverage, evidence):
         primary_source=primary,
         coverage=coverage,
         evidence=[dict(e, text="") for e in evidence],
+        canonical_decision_refs=[],
     )
     by_id = {s["id"]: s for s in coverage}
     for item in evidence:
@@ -267,6 +275,26 @@ def _build_prompt(before, coverage, evidence):
     def render():
         return SYSTEM + "\n" + json.dumps(payload, ensure_ascii=False, separators=(",", ":"))
 
+    # Optional whole-summary references cannot crowd out pending cores or source
+    # text. Deep details/evidence never enter this ordinary synthesis payload.
+    remaining = MAX_PROMPT_CHARS - len(render())
+    allowance = min(
+        MAX_CANONICAL_REF_CHARS,
+        max(0, remaining - max(128 * len(evidence), min(12000, remaining // 2))),
+    )
+    used = 2
+    for decision in decisions:
+        detail = before.get("decision_details", {}).get(decision["key"], {})
+        summary, readiness = detail.get("summary"), detail.get("readiness")
+        if not isinstance(summary, str) or not summary or len(summary) > 600:
+            continue
+        if readiness not in ("ready", "needs_context"):
+            continue
+        reference = dict(key=decision["key"], summary=summary, readiness=readiness)
+        cost = len(json.dumps(reference, ensure_ascii=False, separators=(",", ":"))) + 1
+        if used + cost <= allowance:
+            payload["canonical_decision_refs"].append(reference)
+            used += cost
     remaining = MAX_PROMPT_CHARS - len(render())
     if remaining < 128 * len(evidence):
         raise PromptBudgetError(

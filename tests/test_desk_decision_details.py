@@ -380,6 +380,48 @@ def test_ready_means_context_understood_not_that_human_answer_is_known(desk):
     assert all(e["context_only"] for e in result["decision_details"]["oct16"]["evidence"])
 
 
+def test_base_prompt_references_canonical_ask_without_importing_deep_details(desk):
+    from ai_sessions.desk import observer
+
+    output = details()
+    output["summary"] = "Did you previously approve the October 16 test?"
+    record = enrich(desk, runner=lambda p: json.dumps(output))
+    record["decision_details"]["oct16"]["evidence"][0]["text"] = "DEEP_CONTEXT_NOT_FOR_BASE_PROMPT"
+    coverage = [dict(id="s0", status="available", changed=True)]
+    prompt = observer._build_prompt(
+        record, coverage, [dict(citation="s0", text="Latest source text")]
+    )
+    payload = json.loads(prompt[len(observer.SYSTEM) + 1 :])
+    assert payload["canonical_decision_refs"] == [
+        dict(key="oct16", summary=output["summary"], readiness="needs_context")
+    ]
+    assert payload["previous_decisions"] == [core()]
+    assert "DEEP_CONTEXT_NOT_FOR_BASE_PROMPT" not in prompt
+    assert "NOT new evidence" in observer.SYSTEM
+
+
+def test_canonical_reference_budget_keeps_all_eighty_pending_cores_and_current_text(desk):
+    from ai_sessions.desk import observer
+
+    record = desk.get("demo")
+    record["decisions"] = [dict(core(), key=f"q{i}") for i in range(80)]
+    record["decision_details"] = {
+        f"q{i}": dict(summary="Question " + "x" * 580, readiness="ready") for i in range(80)
+    }
+    coverage = [dict(id="s0", status="available", changed=True)]
+    prompt = observer._build_prompt(
+        record, coverage, [dict(citation="s0", text="Latest evidence " * 1000)]
+    )
+    payload = json.loads(prompt[len(observer.SYSTEM) + 1 :])
+    assert len(payload["previous_decisions"]) == 80
+    assert (
+        len(json.dumps(payload["canonical_decision_refs"], separators=(",", ":")))
+        <= observer.MAX_CANONICAL_REF_CHARS
+    )
+    assert payload["evidence"][0]["text"]
+    assert len(prompt) <= observer.MAX_PROMPT_CHARS
+
+
 def test_default_model_uses_details_schema_and_existing_tools_disabled_backend(monkeypatch):
     import subprocess
     import sys
