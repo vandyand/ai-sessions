@@ -10,6 +10,7 @@ import time
 from pathlib import Path
 
 from ..harnesses.desk_support import DEFAULT_TOOL, TOOLS
+from .runtime import Activity, ensure_observer, folder, serialized, status, stop_observer
 from .store import Store
 
 
@@ -137,7 +138,35 @@ def update_target(store, record, item):
         store.export(record["name"])
 
 
-def resolve_desk_name(store, reference, *, update=False):
+def ensure_record(store, item, state):
+    """Both entry points serialize creation and preserve linked source membership."""
+    from ..references import native_key
+
+    with serialized(store.root / ".observers" / "records.lock"):
+        matches = target_desks(store, item, state)
+        if matches:
+            update_target(store, matches[0], item)
+            return matches[0]["name"]
+        name = item.handle or item.slug or item.session_id
+        store.create(
+            name,
+            [
+                {
+                    "tool": item.tool,
+                    "session_id": item.session_id,
+                    "storage": item.storage,
+                    "home": native_key(item.tool, item.session_id).home,
+                    "role": "supervisor",
+                    "title": item.title,
+                }
+            ],
+            str(Path(item.cwd or ".").resolve()),
+        )
+        store.export(name)
+        return name
+
+
+def resolve_desk_name(store, reference, *, update=False, create=False):
     from ..handles import HandleStore
 
     try:
@@ -159,6 +188,10 @@ def resolve_desk_name(store, reference, *, update=False):
     items, state = catalog()
     item = resolve_session(reference, items, store=getattr(state, "slugs", None))
     matches = target_desks(store, item, state)
+    if not matches and create:
+        if item.compressed or not item.storage:
+            raise ValueError("Decompress the selected session before observing its desk")
+        return ensure_record(store, item, state)
     if not matches:
         raise ValueError(f"No desk for this session yet; run ses desk {reference} first")
     record = matches[0]
@@ -173,7 +206,7 @@ def resolve_desk_name(store, reference, *, update=False):
 
 def open_target(argv) -> int:
     from ..handles_cli import catalog
-    from ..references import native_key, resolve_session
+    from ..references import resolve_session
     from .launch import open_agent
 
     parser = argparse.ArgumentParser(prog="ses desk")
@@ -190,7 +223,6 @@ def open_target(argv) -> int:
             raise ValueError("Decompress the selected session before creating its desk")
         store = Store(readonly=args.dry_run)
         matches = target_desks(store, item, state)
-        target_key = native_key(item.tool, item.session_id)
         existing = next(iter(matches), None)
         name = existing["name"] if existing else item.handle or item.slug or item.session_id
         if args.dry_run and existing is None:
@@ -206,24 +238,12 @@ def open_target(argv) -> int:
                 )
             )
             return 0
-        if existing is None:
-            store.create(
-                name,
-                [
-                    {
-                        "tool": item.tool,
-                        "session_id": item.session_id,
-                        "storage": item.storage,
-                        "home": target_key.home,
-                        "role": "supervisor",
-                        "title": item.title,
-                    }
-                ],
-                str(Path(item.cwd or ".").resolve()),
+        if not args.dry_run:
+            name = ensure_record(store, item, state)
+            ensure_observer(store, name)
+            print(
+                f"Observer running. Status: ses desk status {args.target}; stop: ses desk stop {args.target}"
             )
-            store.export(name)
-        elif not args.dry_run:
-            update_target(store, existing, item)
         print(f"Briefing pane: ses desk view {args.target}")
         return open_agent(store, name, args.tool or item.tool, dry_run=args.dry_run)
     except (OSError, RuntimeError, ValueError, KeyError) as error:
@@ -233,7 +253,19 @@ def open_target(argv) -> int:
 
 def main(argv=None) -> int:
     raw = list(sys.argv[1:] if argv is None else argv)
-    actions = {"create", "show", "refresh", "watch", "view", "open", "list", "-h", "--help"}
+    actions = {
+        "create",
+        "show",
+        "refresh",
+        "watch",
+        "view",
+        "open",
+        "list",
+        "status",
+        "stop",
+        "-h",
+        "--help",
+    }
     if raw and raw[0] not in actions:
         return open_target(raw)
     parser = argparse.ArgumentParser(
@@ -246,7 +278,7 @@ def main(argv=None) -> int:
     create.add_argument("name")
     create.add_argument("--supervisor", required=True)
     create.add_argument("--source", action="append", default=[])
-    for action in ("show", "refresh", "watch", "view", "open"):
+    for action in ("show", "refresh", "watch", "view", "open", "status", "stop"):
         sub = commands.add_parser(action)
         sub.add_argument("name", help="Session handle, native ID, slug, or saved desk name")
         if action == "show":
@@ -258,7 +290,7 @@ def main(argv=None) -> int:
                 "--watch",
                 action=argparse.BooleanOptionalAction,
                 default=True,
-                help="Update with Haiku while open (default); --no-watch reads saved briefings only",
+                help="Ensure background Haiku updates (default); --no-watch reads saved briefings only",
             )
         if action == "open":
             sub.add_argument("--tool", choices=TOOLS, default=DEFAULT_TOOL)
@@ -268,13 +300,14 @@ def main(argv=None) -> int:
     args = parser.parse_args(argv)
     try:
         store = Store()
-        if args.action in ("show", "refresh", "watch", "view", "open"):
+        if args.action in ("show", "refresh", "watch", "view", "open", "status", "stop"):
             args.name = resolve_desk_name(
                 store,
                 args.name,
                 update=args.action in ("refresh", "watch")
                 or (args.action == "open" and not args.dry_run)
                 or (args.action == "view" and args.watch),
+                create=args.action == "view" and args.watch,
             )
         if args.action == "list":
             rows = store.list()
@@ -320,33 +353,32 @@ def main(argv=None) -> int:
         elif args.action == "open":
             from .launch import open_agent
 
+            if not args.dry_run:
+                ensure_observer(store, args.name)
             return open_agent(store, args.name, args.tool, dry_run=args.dry_run)
         elif args.action == "watch":
-            store.get(args.name)
-            watch(store, args.name, args.interval, threading.Event())
+            ensure_observer(store, args.name, args.interval)
+            print(f"Observer running for {args.name}. Use ses desk stop {args.name} to stop.")
+        elif args.action == "status":
+            row = status(store, args.name)
+            print(
+                json.dumps(
+                    dict(row, log=str(folder(store, args.name) / "observer.log")),
+                    ensure_ascii=False,
+                )
+            )
+        elif args.action == "stop":
+            row = stop_observer(store, args.name)
+            print(f"Observer {row['state']} for {args.name}.")
         elif args.action == "view":
             from .view import run
 
             store.get(args.name)
-            stop = threading.Event()
-            thread = None
-            activity = {}
             if args.watch:
-                thread = threading.Thread(
-                    target=watch,
-                    args=(store, args.name, args.interval, stop, activity),
-                    daemon=True,
-                )
-                thread.start()
-            try:
-                if thread:
-                    run(store, args.name, activity=activity)
-                else:
-                    run(store, args.name)
-            finally:
-                stop.set()
-                if thread:
-                    thread.join(timeout=10)
+                ensure_observer(store, args.name, args.interval)
+                run(store, args.name, activity=Activity(store, args.name))
+            else:
+                run(store, args.name)
         return 0
     except KeyboardInterrupt:
         return 0

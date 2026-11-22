@@ -42,7 +42,9 @@ needed; do not relay every operational exchange into this conversation. A send
 receipt proves transport status, not completion. Do not mark work complete based
 on a summary or send. Do not change approval settings or take over workers.
 
-The briefing pane switches Review / Needs you / Next action. Internal decision
+The observer starts automatically in the background, independently of the briefing pane.
+The first briefing may still be preparing; do not wait for the user to open a view.
+The briefing pane switches Overview / Review / Needs you / Next action. Internal decision
 keys are for correlation, not vocabulary the human must use. If the user says
 "that question", identify it from the current briefing or clarify naturally.
 """
