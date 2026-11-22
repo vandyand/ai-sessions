@@ -1,6 +1,6 @@
 # Project Desk
 
-Updated November 21, 2026.
+Updated November 22, 2026.
 
 Project Desk gives a busy project's human a quiet native Claude Code or Codex conversation, alongside a live terminal briefing. The operational supervisor continues coordinating workers and managers. The human-facing project agent discusses ideas, explains questions and conveys settled direction when asked; it does not receive a stream of team chat notifications.
 
@@ -76,6 +76,12 @@ tradeoffs remain in the normal card. For older saved requests, meaningful contex
 and earlier suggestions stay visible while the background/options prepare; the
 card says Needs context rather than claiming it is ready.
 
+Richer details prepare in the background, up to two pending decisions per observer
+pass. With four older requests and the default 60-second interval, filling all
+four can take roughly two minutes plus model time. Existing questions and saved
+context remain readable during preparation; a missing detail card stays marked
+Needs context. Continue discussing the project while the remaining cards prepare.
+
 Refresh preserves the viewed decision, disclosure fold and scroll when content
 is unchanged. If the selected item resolves, becomes superseded, or disappears,
 it remains visible with that status until you browse to another pending decision
@@ -149,9 +155,12 @@ Review leads with progress, outcomes, and the next human action. Source citation
 details remain in saved records rather than terminal prose. Partial-history details
 are available in help. Desk display and Markdown timestamps use US Eastern Time (EST/EDT).
 
-After upgrading, run `ses desk stop HANDLE`, close an old view with `q`, then reopen
-`ses desk view HANDLE` to load the updated worker and viewer. The operational agent
-need not restart.
+After upgrading, close an old view with `q` and rerun `ses desk view HANDLE`, or
+open a new Desk entry with `ses desk HANDLE`. The new launcher checks the verified
+observer version, gracefully stops an older worker through its scoped stop
+protocol, and starts the updated observer. The refreshed view loads the new UI.
+Neither the operational agent nor the native Desk conversation needs a restart;
+there is no required manual observer-stop step.
 
 ## Observation and costs
 

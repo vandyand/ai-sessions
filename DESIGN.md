@@ -2,7 +2,7 @@
 product: "ai-sessions terminal browser"
 owner: "vandyand"
 status: "active"
-last_reviewed: "2026-11-21"
+last_reviewed: "2026-11-22"
 implementation_roots:
   - "src/ai_sessions/app.py"
   - "src/ai_sessions/harnesses"
@@ -226,6 +226,8 @@ a separate source reader would add another selection and scrolling mode.
   No longer listed, until the user browses away; it never silently becomes a new ask.
 - Empty, initial-preparing, failed-update and partial-history states qualify the
   absence of open decisions. Last good content survives read/update failures.
+  Rich details prepare for at most two pending decisions per observer pass;
+  remaining legacy cards retain saved context and say Needs context while waiting.
 - First row: Desk identity and source freshness plus summary age. Age alone never
   implies stale. Second row: three view names, active view bracketed. One blank
   row separates navigation from prose. The footer has contextual controls and an
@@ -234,6 +236,9 @@ a separate source reader would add another selection and scrolling mode.
 - Answers go in the Desk conversation. No send controls or approval buttons.
   Background observation/lifecycle is unchanged; rendering performs no model or
   filesystem I/O. The viewer checks source stats at most once per second.
+  After a package upgrade, q and reopening the view loads the new UI; either fresh
+  Desk entry also replaces a verified older observer through the existing scoped
+  stop protocol. Native project/operational agents need no restart or manual stop.
 
 ### Data boundary
 
