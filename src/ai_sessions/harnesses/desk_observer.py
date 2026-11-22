@@ -12,6 +12,7 @@ import threading
 import time
 from pathlib import Path
 
+from ..conversion import _block_text, scrub
 from ..model import ReadSnapshot
 
 BRIEFING_SCHEMA = {
@@ -74,7 +75,9 @@ def read_since(tool, ref, checkpoint, *, end):
     return ReadSnapshot(transcript, end)
 
 
-def run_model(prompt, stop=None, *, max_output_bytes, timeout, system, citation_ids=None):
+def run_model(
+    prompt, stop=None, *, max_output_bytes, timeout, system, citation_ids=None, output_schema=None
+):
     """Existing CLI login only; bounded memory, execution time, and pipe writes.
 
     Safe mode disables custom instructions/plugins/hooks, while preserving normal
@@ -90,8 +93,10 @@ def run_model(prompt, stop=None, *, max_output_bytes, timeout, system, citation_
         executable = native_executable()
     if not executable:
         raise RuntimeError("Claude CLI unavailable; install/sign in separately")
-    schema = json.loads(json.dumps(BRIEFING_SCHEMA))
-    if citation_ids:
+    schema = json.loads(json.dumps(output_schema if output_schema is not None else BRIEFING_SCHEMA))
+    if output_schema is not None:
+        pass  # A separately validated details schema cannot edit the legacy decision core.
+    elif citation_ids:
         schema["properties"]["decisions"]["items"]["properties"]["evidence"]["items"]["enum"] = (
             citation_ids
         )
@@ -227,3 +232,36 @@ def run_model(prompt, stop=None, *, max_output_bytes, timeout, system, citation_
     if not isinstance(result, str):
         raise ValueError("observer model envelope has no result")
     return result
+
+
+def supports_context_source(source):
+    return source.get("tool") in ("claude", "codex") and str(source.get("storage", "")).endswith(
+        ".jsonl"
+    )
+
+
+def context_message(raw, tool):
+    try:
+        value = json.loads(raw)
+        if not isinstance(value, dict):
+            return None
+        if tool == "claude":
+            if value.get("type") not in ("user", "assistant") or value.get("isMeta"):
+                return None
+            message = value.get("message")
+            role = value["type"]
+        else:
+            if value.get("type") != "response_item":
+                return None
+            message = value.get("payload")
+            if not isinstance(message, dict) or message.get("type") != "message":
+                return None
+            role = message.get("role")
+        if not isinstance(message, dict) or role not in ("user", "assistant"):
+            return None
+        text = scrub(_block_text(message.get("content")))
+        if text:
+            return role, text, bool(value.get("isSidechain"))
+    except (ValueError, TypeError, RecursionError):
+        pass
+    return None

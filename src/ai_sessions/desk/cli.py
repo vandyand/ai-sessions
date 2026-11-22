@@ -283,6 +283,12 @@ def main(argv=None) -> int:
         sub.add_argument("name", help="Session handle, native ID, slug, or saved desk name")
         if action == "show":
             sub.add_argument("--json", action="store_true")
+        if action == "refresh":
+            sub.add_argument(
+                "--retry-context",
+                action="store_true",
+                help="Retry preparation of missing decision background",
+            )
         if action in ("watch", "view"):
             sub.add_argument("--interval", type=positive_seconds, default=60.0)
         if action == "view":
@@ -346,7 +352,11 @@ def main(argv=None) -> int:
         elif args.action == "refresh":
             from .observer import refresh
 
-            result = refresh(store, args.name)
+            result = (
+                refresh(store, args.name, force_details=True)
+                if args.retry_context
+                else refresh(store, args.name)
+            )
             if result.get("error"):
                 raise RuntimeError(result["error"])
             print(f"Updated {args.name}.")

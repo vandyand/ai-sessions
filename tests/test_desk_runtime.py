@@ -4,6 +4,7 @@ from unittest.mock import patch
 
 import pytest
 
+from ai_sessions import __version__
 from ai_sessions.desk import cli, runtime
 from ai_sessions.desk.store import Store
 from ai_sessions.model import Session
@@ -82,7 +83,9 @@ def test_existing_worker_attaches_without_spawning(tmp_path):
     store = Store(tmp_path)
     store.create("desk", [{"tool": "codex", "session_id": "ops", "storage": "log"}], str(tmp_path))
     with (
-        patch.object(runtime, "status", return_value={"state": "running", "pid": 123}),
+        patch.object(
+            runtime, "status", return_value={"state": "running", "pid": 123, "version": __version__}
+        ),
         patch.object(runtime.subprocess, "Popen") as spawn,
     ):
         assert runtime.ensure_observer(store, "desk")["pid"] == 123

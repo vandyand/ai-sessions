@@ -1,5 +1,17 @@
 # Changelog
 
+## 3.21.0 — 2026-11-22
+
+- Combine Needs you and Next action into Decisions, with project background,
+  explicit choices, tradeoffs, supported recommendations and missing information.
+- Retrieve bounded original conversation context for existing human requests;
+  correct lossy question wording from cited evidence without changing its status.
+- Expand source excerpts inline, retain the selected decision across updates,
+  and show the same canonical question in Overview and Review.
+- Cache decision enrichment, preserve details across older writers and failed
+  updates, and provide an explicit retry for unavailable background.
+- Gracefully replace an older owned Desk observer when opening the updated app.
+
 ## 3.20.10 — 2026-11-21
 
 - Start either the Desk conversation or live briefing first; both initialize the

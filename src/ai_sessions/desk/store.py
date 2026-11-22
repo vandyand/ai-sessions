@@ -8,6 +8,7 @@ import re
 import sqlite3
 import tempfile
 import time
+import uuid
 from contextlib import contextmanager
 from datetime import datetime, timezone
 from pathlib import Path
@@ -117,6 +118,7 @@ class Store:
             return
         self.root.mkdir(parents=True, exist_ok=True)
         with self._connect() as db:
+            db.execute("BEGIN IMMEDIATE")  # Serialize additive schema migration across viewers.
             db.execute(
                 "CREATE TABLE IF NOT EXISTS desks "
                 "(name TEXT PRIMARY KEY COLLATE NOCASE, data TEXT NOT NULL)"
@@ -124,6 +126,26 @@ class Store:
             from .notifications import create_tables
 
             create_tables(db)
+            db.execute(
+                "CREATE TABLE IF NOT EXISTS decision_details "
+                "(desk TEXT COLLATE NOCASE, key TEXT, core_hash TEXT, context_hash TEXT, "
+                "version INTEGER, data TEXT NOT NULL, PRIMARY KEY(desk,key))"
+            )
+            db.execute(
+                "CREATE TABLE IF NOT EXISTS decision_enrichment_attempts "
+                "(desk TEXT COLLATE NOCASE, key TEXT, core_hash TEXT, context_hash TEXT, "
+                "version INTEGER, status TEXT, checked_at REAL, source_hash TEXT, "
+                "started_at REAL, attempt_token TEXT, "
+                "PRIMARY KEY(desk,key,core_hash,context_hash,version))"
+            )
+            columns = {
+                row[1] for row in db.execute("PRAGMA table_info(decision_enrichment_attempts)")
+            }
+            for column, kind in (("started_at", "REAL"), ("attempt_token", "TEXT")):
+                if column not in columns:
+                    db.execute(
+                        f"ALTER TABLE decision_enrichment_attempts ADD COLUMN {column} {kind}"
+                    )
 
     @contextmanager
     def _connect(self):
@@ -157,13 +179,75 @@ class Store:
         row = db.execute("SELECT data FROM desks WHERE name=?", (name,)).fetchone()
         if row is None:
             raise KeyError(name)
-        return json.loads(row[0])
+        snapshot = json.loads(row[0])
+        snapshot["decision_details"] = {}
+        snapshot["decision_enrichment"] = {}
+        cores = {d["key"]: d for d in snapshot["decisions"]}
+        if db.execute("SELECT 1 FROM sqlite_master WHERE name='decision_details'").fetchone():
+            from .decisions import core_fingerprint, validate_details, validate_evidence
+
+            for key, fingerprint, value in db.execute(
+                "SELECT key,core_hash,data FROM decision_details WHERE desk=?", (name,)
+            ):
+                if key not in cores or core_fingerprint(cores[key]) != fingerprint:
+                    continue
+                try:
+                    details = json.loads(value)
+                    validate_details(details)
+                    validate_evidence(details["evidence"], snapshot["sources"])
+                    snapshot["decision_details"][key] = details
+                except (ValueError, TypeError, KeyError):
+                    continue
+        if db.execute(
+            "SELECT 1 FROM sqlite_master WHERE name='decision_enrichment_attempts'"
+        ).fetchone():
+            from .decisions import ENRICHMENT_LEASE_SECONDS, SCHEMA_VERSION, core_fingerprint
+
+            columns = {
+                row[1] for row in db.execute("PRAGMA table_info(decision_enrichment_attempts)")
+            }
+            started_column = "started_at" if "started_at" in columns else "NULL"
+            for key, fingerprint, status, checked, started in db.execute(
+                f"SELECT key,core_hash,status,checked_at,{started_column} FROM decision_enrichment_attempts "
+                "WHERE desk=? AND version=? ORDER BY checked_at DESC,rowid DESC",
+                (name, SCHEMA_VERSION),
+            ):
+                if (
+                    key in snapshot["decision_enrichment"]
+                    or key not in cores
+                    or core_fingerprint(cores[key]) != fingerprint
+                ):
+                    continue
+                if status == "claimed" and (
+                    started is None or started + ENRICHMENT_LEASE_SECONDS <= time.time()
+                ):
+                    status = "expired"
+                state = {
+                    "claimed": "in_progress",
+                    "expired": "failed",
+                    "failed": "failed",
+                    "success": "success",
+                }.get(status)
+                if state is not None:
+                    snapshot["decision_enrichment"][key] = {"status": state, "checked_at": checked}
+        return snapshot
 
     @staticmethod
     def _write(db, snapshot):
         db.execute(
             "UPDATE desks SET data=? WHERE name=?",
-            (json.dumps(snapshot, ensure_ascii=False, allow_nan=False), snapshot["name"]),
+            (
+                json.dumps(
+                    {
+                        k: v
+                        for k, v in snapshot.items()
+                        if k not in ("decision_details", "decision_enrichment")
+                    },
+                    ensure_ascii=False,
+                    allow_nan=False,
+                ),
+                snapshot["name"],
+            ),
         )
 
     def create(self, name, sources, cwd):
@@ -198,6 +282,7 @@ class Store:
             review="",
             overview={},
             decisions=[],
+            decision_details={},
             observed_at=None,
             updated_at=time.time(),
             error=None,
@@ -212,6 +297,7 @@ class Store:
                 db.execute("INSERT INTO desks VALUES (?, ?)", (name, json.dumps(snapshot)))
             except sqlite3.IntegrityError as exc:
                 raise ValueError(f"desk already exists: {name}") from exc
+        snapshot["decision_enrichment"] = {}
         return snapshot
 
     def get(self, name):
@@ -223,7 +309,7 @@ class Store:
             return []
         with self._connect() as db:
             return [
-                json.loads(row[0]) for row in db.execute("SELECT data FROM desks ORDER BY name")
+                self._get(db, row[0]) for row in db.execute("SELECT name FROM desks ORDER BY name")
             ]
 
     def update_primary_source(self, name, expected_revision, source):
@@ -307,7 +393,194 @@ class Store:
                 attempted_coverage=observation.get("sources", []),
             )
             self._write(db, snapshot)
+            # An older publisher omits details. The sidecar remains authoritative;
+            # material ask changes are filtered rather than copied into core JSON.
+            snapshot = self._get(db, name)
+            from .decisions import ENRICHMENT_LEASE_SECONDS, core_fingerprint
+
+            hashes = {d["key"]: core_fingerprint(d) for d in decisions}
+            for key, fingerprint in db.execute(
+                "SELECT key,core_hash FROM decision_enrichment_attempts WHERE desk=?", (name,)
+            ).fetchall():
+                if hashes.get(key) != fingerprint:
+                    db.execute(
+                        "DELETE FROM decision_enrichment_attempts WHERE desk=? AND key=? AND core_hash=? "
+                        "AND NOT(status='claimed' AND started_at>?)",
+                        (name, key, fingerprint, time.time() - ENRICHMENT_LEASE_SECONDS),
+                    )
+            for (key,) in db.execute(
+                "SELECT key FROM decision_details WHERE desk=?", (name,)
+            ).fetchall():
+                if key not in hashes:
+                    db.execute("DELETE FROM decision_details WHERE desk=? AND key=?", (name, key))
         return snapshot
+
+    def decision_enrichment_order(self, name):
+        with self._connect() as db:
+            return dict(
+                db.execute(
+                    "SELECT key,MAX(checked_at) FROM decision_enrichment_attempts WHERE desk=? GROUP BY key",
+                    (name,),
+                )
+            )
+
+    def claim_decision_enrichment(
+        self, name, key, core_hash, context_hash, *, force=False, source_hash=None
+    ):
+        """Claim before calling the model; cached failures and interrupted claims stay cached."""
+        from .decisions import (
+            ENRICHMENT_LEASE_SECONDS,
+            SCHEMA_VERSION,
+            core_fingerprint,
+            source_fingerprint,
+        )
+
+        if not isinstance(context_hash, str) or not context_hash or len(context_hash) > 200:
+            raise ValueError("invalid context fingerprint")
+        with self._connect() as db:
+            db.execute("BEGIN IMMEDIATE")
+            snapshot = self._get(db, name)
+            core = next((d for d in snapshot["decisions"] if d["key"] == key), None)
+            if core is None or core["status"] != "pending" or core_fingerprint(core) != core_hash:
+                return False
+            current_sources = source_fingerprint(snapshot)
+            if source_hash is not None and source_hash != current_sources:
+                return False
+            now = time.time()
+            cutoff = now - ENRICHMENT_LEASE_SECONDS
+            # The lease start is immutable. Polls/force never extend or steal a
+            # live claim, including a claim for a different context/core of this key.
+            db.execute(
+                "UPDATE decision_enrichment_attempts SET status='expired' WHERE desk=? AND key=? "
+                "AND status='claimed' AND (started_at IS NULL OR started_at<=?)",
+                (name, key, cutoff),
+            )
+            if db.execute(
+                "SELECT 1 FROM decision_enrichment_attempts WHERE desk=? AND key=? "
+                "AND status='claimed' AND started_at>?",
+                (name, key, cutoff),
+            ).fetchone():
+                db.execute(
+                    "UPDATE decision_enrichment_attempts SET checked_at=? WHERE desk=? AND key=? "
+                    "AND status='claimed' AND started_at>?",
+                    (now, name, key, cutoff),
+                )
+                return False
+            if (
+                not force
+                and db.execute(
+                    "SELECT 1 FROM decision_enrichment_attempts WHERE desk=? AND key=? "
+                    "AND core_hash=? AND status='expired'",
+                    (name, key, core_hash),
+                ).fetchone()
+            ):
+                db.execute(
+                    "UPDATE decision_enrichment_attempts SET checked_at=? WHERE desk=? AND key=? "
+                    "AND core_hash=? AND status='expired'",
+                    (now, name, key, core_hash),
+                )
+                return False
+            args = (name, key, core_hash, context_hash, SCHEMA_VERSION)
+            existing = db.execute(
+                "SELECT status FROM decision_enrichment_attempts WHERE desk=? AND key=? "
+                "AND core_hash=? AND context_hash=? AND version=?",
+                args,
+            ).fetchone()
+            if existing and not force:
+                db.execute(
+                    "UPDATE decision_enrichment_attempts SET checked_at=? WHERE desk=? AND key=? "
+                    "AND core_hash=? AND context_hash=? AND version=?",
+                    (time.time(), *args),
+                )
+                return False
+            db.execute(
+                "INSERT OR REPLACE INTO decision_enrichment_attempts "
+                "(desk,key,core_hash,context_hash,version,status,checked_at,source_hash,started_at,attempt_token) "
+                "VALUES (?,?,?,?,?,?,?,?,?,?)",
+                (*args, "claimed", now, current_sources, now, token := uuid.uuid4().hex),
+            )
+            if force:
+                db.execute(
+                    "UPDATE decision_enrichment_attempts SET status='failed' WHERE desk=? AND key=? "
+                    "AND core_hash=? AND status='expired'",
+                    (name, key, core_hash),
+                )
+            # Bound changing context histories while preserving every pending core/detail.
+            db.execute(
+                "DELETE FROM decision_enrichment_attempts WHERE desk=? AND key=? AND status!='claimed' AND rowid NOT IN "
+                "(SELECT rowid FROM decision_enrichment_attempts WHERE desk=? AND key=? "
+                "ORDER BY checked_at DESC LIMIT 16)",
+                (name, key, name, key),
+            )
+            return token
+
+    def finish_decision_enrichment(self, name, key, core_hash, context_hash, *, attempt_token=None):
+        from .decisions import SCHEMA_VERSION
+
+        with self._connect() as db:
+            db.execute(
+                "UPDATE decision_enrichment_attempts SET status='failed' WHERE desk=? AND key=? "
+                "AND core_hash=? AND context_hash=? AND version=? AND status='claimed' AND attempt_token=?",
+                (name, key, core_hash, context_hash, SCHEMA_VERSION, attempt_token),
+            )
+
+    def publish_decision_details(
+        self, name, expected_revision, key, core_hash, context_hash, details, *, attempt_token=None
+    ):
+        """Commit details and revision together, without touching core status or notifications."""
+        from .decisions import (
+            ENRICHMENT_LEASE_SECONDS,
+            SCHEMA_VERSION,
+            core_fingerprint,
+            source_fingerprint,
+            validate_details,
+            validate_evidence,
+        )
+
+        validate_details(details)
+        details = json.loads(json.dumps(details, allow_nan=False))
+        with self._connect() as db:
+            db.execute("BEGIN IMMEDIATE")
+            snapshot = self._get(db, name)
+            core = next((d for d in snapshot["decisions"] if d["key"] == key), None)
+            if (
+                type(expected_revision) is not int
+                or expected_revision < 0
+                or expected_revision > snapshot["revision"]
+                or core is None
+                or core["status"] != "pending"
+                or core_fingerprint(core) != core_hash
+            ):
+                raise ConflictError("decision changed during enrichment")
+            validate_evidence(details["evidence"], snapshot["sources"])
+            args = (name, key, core_hash, context_hash, SCHEMA_VERSION)
+            claim = db.execute(
+                "SELECT status,source_hash,started_at,attempt_token FROM decision_enrichment_attempts WHERE desk=? AND key=? "
+                "AND core_hash=? AND context_hash=? AND version=?",
+                args,
+            ).fetchone()
+            if (
+                not claim
+                or claim[0] != "claimed"
+                or claim[1] != source_fingerprint(snapshot)
+                or claim[2] is None
+                or claim[2] + ENRICHMENT_LEASE_SECONDS <= time.time()
+                or not attempt_token
+                or claim[3] != attempt_token
+            ):
+                raise ConflictError("enrichment attempt is no longer claimed")
+            db.execute(
+                "INSERT OR REPLACE INTO decision_details VALUES (?,?,?,?,?,?)",
+                (*args, json.dumps(details, ensure_ascii=False)),
+            )
+            db.execute(
+                "UPDATE decision_enrichment_attempts SET status='success' WHERE desk=? AND key=? "
+                "AND core_hash=? AND context_hash=? AND version=?",
+                args,
+            )
+            snapshot.update(revision=snapshot["revision"] + 1, updated_at=time.time())
+            self._write(db, snapshot)
+            return self._get(db, name)
 
     def fail(self, name, error):
         return self._fail(name, error)
@@ -413,6 +686,20 @@ class Store:
                 )
                 or "No pending questions recorded."
             )
+            if snapshot.get("decision_details"):
+                from .decisions import markdown_details, markdown_text
+
+                text = "\n\n".join(
+                    "## "
+                    + markdown_text(snapshot["decision_details"][d["key"]]["summary"])
+                    + "\n"
+                    + markdown_details(snapshot["decision_details"][d["key"]])
+                    if d["key"] in snapshot["decision_details"]
+                    else f"## {d['question']}\n{d['context']}\nRecommendation: {d['recommendation']}\n"
+                    + "Evidence: "
+                    + ", ".join(d["evidence"])
+                    for d in pending
+                )
             review = snapshot["review"] or "Not observed yet."
             overview_text = _overview_projection(snapshot.get("overview"))
             if overview_text:

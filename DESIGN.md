@@ -2,7 +2,7 @@
 product: "ai-sessions terminal browser"
 owner: "vandyand"
 status: "active"
-last_reviewed: "2026-11-19"
+last_reviewed: "2026-11-22"
 implementation_roots:
   - "src/ai_sessions/app.py"
   - "src/ai_sessions/harnesses"
@@ -194,38 +194,99 @@ file, so a compressed copy can never be mistaken for no copy and bridged again. 
 
 ## Project Desk Briefing
 
-The human's job is to regain project context, understand current progress, and
-identify a question worth discussing in the adjacent Desk conversation. The
-briefing is a keyboard-first, read-only terminal pane, often only 40 columns wide.
+The human's job is to regain project context, understand progress, and decide what
+to discuss in the adjacent Desk conversation. The read-only terminal pane often
+has only 40 columns. The approved navigation is **1 Overview / 2 Review / 3 Decisions**.
+A single decision keeps the ask, context and recommendation together. Splitting
+context and next action into separate views made understanding depend on recall;
+a separate source reader would add another selection and scrolling mode.
 
-- Entry opens **1 Overview**, then **2 Review**, **3 Needs you**, **4 Next action**.
-  Overview preserves background, current position, direction and goal separately
-  from the rolling Review. Missing evidence is stated without inventing goals.
-- Left/Right and Tab/Shift+Tab cycle views. Numeric keys select directly. n/p
-  opens questions from the first two views and cycles them in the last two.
-- First row: desk identity left, freshness plus summary age right. Age alone never
-  implies staleness. `Up to date` requires a current bounded source-stat match;
-  changed, unavailable, unverified and failed states are distinguished in words.
-- Second row: all four view names, abbreviated when narrow, active view bracketed.
-  One blank row separates navigation from prose. Body scroll is independent.
-- Footer: Help and Exit always fit at supported widths. Scroll hint and line range
-  appear only on overflow. Question hints appear only when useful. No clipped
-  all-purpose shortcut paragraph. h/? opens scrollable help; Esc returns.
-- Help includes source scope, status meaning, complete keys, exact Eastern time,
-  partial-history context and recoverable update error details. No native IDs or
-  byte offsets are dumped into the routine view. Color is never required.
-- Last good content survives errors. Viewer checks source metadata at most once
-  per second (32 files maximum); render performs no filesystem or model I/O.
-- Source scope is explicit: supervisor by default, additional selected sessions
-  only. No automatic project-wide observation or messaging.
+### Journey and component contract
 
-Audit evidence and remedies: the previous five-minute age threshold falsely
-implied staleness (major); permanently reserved metadata rows crowded prose
-(minor); a clipped footer advertised inactive controls (major); Review lacked
-stable project context (major). Status/age separation, compact layout, contextual
-controls/help and persistent Overview address these respectively.
+- Entry opens Overview (background, current position, direction, goal). Review is
+  the rolling progress report. Decisions presents one self-contained ask at a time.
+- Left/Right and Tab/Shift+Tab cycle three views; 1/2/3 select directly. n/p opens
+  first/last pending decision from Overview/Review and browses pending decisions.
+- A decision starts with its position and plain **Background ready** or **Background needed**.
+  Summary explains the precise ask/proposal. Background carries the goal,
+  definitions and prior story; Why now explains the trigger. Options include
+  descriptions, benefits, risks and consequences. Recommendation identifies its
+  option and reason, or explains why no option can be recommended yet. Specific
+  missing facts, deferral consequences and deadlines appear when supplied.
+- d reveals deeper background/source excerpts inline, in the same body scroll.
+  The d Sources footer hint remains visible at 40 columns. No nested reader or secondary scroll.
+  Essential context and tradeoffs never require opening the fold.
+- Source excerpts use human titles and exact Eastern times when supplied as
+  explicit timestamps. Byte start/end offsets are never treated as dates. Native
+  IDs, paths, digests, citation IDs and decision keys are not presentation labels.
+- Legacy questions retain meaningful saved context/recommendation but explicitly
+  say Preparing background. Missing details never mean Background ready.
+- Selection is keyed internally. Unchanged refreshes retain key, disclosure and
+  scroll. A selected resolved or removed item stays visible, marked Resolved or
+  No longer listed, until the user browses away; it never silently becomes a new ask.
+- Empty, initial-preparing, failed-update and partial-history states qualify the
+  absence of open decisions. Last good content survives read/update failures.
+  Rich details prepare for at most two pending decisions per observer pass;
+  remaining legacy cards retain saved context and say Preparing background while waiting.
+- First row: Desk identity and source freshness plus summary age. Age alone never
+  implies stale. Second row: three view names, active view bracketed. One blank
+  row separates navigation from prose. The footer has contextual controls and an
+  overflow-only line range. Help and Exit remain available. Help documents all
+  keys, source scope, status meanings, history limits and exact Eastern times.
+- Answers go in the Desk conversation. No send controls or approval buttons.
+  Background observation/lifecycle is unchanged; rendering performs no model or
+  filesystem I/O. The viewer checks source stats at most once per second.
+  After a package upgrade, q and reopening the view loads the new UI; either fresh
+  Desk entry also replaces a verified older observer through the existing scoped
+  stop protocol. Native project/operational agents need no restart or manual stop.
 
-Validation: fictional-source freshness/rebinding/failure tests, four-view keyboard
-and scroll tests, and actual Windows console input/capture at 40×18, 60×12 and
-100×25. Human feedback remains the measure of whether the project explanation is
-sufficient; source coverage is bounded and an overview is not an independent audit.
+### Data boundary
+
+The UI consumes the six-field core decision and `record['decision_details'][key]`
+with schema_version 1: kind, readiness, summary, background, why_now, options,
+recommendation, if_deferred, deadline, missing_information, citations and attached
+backend-authoritative evidence. It never chooses source paths or synthesizes
+missing project facts. The backend filters stale details by core fingerprint.
+A reconstructed details.summary is the sole main ask when present; the lossy
+legacy question is only a fallback, never a second contradictory title. In
+particular, an already-run test with missing prior approval is an information
+request about remembered consent, not a new approval action. Result files never
+become approval evidence through UI wording.
+No backend/store/observer changes belong to this UI work.
+
+### Implementation and validation plan
+
+1. Pin three-view keys, complete cards, truthful legacy fallback, inline sources,
+   stable folds/selection, resolved refresh and narrow layout in UI regression tests.
+2. Implement pure decision formatting and state transitions in desk/view.py.
+3. Update the finite native console fixture with rich decisions, disclosure and
+   real keyboard transitions at 40/60/100 columns. Inspect captured console frames.
+4. Run isolated UI/startup tests and lint, update the Project Desk guide, and commit
+   only owned UI files for parent integration. No PR or version bump here.
+
+Validation distinguishes deterministic keyboard/render evidence and native console
+captures from human comprehension. Human use remains the measure of whether the
+project explanation provides enough context; bounded evidence is not an audit.
+
+Current validation: 221 isolated source Desk tests passed, 10 subtests passed,
+1 skipped. The native Windows console fixture passes at 40/60/100 columns with
+real arrow/Tab/Shift+Tab/Page/Home/End, disclosure, help and exit input. Captured
+console frames were visually inspected at all three widths, including missing
+context and expanded sources. `AI_SESSIONS_DESK_SMOKE_CAPTURE` saves the finite
+fixture captures for integration review.
+
+The consent-reconstruction regression passes in the isolated Desk suite,
+replacing a false legacy premise without inferring prior approval.
+
+Overview and Review append a bounded Your decisions section: total pending count,
+at most two canonical hydrated summaries (selected/first), and n/p to open them.
+The UI does not independently paraphrase questions. Resolved/removed retained
+cards show their closed/saved status without background-readiness or a new answer
+prompt. The d Sources / d Hide footer control replaces a permanent body row.
+
+Decision enrichment status is read from decision_enrichment[key] for the latest
+matching core. Failed enrichment without details says Background unavailable,
+keeps saved context and directs the reader to the retry command in help:
+`ses desk refresh HANDLE --retry-context`. Existing valid details survive a failed
+refresh with a small note. Pending/in-progress hydration says Preparing background.
+Raw exception messages are never presentation text.

@@ -112,7 +112,7 @@ def test_question_navigation_from_review_and_contextual_controls():
     last = view.handle_key(view.State(tab=2), "p", data, 80, 20)
     assert last.tab == 3 and last.selected_key == "two"
     frame = view.render(data, view.State(tab=2), 100, 20)
-    assert "Scroll" not in frame.lines[-1] and "n Questions" in frame.lines[-1]
+    assert "Scroll" not in frame.lines[-1] and "n Decisions" in frame.lines[-1]
     data["decisions"] = data["decisions"][:1]
     frame = view.render(data, view.State(tab=3), 100, 20)
     assert "n/p" not in "\n".join(frame.lines)
@@ -135,7 +135,7 @@ def test_overview_is_first_and_preserves_project_context():
         assert value in text
     assert "[1 Overview]" in text
     assert "paving" not in text
-    assert view.handle_key(view.State(), "4", data, 80, 25).tab == 4
+    assert view.handle_key(view.State(), "4", data, 80, 25).tab == 3
 
 
 def test_first_failure_and_invalid_timestamp_stay_readable():

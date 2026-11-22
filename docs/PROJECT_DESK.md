@@ -1,6 +1,6 @@
 # Project Desk
 
-Updated November 21, 2026.
+Updated November 22, 2026.
 
 Project Desk gives a busy project's human a quiet native Claude Code or Codex conversation, alongside a live terminal briefing. The operational supervisor continues coordinating workers and managers. The human-facing project agent discusses ideas, explains questions and conveys settled direction when asked; it does not receive a stream of team chat notifications.
 
@@ -50,15 +50,57 @@ The project conversation runs in the desk folder so it can read the briefing. It
 
 - `1`: Overview — background, current position, direction and goal (the opening view).
 - `2`: Review — recent progress and outcomes.
-- `3`: Needs you — open questions with context.
-- `4`: Next action — a focused suggested response.
+- `3`: Decisions — each ask, its context, options and recommendation together.
 - Left/Right and Tab/Shift+Tab switch views, wrapping at the ends.
-- `n` / `p` opens the first/last question from Overview or Review, or cycles questions
-  from Needs you / Next action. The shortcut appears only when it is useful.
+- `n` / `p` opens the first/last pending decision from Overview or Review, or cycles
+  pending decisions in Decisions. The shortcut appears only when useful.
+- `d` shows or hides deeper background/source excerpts inline. The whole decision
+  uses the same Up/Down/Page/Home/End scroll; there is no separate source reader.
 - Up/Down and Page Up/Page Down scroll when content exceeds the pane. A line range
   appears at bottom right; no scroll hint is shown when everything fits.
 - `h` or `?` opens help, including the exact watched sessions and status meanings.
   `h`, `?` or Esc returns. `q` closes the briefing.
+
+Overview and Review include a short **Your decisions** section with the pending
+count and at most two summaries from the same canonical decision records. `n` / `p`
+opens Decisions. These teasers do not generate separate versions of the questions.
+
+A decision shows **Background ready** or **Background needed**, followed by a precise description
+of the ask or proposal. Its normal view includes project background/definitions,
+why the question matters now, explicit options with benefits/risks/consequences,
+and a recommendation with its reason. Missing definitions or numbers are listed
+as specific missing information. The briefing does not invent yes/no choices or
+recommend an option without support. Deferral consequences and deadlines appear
+when supplied. Action requests and requests for information do not need choices.
+
+Use `d Sources` for human-titled source excerpts. Earlier context is labeled;
+explicit source timestamps appear in Eastern Time. Internal decision keys, native
+IDs, paths, byte ranges and digests are not source labels. Essential context and
+tradeoffs remain in the normal card. For older saved requests, meaningful context
+and earlier suggestions stay visible while the background/options prepare; the
+card says Preparing background rather than claiming it is ready.
+
+Richer details prepare in the background, up to two pending decisions per observer
+pass. With four older requests and the default 60-second interval, filling all
+four can take roughly two minutes plus model time. Existing questions and saved
+context remain readable during preparation; a missing detail card stays marked
+Preparing background. Continue discussing the project while the remaining cards prepare.
+
+If the latest background lookup fails, a request without details says
+**Background unavailable**, retains its saved question/context, and offers a
+retry step. It does not stay labeled Preparing background forever. If valid
+details already exist, they remain readable with a small update-unavailable note.
+Help includes the explicit retry command:
+
+```powershell
+ses desk refresh HANDLE --retry-context
+```
+
+Refresh preserves the viewed decision, disclosure fold and scroll when content
+is unchanged. If the selected item resolves, becomes superseded, or disappears,
+it remains visible with that status until you browse to another pending decision
+or leave the view. A new request never silently replaces the one being read.
+Answers belong in the Desk conversation; this pane has no send/approval buttons.
 
 The top-right indicator separates summary age from source freshness:
 `Up to date · 2h` means the summary last changed two hours ago and the current
@@ -127,9 +169,12 @@ Review leads with progress, outcomes, and the next human action. Source citation
 details remain in saved records rather than terminal prose. Partial-history details
 are available in help. Desk display and Markdown timestamps use US Eastern Time (EST/EDT).
 
-After upgrading, run `ses desk stop HANDLE`, close an old view with `q`, then reopen
-`ses desk view HANDLE` to load the updated worker and viewer. The operational agent
-need not restart.
+After upgrading, close an old view with `q` and rerun `ses desk view HANDLE`, or
+open a new Desk entry with `ses desk HANDLE`. The new launcher checks the verified
+observer version, gracefully stops an older worker through its scoped stop
+protocol, and starts the updated observer. The refreshed view loads the new UI.
+Neither the operational agent nor the native Desk conversation needs a restart;
+there is no required manual observer-stop step.
 
 ## Observation and costs
 

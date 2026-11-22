@@ -251,7 +251,13 @@ def test_refresh_drains_even_unchanged_successful_observation(desk, monkeypatch)
     publish(store, [decision()])
     good = store.get("demo")
     monkeypatch.setattr(observer, "_refresh", lambda *a, **kw: good)
-    assert observer.refresh(Store(store.root), "demo") == good
+    result = observer.refresh(Store(store.root), "demo")
+    # Independent details hydration can now expose a cached context failure;
+    # notification draining still preserves every main-briefing field.
+    assert {k: v for k, v in result.items() if k != "decision_enrichment"} == {
+        k: v for k, v in good.items() if k != "decision_enrichment"
+    }
+    assert result["decision_enrichment"]["color"]["status"] == "failed"
     assert len(deliveries) == 1
 
 

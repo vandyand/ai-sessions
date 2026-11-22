@@ -15,6 +15,7 @@ from pathlib import Path
 
 import psutil
 
+from .. import __version__
 from ..fastjson import write_atomic as write
 
 
@@ -99,7 +100,14 @@ def status(store, name):
     location = folder(store, name)
     stopped = {"state": "stopped", "busy": False}
     try:
-        row = json.loads((location / "status.json").read_text(encoding="utf-8"))
+        for attempt in range(3):
+            try:
+                row = json.loads((location / "status.json").read_text(encoding="utf-8"))
+                break
+            except PermissionError:
+                if attempt == 2:
+                    raise
+                time.sleep(0.02 * (attempt + 1))
         if (
             Path(row["root"]).resolve() != store.root.resolve()
             or row["name"] != store.get(name)["name"]
@@ -146,7 +154,13 @@ def ensure_observer(store, name, interval=60.0):
     with serialized(location / "startup.lock"):
         current = status(store, name)
         if current["state"] != "stopped":
-            return current
+            if current.get("version") == __version__:
+                return current
+            # Cooperative, generation-scoped shutdown loads updated observer
+            # code without restarting any native agent or shared daemon.
+            current = _stop_current(store, name, current)
+            if current["state"] != "stopped":
+                raise RuntimeError("Previous Desk observer is still stopping; retry shortly")
         generation = uuid.uuid4().hex
         command = [
             sys.executable,
@@ -185,19 +199,23 @@ def ensure_observer(store, name, interval=60.0):
         )
 
 
+def _stop_current(store, name, current):
+    location = folder(store, name)
+    if current["state"] == "stopped":
+        return current
+    write(location / "stop.json", {"generation": current["generation"]})
+    deadline = time.monotonic() + 15
+    while time.monotonic() < deadline:
+        if status(store, name)["state"] == "stopped":
+            return {"state": "stopped", "busy": False}
+        time.sleep(0.1)
+    return dict(current, state="stopping")
+
+
 def stop_observer(store, name):
     location = folder(store, name)
     with serialized(location / "startup.lock"):
-        current = status(store, name)
-        if current["state"] == "stopped":
-            return current
-        write(location / "stop.json", {"generation": current["generation"]})
-        deadline = time.monotonic() + 15
-        while time.monotonic() < deadline:
-            if status(store, name)["state"] == "stopped":
-                return {"state": "stopped", "busy": False}
-            time.sleep(0.1)
-        return dict(current, state="stopping")
+        return _stop_current(store, name, status(store, name))
 
 
 class Activity(dict):
@@ -240,6 +258,7 @@ def serve(store, name, generation, interval):
             state="running",
             busy=True,
             interval=interval,
+            version=__version__,
         )
 
         class Stop:
