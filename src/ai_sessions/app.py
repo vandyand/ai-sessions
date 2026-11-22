@@ -3558,6 +3558,16 @@ def remembered_session(entry: dict[str, Any], sessions: Iterable[Session]) -> Se
     """Resolve terminal memory by harness and native ID, never by conversation head."""
     wanted = str(entry.get("session_id", ""))
     tool = str(entry.get("tool", ""))
+    home = entry.get("home")
+    if home:
+        try:
+            expected = REGISTRY.get(tool).home
+            if os.path.normcase(os.path.abspath(home)) != os.path.normcase(
+                os.path.abspath(expected)
+            ):
+                return None
+        except (KeyError, TypeError, ValueError):
+            return None
     matches = [
         item
         for item in sessions
@@ -6529,9 +6539,16 @@ def choose_reopen(sessions: list[Session]) -> Session | None:
             choices.append(item)
     choices = choices[:REOPEN_CHOICES]
     if not choices:
-        print("sessions: no recently closed session to reopen.", file=sys.stderr)
+        print(
+            "sessions: no recorded session for this terminal. Open the exact session by its "
+            "name or handle; use `sessions new codex` for tracked launches and --reopen "
+            "after exiting. Direct native launches may have no reopen history."
+            if terminal
+            else "sessions: no recently closed session to reopen.",
+            file=sys.stderr,
+        )
         return None
-    if len(choices) == 1:
+    if len(choices) == 1 and not terminal:
         return choices[0]
     print("Recently closed sessions:")
     for index, item in enumerate(choices, 1):
