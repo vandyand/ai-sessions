@@ -85,7 +85,10 @@ SYSTEM = (
 
 def core_fingerprint(core):
     """Ignore citation clocks/status and whitespace, but invalidate changed asks/context."""
-    content = {k: " ".join(core.get(k, "").split()) for k in ("key", "question", "context")}
+    content = {
+        k: " ".join(core.get(k, "").split())
+        for k in ("key", "question", "context", "recommendation")
+    }
     return hashlib.sha256(json.dumps(content, sort_keys=True).encode()).hexdigest()
 
 
@@ -333,7 +336,13 @@ def enrich_pending(store, name, *, context_runner=None, runner=None, stop=None, 
         )
     ]
     order = store.decision_enrichment_order(name)
-    candidates.sort(key=lambda d: order.get(d["key"], 0))
+    candidates.sort(
+        key=lambda d: (
+            record.get("decision_details", {}).get(d["key"], {}).get("readiness") == "ready"
+            and record.get("decision_enrichment", {}).get(d["key"], {}).get("status") != "failed",
+            order.get(d["key"], 0),
+        )
+    )
     for decision in candidates[:MAX_PER_PASS]:
         _check_stop(stop)
         record = store.get(name)
@@ -384,6 +393,8 @@ def enrich_pending(store, name, *, context_runner=None, runner=None, stop=None, 
             )
             store.export(name)
         except ObservationCancelled:
+            if claimed:
+                store.finish_decision_enrichment(name, decision["key"], fingerprint, context_key)
             raise
         except Exception:
             if not claimed:

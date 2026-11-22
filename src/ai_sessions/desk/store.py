@@ -170,10 +170,11 @@ class Store:
             raise KeyError(name)
         snapshot = json.loads(row[0])
         snapshot["decision_details"] = {}
+        snapshot["decision_enrichment"] = {}
+        cores = {d["key"]: d for d in snapshot["decisions"]}
         if db.execute("SELECT 1 FROM sqlite_master WHERE name='decision_details'").fetchone():
             from .decisions import core_fingerprint, validate_details, validate_evidence
 
-            cores = {d["key"]: d for d in snapshot["decisions"]}
             for key, fingerprint, value in db.execute(
                 "SELECT key,core_hash,data FROM decision_details WHERE desk=?", (name,)
             ):
@@ -186,6 +187,27 @@ class Store:
                     snapshot["decision_details"][key] = details
                 except (ValueError, TypeError, KeyError):
                     continue
+        if db.execute(
+            "SELECT 1 FROM sqlite_master WHERE name='decision_enrichment_attempts'"
+        ).fetchone():
+            from .decisions import SCHEMA_VERSION, core_fingerprint
+
+            for key, fingerprint, status, checked in db.execute(
+                "SELECT key,core_hash,status,checked_at FROM decision_enrichment_attempts "
+                "WHERE desk=? AND version=? ORDER BY checked_at DESC,rowid DESC",
+                (name, SCHEMA_VERSION),
+            ):
+                if (
+                    key in snapshot["decision_enrichment"]
+                    or key not in cores
+                    or core_fingerprint(cores[key]) != fingerprint
+                ):
+                    continue
+                state = {"claimed": "in_progress", "failed": "failed", "success": "success"}.get(
+                    status
+                )
+                if state is not None:
+                    snapshot["decision_enrichment"][key] = {"status": state, "checked_at": checked}
         return snapshot
 
     @staticmethod
@@ -194,7 +216,11 @@ class Store:
             "UPDATE desks SET data=? WHERE name=?",
             (
                 json.dumps(
-                    {k: v for k, v in snapshot.items() if k != "decision_details"},
+                    {
+                        k: v
+                        for k, v in snapshot.items()
+                        if k not in ("decision_details", "decision_enrichment")
+                    },
                     ensure_ascii=False,
                     allow_nan=False,
                 ),
@@ -249,6 +275,7 @@ class Store:
                 db.execute("INSERT INTO desks VALUES (?, ?)", (name, json.dumps(snapshot)))
             except sqlite3.IntegrityError as exc:
                 raise ValueError(f"desk already exists: {name}") from exc
+        snapshot["decision_enrichment"] = {}
         return snapshot
 
     def get(self, name):

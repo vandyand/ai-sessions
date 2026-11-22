@@ -139,10 +139,129 @@ def test_invalid_enrichment_is_cached_without_failing_good_briefing(desk):
         return "invalid output"
 
     before = desk.get("demo")
-    assert enrich(desk, runner=runner) == before
-    assert enrich(desk, runner=runner) == before
+    failed = enrich(desk, runner=runner)
+    assert failed["decision_enrichment"]["oct16"]["status"] == "failed"
+    assert isinstance(failed["decision_enrichment"]["oct16"]["checked_at"], (float, int))
+    assert failed["decision_details"] == before["decision_details"]
+    for key in ("revision", "decisions", "review", "error"):
+        assert failed[key] == before[key]
+    assert enrich(desk, runner=runner)["decision_enrichment"]["oct16"]["status"] == "failed"
     assert len(calls) == 1
     assert desk.get("demo")["error"] is None
+
+
+def test_enrichment_metadata_is_derived_and_survives_legacy_omission(desk):
+    result = enrich(desk)
+    assert result["decision_enrichment"]["oct16"]["status"] == "success"
+    result = desk.publish(
+        "demo", result["revision"], result["observation"], result["review"], result["decisions"]
+    )
+    assert result["decision_enrichment"]["oct16"]["status"] == "success"
+    assert result["decision_details"]["oct16"]
+    with desk._connect() as db:
+        data = json.loads(db.execute("SELECT data FROM desks WHERE name='demo'").fetchone()[0])
+    assert "decision_enrichment" not in data and "decision_details" not in data
+    assert set(result["decision_enrichment"]["oct16"]) == {"status", "checked_at"}
+    changed = desk.publish(
+        "demo", result["revision"], result["observation"], result["review"], [core("Changed ask?")]
+    )
+    assert changed["decision_enrichment"] == {}
+
+
+def test_claimed_attempt_exposes_in_progress_without_raw_internal_data(desk):
+    assert desk.claim_decision_enrichment(
+        "demo", "oct16", decisions.core_fingerprint(core()), "context-1"
+    )
+    progress = desk.get("demo")["decision_enrichment"]["oct16"]
+    assert progress["status"] == "in_progress"
+    assert set(progress) == {"status", "checked_at"}
+
+
+def test_cancelled_owned_model_attempt_exposes_failed_for_manual_retry(desk):
+    from ai_sessions.harnesses.desk_observer import ObservationCancelled
+
+    def cancelled(prompt):
+        raise ObservationCancelled()
+
+    with pytest.raises(ObservationCancelled):
+        enrich(desk, runner=cancelled)
+    assert desk.get("demo")["decision_enrichment"]["oct16"]["status"] == "failed"
+
+
+def test_force_prioritizes_failed_attempt_even_if_previous_details_were_ready(desk, monkeypatch):
+    ready = details()
+    ready.update(readiness="ready", missing_information=[])
+    enrich(desk, runner=lambda p: json.dumps(ready))
+    record = desk.get("demo")
+    other = dict(core(), key="other")
+    desk.publish(
+        "demo", record["revision"], record["observation"], record["review"], [core(), other]
+    )
+    enrich(desk, runner=lambda p: json.dumps(ready))
+    assert desk.claim_decision_enrichment(
+        "demo", "other", decisions.core_fingerprint(other), "failed-new-context"
+    )
+    desk.finish_decision_enrichment(
+        "demo", "other", decisions.core_fingerprint(other), "failed-new-context"
+    )
+    monkeypatch.setattr(decisions, "MAX_PER_PASS", 1)
+    selected = []
+    decisions.enrich_pending(
+        desk,
+        "demo",
+        force=True,
+        context_runner=lambda r, d: selected.append(d["key"]) or context(),
+        runner=lambda p: json.dumps(ready),
+    )
+    assert selected == ["other"]
+
+
+def test_old_database_without_sidecars_exposes_empty_metadata(desk):
+    with desk._connect() as db:
+        db.execute("DROP TABLE decision_enrichment_attempts")
+        db.execute("DROP TABLE decision_details")
+    saved = Store(desk.root, readonly=True).get("demo")
+    assert saved["decision_enrichment"] == {} and saved["decision_details"] == {}
+
+
+def test_changed_recommendation_invalidates_details_and_cached_attempt(desk):
+    result = enrich(desk)
+    updated = dict(core(), recommendation="Do not run until the new risk is addressed.")
+    result = desk.publish(
+        "demo", result["revision"], result["observation"], result["review"], [updated]
+    )
+    assert result["decision_details"] == {} and result["decision_enrichment"] == {}
+    calls = []
+    result = enrich(desk, runner=lambda p: calls.append(p) or json.dumps(details()))
+    assert len(calls) == 1 and "oct16" in result["decision_details"]
+
+
+def test_force_prioritizes_missing_or_failed_before_ready_but_can_retry_ready(desk, monkeypatch):
+    ready = details()
+    ready.update(readiness="ready", missing_information=[])
+    enrich(desk, runner=lambda p: json.dumps(ready))
+    record = desk.get("demo")
+    missing = dict(core(), key="missing", question="Missing context question?")
+    desk.publish(
+        "demo", record["revision"], record["observation"], record["review"], [core(), missing]
+    )
+    monkeypatch.setattr(decisions, "MAX_PER_PASS", 1)
+    calls = []
+
+    def model(prompt):
+        calls.append(json.loads(prompt[len(decisions.SYSTEM) + 1 :])["decision"]["key"])
+        return json.dumps(ready)
+
+    result = decisions.enrich_pending(
+        desk, "demo", context_runner=lambda *a: context(), runner=model, force=True
+    )
+    assert calls == ["missing"]
+    assert result["decision_enrichment"]["missing"]["status"] == "success"
+    calls.clear()
+    decisions.enrich_pending(
+        desk, "demo", context_runner=lambda *a: context(), runner=model, force=True
+    )
+    assert len(calls) == 1  # Both are now ready; explicit force still refreshes one.
 
 
 def test_enrichment_claim_prevents_concurrent_or_crashed_duplicate(desk):
