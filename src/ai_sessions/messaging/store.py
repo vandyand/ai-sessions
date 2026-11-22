@@ -41,9 +41,8 @@ def _path(kind: str, identity: str) -> Path:
 def locked():
     ROOT.mkdir(parents=True, exist_ok=True)
     with (ROOT / ".lock").open("a+b") as handle:
-        if handle.tell() == 0:
-            handle.write(b"0")
-            handle.flush()
+        # Region locks work beyond EOF. Initializing a byte before locking can
+        # write into another owner's mandatory Windows lock during first use.
         handle.seek(0)
         if os.name == "nt":
             import msvcrt

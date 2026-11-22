@@ -1,4 +1,5 @@
 import json
+import os
 import threading
 import time
 from unittest.mock import patch
@@ -7,6 +8,72 @@ import pytest
 
 from ai_sessions import app, detached
 from ai_sessions.model import Session
+
+
+@pytest.mark.skipif(os.name != "nt", reason="Windows mandatory byte-region locks")
+@pytest.mark.parametrize("kind", ["terminal", "receiver", "observer"])
+def test_first_lock_creation_does_not_write_into_another_owners_region(tmp_path, kind):
+    from ai_sessions.desk import runtime
+    from ai_sessions.messaging import store
+
+    path = tmp_path / "terminals.json"
+    if kind == "terminal":
+        lock_path = path.with_suffix(".json.lock")
+    elif kind == "receiver":
+        lock_path = tmp_path / ".lock"
+    else:
+        lock_path = tmp_path / "worker.lock"
+
+    def factory():
+        if kind == "terminal":
+            return detached._locked(path)
+        if kind == "receiver":
+            return store.locked()
+        return runtime.claim(lock_path)
+
+    import msvcrt
+
+    held, release, finished = (threading.Event() for _ in range(3))
+    errors = []
+
+    def owner():
+        try:
+            # Windows permits a region lock beyond EOF. A contender must wait
+            # on this valid empty-file lock without first writing into it.
+            with lock_path.open("a+b") as handle:
+                handle.seek(0)
+                msvcrt.locking(handle.fileno(), msvcrt.LK_NBLCK, 1)
+                try:
+                    held.set()
+                    assert release.wait(3)
+                finally:
+                    handle.seek(0)
+                    msvcrt.locking(handle.fileno(), msvcrt.LK_UNLCK, 1)
+        except BaseException as error:
+            errors.append(error)
+
+    def contender():
+        try:
+            assert held.wait(3)
+            with factory():
+                pass
+        except BaseException as error:
+            errors.append(error)
+        finally:
+            finished.set()
+
+    with patch.object(store, "ROOT", tmp_path):
+        first = threading.Thread(target=owner, name="first-owner")
+        second = threading.Thread(target=contender, name="late-contender")
+        first.start()
+        second.start()
+        assert held.wait(3)
+        finished.wait(0.3)
+        release.set()
+        first.join(4)
+        second.join(4)
+    assert not first.is_alive() and not second.is_alive()
+    assert not errors, errors
 
 
 @pytest.fixture(autouse=True)
