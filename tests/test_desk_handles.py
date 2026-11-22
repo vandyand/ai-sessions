@@ -4,19 +4,18 @@ import tempfile
 import unittest
 from unittest.mock import patch
 
-import pytest
-
 from ai_sessions.desk import cli
 from ai_sessions.model import Session
 
 
-@pytest.fixture(autouse=True)
-def offline_observer():
-    with patch("ai_sessions.desk.cli.ensure_observer"):
-        yield
+class OfflineDeskCase(unittest.TestCase):
+    def setUp(self):
+        observer = patch("ai_sessions.desk.cli.ensure_observer")
+        observer.start()
+        self.addCleanup(observer.stop)
 
 
-class DeskHandleTests(unittest.TestCase):
+class DeskHandleTests(OfflineDeskCase):
     def test_defaults_to_target_harness_and_reuses_existing_desk(self):
         item = Session(
             "codex", "ops", "Operational supervisor", ".", 0, 0, "", True, "fiction.jsonl"
@@ -79,7 +78,7 @@ class DeskHandleTests(unittest.TestCase):
             self.assertEqual(store.get("desk")["sources"][0]["tool"], "codex")
 
 
-class DeskMembershipTests(unittest.TestCase):
+class DeskMembershipTests(OfflineDeskCase):
     def test_linked_member_reuses_desk_and_preserves_conversation(self):
         from types import SimpleNamespace
 
@@ -213,7 +212,7 @@ class DeskMembershipTests(unittest.TestCase):
             self.assertEqual(Path(store.path).read_bytes(), before)
 
 
-class DeskHomeBoundaryTests(unittest.TestCase):
+class DeskHomeBoundaryTests(OfflineDeskCase):
     def test_home_switch_same_native_id_never_reuses_other_transcript(self):
         from pathlib import Path
 
@@ -284,7 +283,7 @@ class DeskHomeBoundaryTests(unittest.TestCase):
             self.assertFalse(cli.source_matches_target(source, target, {member}))
 
 
-class DeskLiveBridgeTests(unittest.TestCase):
+class DeskLiveBridgeTests(OfflineDeskCase):
     def test_live_handle_follows_bridge_but_readonly_view_preserves_source(self):
         from types import SimpleNamespace
 
