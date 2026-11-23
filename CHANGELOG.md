@@ -1,5 +1,16 @@
 # Changelog
 
+## 3.22.1 — 2026-11-23
+
+- Deliver a Grok peer message by writing the owner pipe directly. Do not run
+  `grok session prompt`, which Grok 1.0.92 parses as a user prompt.
+- If that pipe is not open, say this Grok is not listening instead of storing
+  the CLI usage error. Time out a stuck pipe instead of waiting forever.
+- Skip the session-catalog scan on send, so a known but unregistered Grok
+  fails immediately instead of sitting silent for minutes.
+- Give a Grok registration a generation from its session, pid, and start time,
+  and record the pipe address only when something is listening.
+
 ## 3.22.0 — 2026-11-23
 
 - Add Grok as a sessions harness: discover, resume, bridge, rename, hide,

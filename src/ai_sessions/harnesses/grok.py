@@ -10,6 +10,7 @@ import json
 import os
 import re
 import shutil
+import sys
 import time
 import uuid
 from pathlib import Path
@@ -616,6 +617,82 @@ def execute_delete(plan: DeletePlan) -> None:
         shutil.rmtree(directory)
 
 
+def _generation(session_id: str, pid: int, started: float) -> str:
+    import hashlib
+
+    return hashlib.sha256(
+        json.dumps([session_id, pid, started], separators=(",", ":")).encode()
+    ).hexdigest()
+
+
+def _owner_pipe(session_id: str) -> str:
+    return rf"\\.\pipe\grok-session-{session_id}"
+
+
+def _pipe_open(session_id: str) -> bool:
+    return sys.platform == "win32" and os.path.exists(_owner_pipe(session_id))
+
+
+def _write_owner_pipe(session_id: str, payload: str, timeout: float = 15) -> dict:
+    """Write one peer frame to the live owner. The installed Grok must be listening."""
+    import queue
+    import threading
+
+    if not _pipe_open(session_id):
+        return {
+            "status": "unavailable",
+            "reason": (
+                "this Grok process is not listening for peer messages. "
+                f"Nothing is bound at {_owner_pipe(session_id)}. "
+                "Grok 1.0.92 has no owner pipe; restart that session with a Grok "
+                "that accepts session ingress."
+            ),
+        }
+    result: queue.Queue[dict] = queue.Queue(maxsize=1)
+
+    def deliver() -> None:
+        try:
+            with open(_owner_pipe(session_id), "r+b", buffering=0) as pipe:
+                pipe.write(payload.encode("utf-8") + b"\n")
+                collected = bytearray()
+                while b"\n" not in collected and len(collected) < 65536:
+                    chunk = pipe.read(4096)
+                    if not chunk:
+                        break
+                    collected.extend(chunk)
+            text = collected.decode("utf-8", errors="replace").strip()
+            try:
+                body = json.loads(text.splitlines()[0] if text else "{}")
+            except json.JSONDecodeError:
+                body = {}
+            if isinstance(body, dict) and body.get("status") == "accepted":
+                result.put({"status": "accepted"})
+            else:
+                result.put(
+                    {
+                        "status": "unavailable",
+                        "reason": text or "owner pipe did not accept the message",
+                    }
+                )
+        except OSError as error:
+            result.put(
+                {"status": "unavailable", "reason": f"owner pipe failed: {error.strerror or error}"}
+            )
+
+    worker = threading.Thread(target=deliver, daemon=True)
+    worker.start()
+    worker.join(timeout)
+    if worker.is_alive():
+        return {
+            "status": "uncertain",
+            "reason": "Grok owner pipe timed out; no automatic retry.",
+        }
+    try:
+        return result.get_nowait()
+    except queue.Empty:
+        return {"status": "unavailable", "reason": "owner pipe returned nothing"}
+
+
 def messaging_register(payload: dict, env: dict) -> dict | None:
     """Record the live grok.exe owner so `sessions messaging status` can see it."""
     import psutil
@@ -643,9 +720,9 @@ def messaging_register(payload: dict, env: dict) -> dict | None:
         "pid": owner.pid,
         "started": started,
         "home": env.get("GROK_HOME") or str(grok_home()),
-        "address": rf"\\.\pipe\grok-session-{session_id}",
+        "address": _owner_pipe(session_id) if _pipe_open(session_id) else "",
         "vault_name": f"grok-{session_id}",
-        "generation": "1",
+        "generation": _generation(session_id, owner.pid, started),
     }
 
 
@@ -655,8 +732,6 @@ def messaging_forget(row: dict) -> dict:
 
 
 def message_send(receiver: dict, text: str, message_id: str, sender: dict) -> dict:
-    import subprocess
-
     session_id = str(receiver.get("session_id") or "")
     if not live_pid(session_id):
         return {
@@ -664,30 +739,17 @@ def message_send(receiver: dict, text: str, message_id: str, sender: dict) -> di
             "reason": "grok owner is not live",
             "message_id": message_id,
         }
-    binary = os.environ.get("GROK_BIN") or shutil.which("grok") or "grok"
     payload = json.dumps(
         {
             "type": "peer_message",
             "message_id": message_id,
             "sender": sender,
             "text": text,
-        }
+        },
+        ensure_ascii=False,
     )
-    folder = Path(os.environ.get("TEMP", ".")) / "grok-send"
-    folder.mkdir(parents=True, exist_ok=True)
-    message_file = folder / f"{message_id}.json"
-    message_file.write_text(payload, encoding="utf-8")
-    completed = subprocess.run(
-        [binary, "session", "prompt", session_id, "--message-file", str(message_file)],
-        capture_output=True,
-        text=True,
-        check=False,
-    )
-    try:
-        body = json.loads(completed.stdout or "{}")
-    except json.JSONDecodeError:
-        body = {}
-    if completed.returncode == 0 and body.get("status") == "accepted":
+    outcome = _write_owner_pipe(session_id, payload)
+    if outcome.get("status") == "accepted":
         return {
             "status": "submitted",
             "message_id": message_id,
@@ -695,11 +757,8 @@ def message_send(receiver: dict, text: str, message_id: str, sender: dict) -> di
             "recipient": {"tool": "grok", "session_id": session_id},
             "sender": sender,
         }
-    return {
-        "status": "unavailable",
-        "reason": (completed.stderr or completed.stdout or "pipe failed").strip(),
-        "message_id": message_id,
-    }
+    outcome["message_id"] = message_id
+    return outcome
 
 
 ADAPTER = HarnessAdapter(
