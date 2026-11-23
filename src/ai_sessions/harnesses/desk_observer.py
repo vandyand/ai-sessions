@@ -60,6 +60,30 @@ def _check_stop(stop):
         raise ObservationCancelled()
 
 
+def _read_grok_projection(path: Path, *, start: int, end: int | None):
+    """Read closed-turn projection lines. The raw update stream is not a desk source."""
+    from ..model import Transcript, Turn
+
+    if path.name == "updates.jsonl" or not path.name.endswith(".desk.jsonl"):
+        raise ValueError("desk grok sources must be the wrapper projection, not updates.jsonl")
+    data = path.read_bytes()
+    stop = len(data) if end is None else end
+    turns = []
+    for line in data[start:stop].decode("utf-8").splitlines():
+        try:
+            row = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        if row.get("type") != "turn":
+            continue
+        if row.get("user"):
+            turns.append(Turn("user", str(row["user"])))
+        assistant = str(row.get("assistant") or "")
+        if assistant:
+            turns.append(Turn("assistant", assistant))
+    return Transcript(turns)
+
+
 def read_since(tool, ref, checkpoint, *, end):
     """Bounded adaptation of native read_since: fixed byte range, no tool output stored."""
     if tool == "claude":
@@ -70,6 +94,8 @@ def read_since(tool, ref, checkpoint, *, end):
         from ..harnesses.codex import read_codex
 
         transcript = read_codex(Path(ref.storage), start=checkpoint, end=end)
+    elif tool == "grok":
+        transcript = _read_grok_projection(Path(ref.storage), start=checkpoint, end=end)
     else:
         raise ValueError("bounded observer supports plain Claude/Codex JSONL only")
     return ReadSnapshot(transcript, end)

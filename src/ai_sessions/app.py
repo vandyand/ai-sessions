@@ -6222,14 +6222,16 @@ def launch(
     return 127
 
 
-def supervisor_hook_files() -> tuple[Path, Path]:
-    """The real Claude settings file and Codex hooks file the supervisor hooks live in."""
+def supervisor_hook_files() -> tuple[Path, Path, Path]:
+    """Claude settings, Codex hooks, and the Grok supervisor hook file."""
     from .harnesses import claude as claude_harness
     from .harnesses import codex as codex_harness
+    from .harnesses.grok import grok_home
 
     return (
         claude_harness.ADAPTER.home / "settings.json",
         codex_harness.ADAPTER.home / "hooks.json",
+        grok_home() / "hooks" / "sessions-supervisor.json",
     )
 
 
@@ -6707,7 +6709,7 @@ def compress_idle(sessions: list[Session], config: LaunchConfig, *, dry_run: boo
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="sessions",
-        description="Search, browse, and resume local Claude Code and Codex CLI sessions.",
+        description="Search, browse, and resume local Claude Code, Codex, OpenCode, and Grok sessions.",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog=textwrap.dedent(
             """
@@ -6717,11 +6719,13 @@ def build_parser() -> argparse.ArgumentParser:
               sessions send codex:<session-id> --message "Migration finished"
               sessions reply <message-id> --message "Received"
               sesres  (shorthand for sessions --restart)
+              sesres --grok  (restart this session in Grok, from any harness)
               ses whoami  (or ses handle: show this session's handle)
 
             New native sessions:
               sessions new codex
               sessions new claude
+              sessions new grok
               sessions new codex -- --model MODEL
               ses list elev
               ses open elev-mgr

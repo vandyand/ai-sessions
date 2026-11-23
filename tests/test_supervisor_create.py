@@ -339,9 +339,10 @@ class CliTests(unittest.TestCase):
             self.assertIn(option, text)
 
     def test_hook_files_are_named_for_each_harness(self) -> None:
-        claude_file, codex_file = app.supervisor_hook_files()
+        claude_file, codex_file, grok_file = app.supervisor_hook_files()
         self.assertEqual(claude_file.name, "settings.json")
         self.assertEqual(codex_file.name, "hooks.json")
+        self.assertEqual(grok_file.name, "sessions-supervisor.json")
 
 
 class SupervisorPosixTests(Fixture):

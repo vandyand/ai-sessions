@@ -36,7 +36,7 @@ class HookImportTests(unittest.TestCase):
             text=True,
             check=True,
         ).stdout.strip()
-        self.assertEqual(set(names.split(",")), {"claude", "codex", "opencode"})
+        self.assertEqual(set(names.split(",")), {"claude", "codex", "grok", "opencode"})
 
 
 if __name__ == "__main__":

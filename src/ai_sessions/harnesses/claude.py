@@ -221,12 +221,30 @@ def write_claude_session(
             record["message"] = {"role": "user", "content": turn.text}
             record["origin"] = {"kind": "human"}
         else:
+            content: list[dict[str, Any]] = [{"type": "text", "text": turn.text}]
+            for call in turn.calls:
+                call_id = "toolu_" + secrets.token_hex(8)
+                try:
+                    raw_input = json.loads(call.request) if call.request else {}
+                except json.JSONDecodeError:
+                    raw_input = {"input": call.request}
+                content.append(
+                    {"type": "tool_use", "id": call_id, "name": call.name, "input": raw_input}
+                )
+                content.append(
+                    {
+                        "type": "tool_result",
+                        "tool_use_id": call_id,
+                        "content": call.result,
+                        "is_error": call.failed,
+                    }
+                )
             record["message"] = {
                 "id": "msg_" + secrets.token_hex(12),
                 "type": "message",
                 "role": "assistant",
                 "model": COPIED_REPLY_MODEL,
-                "content": [{"type": "text", "text": turn.text}],
+                "content": content,
                 "stop_reason": None,
                 "stop_sequence": None,
                 "usage": {"input_tokens": 1, "output_tokens": 1},

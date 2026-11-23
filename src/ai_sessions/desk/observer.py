@@ -110,7 +110,9 @@ def _run_model(prompt, stop=None):
 def _source(source, previous, index):
     ref = NativeRef(source["session_id"], source["storage"])
     if source["tool"] not in TOOLS or not ref.storage.endswith(".jsonl"):
-        raise ValueError("bounded observer supports plain Claude/Codex JSONL only")
+        raise ValueError("bounded observer supports a projection jsonl only")
+    if source["tool"] == "grok" and not ref.storage.endswith(".desk.jsonl"):
+        raise ValueError("desk grok sources must be the wrapper projection, not updates.jsonl")
     path = Path(ref.storage)
     stamp = path.stat()
     # Windows reports different ctime semantics for stat vs fstat; mtime and
@@ -211,6 +213,8 @@ def _initial_context(source):
     """Read only the supervisor's bounded prefix ending at a complete JSONL boundary."""
     if source["tool"] not in TOOLS or not source["storage"].endswith(".jsonl"):
         raise ValueError("initial context requires supported plain JSONL")
+    if source["tool"] == "grok" and not source["storage"].endswith(".desk.jsonl"):
+        raise ValueError("desk grok sources must be the wrapper projection, not updates.jsonl")
     path = Path(source["storage"])
     with path.open("rb") as handle:
         stamp = os.fstat(handle.fileno())

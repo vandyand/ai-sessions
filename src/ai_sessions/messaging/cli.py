@@ -81,6 +81,19 @@ def _address(row: dict) -> dict:
     return {k: row[k] for k in ("tool", "session_id", "home", "generation") if k in row}
 
 
+def pipe_sender(row: dict) -> dict:
+    """Address plus the sessions handle, when the row has one.
+
+    The owner pipe reads ``sender.handle``. Receipt correlation stays on
+    ``_address`` and does not include this field.
+    """
+    sender = _address(row)
+    handle = row.get("handle")
+    if isinstance(handle, str) and handle:
+        sender["handle"] = handle
+    return sender
+
+
 def deliver(row: dict, text: str, message_id: str, sender: dict) -> dict:
     from ..registry import REGISTRY
 
@@ -151,6 +164,7 @@ def send_message(
                 break
     sender_row = store.resolve(source, rows, slugs=_slug_store()) if source else None
     sender = _address(sender_row) if sender_row else {"tool": "user", "session_id": "terminal"}
+    delivered = pipe_sender(sender_row) if sender_row else sender
     if expected_sender is not None and sender != expected_sender:
         raise ValueError(
             "original recipient is unavailable; this session cannot acknowledge its message"
@@ -175,7 +189,7 @@ def send_message(
     # Record pending before I/O so a very fast reply can correlate the message ID.
     store.save_receipt({**meta, "status": "submitting"})
     try:
-        result = deliver(receiver, envelope, mid, sender)
+        result = deliver(receiver, envelope, mid, delivered)
     except (OSError, RuntimeError, ValueError):
         result = {
             "status": "uncertain",

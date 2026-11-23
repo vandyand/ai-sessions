@@ -6,6 +6,26 @@ from pathlib import Path
 from unittest.mock import patch
 
 
+class PipeSenderTests(unittest.TestCase):
+    def test_handle_is_copied_and_absent_when_missing(self):
+        from ai_sessions.messaging.cli import pipe_sender
+
+        with_handle = pipe_sender(
+            {
+                "tool": "claude",
+                "session_id": "s",
+                "home": "h",
+                "generation": "1",
+                "handle": "elev-mgr",
+            }
+        )
+        self.assertEqual(with_handle["handle"], "elev-mgr")
+        self.assertEqual(with_handle["tool"], "claude")
+        without = pipe_sender({"tool": "claude", "session_id": "s", "home": "h", "generation": "1"})
+        self.assertNotIn("handle", without)
+        self.assertNotIn("handle", pipe_sender({**without, "handle": ""}))
+
+
 class MessagingCliTests(unittest.TestCase):
     def setUp(self):
         from ai_sessions.messaging import cli

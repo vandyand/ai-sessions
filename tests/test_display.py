@@ -295,13 +295,15 @@ class DisplayTests(unittest.TestCase):
                     LaunchConfig(path=Path(directory) / "config.toml"),
                 )
                 browser.tool_picker()
-        self.assertEqual(browser.tools, frozenset(("codex", "opencode")))
+        self.assertEqual(browser.tools, frozenset(("codex", "grok", "opencode")))
         self.assertEqual([item.tool for item in browser.current()], ["codex", "opencode"])
         self.assertTrue(any("[ ] Claude Code" in frame for frame in screen.frames))
-        self.assertEqual(browser.message, "Showing Codex + OpenCode.")
+        self.assertEqual(browser.message, "Showing Codex + Grok + OpenCode.")
 
     def test_tool_picker_prevents_an_empty_filter_and_offers_recovery(self) -> None:
         keys = (
+            " ",
+            app.curses.KEY_DOWN,
             " ",
             app.curses.KEY_DOWN,
             " ",
@@ -324,7 +326,7 @@ class DisplayTests(unittest.TestCase):
                     LaunchConfig(path=Path(directory) / "config.toml"),
                 )
                 browser.tool_picker()
-        self.assertEqual(browser.tools, frozenset(("codex", "claude", "opencode")))
+        self.assertEqual(browser.tools, frozenset(("codex", "claude", "grok", "opencode")))
         self.assertTrue(any("Choose at least one tool" in frame for frame in screen.frames))
 
     def test_draw_is_side_effect_free_and_advertises_tool_filter(self) -> None:

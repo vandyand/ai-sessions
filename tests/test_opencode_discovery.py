@@ -1740,7 +1740,7 @@ class OpenCodeDiscoveryTests(unittest.TestCase):
             str(self.root / "opencode.db"),
         )
         self.assertTrue(can_bridge(item))
-        self.assertEqual(available_launch_tools(item), ("opencode", "codex", "claude"))
+        self.assertEqual(available_launch_tools(item), ("opencode", "codex", "claude", "grok"))
 
     def test_home_resolution_treats_empty_environment_as_unset(self) -> None:
         fake_home = self.root / "user"
