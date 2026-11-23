@@ -47,7 +47,7 @@ def _receiver_names(rows):
     return result
 
 
-def reachable() -> list[dict]:
+def reachable(*, enrich: bool = True) -> list[dict]:
     from ..references import native_key
     from ..registry import REGISTRY
 
@@ -59,8 +59,9 @@ def reachable() -> list[dict]:
                     rows.extend(adapter.messaging.receivers(home))
                 except (OSError, RuntimeError, ValueError):
                     pass
-    if rows:
+    if rows and enrich:
         rows = _receiver_names(rows)
+    if rows:
         keys = [native_key(row["tool"], row["session_id"], row.get("home")) for row in rows]
         entries = [
             (key, (row.get("name") or "") if row.get("name") != row["session_id"] else "")
@@ -139,7 +140,9 @@ def send_message(
 ) -> tuple[int, dict]:
     if not text.strip() or len(text.encode("utf-8")) > 65536:
         raise ValueError("message must contain text and be at most 65536 UTF-8 bytes")
-    rows = reachable()
+    # Names are display-only. Loading the session catalog here is what made an
+    # unregistered Grok send sit silent for minutes.
+    rows = reachable(enrich=False)
     if expected_recipient is not None:
         matches = [r for r in rows if _address(r) == expected_recipient]
         if len(matches) != 1:

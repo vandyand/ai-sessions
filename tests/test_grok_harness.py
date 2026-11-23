@@ -167,3 +167,32 @@ def test_rename_delete_and_launcher(tmp_path, monkeypatch):
 
     assert create_id(Adapter(), tmp_path, "desk")
     assert grok.new_session_args(session_id="abc") == ["-s", "abc"]
+
+
+def test_generation_changes_with_the_process():
+    first = grok._generation("sid", 10, 1.5)
+    assert first != "1"
+    assert first != grok._generation("sid", 11, 1.5)
+    assert first == grok._generation("sid", 10, 1.5)
+
+
+def test_message_send_does_not_invoke_grok_when_the_pipe_is_absent(monkeypatch):
+    monkeypatch.setattr(grok, "live_pid", lambda session_id: 69144)
+    monkeypatch.setattr(grok, "_pipe_open", lambda session_id: False)
+    called = {}
+
+    def fail(*args, **kwargs):
+        called["ran"] = True
+        raise AssertionError("message_send must not spawn grok")
+
+    monkeypatch.setattr(subprocess, "run", fail)
+    result = grok.message_send(
+        {"session_id": "22bdef25-0d1f-4eb6-a55d-caa2cc78c04c"},
+        "ping",
+        "mid",
+        {"tool": "claude", "handle": "own-ses-1"},
+    )
+    assert called == {}
+    assert result["status"] == "unavailable"
+    assert "not listening" in result["reason"]
+    assert "message-file" not in result["reason"]
