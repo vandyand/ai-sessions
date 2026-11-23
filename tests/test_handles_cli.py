@@ -31,6 +31,7 @@ class HandleCliTests(unittest.TestCase):
         row.session_role = "wrk"
         with (
             patch("ai_sessions.handles_cli.catalog", return_value=([row], object())),
+            patch("ai_sessions.handles.HandleStore.current_keys", return_value={}),
             contextlib.redirect_stdout(io.StringIO()) as output,
         ):
             self.assertEqual(handles_cli.main(["list", "elev"]), 0)

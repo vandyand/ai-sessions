@@ -1,5 +1,14 @@
 # Changelog
 
+## 3.22.0 — 2026-11-23
+
+- Add Grok as a sessions harness: discover, resume, bridge, rename, hide,
+  delete, desk projection, supervisor hooks, and messaging.
+- `sessions --restart --grok` and `sesres --grok` carry the current session
+  into Grok from any harness. The same `--grok` flag works on `--launch-tool`.
+- Deliver a message to an open Grok through its owner pipe, and show the
+  sender handle on the one-line peer row.
+
 ## 3.21.0 — 2026-11-22
 
 - Combine Needs you and Next action into Decisions, with project background,

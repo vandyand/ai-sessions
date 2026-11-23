@@ -80,7 +80,9 @@ def compress_session(session: Session, *, still_idle: Callable[[], bool] | None 
     ``still_idle`` is asked before each file, so that a run stops as soon as it is reopened.
     """
     if session.is_open:
-        raise CompressionError(f"{session.title or session.session_id} is open")
+        raise CompressionError(
+            f"skipped because open: {session.title or session.session_id} is open"
+        )
     files = _files(session)
     if resolve_storage(files[-1]) is None:
         raise CompressionError(f"the transcript of {session.session_id} is missing")

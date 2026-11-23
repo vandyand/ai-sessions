@@ -214,6 +214,7 @@ def open_target(argv) -> int:
     tool = parser.add_mutually_exclusive_group()
     tool.add_argument("--claude", dest="tool", action="store_const", const=TOOLS[0])
     tool.add_argument("--codex", dest="tool", action="store_const", const=TOOLS[1])
+    tool.add_argument("--grok", dest="tool", action="store_const", const="grok")
     parser.add_argument("--dry-run", action="store_true")
     args = parser.parse_args(argv)
     try:
@@ -263,6 +264,7 @@ def main(argv=None) -> int:
         "list",
         "status",
         "stop",
+        "check",
         "-h",
         "--help",
     }
@@ -303,8 +305,24 @@ def main(argv=None) -> int:
             sub.add_argument("--dry-run", action="store_true")
     listing = commands.add_parser("list")
     listing.add_argument("--json", action="store_true")
+    check = commands.add_parser("check")
+    check.add_argument("name", help="Grok session id or updates.jsonl path")
     args = parser.parse_args(argv)
     try:
+        if args.action == "check":
+            from ..harnesses.grok import resolve
+            from .grok_projection import check as grok_check
+
+            path = Path(args.name)
+            if not path.is_file():
+                ref = resolve(args.name)
+                if ref is None:
+                    print(f"ses desk: unknown grok session {args.name}", file=sys.stderr)
+                    return 2
+                path = Path(ref.storage)
+            code, text = grok_check(path)
+            print(text)
+            return code
         store = Store()
         if args.action in ("show", "refresh", "watch", "view", "open", "status", "stop"):
             args.name = resolve_desk_name(

@@ -3,8 +3,8 @@
 The terminal interaction contract is documented in [DESIGN.md](DESIGN.md).
 
 `ai-sessions` is a searchable terminal browser for local
-[Codex CLI](https://developers.openai.com/codex/cli/), Claude Code, and
-[OpenCode](https://opencode.ai/) conversations. It indexes each harness's existing native history.
+[Codex CLI](https://developers.openai.com/codex/cli/), Claude Code,
+[OpenCode](https://opencode.ai/), and Grok conversations. It indexes each harness's existing native history.
 Browsing is read-only; explicit rename and bridge actions use the provider-specific operations
 described below.
 
@@ -92,16 +92,16 @@ does not wake an offline session.
 
 ## Features
 
-- One conversation-centered list for Codex, Claude Code, and OpenCode sessions
+- One conversation-centered list for Codex, Claude Code, OpenCode, and Grok sessions
 - Expandable project/thread groups and collapsed cross-harness lineage copies
 - Search and filters for provider, directory, origin, open state, and visibility
 - Human, cross-provider, and subagent/automation origin labels
 - Started/updated timestamps plus compact `turns / compactions / prompts` activity
-- Rename that carries through to all three harnesses, plus utility-local hiding
+- Rename that carries through to all four harnesses, plus utility-local hiding
 - Nickname labels that tell sibling subagent threads apart without exposing native IDs
 - Detection of currently open sessions on Linux and Windows
 - tmux pane and desktop-terminal focus on Linux when the environment exposes it
-- Cross-harness resume: continue any session in any of the three harnesses
+- Cross-harness resume: continue any session in any of the four harnesses
 - Safe, dangerous, and custom launch profiles
 - Native paths and argument handling on both operating systems
 
@@ -137,14 +137,18 @@ To carry the conversation into another harness as it restarts, name that harness
 ! sessions --restart --claude
 ! sessions --restart --codex
 ! sessions --restart --opencode
+! sessions --restart --grok
 ```
+
+`sesres` is the same command. `sesres --grok` carries the session you are in
+into Grok, whether that session is Claude Code, Codex, OpenCode, or Grok.
 
 The session is copied across first, as when you pick another harness in the list, and reopens there in the same tab. If the conversation already has a copy there that is just as far along, that copy is opened instead of making a new one. `--launch-tool NAME` does the same thing. Naming the harness the session is already in is a plain restart.
 
 ## Requirements
 
 - Python 3.11 or newer
-- Codex CLI, Claude Code, OpenCode, or any combination
+- Codex CLI, Claude Code, OpenCode, Grok, or any combination
 - Linux or native Windows PowerShell
 
 The Windows-only `windows-curses` dependency is installed automatically. `psutil` is used for portable process inspection.

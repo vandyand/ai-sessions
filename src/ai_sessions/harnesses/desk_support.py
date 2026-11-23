@@ -6,7 +6,7 @@ import uuid
 
 from ..capabilities import Unsupported
 
-TOOLS = ("claude", "codex")
+TOOLS = ("claude", "codex", "grok")
 DEFAULT_TOOL = "claude"
 
 
@@ -19,15 +19,17 @@ def arguments(tool, session_id, *, fresh, prompt):
         )
     if tool == "codex":
         return ["resume", session_id, prompt]
+    if tool == "grok":
+        return ["--session-id", session_id, prompt] if fresh else ["--resume", session_id, prompt]
     raise ValueError("Project conversations support Claude Code or Codex")
 
 
 def missing_can_start(tool):
-    return tool == "claude"
+    return tool in ("claude", "grok")
 
 
 def create_id(adapter, folder, name):
-    if adapter.name == "claude":
+    if adapter.name in ("claude", "grok"):
         return str(uuid.uuid4())
     if isinstance(adapter.create_session, Unsupported):
         raise ValueError("This harness cannot create a persistent project conversation")

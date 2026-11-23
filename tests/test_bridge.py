@@ -1257,7 +1257,7 @@ class LaunchIntegrationTests(unittest.TestCase):
     def test_a_session_with_a_transcript_offers_both_harnesses(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             item = session(directory)
-            self.assertEqual(available_launch_tools(item), ("codex", "claude", "opencode"))
+            self.assertEqual(available_launch_tools(item), ("codex", "claude", "grok", "opencode"))
             self.assertTrue(can_bridge(item))
 
     def test_a_session_without_a_transcript_offers_only_its_own(self) -> None:

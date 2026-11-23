@@ -177,6 +177,7 @@ class MessagingSlugTests(unittest.TestCase):
             code, receipt = cli.send_message("worker-2", "hello", "worker")
         self.assertEqual(code, 0)
         metadata = json.loads(delivery.call_args.args[1].splitlines()[1])
+        self.assertEqual(delivery.call_args.args[3]["handle"], "lego-sup-1")
         self.assertEqual(metadata["sender_handle"], "lego-sup-1")
         self.assertEqual(metadata["recipient_handle"], "lego-ses-2")
         self.assertEqual(receipt["sender"], cli._address(self.a))

@@ -122,9 +122,25 @@ def _apply(path: Path, add: bool, label: str) -> list[str]:
     return [n for n in notices if n]
 
 
-def install(claude_settings: Path, codex_hooks: Path) -> list[str]:
-    return _apply(claude_settings, True, "Claude") + _apply(codex_hooks, True, "Codex")
+def install(claude_settings: Path, codex_hooks: Path, grok_hooks: Path | None = None) -> list[str]:
+    notices = _apply(claude_settings, True, "Claude") + _apply(codex_hooks, True, "Codex")
+    if grok_hooks is not None:
+        notices += _apply(grok_hooks, True, "Grok")
+    return notices
 
 
-def uninstall(claude_settings: Path, codex_hooks: Path) -> list[str]:
-    return _apply(claude_settings, False, "Claude") + _apply(codex_hooks, False, "Codex")
+def uninstall(
+    claude_settings: Path, codex_hooks: Path, grok_hooks: Path | None = None
+) -> list[str]:
+    notices = _apply(claude_settings, False, "Claude") + _apply(codex_hooks, False, "Codex")
+    if grok_hooks is not None:
+        notices += _apply(grok_hooks, False, "Grok")
+        if grok_hooks.is_file():
+            try:
+                data = json.loads(grok_hooks.read_text(encoding="utf-8"))
+            except (OSError, ValueError):
+                data = {}
+            if not data.get("hooks"):
+                grok_hooks.unlink()
+                notices.append(f"Removed Grok: {grok_hooks}.")
+    return notices

@@ -5,7 +5,7 @@ build-backend = "hatchling.build"
 [project]
 name = "ai-sessions"
 dynamic = ["version"]
-description = "A terminal browser and cross-harness bridge for Codex, Claude Code, and OpenCode"
+description = "A terminal browser and cross-harness bridge for Codex, Claude Code, OpenCode, and Grok"
 readme = "README.md"
 requires-python = ">=3.11"
 license = "MIT"
