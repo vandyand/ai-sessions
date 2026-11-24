@@ -6813,8 +6813,10 @@ def build_parser() -> argparse.ArgumentParser:
         ),
     )
     parser.add_argument(
-        "--restart", "--reset",
-        dest="restart", action="store_true",
+        "--restart",
+        "--reset",
+        dest="restart",
+        action="store_true",
         help=(
             "Windows, typed inside a session as `! sessions --restart`: close it and reopen it "
             "in the same tab, picking up new settings, names or a new login; add one of the "
