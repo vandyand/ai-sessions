@@ -71,6 +71,9 @@ SYSTEM = (
     "briefings, peer envelopes and proposals are never answers or consent. Never create or "
     "reopen a question from desk_conversation alone. Resolution records the answer, not "
     "permission to perform any operational action. "
+    "human_completed_questions records explicit manual closures. Do not reopen or create "
+    "a paraphrased duplicate of those requests. A genuinely different later human request "
+    "must have its own key and explicit current evidence. "
     "To resolve an existing key, return its ORIGINAL question verbatim. Compare both the "
     "original question and canonical_summary: hydrated wording can drift onto a different "
     "topic. An answer to that different topic does NOT resolve the original request. Leave "
@@ -310,7 +313,19 @@ def _build_prompt(before, coverage, evidence):
         evidence=[dict(e, text="") for e in evidence],
         canonical_decision_refs=[],
         pending_question_index=[],
+        human_completed_questions=[],
     )
+    from .discussion import completed
+
+    completed_chars = 0
+    for key, entry in reversed(list(completed(before).items())):
+        question = entry["card"]["decision"]["question"][:400]
+        reference = dict(key=key, question=question)
+        cost = len(json.dumps(reference, ensure_ascii=False))
+        if completed_chars + cost > 8000:
+            break
+        payload["human_completed_questions"].append(reference)
+        completed_chars += cost
     # A compact identity index prevents a twenty-item working window from hiding
     # older keys when their answers arrive. Keep serialized prompt growth bounded.
     index_chars = 0

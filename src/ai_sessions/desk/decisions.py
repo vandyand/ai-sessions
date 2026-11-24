@@ -62,6 +62,14 @@ SYSTEM = (
     "rather than silently substituting it. Do not treat an answer to a related request as "
     "an answer to this one. "
     "Keep the core untouched; the corrected ask belongs in summary. "
+    "Lead with the precise proposed behavior and customer impact, not 'approve the built "
+    "option'. Explain what each option actually changes, who is affected, price/billing and "
+    "exceptions when relevant. Use short option labels. Put implementation commits and test "
+    "counts behind the explanation. Keep background focused and readable. Attribute reports "
+    "once, not repeatedly in every sentence. Avoid boilerplate about 'supplied evidence' or "
+    "'not verified here'; list specific unknowns that would change this decision instead. "
+    "A recommendation needs a concrete benefit/tradeoff, not simply that an assistant "
+    "recommended it. If timing changes the cost of waiting, identify the missing date. "
     "Summary is ONLY the precise self-contained ask in one or two short sentences (max 600 "
     "characters). Do not audit legacy wording or narrate your reconstruction. Put project "
     "definitions, prior story and conditional branches in background/options instead. List only "
@@ -346,6 +354,7 @@ def enrich_pending(store, name, *, context_runner=None, runner=None, stop=None, 
     order = store.decision_enrichment_order(name)
     candidates.sort(
         key=lambda d: (
+            bool(record.get("decision_details", {}).get(d["key"])),
             record.get("decision_details", {}).get(d["key"], {}).get("readiness") == "ready"
             and record.get("decision_enrichment", {}).get(d["key"], {}).get("status") != "failed",
             order.get(d["key"], 0),

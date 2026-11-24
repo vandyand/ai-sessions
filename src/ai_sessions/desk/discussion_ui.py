@@ -9,16 +9,22 @@ from datetime import datetime, timezone
 from .discussion import MAX_TEXT
 from .time_format import eastern_time
 
-ACTIONS = ("Save note", "Ask for clarification", "Send answer")
+ACTIONS = ("Save note", "Ask for clarification", "Send answer", "Mark as completed")
 ACTION_HELP = (
     "Keep this note with the question.",
     "Ask the reviewer to explain or find missing context.",
     "Send your answer to the Desk agent.",
+    "Close this question. Your comment is optional. You can undo completion.",
 )
 
 
 def answer(snapshot, key, *, core=None):
     from .decisions import core_fingerprint
+    from .discussion import completed
+
+    completion = completed(snapshot).get(key)
+    if completion:
+        return completion
 
     core = core or next((d for d in snapshot.get("decisions", []) if d.get("key") == key), None)
     if core is None:
@@ -69,9 +75,18 @@ def answered_keys(snapshot):
 
 
 def receipt(snapshot, row, wrap, width, *, reviewing=False):
+    from .presentation import line
+
     kind = row["kind"]
     delivery = row.get("delivery")
-    if kind == "decision":
+    if kind == "completion":
+        title, detail, label, primary = (
+            "Marked as completed",
+            "[u Undo completion]",
+            "Your comment",
+            "Enter: Next unanswered question",
+        )
+    elif kind == "decision":
         title = (
             "Answer sent to the Desk agent"
             if delivery in ("submitted", "delivered")
@@ -116,8 +131,13 @@ def receipt(snapshot, row, wrap, width, *, reviewing=False):
     question = (card.get("details") or {}).get("summary") or card.get("decision", {}).get(
         "question", ""
     )
-    parts = [title, primary, "b Question · e Comment · t Discussion", ""]
-    parts += [label, row["text"], ""]
+    parts = [line(title, "success"), line("[ " + primary + " ]", "focus"), ""]
+    if row["text"]:
+        parts += [
+            line(label, "heading"),
+            line("│ " + row["text"].replace("\n", "\n│ "), "user"),
+            "",
+        ]
     if detail:
         parts += [detail, ""]
     if row.get("reply"):
@@ -134,8 +154,8 @@ def receipt(snapshot, row, wrap, width, *, reviewing=False):
         if tool:
             command += " --tool " + tool
         parts += ["", "To connect, run in another terminal:", command]
-    parts += ["", "Question", question]
-    return wrap("\n".join(parts), width)
+    parts += ["", line("Question", "heading"), question]
+    return [row for part in parts for row in wrap(part, width)]
 
 
 @dataclass(frozen=True)
@@ -152,14 +172,21 @@ def edit(editor, key):
     if key == "\x1b":
         return None
     if key in ("\t", curses.KEY_BTAB):
-        return replace(editor, focus=(editor.focus + (1 if key == "\t" else -1)) % 4)
+        return replace(
+            editor, focus=(editor.focus + (1 if key == "\t" else -1)) % (len(ACTIONS) + 1)
+        )
     if editor.focus:
         if key in (curses.KEY_LEFT, curses.KEY_RIGHT):
             return replace(
-                editor, focus=1 + (editor.focus - 1 + (1 if key == curses.KEY_RIGHT else -1)) % 3
+                editor,
+                focus=1
+                + (editor.focus - 1 + (1 if key == curses.KEY_RIGHT else -1)) % len(ACTIONS),
             )
         if key in ("\n", "\r", curses.KEY_ENTER):
-            return replace(editor, request=("note", "clarification", "decision")[editor.focus - 1])
+            return replace(
+                editor,
+                request=("note", "clarification", "decision", "completion")[editor.focus - 1],
+            )
         return editor
     cursor, text = editor.cursor, editor.text
     if key in (curses.KEY_BACKSPACE, "\b", "\x7f"):
@@ -202,22 +229,39 @@ def edit(editor, key):
 
 
 def editor_lines(editor, wrap, width, height, title):
-    marked = editor.text[: editor.cursor] + "▏" + editor.text[editor.cursor :]
+    from .presentation import line
+
+    marked = (
+        editor.text[: editor.cursor] + "|" + editor.text[editor.cursor :]
+        if editor.focus == 0
+        else editor.text or "(Optional comment)"
+    )
     lines = wrap(marked, width)
-    before = wrap(editor.text[: editor.cursor] + "▏", width)
-    capacity = max(1, height - 18)
+    before = wrap(editor.text[: editor.cursor] + "|", width)
+    capacity = max(1, height - 19)
     start = max(0, len(before) - capacity)
     visible = lines[start : start + capacity]
-    result = wrap("Question: " + title, width)[:2] + [
+    result = wrap(line(title, "question"), width)[:2] + [
         "",
-        "Your response" + (" [typing]" if editor.focus == 0 else ""),
-        *visible,
+        line("Your response" + (" [typing]" if editor.focus == 0 else ""), "heading"),
+        line("─" * min(width, 72), "metadata"),
+        *(line(row, "user") for row in visible),
         "",
     ]
     if height < 15:
-        result = wrap("Your comment", width)[:1] + visible[-1:]
+        result = (
+            wrap(line(title, "question"), width)[:1]
+            + [line("Your comment", "heading")]
+            + [line(row, "user") for row in visible[-1:]]
+        )
     for i, action in enumerate(ACTIONS, 1):
-        result += wrap(("[ " + action + " ]") if editor.focus == i else action, width)
+        result += wrap(
+            line(
+                ("› [ " + action + " ]") if editor.focus == i else "  [ " + action + " ]",
+                "focus" if editor.focus == i else "action",
+            ),
+            width,
+        )
     if height < 15:
         return result + wrap("Tab selects · Enter activates", width)[:1]
     result += [
@@ -225,15 +269,16 @@ def editor_lines(editor, wrap, width, height, title):
         *wrap(
             ACTION_HELP[editor.focus - 1]
             if editor.focus
-            else "Type your response. Tab chooses what to do with it.",
+            else "Type your response. Tab selects an action.",
             width,
         ),
-        *wrap("Enter: new line / selected action · Esc: keep draft", width),
     ]
     return result
 
 
 def status(row, bound=True):
+    if row["kind"] == "completion":
+        return "Completion undone" if row.get("undone_at") else "Marked as completed"
     state = row["status"]
     if state == "failed":
         return "Clarification unavailable · r Retry"
@@ -300,10 +345,12 @@ def _copy(card):
 
 
 def lines(snapshot, key, expanded=False, show_versions=False):
+    from .presentation import line
+
     rows = snapshot.get("decision_discussion", {}).get(key, [])
-    result = ["", "Discussion" + (f" ({len(rows)})" if rows else "")]
+    result = ["", line("Discussion" + (f" ({len(rows)})" if rows else ""), "heading")]
     if expanded:
-        result = ["Discussion", "t Back · v Earlier versions", ""]
+        result = [line("Discussion", "heading"), line("t Back · v Earlier versions", "action"), ""]
     if not rows and not expanded:
         return []
     if not rows:
@@ -313,14 +360,17 @@ def lines(snapshot, key, expanded=False, show_versions=False):
     selected = rows if expanded else [r for r in rows if r is clarification or r is rows[-1]]
     for row in selected:
         stamp = eastern_time(datetime.fromtimestamp(row["created_at"], timezone.utc))
-        label = {"note": "Your note", "clarification": "Your question", "decision": "Your answer"}[
-            row["kind"]
-        ]
+        label = {
+            "note": "Your note",
+            "clarification": "Your question",
+            "decision": "Your answer",
+            "completion": "Your completion",
+        }[row["kind"]]
         result += [
             "",
-            label + " · " + stamp,
-            row["text"],
-            status(row, bool(snapshot.get("agents"))),
+            line(label + " · " + stamp, "heading"),
+            line("│ " + row["text"].replace("\n", "\n│ "), "user"),
+            line(status(row, bool(snapshot.get("agents"))), "metadata"),
         ]
         if row.get("reply"):
             result += ["", "Clarification", row["reply"]]

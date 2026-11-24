@@ -141,9 +141,9 @@ def save_draft(store, name, key, text, version):
 
 def submit(store, name, key, kind, text, version):
     if (
-        kind not in ("note", "clarification", "decision")
+        kind not in ("note", "clarification", "decision", "completion")
         or not isinstance(text, str)
-        or not text.strip()
+        or (kind != "completion" and not text.strip())
         or len(text) > MAX_TEXT
     ):
         raise ValueError("Enter a note, question or answer (up to 12,000 characters)")
@@ -170,11 +170,11 @@ def submit(store, name, key, kind, text, version):
             key=key,
             kind=kind,
             text=text,
-            card=card(snapshot, key),
+            card=json.loads(json.dumps(card(snapshot, key), ensure_ascii=False)),
             version=version,
             core_hash=core_fingerprint(card(snapshot, key)["decision"]),
             created_at=time.time(),
-            status="saved" if kind == "note" else "queued",
+            status="saved" if kind in ("note", "completion") else "queued",
             reply=None,
             updated_details=None,
             delivery="queued" if kind == "decision" else None,
@@ -182,9 +182,20 @@ def submit(store, name, key, kind, text, version):
         from .notifications import _targets
 
         targets = _targets(snapshot)
-        if targets and kind != "note":
+        if targets and kind not in ("note", "completion"):
             row["recipient"] = targets[0]
         _put(db, snapshot["name"], row)
+        if kind == "completion":
+            from .backlog import record
+
+            for core in snapshot["decisions"]:
+                if core["key"] == key:
+                    core["status"] = "resolved"
+            record(
+                db,
+                dict(snapshot, decisions=[d for d in snapshot["decisions"] if d["key"] == key]),
+                note="Marked completed by the user",
+            )
         db.execute(
             "DELETE FROM desk_decision_drafts WHERE desk=? AND key=?", (snapshot["name"], key)
         )
@@ -192,9 +203,46 @@ def submit(store, name, key, kind, text, version):
         store._write(db, snapshot)
     try:
         export(store, name, row["id"])
+        if kind == "completion":
+            store.export(name)
     except OSError:
         pass  # SQLite already committed; the outbox will retry projection before delivery.
     return row
+
+
+def completed(snapshot):
+    result = {}
+    for key, rows in snapshot.get("decision_discussion", {}).items():
+        latest = next((r for r in reversed(rows) if r["kind"] == "completion"), None)
+        if latest and not latest.get("undone_at"):
+            result[key] = latest
+    return result
+
+
+def undo_completion(store, name, ident):
+    with store._connect() as db:
+        db.execute("BEGIN IMMEDIATE")
+        snapshot = store._get(db, name)
+        row = next((r for r in _rows(db, name) if r["id"] == ident), None)
+        if not row or completed(snapshot).get(row["key"], {}).get("id") != ident:
+            raise ConflictError("This completion has already changed; refresh the question")
+        row["undone_at"] = time.time()
+        _put(db, snapshot["name"], row)
+        core = next((d for d in snapshot["decisions"] if d["key"] == row["key"]), None)
+        if core is None:
+            core = dict(row["card"]["decision"])
+            snapshot["decisions"].append(core)
+        core["status"] = "pending"
+        from .backlog import record
+
+        record(db, dict(snapshot, decisions=[core]), note="User reopened the completed question")
+        snapshot.update(revision=snapshot["revision"] + 1, updated_at=time.time())
+        store._write(db, snapshot)
+
+    try:
+        store.export(name)
+    except OSError:
+        pass  # The durable completion/undo is authoritative; the observer retries projections.
 
 
 def claim(store, name):

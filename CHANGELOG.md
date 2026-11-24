@@ -1,5 +1,11 @@
 # Changelog
 
+## 3.22.6
+
+- Give Decisions semantic visual hierarchy: bold questions/options, accent section headings, distinct user text, focused buttons and subdued metadata. Fold secondary timing/source detail and separate the response editor from reading.
+- Add Mark as completed with optional comments, persistent history, protection against model reopening and inline undo.
+- Recover failed background lookups with bounded automatic retries and a direct per-card retry action. Prioritize questions without background and explain proposed behavior/customer impact before implementation details.
+
 ## 3.22.5
 
 - Read the exact bound Desk conversation as resolution evidence so explicit answers can retire existing questions. Index older questions outside the model working set to avoid paraphrased duplicates.

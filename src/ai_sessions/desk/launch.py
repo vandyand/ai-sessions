@@ -46,7 +46,10 @@ The observer starts automatically in the background, independently of the briefi
 The first briefing may still be preparing; do not wait for the user to open a view.
 The briefing pane switches Overview / Review / Decisions. Saved answers and their delivery
 status are available in decision_discussion in the structured snapshot above. Read those
-before asking an already answered question again. The observer reads this exact bound
+and the recent user completions before asking questions again. A completion records the
+human closing that question and their optional comment, not authorization for unrelated
+actions. Do not re-open a user-completed question on your own.
+The observer reads this exact bound
 conversation for explicit answers and superseding outcomes; do not treat a copied briefing,
 agent suggestion or transport receipt as a human answer. Refer to existing question keys
 when discussing their resolution so the briefing can correlate the answer.

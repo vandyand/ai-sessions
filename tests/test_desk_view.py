@@ -395,8 +395,8 @@ def test_complete_decision_has_options_reasons_and_context_without_disclosure():
         "Rain may delay",
         "volunteer must open",
         "protects the plants",
-        "another customer",
-        "Desk conversation",
+        "e Respond",
+        "c Mark completed",
         "d Sources",
     ):
         assert expected in text

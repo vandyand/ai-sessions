@@ -282,3 +282,12 @@ A queued answer says it is saved and waiting to send. When the exact Desk receiv
 The observer reads the exact bound Desk conversation as well as the configured operational sources. Explicit human answers there can resolve existing questions. It does not infer agreement from agent suggestions, copied questions, silence or a send receipt. Older pending keys are included in a compact index so an answer can match a question outside the detailed model window. Old questions without resolution evidence remain available; their age alone does not close them.
 
 The Decisions tab numbers questions **1 through n, newest first**. Background updates do not move older questions to the top. The generated decisions file uses the same ordering and omits matching saved answers, so the Desk agent does not re-ask them.
+
+
+### Completing a question and recovering missing background
+
+On Decisions, **c** selects **Mark as completed**. Add an optional comment (Tab moves to the text area), select the completion button and press Enter. Completion is saved immediately; **u** undoes it and **Enter** moves to the next unanswered question. The exact original card and comment remain in Discussion. A later model update cannot reopen a manually completed question. This marks the question complete; it does not send an operational approval. Use **Send answer** to convey an answer to the Desk agent.
+
+Questions, headings, options, comments, focused controls and metadata have separate visual styles. Colors follow the terminal palette; NO_COLOR retains bold, reverse focus, brackets and spacing. Optional detail stays behind **d**; Discussion remains behind **t**.
+
+If background generation fails, the card shows **Background unavailable** and **r Retry background lookup**. Automatic retry is limited to two retries per unchanged context (after one minute and then five minutes). Pressing r explicitly queues another attempt without discarding saved context or interrupting an active lookup. A new question without background takes priority over optional improvements to existing background.

@@ -63,3 +63,20 @@ def test_discussion_controls_do_not_break_original_tab_switching():
     assert "ask" in state.discussions
     state = view.handle_key(state, curses.KEY_BTAB, snap, 40, 24)
     assert state.tab == 2
+
+
+def test_complete_action_is_explicit_and_supports_optional_text():
+    editor = Editor("ask", "version", focus=4)
+    assert edit(editor, "\n").request == "completion"
+    assert "Mark as completed" in "\n".join(editor_lines(editor, view.wrap, 40, 24, "Choose a day"))
+
+
+def test_visual_roles_survive_wrap_scroll_and_frame_layout():
+    from ai_sessions.desk.presentation import line
+
+    wrapped = view.wrap(line("A long heading " * 8, "heading"), 20)
+    assert len(wrapped) > 1 and all(row.role == "heading" for row in wrapped)
+    frame = view.render(snapshot(), view.State(tab=3), 60, 24)
+    assert "question" in frame.roles
+    assert "action" in frame.roles
+    assert "metadata" in frame.roles

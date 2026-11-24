@@ -335,3 +335,23 @@ Discussion is its own reading stage. Comments/replies lead; full previous card v
 The observer also reads the exact bound Desk conversation in its configured native home. Explicit human answers and superseding outcomes may resolve existing questions; copied briefings, agent suggestions and transport receipts cannot establish consent. Desk conversation evidence alone cannot create or reopen questions. The bounded synthesis prompt indexes pending question identities beyond the detailed twenty-item window so later answers can match older keys rather than create paraphrases.
 
 Questions are numbered newest-first by persisted first-seen order, with insertion sequence breaking ties. Editing or hydrating an old question does not make it new. Imported history has a known relative order, not fabricated original timestamps. Saved answers survive first-time choice hydration; corrected information asks and changed underlying cores still require review. The view and generated decisions file exclude matching saved answers while preserving discussion and operational status separately.
+
+
+## Decisions: visual hierarchy and explicit completion
+
+Andrew's job is to understand the specific proposal, respond or close it, and move on. Success requires a self-contained ask with actual behavior, impact, options and tradeoffs, plus persistence of the user's exact input. A failed lookup must not leave an opaque approval request looking ready.
+
+| Journey | Contract |
+| --- | --- |
+| Orient | Project/status and view tabs form chrome; the numbered question is a bold title. Primary reading controls remain in a separate action row. |
+| Understand | Context, options and recommendation use accent headings; options are bold content, not pretend selectable controls. Required background/tradeoffs remain visible; secondary timing/source detail is disclosed with d. |
+| Respond | e opens the response editor. User text is bold and visibly separate from model copy. Bracketed action buttons use a pointer plus reverse fill for keyboard focus. Tab/Shift+Tab cycle input and actions. |
+| Complete | c opens the same editor at Mark as completed. Text is optional. Completion closes the question, archives the original card and exact comment, and cannot be reversed by model publication. It does not send an operational approval. |
+| Recover | u undoes completion in place with visible confirmation. Original comments remain. Changed-card submission preserves the draft. Failed background has r Retry on the card, bounded automatic retries, and an explicit unavailable state. |
+| Continue | Inline success offers Enter for the next unanswered question. Completed items remain accessible with saved responses and Discussion. |
+
+Terminal roles are explicit rendering metadata, never guessed from user/model text: header/tabs = bold; question/option = bold; heading/action = cyan accent plus bold; user = bold with a visible comment rail; success = green plus bold; metadata/hints = subdued; focused action = reverse plus bold and a pointer. Colors use the terminal palette/default background and honor NO_COLOR. Weight, brackets, pointer, spacing and labels retain hierarchy without color. The pure frame carries roles through wrapping and scrolling, and the native paint uses those roles.
+
+Validation uses isolated persistence/retry tests and actual Windows console input at 40/60/100 columns, including completion/undo, typed comments, focus, arrows, wheel and rapid navigation. Native character/attribute captures verify actual color, bold and reverse states. Renderings of those captured cells are visual QA artifacts, not claimed desktop pixel screenshots. They provide implementation evidence, not a substitute for Andrew's usability feedback.
+
+Sources: IBM Carbon button hierarchy https://carbondesignsystem.com/components/button/usage/ and USWDS typography/spacing https://designsystem.digital.gov/components/typography/.

@@ -146,3 +146,79 @@ def test_dismissed_request_cannot_be_reopened_by_model_publication(desk):
     current = desk.get("fixture")
     desk.publish("fixture", current["revision"], {}, "Review", snap["decisions"])
     assert desk.get("fixture")["decisions"][0]["status"] == "superseded"
+
+
+def test_completion_saves_optional_comment_is_persistent_and_can_be_undone(desk):
+    from ai_sessions.desk import view
+
+    snap = desk.get("fixture")
+    version = discussion.card_version(snap, "ask")
+    entry = discussion.submit(
+        desk, "fixture", "ask", "completion", "Already handled in the Desk conversation.", version
+    )
+    saved = Store(desk.root).get("fixture")
+    assert not view._pending(saved)
+    assert saved["decision_discussion"]["ask"][-1]["text"] == entry["text"]
+    assert saved["decisions"][0]["status"] == "resolved"
+    # A delayed model publication must not reopen an explicit human completion.
+    saved = desk.publish("fixture", saved["revision"], {}, "Later", snap["decisions"])
+    assert saved["decisions"][0]["status"] == "resolved"
+    discussion.undo_completion(desk, "fixture", entry["id"])
+    reopened = desk.get("fixture")
+    assert [d["key"] for d in view._pending(reopened)] == ["ask"]
+    assert reopened["decision_discussion"]["ask"][-1]["text"] == entry["text"]
+
+
+def test_completion_can_have_no_comment_and_is_not_an_outbound_approval(desk):
+    version = discussion.card_version(desk.get("fixture"), "ask")
+    entry = discussion.submit(desk, "fixture", "ask", "completion", "", version)
+    assert entry["text"] == ""
+    assert entry["delivery"] is None
+    assert discussion.claim(desk, "fixture") is None
+
+
+def test_completed_card_and_comment_survive_projection_pruning(desk):
+    from ai_sessions.desk import view
+
+    snap = desk.get("fixture")
+    row = discussion.submit(
+        desk,
+        "fixture",
+        "ask",
+        "completion",
+        "Already resolved.",
+        discussion.card_version(snap, "ask"),
+    )
+    assert row["card"]["decision"]["status"] == "pending"
+    for i in range(25):
+        snap = desk.get("fixture")
+        core = dict(row["card"]["decision"], key=f"closed-{i}", status="resolved")
+        desk.publish("fixture", snap["revision"], {}, "Later", [core])
+    snap = desk.get("fixture")
+    assert any(d["key"] == "ask" for d in view._answered(snap))
+    discussion.undo_completion(desk, "fixture", row["id"])
+    assert any(d["key"] == "ask" for d in view._pending(desk.get("fixture")))
+
+
+def test_manual_completion_is_visible_to_the_model_without_exposing_comment_as_consent(desk):
+    from ai_sessions.desk import observer
+
+    snap = desk.get("fixture")
+    discussion.submit(
+        desk,
+        "fixture",
+        "ask",
+        "completion",
+        "Already handled.",
+        discussion.card_version(snap, "ask"),
+    )
+    coverage = [dict(id="s0", status="available", changed=True)]
+    payload = json.loads(
+        observer._build_prompt(
+            desk.get("fixture"), coverage, [dict(citation="s0", text="Current activity")]
+        ).split("\n", 1)[1]
+    )
+    assert payload["human_completed_questions"] == [dict(key="ask", question="Which option?")]
+    assert "Already handled." not in str(payload["human_completed_questions"])
+    text = desk.export("fixture")["decisions"].read_text(encoding="utf-8")
+    assert "Recently completed by you" in text and "Already handled." in text

@@ -176,6 +176,8 @@ def child(result):
                     snapshot = self._get(db, name)
                 return dict(
                     record,
+                    decisions=snapshot["decisions"],
+                    decision_meta=snapshot["decision_meta"],
                     decision_discussion=snapshot["decision_discussion"],
                     decision_drafts=snapshot["decision_drafts"],
                 )
@@ -257,6 +259,10 @@ def child(result):
                             lines=[
                                 self.screen.instr(row, 0).decode("utf-8", errors="replace").rstrip()
                                 for row in range(rows)
+                            ],
+                            cells=[
+                                [self.screen.inch(y, x) for x in range(columns)]
+                                for y in range(rows)
                             ],
                         )
                     )
@@ -364,6 +370,18 @@ def child(result):
                             (13, "\r", 0),
                             (65, "a", 0),
                             (66, "b", 0),
+                            (67, "c", 0),
+                            (9, "\t", 0),
+                            (70, "F", 0),
+                            (73, "i", 0),
+                            (88, "x", 0),
+                            (69, "e", 0),
+                            (68, "d", 0),
+                            (9, "\t", 16),
+                            (13, "\r", 0),
+                            (85, "u", 0),
+                            (84, "t", 0),
+                            (84, "t", 0),
                             (72, "h", 0),
                             (0x22, "", 0),
                             (27, "\x1b", 0),
@@ -452,11 +470,15 @@ def main():
         startup.dwFlags |= subprocess.STARTF_USESHOWWINDOW
         startup.wShowWindow = subprocess.SW_HIDE
         with (Path(root) / "error.log").open("w", encoding="utf-8") as errors:
+            environment = dict(os.environ)
+            if not environment.get("AI_SESSIONS_DESK_SMOKE_MONO"):
+                environment.pop("NO_COLOR", None)
             process = subprocess.Popen(
                 [sys.executable, str(Path(__file__).resolve()), str(result)],
                 creationflags=subprocess.CREATE_NEW_CONSOLE,
                 startupinfo=startup,
                 stderr=errors,
+                env=environment,
             )
             try:
                 code = process.wait(timeout=30)
@@ -514,6 +536,21 @@ def main():
         assert any("v Earlier versions" in "\n".join(frame["lines"]) for frame in data["captures"])
         assert any(row["editing"] for row in data["states"])
         assert any("Note saved" in "\n".join(frame["lines"]) for frame in data["captures"])
+        assert any("Marked as completed" in "\n".join(frame["lines"]) for frame in data["captures"])
+        assert any("Completion undone" in "\n".join(frame["lines"]) for frame in data["captures"])
+        assert any(
+            cell & curses.A_REVERSE
+            for frame in data["captures"]
+            for row in frame["cells"]
+            for cell in row
+        )
+        colored = any(
+            cell & curses.A_COLOR
+            for frame in data["captures"]
+            for row in frame["cells"]
+            for cell in row
+        )
+        assert not colored if os.environ.get("AI_SESSIONS_DESK_SMOKE_MONO") else colored
         print(
             "Native Windows console: 40/60/100 columns, view keys, multiline notes, discussion, help, scroll and exit passed."
         )

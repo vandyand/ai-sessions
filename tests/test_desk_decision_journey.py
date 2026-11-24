@@ -138,3 +138,12 @@ def test_cli_audit_and_view_have_the_same_numbered_unanswered_projection():
         [row["key"] for row in audit(snap)] == [d["key"] for d in view._pending(snap)] == ["next"]
     )
     assert audit(snap)[0]["number"] == 1
+
+
+def test_completed_question_review_has_undo_instead_of_dead_response_controls():
+    snap = fixture(kind="completion")
+    snap["decisions"][0]["status"] = "resolved"
+    state = view.State(tab=3, selected_key="day", question_open=frozenset({"day"}))
+    text = "\n".join(view.render(snap, state, 60, 24).lines)
+    assert "[u Undo completion]" in text
+    assert "[e Respond]" not in text and "[c Mark completed]" not in text

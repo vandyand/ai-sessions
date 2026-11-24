@@ -134,13 +134,17 @@ class Store:
                 "CREATE TABLE IF NOT EXISTS decision_enrichment_attempts "
                 "(desk TEXT COLLATE NOCASE, key TEXT, core_hash TEXT, context_hash TEXT, "
                 "version INTEGER, status TEXT, checked_at REAL, source_hash TEXT, "
-                "started_at REAL, attempt_token TEXT, "
+                "started_at REAL, attempt_token TEXT, retry_count INTEGER NOT NULL DEFAULT 0, "
                 "PRIMARY KEY(desk,key,core_hash,context_hash,version))"
             )
             columns = {
                 row[1] for row in db.execute("PRAGMA table_info(decision_enrichment_attempts)")
             }
-            for column, kind in (("started_at", "REAL"), ("attempt_token", "TEXT")):
+            for column, kind in (
+                ("started_at", "REAL"),
+                ("attempt_token", "TEXT"),
+                ("retry_count", "INTEGER NOT NULL DEFAULT 0"),
+            ):
                 if column not in columns:
                     db.execute(
                         f"ALTER TABLE decision_enrichment_attempts ADD COLUMN {column} {kind}"
@@ -246,6 +250,7 @@ class Store:
                     "expired": "failed",
                     "failed": "failed",
                     "success": "success",
+                    "retry": "in_progress",
                 }.get(status)
                 if state is not None:
                     snapshot["decision_enrichment"][key] = {"status": state, "checked_at": checked}
@@ -445,6 +450,12 @@ class Store:
                 dismissed[d["key"]] if d["status"] == "pending" and d["key"] in dismissed else d
                 for d in decisions
             ]
+            from .discussion import completed
+
+            closed_by_user = completed(snapshot)
+            decisions = [
+                dict(d, status="resolved") if d["key"] in closed_by_user else d for d in decisions
+            ]
             incoming = {d["key"] for d in decisions}
             decisions = [
                 d
@@ -611,11 +622,18 @@ class Store:
                 return False
             args = (name, key, core_hash, context_hash, SCHEMA_VERSION)
             existing = db.execute(
-                "SELECT status FROM decision_enrichment_attempts WHERE desk=? AND key=? "
+                "SELECT status,started_at,retry_count FROM decision_enrichment_attempts WHERE desk=? AND key=? "
                 "AND core_hash=? AND context_hash=? AND version=?",
                 args,
             ).fetchone()
-            if existing and not force:
+            retry_count = (existing[2] or 0) if existing else 0
+            retry_due = bool(
+                existing
+                and existing[0] == "failed"
+                and retry_count < 2
+                and now - (existing[1] or now) >= 60 * (5**retry_count)
+            )
+            if existing and not force and existing[0] != "retry" and not retry_due:
                 db.execute(
                     "UPDATE decision_enrichment_attempts SET checked_at=? WHERE desk=? AND key=? "
                     "AND core_hash=? AND context_hash=? AND version=?",
@@ -624,9 +642,17 @@ class Store:
                 return False
             db.execute(
                 "INSERT OR REPLACE INTO decision_enrichment_attempts "
-                "(desk,key,core_hash,context_hash,version,status,checked_at,source_hash,started_at,attempt_token) "
-                "VALUES (?,?,?,?,?,?,?,?,?,?)",
-                (*args, "claimed", now, current_sources, now, token := uuid.uuid4().hex),
+                "(desk,key,core_hash,context_hash,version,status,checked_at,source_hash,started_at,attempt_token,retry_count) "
+                "VALUES (?,?,?,?,?,?,?,?,?,?,?)",
+                (
+                    *args,
+                    "claimed",
+                    now,
+                    current_sources,
+                    now,
+                    token := uuid.uuid4().hex,
+                    0 if force else retry_count + int(retry_due),
+                ),
             )
             if force:
                 db.execute(
@@ -642,6 +668,22 @@ class Store:
                 (name, key, name, key),
             )
             return token
+
+    def retry_decision_background(self, name, key, core_hash):
+        from .decisions import ENRICHMENT_LEASE_SECONDS, core_fingerprint
+
+        with self._connect() as db:
+            db.execute("BEGIN IMMEDIATE")
+            snapshot = self._get(db, name)
+            core = next((d for d in snapshot["decisions"] if d["key"] == key), None)
+            if core is None or core["status"] != "pending" or core_fingerprint(core) != core_hash:
+                raise ConflictError("Question changed; review the current question")
+            changed = db.execute(
+                "UPDATE decision_enrichment_attempts SET status='retry',checked_at=0,retry_count=0 WHERE desk=? AND key=? AND core_hash=? AND (status IN ('failed','expired') OR (status='claimed' AND (started_at IS NULL OR started_at<=?)))",
+                (snapshot["name"], key, core_hash, time.time() - ENRICHMENT_LEASE_SECONDS),
+            ).rowcount
+            if not changed:
+                raise ConflictError("Background lookup is already in progress")
 
     def finish_decision_enrichment(self, name, key, core_hash, context_hash, *, attempt_token=None):
         from .decisions import SCHEMA_VERSION
@@ -845,6 +887,31 @@ class Store:
                     + ", ".join(d["evidence"])
                     for d in pending
                 )
+            from .decisions import markdown_text
+            from .discussion import completed
+
+            recent = sorted(
+                completed(snapshot).values(), key=lambda row: row["created_at"], reverse=True
+            )[:5]
+            if recent:
+                text += "\n\n# Recently completed by you\n"
+                for entry in recent:
+                    card = entry["card"]
+                    title = (card.get("details") or {}).get("summary") or card["decision"][
+                        "question"
+                    ]
+                    text += "\n## " + markdown_text(title) + "\n"
+                    if entry["text"]:
+                        text += (
+                            "User's completion comment: "
+                            + markdown_text(entry["text"][:600])
+                            + "\n"
+                        )
+                    text += (
+                        "Full original comment/card: sessions desk show "
+                        + json.dumps(name)
+                        + " --json (decision_discussion).\n"
+                    )
             review = snapshot["review"] or "Not observed yet."
             overview_text = _overview_projection(snapshot.get("overview"))
             if overview_text:
