@@ -73,6 +73,24 @@ def sync(source: Path, projection: Path | None = None, *, fault: str = "") -> in
     return written
 
 
+def prepare_storage(storage: str) -> str:
+    """Build the desk wrapper from a Grok update stream and return the wrapper path.
+
+    The observer owns this file. A desk source may still point at updates.jsonl
+    after a Grok reopen. Sync is incremental; an unchanged stream writes nothing.
+    """
+    path = Path(storage)
+    stream = path
+    if path.name.endswith(".desk.jsonl"):
+        stream = path.with_name(path.name[: -len(".desk.jsonl")])
+    if stream.name != "updates.jsonl":
+        return storage
+    if not stream.is_file():
+        return storage
+    sync(stream)
+    return str(projection_path(stream))
+
+
 def check(source: Path) -> tuple[int, str]:
     state_path = _state_path(source)
     size = source.stat().st_size

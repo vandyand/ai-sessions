@@ -320,6 +320,10 @@ def main(argv=None) -> int:
                     print(f"ses desk: unknown grok session {args.name}", file=sys.stderr)
                     return 2
                 path = Path(ref.storage)
+            from .grok_projection import sync as grok_sync
+
+            if path.name == "updates.jsonl":
+                grok_sync(path)
             code, text = grok_check(path)
             print(text)
             return code

@@ -107,7 +107,19 @@ def _run_model(prompt, stop=None):
     )
 
 
+def _prepare_grok(source):
+    if source.get("tool") != "grok":
+        return source
+    from .grok_projection import prepare_storage
+
+    storage = prepare_storage(source["storage"])
+    if storage == source["storage"]:
+        return source
+    return dict(source, storage=storage)
+
+
 def _source(source, previous, index):
+    source = _prepare_grok(source)
     ref = NativeRef(source["session_id"], source["storage"])
     if source["tool"] not in TOOLS or not ref.storage.endswith(".jsonl"):
         raise ValueError("bounded observer supports a projection jsonl only")
@@ -211,6 +223,7 @@ def _citation(source):
 
 def _initial_context(source):
     """Read only the supervisor's bounded prefix ending at a complete JSONL boundary."""
+    source = _prepare_grok(source)
     if source["tool"] not in TOOLS or not source["storage"].endswith(".jsonl"):
         raise ValueError("initial context requires supported plain JSONL")
     if source["tool"] == "grok" and not source["storage"].endswith(".desk.jsonl"):
@@ -437,6 +450,7 @@ def _refresh(store, name, *, runner=None, stop=None):
         _check_stop(stop)
         for index, source in enumerate(before["sources"]):
             _check_stop(stop)
+            source = _prepare_grok(source)
             key = (source["tool"], source["session_id"], source["storage"])
             try:
                 observed, text = _source(source, old.get(key, {}), index)

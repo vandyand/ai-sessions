@@ -629,37 +629,116 @@ def _owner_pipe(session_id: str) -> str:
     return rf"\\.\pipe\grok-session-{session_id}"
 
 
+def _kernel32():
+    import ctypes
+    from ctypes import wintypes
+
+    kernel = ctypes.WinDLL("kernel32", use_last_error=True)
+    kernel.WaitNamedPipeW.argtypes = [wintypes.LPCWSTR, wintypes.DWORD]
+    kernel.WaitNamedPipeW.restype = wintypes.BOOL
+    kernel.CreateFileW.argtypes = [
+        wintypes.LPCWSTR,
+        wintypes.DWORD,
+        wintypes.DWORD,
+        ctypes.c_void_p,
+        wintypes.DWORD,
+        wintypes.DWORD,
+        wintypes.HANDLE,
+    ]
+    kernel.CreateFileW.restype = wintypes.HANDLE
+    kernel.WriteFile.argtypes = [
+        wintypes.HANDLE,
+        ctypes.c_void_p,
+        wintypes.DWORD,
+        ctypes.POINTER(wintypes.DWORD),
+        ctypes.c_void_p,
+    ]
+    kernel.WriteFile.restype = wintypes.BOOL
+    kernel.ReadFile.argtypes = [
+        wintypes.HANDLE,
+        ctypes.c_void_p,
+        wintypes.DWORD,
+        ctypes.POINTER(wintypes.DWORD),
+        ctypes.c_void_p,
+    ]
+    kernel.ReadFile.restype = wintypes.BOOL
+    kernel.CloseHandle.argtypes = [wintypes.HANDLE]
+    kernel.CloseHandle.restype = wintypes.BOOL
+    return kernel
+
+
 def _pipe_open(session_id: str) -> bool:
-    return sys.platform == "win32" and os.path.exists(_owner_pipe(session_id))
+    """A named pipe does not show up through os.path.exists."""
+    if sys.platform != "win32":
+        return False
+    import ctypes
+
+    kernel = _kernel32()
+    if kernel.WaitNamedPipeW(_owner_pipe(session_id), 50):
+        return True
+    # 2 is file-not-found. A timeout or busy pipe still means the owner is listening.
+    return ctypes.get_last_error() not in (0, 2, 3)
 
 
 def _write_owner_pipe(session_id: str, payload: str, timeout: float = 15) -> dict:
     """Write one peer frame to the live owner. The installed Grok must be listening."""
+    import ctypes
     import queue
     import threading
+    from ctypes import wintypes
 
     if not _pipe_open(session_id):
         return {
             "status": "unavailable",
             "reason": (
                 "this Grok process is not listening for peer messages. "
-                f"Nothing is bound at {_owner_pipe(session_id)}. "
-                "Grok 1.0.92 has no owner pipe; restart that session with a Grok "
-                "that accepts session ingress."
+                f"Nothing is bound at {_owner_pipe(session_id)}."
             ),
         }
     result: queue.Queue[dict] = queue.Queue(maxsize=1)
 
     def deliver() -> None:
+        kernel = _kernel32()
+        invalid = wintypes.HANDLE(-1).value
+        handle = kernel.CreateFileW(
+            _owner_pipe(session_id),
+            0x80000000 | 0x40000000,
+            0,
+            None,
+            3,
+            0,
+            None,
+        )
+        if not handle or handle == invalid:
+            result.put(
+                {
+                    "status": "unavailable",
+                    "reason": f"owner pipe open failed ({ctypes.get_last_error()})",
+                }
+            )
+            return
         try:
-            with open(_owner_pipe(session_id), "r+b", buffering=0) as pipe:
-                pipe.write(payload.encode("utf-8") + b"\n")
-                collected = bytearray()
-                while b"\n" not in collected and len(collected) < 65536:
-                    chunk = pipe.read(4096)
-                    if not chunk:
-                        break
-                    collected.extend(chunk)
+            data = (payload + "\n").encode("utf-8")
+            wrote = wintypes.DWORD(0)
+            buffer = ctypes.create_string_buffer(data)
+            if not kernel.WriteFile(handle, buffer, len(data), ctypes.byref(wrote), None):
+                result.put(
+                    {
+                        "status": "unavailable",
+                        "reason": f"owner pipe write failed ({ctypes.get_last_error()})",
+                    }
+                )
+                return
+            collected = bytearray()
+            chunk = ctypes.create_string_buffer(4096)
+            read = wintypes.DWORD(0)
+            while b"\n" not in collected and len(collected) < 65536:
+                if (
+                    not kernel.ReadFile(handle, chunk, 4096, ctypes.byref(read), None)
+                    or read.value == 0
+                ):
+                    break
+                collected.extend(chunk.raw[: read.value])
             text = collected.decode("utf-8", errors="replace").strip()
             try:
                 body = json.loads(text.splitlines()[0] if text else "{}")
@@ -674,10 +753,8 @@ def _write_owner_pipe(session_id: str, payload: str, timeout: float = 15) -> dic
                         "reason": text or "owner pipe did not accept the message",
                     }
                 )
-        except OSError as error:
-            result.put(
-                {"status": "unavailable", "reason": f"owner pipe failed: {error.strerror or error}"}
-            )
+        finally:
+            kernel.CloseHandle(handle)
 
     worker = threading.Thread(target=deliver, daemon=True)
     worker.start()

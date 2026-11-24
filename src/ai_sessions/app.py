@@ -6721,6 +6721,7 @@ def build_parser() -> argparse.ArgumentParser:
               sesres  (shorthand for sessions --restart)
               sesres --grok  (restart this session in Grok, from any harness)
               ses whoami  (or ses handle: show this session's handle)
+              sessions identify  (show the session recorded for this terminal)
 
             New native sessions:
               sessions new codex
@@ -6955,6 +6956,10 @@ def _main(argv: list[str] | None = None) -> int:
         from .desk.cli import main as desk_main
 
         return desk_main(raw[1:])
+    if raw and raw[0] == "identify":
+        from .handle_lookup import identify
+
+        return identify(raw[1:])
     if raw and raw[0] in ("list", "open", "project", "handle", "whoami"):
         from .handles_cli import main as handles_main
 
