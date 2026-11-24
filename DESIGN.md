@@ -355,3 +355,7 @@ Terminal roles are explicit rendering metadata, never guessed from user/model te
 Validation uses isolated persistence/retry tests and actual Windows console input at 40/60/100 columns, including completion/undo, typed comments, focus, arrows, wheel and rapid navigation. Native character/attribute captures verify actual color, bold and reverse states. Renderings of those captured cells are visual QA artifacts, not claimed desktop pixel screenshots. They provide implementation evidence, not a substitute for Andrew's usability feedback.
 
 Sources: IBM Carbon button hierarchy https://carbondesignsystem.com/components/button/usage/ and USWDS typography/spacing https://designsystem.digital.gov/components/typography/.
+
+Briefing validation advertises an explicit per-pass citation allowlist. Unknown citations are never guessed or silently stripped. A known validation failure receives at most one tools-disabled correction attempt with the same evidence and a bounded prompt reserve. A second failure preserves the saved briefing. Core synthesis failure skips unrelated enrichment so background recovery is not delayed.
+
+Decision-detail generation also corrects one missing field-attribution reply, within a shared 120-second model budget and the existing ownership lease. The schema requires a summary citation; every reply still passes unchanged provenance and readiness checks before publication. No missing reference is silently accepted or inferred.

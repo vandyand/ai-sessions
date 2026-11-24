@@ -2,9 +2,10 @@
 
 ## 3.22.6
 
+- Repair a rejected briefing once with explicit valid citation IDs; preserve the last good record if correction fails and keep unrelated enrichment from delaying recovery.
 - Give Decisions semantic visual hierarchy: bold questions/options, accent section headings, distinct user text, focused buttons and subdued metadata. Fold secondary timing/source detail and separate the response editor from reading.
 - Add Mark as completed with optional comments, persistent history, protection against model reopening and inline undo.
-- Recover failed background lookups with bounded automatic retries and a direct per-card retry action. Prioritize questions without background and explain proposed behavior/customer impact before implementation details.
+- Require summary attribution and repair one invalid background reply within the existing time budget. Recover failed background lookups with bounded automatic retries and a direct per-card retry action. Prioritize questions without background and explain proposed behavior/customer impact before implementation details.
 
 ## 3.22.5
 

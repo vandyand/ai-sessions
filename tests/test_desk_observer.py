@@ -685,3 +685,39 @@ def test_resolution_cannot_substitute_a_related_but_different_question(tmp_path,
     )
     assert result["error"]
     assert result["decisions"] == first["decisions"]
+
+
+def test_bad_review_citation_gets_one_bounded_repair_without_advancing_bad_state(
+    tmp_path, monkeypatch
+):
+    store, path = setup_source(tmp_path, monkeypatch)
+    calls = []
+
+    def runner(prompt):
+        payload = json.loads(prompt.split("\n", 1)[1])
+        calls.append(payload)
+        if len(calls) == 1:
+            return json.dumps(
+                dict(review="Unsupported old source [s7] and current [s0]", decisions=[])
+            )
+        assert "s0" in payload["review_citation_ids"]
+        assert "validation_feedback" in payload
+        return output()
+
+    result = observer.refresh(store, "demo", runner=runner)
+    assert result["error"] is None and len(calls) == 2
+    assert result["observation"]["sources"][0]["checkpoint"] == path.stat().st_size
+
+
+def test_repeated_bad_citation_stays_bounded_and_preserves_briefing(tmp_path, monkeypatch):
+    store, path = setup_source(tmp_path, monkeypatch)
+    calls = []
+    result = observer.refresh(
+        store,
+        "demo",
+        runner=lambda prompt: (
+            calls.append(prompt) or json.dumps(dict(review="Current [s0], bad [s7]", decisions=[]))
+        ),
+    )
+    assert result["error"] and len(calls) == 2
+    assert not result["observation"].get("synthesized_at")

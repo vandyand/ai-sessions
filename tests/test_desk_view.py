@@ -217,7 +217,7 @@ def test_idle_loop_does_not_rebuild_frames(monkeypatch):
 
 def test_partial_history_detail_is_available_in_help():
     data = snapshot(review="Partial coverage: one source was truncated.")
-    text = "\n".join(view.render(data, view.State(tab=3, help=True), 80, 60, now=NOW).lines)
+    text = "\n".join(view.render(data, view.State(tab=3, help=True), 80, 100, now=NOW).lines)
     assert "Recent history only" in text
 
 
@@ -625,3 +625,18 @@ def test_failed_details_refresh_preserves_valid_content_with_small_note():
     assert "Background ready" in text and "Showing saved context" in text
     assert "Choose whether the garden" in text and "protects the plants" in text
     assert "Preparing background" not in text
+
+
+def test_find_context_opens_reviewable_question_and_preserves_existing_draft():
+    data = detailed_snapshot()
+    data["decision_details"]["secret-a"]["missing_information"] = ["Exact migration SQL"]
+    state = view.normalize(view.State(tab=3), data, 80, 25)
+    opened = view.handle_key(state, "f", data, 80, 25)
+    assert opened.editor.focus == 2
+    assert "Exact migration SQL" in opened.editor.text
+    assert "Find context" in "\n".join(view.render(data, state, 80, 25, now=NOW).lines)
+    data["decision_drafts"] = {"secret-a": {"text": "My original question"}}
+    opened = view.handle_key(state, "f", data, 80, 25)
+    assert opened.editor.text == "My original question"
+    data["decision_details"]["secret-a"]["missing_information"] = []
+    assert view.handle_key(state, "f", data, 80, 25).editor is None

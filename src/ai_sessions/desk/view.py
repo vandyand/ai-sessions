@@ -232,7 +232,7 @@ def _detail(snapshot: dict | None, state: State, width: int) -> list[str]:
             "Reconnecting: the saved briefing cannot be reloaded right now.\n\n"
             "Observer stopped: reopen a live view or Desk conversation to restart it. "
             "Use ses desk status HANDLE or ses desk stop HANDLE to manage observation.\n\n"
-            "In Decisions, e opens your text area; c selects Mark as completed with an optional comment. u undoes completion. "
+            "In Decisions, e opens your text area; f prepares a clarification for the listed missing facts. c selects Mark as completed with an optional comment. u undoes completion. "
             "Tab selects Save note, Ask for clarification, Send answer, or Mark as completed. "
             "Enter inserts a new line while typing or activates the selected action. Esc keeps your draft. "
             "t opens Discussion with earlier cards and comments; r retries the failed background or clarification shown. "
@@ -677,13 +677,25 @@ def handle_key(
                 width,
                 height,
             )
-    if key in ("e", "E", "c", "C") and state.tab == 3 and state.selected_key and not state.help:
+    if (
+        key in ("e", "E", "c", "C", "f", "F")
+        and state.tab == 3
+        and state.selected_key
+        and not state.help
+    ):
         from .discussion import card_version
 
-        selected, _, missing = _selected(snapshot, state)
+        selected, selected_details, missing = _selected(snapshot, state)
         if selected and not missing and selected.get("status") == "pending":
             draft = (snapshot or {}).get("decision_drafts", {}).get(state.selected_key, {})
             text = draft.get("text", "")
+            if key in ("f", "F"):
+                facts = (selected_details or {}).get("missing_information") or []
+                if not facts:
+                    return state
+                text = text or "Please find and explain the missing context:\n" + "\n".join(
+                    "- " + fact for fact in facts
+                )
             return replace(
                 state,
                 editor=Editor(
@@ -691,7 +703,7 @@ def handle_key(
                     card_version(snapshot, state.selected_key),
                     text,
                     len(text),
-                    focus=4 if key in ("c", "C") else 0,
+                    focus=4 if key in ("c", "C") else 2 if key in ("f", "F") else 0,
                 ),
                 scroll=0,
                 notice=None,
@@ -942,7 +954,7 @@ def render(
     action = ""
     if state.tab == 3 and not state.help and not state.editor:
         feedback = _feedback(snapshot, state)
-        action_selected, _, action_missing = _selected(snapshot, state)
+        action_selected, action_details, action_missing = _selected(snapshot, state)
         action = (
             "[e Respond]   [c Mark completed]"
             if action_selected
@@ -952,6 +964,8 @@ def render(
             and state.selected_key not in state.discussions
             else ""
         )
+        if action and (action_details or {}).get("missing_information"):
+            action = "[f Find context]   [e Respond]"
         if not action and not feedback and state.selected_key not in state.discussions:
             from .discussion import completed
 

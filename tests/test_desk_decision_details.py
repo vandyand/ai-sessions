@@ -701,3 +701,29 @@ def test_failed_background_retries_are_bounded_and_explicit_retry_resets_budget(
     desk.retry_decision_background("demo", "oct16", fingerprint)
     assert desk.get("demo")["decision_enrichment"]["oct16"]["status"] == "in_progress"
     assert desk.claim_decision_enrichment("demo", "oct16", fingerprint, "context-1")
+
+
+def test_missing_field_attribution_gets_one_repair_before_failure_is_cached(desk):
+    calls = []
+
+    def runner(prompt):
+        calls.append(prompt)
+        value = details()
+        if len(calls) == 1:
+            value["citations"]["summary"] = []
+        else:
+            assert "attribution_feedback" in json.loads(prompt.split("\n", 1)[1])
+        return json.dumps(value)
+
+    result = enrich(desk, runner=runner)
+    assert len(calls) == 2 and "oct16" in result["decision_details"]
+    assert result["decision_enrichment"]["oct16"]["status"] == "success"
+
+
+def test_summary_schema_requires_an_evidence_reference():
+    assert (
+        decisions.details_schema(["d0"])["properties"]["citations"]["properties"]["summary"][
+            "minItems"
+        ]
+        == 1
+    )

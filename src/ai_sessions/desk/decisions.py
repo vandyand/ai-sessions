@@ -6,6 +6,7 @@ import hashlib
 import json
 import os
 import re
+import time
 from functools import lru_cache, partial
 from pathlib import Path
 
@@ -69,7 +70,10 @@ SYSTEM = (
     "once, not repeatedly in every sentence. Avoid boilerplate about 'supplied evidence' or "
     "'not verified here'; list specific unknowns that would change this decision instead. "
     "A recommendation needs a concrete benefit/tradeoff, not simply that an assistant "
-    "recommended it. If timing changes the cost of waiting, identify the missing date. "
+    "recommended it. Do not make install dates, arbitrary deadlines, test counts or unrelated "
+    "release checks blocking facts unless the original human question actually depends on them. "
+    "If attribution_feedback is supplied, correct the cited-field references using only "
+    "the attached evidence IDs. Never invent a fact or reference to satisfy the schema. "
     "Summary is ONLY the precise self-contained ask in one or two short sentences (max 600 "
     "characters). Do not audit legacy wording or narrate your reconstruction. Put project "
     "definitions, prior story and conditional branches in background/options instead. List only "
@@ -167,7 +171,10 @@ def details_schema(ids):
             type="object",
             additionalProperties=False,
             required=list(CITATION_FIELDS),
-            properties={field: citations for field in CITATION_FIELDS},
+            properties={
+                field: {**citations, **({"minItems": 1} if field == "summary" else {})}
+                for field in CITATION_FIELDS
+            },
         ),
     )
     return dict(
@@ -320,14 +327,14 @@ def validate_details(value, *, evidence=None):
     return value
 
 
-def _run_model(prompt, ids, stop):
+def _run_model(prompt, ids, stop, *, timeout=120):
     from ..harnesses import desk_observer
 
     return desk_observer.run_model(
         prompt,
         stop=stop,
         max_output_bytes=64 * 1024,
-        timeout=120,
+        timeout=timeout,
         system=SYSTEM,
         output_schema=details_schema(ids),
     )
@@ -396,15 +403,42 @@ def enrich_pending(store, name, *, context_runner=None, runner=None, stop=None, 
             )
             if len(prompt) > MAX_PROMPT_CHARS:
                 raise ValueError("decision details prompt exceeds budget")
-            raw = runner(prompt) if runner is not None else _run_model(prompt, ids, stop)
-            _check_stop(stop)
-            if not isinstance(raw, str) or len(raw.encode()) > 64 * 1024:
-                raise ValueError("decision detail output exceeds budget")
-            value = json.loads(raw)
-            if not isinstance(value, dict) or set(value) != DETAIL_FIELDS:
-                raise ValueError("invalid model detail fields")
-            value["evidence"] = evidence
-            validate_details(value, evidence=evidence)
+            deadline = time.monotonic() + 120
+            for attempt in range(2):
+                _check_stop(stop)
+                raw = (
+                    runner(prompt)
+                    if runner is not None
+                    else _run_model(prompt, ids, stop, timeout=max(1, deadline - time.monotonic()))
+                )
+                _check_stop(stop)
+                if not isinstance(raw, str) or len(raw.encode()) > 64 * 1024:
+                    raise ValueError("decision detail output exceeds budget")
+                value = json.loads(raw)
+                if not isinstance(value, dict) or set(value) != DETAIL_FIELDS:
+                    raise ValueError("invalid model detail fields")
+                value["evidence"] = evidence
+                try:
+                    validate_details(value, evidence=evidence)
+                    break
+                except ValueError as error:
+                    if (
+                        attempt
+                        or str(error) != "decision detail cites unknown or missing evidence"
+                        or deadline - time.monotonic() < 15
+                    ):
+                        raise
+                    payload = json.loads(prompt[len(SYSTEM) + 1 :])
+                    payload["attribution_feedback"] = (
+                        "A required factual field had no evidence reference or cited an unknown ID. Fill citations.summary, background and why_now for supported text, and recommendation when it names an option. Use only attached evidence IDs. For unsupported background/why_now use the exact missing-information sentence with no invented facts. Unsupported deadline/if_deferred must be null with empty citations."
+                    )
+                    prompt = (
+                        SYSTEM
+                        + "\n"
+                        + json.dumps(payload, ensure_ascii=False, separators=(",", ":"))
+                    )
+                    if len(prompt) > MAX_PROMPT_CHARS:
+                        raise ValueError("decision details repair exceeds prompt budget") from error
             store.publish_decision_details(
                 name,
                 record["revision"],
