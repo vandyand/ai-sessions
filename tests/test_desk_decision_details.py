@@ -477,7 +477,7 @@ def test_cached_unknowns_do_not_starve_later_pending_items(desk, monkeypatch):
             context_runner=lambda r, d: calls.append(d["key"]) or context(),
             runner=lambda p: json.dumps(details()),
         )
-    assert set(calls) == {f"q{i}" for i in range(5)}
+    assert set(calls) == {"oct16", *(f"q{i}" for i in range(5))}
     assert len(calls) == 6
 
 
@@ -623,7 +623,7 @@ def test_base_prompt_references_canonical_ask_without_importing_deep_details(des
     assert "NOT new evidence" in observer.SYSTEM
 
 
-def test_canonical_reference_budget_keeps_all_eighty_pending_cores_and_current_text(desk):
+def test_canonical_reference_budget_uses_bounded_window_and_keeps_current_text(desk):
     from ai_sessions.desk import observer
 
     record = desk.get("demo")
@@ -636,7 +636,9 @@ def test_canonical_reference_budget_keeps_all_eighty_pending_cores_and_current_t
         record, coverage, [dict(citation="s0", text="Latest evidence " * 1000)]
     )
     payload = json.loads(prompt[len(observer.SYSTEM) + 1 :])
-    assert len(payload["previous_decisions"]) == 80
+    assert len(payload["previous_decisions"]) <= 20
+    assert payload["pending_total"] == 80
+    assert len(record["decisions"]) == 80
     assert (
         len(json.dumps(payload["canonical_decision_refs"], separators=(",", ":")))
         <= observer.MAX_CANONICAL_REF_CHARS

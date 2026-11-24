@@ -8,6 +8,7 @@ import json
 import os
 import subprocess
 import sys
+import threading
 import time
 import uuid
 from contextlib import contextmanager
@@ -261,8 +262,12 @@ def serve(store, name, generation, interval):
             version=__version__,
         )
 
+        ending = threading.Event()
+
         class Stop:
             def is_set(self):
+                if ending.is_set():
+                    return True
                 try:
                     return (
                         json.loads((location / "stop.json").read_text())["generation"] == generation
@@ -290,12 +295,21 @@ def serve(store, name, generation, interval):
 
         write(location / "status.json", row)
         diagnostic("Observer started")
+        from .discussion_worker import serve as serve_discussion
+
+        shared_stop = Stop()
+        feedback = threading.Thread(
+            target=serve_discussion, args=(store, name, shared_stop), daemon=True
+        )
+        feedback.start()
         try:
-            watch(store, name, interval, Stop(), PublishedActivity())
+            watch(store, name, interval, shared_stop, PublishedActivity())
         except Exception:
             diagnostic("Observer exited unexpectedly; reopen the live view to restart")
             raise
         finally:
+            ending.set()
+            feedback.join(timeout=5)
             row.update(state="stopped", busy=False)
             write(location / "status.json", row)
             diagnostic("Observer stopped")

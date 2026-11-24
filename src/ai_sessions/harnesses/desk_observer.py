@@ -102,7 +102,15 @@ def read_since(tool, ref, checkpoint, *, end):
 
 
 def run_model(
-    prompt, stop=None, *, max_output_bytes, timeout, system, citation_ids=None, output_schema=None
+    prompt,
+    stop=None,
+    *,
+    max_output_bytes,
+    timeout,
+    system,
+    citation_ids=None,
+    output_schema=None,
+    read_context=None,
 ):
     """Existing CLI login only; bounded memory, execution time, and pipe writes.
 
@@ -154,6 +162,17 @@ def run_model(
         "--system-prompt",
         system,
     ]
+    if read_context is not None:
+        # Only the caller-owned read/search server is enabled; built-in tools stay empty.
+        command[command.index("--safe-mode")] = "--restricted"
+        command.extend(["--permission-mode", "dontAsk"])
+        command[command.index("--mcp-config") + 1] = json.dumps(read_context)
+        command.extend(
+            [
+                "--allowedTools",
+                "mcp__desk_context__search_project,mcp__desk_context__read_project_file",
+            ]
+        )
     # No credential files are inspected or copied. The CLI manages its existing login.
     with tempfile.TemporaryDirectory(prefix="desk-observer-") as cwd:
         job = None

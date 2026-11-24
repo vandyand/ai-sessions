@@ -1,5 +1,12 @@
 # Changelog
 
+## 3.22.3
+
+- Add saved decision notes, clarification questions and submitted answers in the Desk view, with immutable Discussion and prior card versions.
+- Ground one-off clarifications with bounded read-only project search; request missing context only from the exact bound Desk conversation. Send final answers with a discussion reference and durable delivery status.
+- Preserve every unanswered Desk request while bounding the model working set. Archive closed/superseded requests, expose review candidates and revision-checked dismissal, and retain original context.
+- Restore Desk updates when accumulated pending requests exceed the old aggregate prompt limit; add reset/restart and identity/identify aliases while preserving Grok integration.
+
 ## 3.22.1 — 2026-11-23
 
 - Deliver a Grok peer message by writing the owner pipe directly. Do not run

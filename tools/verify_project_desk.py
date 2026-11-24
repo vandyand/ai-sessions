@@ -161,9 +161,24 @@ def child(result):
             ),
         }
 
-        class FixtureStore:
+        class FixtureStore(Store):
+            def __init__(self):
+                self.root, self.path, self.readonly = store.root, store.path, False
+
+            def _get(self, db, name):
+                snapshot = Store._get(db, name)
+                # Rendering-only fixture details; production validates retrieved sources.
+                snapshot["decision_details"] = record["decision_details"]
+                return snapshot
+
             def get(self, name):
-                return record
+                with self._connect() as db:
+                    snapshot = self._get(db, name)
+                return dict(
+                    record,
+                    decision_discussion=snapshot["decision_discussion"],
+                    decision_drafts=snapshot["decision_drafts"],
+                )
 
         original_wrapper = curses.wrapper
         original_render = view.render
@@ -181,7 +196,14 @@ def child(result):
 
         def render(snapshot, state, *args, **kwargs):
             tabs.append(state.tab)
-            states.append(dict(tab=state.tab, expanded=bool(state.expanded), scroll=state.scroll))
+            states.append(
+                dict(
+                    tab=state.tab,
+                    expanded=bool(state.expanded),
+                    scroll=state.scroll,
+                    editing=bool(state.editor),
+                )
+            )
             return original_render(snapshot, state, *args, **kwargs)
 
         for columns, rows in ((100, 25), (60, 12), (40, 18)):
@@ -263,6 +285,15 @@ def child(result):
                         (68, "d", 0),
                         (78, "n", 0),
                         (80, "p", 0),
+                        (69, "e", 0),
+                        (81, "q", 0),
+                        (13, "\r", 0),
+                        (88, "x", 0),
+                        (9, "\t", 0),
+                        (13, "\r", 0),
+                        (84, "t", 0),
+                        (0x23, "", 0),
+                        (84, "t", 0),
                         (72, "h", 0),
                         (0x22, "", 0),
                         (27, "\x1b", 0),
@@ -386,8 +417,15 @@ def main():
             Path(capture_file).write_text(json.dumps(data), encoding="utf-8")
         assert {frame["width"] for frame in data["captures"]} == {40, 60, 100}
         assert any("Briefing help" in "\n".join(frame["lines"]) for frame in data["captures"])
-        assert all("? Help" in frame["lines"][-1] for frame in data["captures"])
-        print("Native Windows console: 40/60/100 columns, view keys, help, scroll and exit passed.")
+        assert all(
+            "? Help" in frame["lines"][-1] or "Tab Select" in frame["lines"][-1]
+            for frame in data["captures"]
+        )
+        assert any(row["editing"] for row in data["states"])
+        assert any("Note saved" in "\n".join(frame["lines"]) for frame in data["captures"])
+        print(
+            "Native Windows console: 40/60/100 columns, view keys, multiline notes, discussion, help, scroll and exit passed."
+        )
 
 
 if __name__ == "__main__":

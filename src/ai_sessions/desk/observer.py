@@ -17,7 +17,8 @@ from pathlib import Path
 from ..harnesses import desk_observer as model_backend
 from ..harnesses.desk_support import TOOLS
 from ..model import NativeRef
-from .store import MAX_PENDING_CHARS, ConflictError, validate_decisions, validate_overview
+from .backlog import WINDOW_CHARS, WINDOW_COUNT, working_set
+from .store import ConflictError, validate_decisions, validate_overview
 
 MAX_SOURCE_BYTES = 256 * 1024
 MAX_SOURCE_CHARS = 12000
@@ -58,8 +59,9 @@ SYSTEM = (
     "audit of the previous summary or lead with coverage, byte offsets, citation mechanics, "
     "or repeated verification disclaimers. Keep technical source metadata out of the prose. "
     "Use US Eastern Time (EST/EDT) for any human-facing times. "
-    f" Be concise: all pending records together must fit {MAX_PENDING_CHARS} serialized JSON characters and "
-    "at most 80 pending items, including carried pending records and expanded evidence citations. "
+    f" Be concise: this pass sees at most {WINDOW_COUNT} pending requests in a {WINDOW_CHARS}-character working set. "
+    "Other pending requests remain stored. Never infer their resolution or absence. "
+    "Context/evidence may be excerpts; unchanged requests must be omitted from output. "
     "Use short questions/context/recommendations; avoid repeating review prose in each item."
     " Overview explains the project's background, current work, direction and intended goal "
     "in plain language. Cite supplied source IDs in each new or changed overview field. "
@@ -271,7 +273,7 @@ def _build_prompt(before, coverage, evidence):
     prior = before["review"][-6000:]
     # Closed records remain in the bounded Store view, but cannot consume the
     # next synthesis budget or crowd out any pending question.
-    decisions = [d for d in before["decisions"] if d["status"] == "pending"]
+    decisions = working_set(before, evidence)
     primary = next(
         (s for s in before["sources"] if s.get("role") == "supervisor"), before["sources"][0]
     )
@@ -279,6 +281,8 @@ def _build_prompt(before, coverage, evidence):
         previous_review=prior,
         previous_review_partial=len(prior) < len(before["review"]),
         previous_decisions=decisions,
+        pending_total=sum(d["status"] == "pending" for d in before["decisions"]),
+        previous_decisions_partial=True,
         previous_overview=before.get("overview", {}),
         primary_source=primary,
         coverage=coverage,
@@ -501,6 +505,9 @@ def _refresh(store, name, *, runner=None, stop=None):
             "synthesized_at": before.get("observation", {}).get("synthesized_at"),
             "overview_context_attempted": context_attempted,
             "overview_context": before.get("observation", {}).get("overview_context"),
+            "decision_window_offset": before.get("observation", {}).get(
+                "decision_window_offset", 0
+            ),
             "limitations": "Bounded plain JSONL history; tool results excluded. "
             "Initial history and reset/gap coverage are partial; synthesis is attributed.",
         }
@@ -508,6 +515,11 @@ def _refresh(store, name, *, runner=None, stop=None):
         current_text_ids = {e["citation"] for e in evidence if e["citation"] != "s32"}
         if evidence:
             prompt = _build_prompt(before, coverage + context_coverage, evidence)
+            pending_count = sum(d["status"] == "pending" for d in before["decisions"])
+            observation["decision_window_offset"] = (
+                before.get("observation", {}).get("decision_window_offset", 0)
+                + len(working_set(before, evidence))
+            ) % max(1, pending_count)
             partial = any(s["partial"] for s in coverage)
             observation["partial"] = partial
             _check_stop(stop)

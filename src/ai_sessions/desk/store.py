@@ -17,8 +17,6 @@ from ..harnesses.desk_support import TOOLS
 from ..paths import APP_CONFIG_DIR, env_path
 from .time_format import eastern_time
 
-MAX_PENDING_COUNT = 80
-MAX_PENDING_CHARS = 64000
 MAX_TERMINAL_COUNT = 20
 OVERVIEW_FIELDS = ("background", "current", "direction", "goal")
 MAX_OVERVIEW_FIELD_CHARS = 6000
@@ -94,14 +92,15 @@ def bounded_decisions(decisions):
     if not isinstance(decisions, list) or any(not isinstance(d, dict) for d in decisions):
         raise ValueError("decisions must be a list of objects")
     pending = [d for d in decisions if d.get("status") == "pending"]
-    if len(pending) > MAX_PENDING_COUNT:
-        raise ValueError("pending decision count exceeds sustainable synthesis budget")
-    serialized = json.dumps(pending, ensure_ascii=False, separators=(",", ":"), allow_nan=False)
-    if len(serialized) > MAX_PENDING_CHARS:
-        raise ValueError("pending decision text exceeds sustainable synthesis budget")
+    # Storage is the ledger, not the model context. Validate each record without
+    # imposing the per-response list bound on the whole accumulated backlog.
+    keys = [d.get("key") for d in decisions]
+    if any(not isinstance(key, str) for key in keys) or len(set(keys)) != len(keys):
+        raise ValueError("decision keys must be unique strings")
+    for start in range(0, len(decisions), 100):
+        validate_decisions(decisions[start : start + 100])
     terminal = [d for d in decisions if d.get("status") != "pending"]
     bounded = pending + terminal[-MAX_TERMINAL_COUNT:]
-    validate_decisions(bounded)
     return bounded
 
 
@@ -146,6 +145,19 @@ class Store:
                     db.execute(
                         f"ALTER TABLE decision_enrichment_attempts ADD COLUMN {column} {kind}"
                     )
+
+            from .backlog import record, setup
+
+            setup(db)
+            from .discussion import setup as setup_discussion
+
+            setup_discussion(db)
+            for (name,) in db.execute(
+                "SELECT name FROM desks WHERE name NOT IN (SELECT desk FROM decision_archive_migrations)"
+            ).fetchall():
+                # Idempotent import: unchanged requests keep their original age.
+                record(db, self._get(db, name), imported=True)
+                db.execute("INSERT INTO decision_archive_migrations VALUES (?)", (name,))
 
     @contextmanager
     def _connect(self):
@@ -230,6 +242,24 @@ class Store:
                 }.get(status)
                 if state is not None:
                     snapshot["decision_enrichment"][key] = {"status": state, "checked_at": checked}
+        snapshot["decision_meta"] = {}
+        if db.execute("SELECT 1 FROM sqlite_master WHERE name='decision_lifecycle'").fetchone():
+            snapshot["decision_meta"] = {
+                key: dict(first_seen=first, last_changed=changed, imported=bool(imported))
+                for key, first, changed, imported in db.execute(
+                    "SELECT key,first_seen,last_changed,imported FROM decision_lifecycle WHERE desk=?",
+                    (name,),
+                )
+                if key in cores
+            }
+        from .backlog import audit
+
+        snapshot["decision_review"] = {
+            row["key"]: row["flags"] for row in audit(snapshot) if row["flags"]
+        }
+        from .discussion import hydrate
+
+        hydrate(db, snapshot)
         return snapshot
 
     @staticmethod
@@ -241,7 +271,15 @@ class Store:
                     {
                         k: v
                         for k, v in snapshot.items()
-                        if k not in ("decision_details", "decision_enrichment")
+                        if k
+                        not in (
+                            "decision_details",
+                            "decision_enrichment",
+                            "decision_meta",
+                            "decision_review",
+                            "decision_discussion",
+                            "decision_drafts",
+                        )
                     },
                     ensure_ascii=False,
                     allow_nan=False,
@@ -283,6 +321,10 @@ class Store:
             overview={},
             decisions=[],
             decision_details={},
+            decision_meta={},
+            decision_review={},
+            decision_discussion={},
+            decision_drafts={},
             observed_at=None,
             updated_at=time.time(),
             error=None,
@@ -360,7 +402,8 @@ class Store:
             if isinstance(decisions, list)
             else []
         )
-        decisions = bounded_decisions(decisions)
+        decisions = json.loads(json.dumps(decisions, allow_nan=False))
+        bounded_decisions(decisions)
         if any(not isinstance(key, str) or not key.strip() or len(key) > 8000 for key in all_keys):
             raise ValueError("invalid decision key")
         if not isinstance(observation, dict):
@@ -375,6 +418,41 @@ class Store:
             snapshot = self._get(db, name)
             if snapshot["revision"] != expected_revision:
                 raise ConflictError(f"desk {name} changed during observation")
+            from .backlog import record
+
+            # Archive complete before/after versions before trimming closed display rows.
+            record(db, snapshot)
+            dismissed = {
+                key: json.loads(data)
+                for key, data in db.execute(
+                    "SELECT key,data FROM decision_history WHERE desk=? AND note IS NOT NULL AND event='superseded' ORDER BY recorded_at,rowid",
+                    (name,),
+                )
+            }
+            decisions = [
+                dismissed[d["key"]] if d["status"] == "pending" and d["key"] in dismissed else d
+                for d in decisions
+            ]
+            incoming = {d["key"] for d in decisions}
+            decisions = [
+                d
+                for d in snapshot["decisions"]
+                if d["status"] == "pending" and d["key"] not in incoming
+            ] + decisions
+            from .decisions import core_fingerprint
+
+            old_cores = {d["key"]: d for d in snapshot["decisions"]}
+            same_keys = {
+                d["key"]
+                for d in decisions
+                if d["key"] in old_cores
+                and core_fingerprint(d) == core_fingerprint(old_cores[d["key"]])
+            }
+            archived_details = {
+                k: v for k, v in snapshot.get("decision_details", {}).items() if k in same_keys
+            }
+            record(db, dict(snapshot, decisions=decisions, decision_details=archived_details))
+            decisions = bounded_decisions(decisions)
             from .notifications import record_publication
 
             record_publication(db, snapshot, decisions, all_keys)
@@ -408,12 +486,51 @@ class Store:
                         "AND NOT(status='claimed' AND started_at>?)",
                         (name, key, fingerprint, time.time() - ENRICHMENT_LEASE_SECONDS),
                     )
-            for (key,) in db.execute(
-                "SELECT key FROM decision_details WHERE desk=?", (name,)
-            ).fetchall():
-                if key not in hashes:
-                    db.execute("DELETE FROM decision_details WHERE desk=? AND key=?", (name, key))
         return snapshot
+
+    def decision_history(self, name, *, limit=100, offset=0):
+        if not 1 <= limit <= 200 or offset < 0:
+            raise ValueError("history page must have 1–200 records and a nonnegative offset")
+        with self._connect() as db:
+            self._get(db, name)
+            return [
+                dict(
+                    key=key,
+                    decision=json.loads(data),
+                    details=json.loads(details),
+                    recorded_at=stamp,
+                    event=event,
+                    note=note,
+                )
+                for key, data, details, stamp, event, note in db.execute(
+                    "SELECT key,data,details,recorded_at,event,note FROM decision_history WHERE desk=? ORDER BY recorded_at DESC,rowid DESC LIMIT ? OFFSET ?",
+                    (name, limit, offset),
+                )
+            ]
+
+    def dismiss_decision(self, name, key, expected_revision, reason):
+        if not isinstance(reason, str) or not reason.strip() or len(reason) > 2000:
+            raise ValueError("give a short reason for dismissing this request")
+        from .backlog import record
+
+        with self._connect() as db:
+            db.execute("BEGIN IMMEDIATE")
+            snapshot = self._get(db, name)
+            if snapshot["revision"] != expected_revision:
+                raise ConflictError("Desk changed; list decisions again before dismissing")
+            selected = next(
+                (d for d in snapshot["decisions"] if d["key"] == key and d["status"] == "pending"),
+                None,
+            )
+            if selected is None:
+                raise ValueError("request is no longer pending; list decisions again")
+            record(db, snapshot)
+            selected["status"] = "superseded"
+            record(db, dict(snapshot, decisions=[selected]), note=reason.strip())
+            snapshot["decisions"] = bounded_decisions(snapshot["decisions"])
+            snapshot.update(revision=expected_revision + 1, updated_at=time.time())
+            self._write(db, snapshot)
+            return self._get(db, name)
 
     def decision_enrichment_order(self, name):
         with self._connect() as db:
@@ -569,6 +686,9 @@ class Store:
                 or claim[3] != attempt_token
             ):
                 raise ConflictError("enrichment attempt is no longer claimed")
+            from .discussion import capture
+
+            capture(db, snapshot)
             db.execute(
                 "INSERT OR REPLACE INTO decision_details VALUES (?,?,?,?,?,?)",
                 (*args, json.dumps(details, ensure_ascii=False)),
@@ -580,7 +700,9 @@ class Store:
             )
             snapshot.update(revision=snapshot["revision"] + 1, updated_at=time.time())
             self._write(db, snapshot)
-            return self._get(db, name)
+            result = self._get(db, name)
+            capture(db, result)
+            return result
 
     def fail(self, name, error):
         return self._fail(name, error)
@@ -634,6 +756,9 @@ class Store:
                     raise ConflictError(f"desk {name} already has a {tool} conversation")
                 return snapshot
             agents[tool] = binding
+            from .discussion import bind_waiting
+
+            bind_waiting(db, snapshot)
             snapshot.update(revision=snapshot["revision"] + 1, updated_at=time.time())
             self._write(db, snapshot)
         return snapshot

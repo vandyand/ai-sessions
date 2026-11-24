@@ -195,7 +195,7 @@ file, so a compressed copy can never be mistaken for no copy and bridged again. 
 ## Project Desk Briefing
 
 The human's job is to regain project context, understand progress, and decide what
-to discuss in the adjacent Desk conversation. The read-only terminal pane often
+to discuss in the adjacent Desk conversation. The terminal briefing pane often
 has only 40 columns. The approved navigation is **1 Overview / 2 Review / 3 Decisions**.
 A single decision keeps the ask, context and recommendation together. Splitting
 context and next action into separate views made understanding depend on recall;
@@ -233,8 +233,8 @@ a separate source reader would add another selection and scrolling mode.
   row separates navigation from prose. The footer has contextual controls and an
   overflow-only line range. Help and Exit remain available. Help documents all
   keys, source scope, status meanings, history limits and exact Eastern times.
-- Answers go in the Desk conversation. No send controls or approval buttons.
-  Background observation/lifecycle is unchanged; rendering performs no model or
+- Decisions provides notes, clarification and answer submission through the durable Discussion flow below.
+  Background processing uses the existing observer lifetime; rendering performs no model or
   filesystem I/O. The viewer checks source stats at most once per second.
   After a package upgrade, q and reopening the view loads the new UI; either fresh
   Desk entry also replaces a verified older observer through the existing scoped
@@ -252,7 +252,7 @@ legacy question is only a fallback, never a second contradictory title. In
 particular, an already-run test with missing prior approval is an information
 request about remembered consent, not a new approval action. Result files never
 become approval evidence through UI wording.
-No backend/store/observer changes belong to this UI work.
+The Discussion envelope extends this boundary without changing the legacy six-field cores.
 
 ### Implementation and validation plan
 
@@ -290,3 +290,32 @@ keeps saved context and directs the reader to the retry command in help:
 `ses desk refresh HANDLE --retry-context`. Existing valid details survive a failed
 refresh with a small note. Pending/in-progress hydration says Preparing background.
 Raw exception messages are never presentation text.
+
+
+## Decision backlog lifecycle
+
+Pending request storage is independent of model context. A bounded rotating and
+source-relevant working set (at most 20 requests / 24,000 characters) feeds each
+synthesis. The complete pending ledger remains available in the UI; closed
+versions move to paginated local history while the live projection keeps 20.
+Missing model output never deletes pending records. Archive import is idempotent.
+
+Seven-day unchanged, duplicate wording and explicit team-addressed questions are
+review flags only. No age-based closure, inferred approval, or automatic semantic
+merge is allowed. The Decisions card may show Review suggested; help points to
+`ses desk decisions HANDLE` and `ses desk history HANDLE`. Explicit dismissal
+requires the listing's revision, the selected number and a human reason. A changed
+revision refuses the action. The original and reason remain in history.
+
+Validation covers >200 pending requests, bounded prompt rotation, original-text
+preservation, terminal-history retention, stale-selection rejection, canonical
+summary audit, and unchanged-source model-call suppression.
+
+
+### Decision input and Discussion
+
+Decisions provides a keyboard-operated multiline editor with Save note, Ask for clarification and Submit decision. Drafts are persisted per decision; successful submission clears the input, failures preserve it. Each entry captures the exact card/version the human read. A materially changed card requires review before resubmission. One current card and latest exchange stay visible, with prior versions/comments under Discussion. Inline confirmations offer the existing n/p navigation rather than a modal.
+
+Clarification is finite background work owned by the existing per-Desk observer. It may use only bounded root-confined read/search MCP tools; source/model content cannot execute commands or edit files. Unavailable intent/history is requested from one exact bound Desk agent, never workers or the operational supervisor. Waiting requires no running model. Replies are accepted only from the requested native identity/home. Model output is validated and cannot resolve decisions or alter Overview/Review. Changed-card results remain discussion history without replacing current presentation.
+
+A submitted decision delivers exact human text plus canonical summary and a Discussion reference. Notes/questions are not approval. Durable transport claims prevent duplicate retries after uncertainty; offline work remains queued. Status distinguishes answer saved, notification submitted, delivery uncertain and clarification failed. All original human text and card versions remain retained.

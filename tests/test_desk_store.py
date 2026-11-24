@@ -123,16 +123,16 @@ def _pending_item(index):
 
 
 @pytest.mark.parametrize("kind", ["count", "characters"])
-def test_pending_budget_rejection_preserves_store(tmp_path, kind):
+def test_pending_storage_is_not_limited_by_model_working_set(tmp_path, kind):
     store = Store(tmp_path)
     good = store.create("demo", [SOURCE], "fiction")
     decisions = [_pending_item(i) for i in range(81 if kind == "count" else 10)]
     if kind == "characters":
         for item in decisions:
             item["context"] = "x" * 7000
-    with pytest.raises(ValueError, match="pending"):
-        store.publish("demo", 0, {}, "oversized", decisions)
-    assert store.get("demo") == good
+    result = store.publish("demo", 0, {}, "current", decisions)
+    assert result["decisions"] == decisions
+    assert result["revision"] == good["revision"] + 1
 
 
 def test_terminal_history_bounded_without_dropping_pending(tmp_path):

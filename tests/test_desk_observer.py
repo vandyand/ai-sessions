@@ -528,15 +528,15 @@ def test_explicit_latest_answer_in_clipped_long_tail_resolves(tmp_path, monkeypa
     assert result["observation"]["sources"][0]["checkpoint"] == path.stat().st_size
 
 
-def test_excessive_synthesis_pending_preserves_last_safe_snapshot(tmp_path, monkeypatch):
+def test_large_valid_synthesis_does_not_block_progress(tmp_path, monkeypatch):
     store, _ = setup_source(tmp_path, monkeypatch)
     items = [
         dict(decision(), key=f"q{i}", question=f"Question {i}?", context="x" * 7000)
         for i in range(10)
     ]
     result = observer.refresh(store, "demo", runner=lambda p: output(items))
-    assert result["error"] and result["review"] == "" and result["decisions"] == []
-    assert result["observation"] == {} and result["observed_at"] is None
+    assert result["error"] is None and len(result["decisions"]) == 10
+    assert result["observed_at"] is not None
 
 
 def test_fenced_legacy_json_is_validated_without_accepting_surrounding_prose(tmp_path, monkeypatch):

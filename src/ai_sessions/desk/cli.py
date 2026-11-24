@@ -265,6 +265,10 @@ def main(argv=None) -> int:
         "status",
         "stop",
         "check",
+        "decisions",
+        "history",
+        "dismiss",
+        "reply",
         "-h",
         "--help",
     }
@@ -280,11 +284,35 @@ def main(argv=None) -> int:
     create.add_argument("name")
     create.add_argument("--supervisor", required=True)
     create.add_argument("--source", action="append", default=[])
-    for action in ("show", "refresh", "watch", "view", "open", "status", "stop"):
+    for action in (
+        "show",
+        "refresh",
+        "watch",
+        "view",
+        "open",
+        "status",
+        "stop",
+        "decisions",
+        "history",
+        "dismiss",
+        "reply",
+    ):
         sub = commands.add_parser(action)
         sub.add_argument("name", help="Session handle, native ID, slug, or saved desk name")
-        if action == "show":
+        if action in ("show", "decisions", "history"):
             sub.add_argument("--json", action="store_true")
+        if action == "history":
+            sub.add_argument("--limit", type=int, default=50)
+            sub.add_argument("--offset", type=int, default=0)
+        if action == "dismiss":
+            sub.add_argument("number", type=int, help="Number from the decisions listing")
+            sub.add_argument(
+                "--revision", type=int, required=True, help="Revision shown in that listing"
+            )
+            sub.add_argument("--reason", required=True)
+        if action == "reply":
+            sub.add_argument("entry")
+            sub.add_argument("--message", required=True)
         if action == "refresh":
             sub.add_argument(
                 "--retry-context",
@@ -328,7 +356,19 @@ def main(argv=None) -> int:
             print(text)
             return code
         store = Store()
-        if args.action in ("show", "refresh", "watch", "view", "open", "status", "stop"):
+        if args.action in (
+            "show",
+            "refresh",
+            "watch",
+            "view",
+            "open",
+            "status",
+            "stop",
+            "decisions",
+            "history",
+            "dismiss",
+            "reply",
+        ):
             args.name = resolve_desk_name(
                 store,
                 args.name,
@@ -337,6 +377,23 @@ def main(argv=None) -> int:
                 or (args.action == "view" and args.watch),
                 create=args.action == "view" and args.watch,
             )
+        if args.action == "reply":
+            from ..handle_lookup import current_identity
+            from ..references import native_key
+            from .discussion import agent_reply
+
+            tool, ident = current_identity()
+            native = native_key(tool, ident)
+            agent_reply(
+                store,
+                args.name,
+                args.entry,
+                args.message,
+                dict(tool=tool, session_id=ident, home=native.home),
+            )
+            ensure_observer(store, args.name)
+            print("Context reply saved; clarification will resume in the background.")
+            return 0
         if args.action == "list":
             rows = store.list()
             print(
@@ -350,6 +407,60 @@ def main(argv=None) -> int:
             store.export(args.name)
             print(f"Created {args.name}. Open the conversation: sessions desk open {args.name}")
             print(f"In the adjacent pane: sessions desk view {args.name}")
+        elif args.action in ("decisions", "dismiss"):
+            from .backlog import audit
+            from .view import sanitize
+
+            snapshot = store.get(args.name)
+            rows = audit(snapshot)
+            if args.action == "dismiss":
+                if args.number < 1 or args.number > len(rows):
+                    raise ValueError("request number is unavailable; list decisions again")
+                store.dismiss_decision(
+                    args.name, rows[args.number - 1]["key"], args.revision, args.reason
+                )
+                store.export(args.name)
+                print(
+                    "Request dismissed; its original context and your reason are preserved in history."
+                )
+            elif args.json:
+                print(
+                    json.dumps(
+                        dict(name=args.name, revision=snapshot["revision"], decisions=rows),
+                        ensure_ascii=False,
+                    )
+                )
+            else:
+                print(f"{args.name}: {len(rows)} pending requests; revision {snapshot['revision']}")
+                if any(not row["age_known"] for row in rows):
+                    print(
+                        "Imported requests may have unknown original age; none are closed by age."
+                    )
+                for row in rows:
+                    print(sanitize(f"{row['number']}. {row['summary']}"))
+                    if row["flags"]:
+                        print("   Review: " + "; ".join(row["flags"]))
+                print("Dismiss with: ses desk dismiss HANDLE NUMBER --revision N --reason REASON")
+        elif args.action == "history":
+            from .store import _when
+            from .view import sanitize
+
+            rows = store.decision_history(args.name, limit=args.limit, offset=args.offset)
+            if args.json:
+                print(json.dumps(rows, ensure_ascii=False))
+            else:
+                for row in rows:
+                    title = (row.get("details") or {}).get("summary") or row["decision"]["question"]
+                    print(
+                        sanitize(
+                            f"{_when(row['recorded_at'])} · {row['decision']['status']} · {title}"
+                        )
+                    )
+                    if row.get("note"):
+                        print("   " + sanitize(row["note"]))
+                print(
+                    f"{len(rows)} history entries; --offset {args.offset + len(rows)} for the next page."
+                )
         elif args.action == "show":
             row = store.get(args.name)
             if args.json:
