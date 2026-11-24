@@ -303,3 +303,14 @@ def test_native_codex_wrapper_keeps_full_system_metadata(desk):
     assert outer["sender"]["tool"] == inner["sender"]["tool"] == "system"
     assert outer["sender"]["session_id"] == inner["sender"]["session_id"] == "observer"
     assert inner["informational"] and inner["sender_handle"] == "briefing"
+
+
+def test_notification_matches_equivalent_home_without_duplicate_send(desk, monkeypatch):
+    store, deliveries, _ = desk
+    publish(store, [decision()])
+    receiver = dict(HUMAN, home=HUMAN["home"] + "/./")
+    monkeypatch.setattr(notifications.messaging, "reachable", lambda: [receiver])
+    notifications.drain(store, "demo")
+    notifications.drain(store, "demo")
+    assert len(deliveries) == 1
+    assert deliveries[0][0] == receiver

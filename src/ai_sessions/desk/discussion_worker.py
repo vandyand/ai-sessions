@@ -13,7 +13,7 @@ from ..harnesses import desk_observer as backend
 from ..messaging import cli as messaging
 from . import discussion
 from .decisions import DETAIL_FIELDS, details_schema, validate_details
-from .notifications import _targets
+from .notifications import _same_target, _targets
 
 SYSTEM = (
     "You clarify one human decision. Return only the supplied JSON schema: a short reply, "
@@ -213,10 +213,10 @@ def deliver_pending(store, name, stop=None):
         recipient = event.get("recipient")
         if recipient is None:
             continue  # Only an explicit first Desk binding may supply a missing recipient.
-        if recipient not in targets:
+        if not any(_same_target(recipient, target) for target in targets):
             discussion.update(store, name, event["id"], delivery="binding_changed")
             continue
-        matches = [r for r in receivers if all(r.get(k) == v for k, v in recipient.items())]
+        matches = [r for r in receivers if _same_target(r, recipient)]
         if len(matches) != 1:
             reason = "offline" if not matches else "ambiguous"
             if event.get("delivery_wait") != reason:
@@ -247,7 +247,9 @@ def deliver_pending(store, name, stop=None):
             current = next(r for r in discussion._rows(db, name) if r["id"] == event["id"])
             if current.get("delivery") != "queued":
                 continue
-            if recipient not in _targets(store._get(db, name)):
+            if not any(
+                _same_target(recipient, target) for target in _targets(store._get(db, name))
+            ):
                 continue
             current.update(delivery="uncertain", recipient=recipient, delivery_wait=None)
             discussion._put(db, name, current)
@@ -269,7 +271,7 @@ def deliver_pending(store, name, stop=None):
         )
         try:
             # Revalidate exact binding immediately before delivery; never resolve a title.
-            if recipient not in _targets(store.get(name)):
+            if not any(_same_target(recipient, target) for target in _targets(store.get(name))):
                 discussion.update(store, name, event["id"], delivery="binding_changed")
                 continue
             result = messaging.deliver(matches[0], envelope, mid, sender)

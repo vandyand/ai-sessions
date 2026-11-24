@@ -43,6 +43,25 @@ def create_tables(db):
     )
 
 
+def _same_target(left, right):
+    """Compare a complete native identity using the platform's home-path semantics."""
+    from ..references import NativeKey
+
+    if not isinstance(left, dict) or not isinstance(right, dict):
+        return False
+    fields = ("tool", "session_id", "home")
+    if any(
+        not isinstance(row.get(k), str) or not row[k].strip()
+        for row in (left, right)
+        for k in fields
+    ):
+        return False
+    try:
+        return NativeKey(*(left[k] for k in fields)) == NativeKey(*(right[k] for k in fields))
+    except (ValueError, OSError, RuntimeError):
+        return False
+
+
 def _targets(snapshot):
     targets = []
     for tool, binding in snapshot.get("agents", {}).items():
@@ -130,7 +149,7 @@ def pending(store, name):
 
 
 def _current_request(snapshot, event):
-    if event["recipient"] not in _targets(snapshot):
+    if not any(_same_target(event["recipient"], target) for target in _targets(snapshot)):
         return None
     return next(
         (d for d in snapshot["decisions"] if d["key"] == event["key"] and d["status"] == "pending"),
@@ -207,7 +226,7 @@ def drain(store, name, *, stop=None):
     for event in events:
         if stop is not None and stop.is_set():
             return
-        matches = [r for r in rows if all(r.get(k) == v for k, v in event["recipient"].items())]
+        matches = [r for r in rows if _same_target(r, event["recipient"])]
         if len(matches) != 1:
             continue
         receiver = matches[0]

@@ -2,6 +2,7 @@
 
 ## 3.22.6
 
+- Fix Desk message delivery falsely treating the same Windows native home as offline when path casing differs. Feedback, new-request notifications, and context replies use canonical native identity; ambiguous receivers still refuse and uncertain sends never retry.
 - Repair a rejected briefing once with explicit valid citation IDs; preserve the last good record if correction fails and keep unrelated enrichment from delaying recovery.
 - Give Decisions semantic visual hierarchy: bold questions/options, accent section headings, distinct user text, focused buttons and subdued metadata. Fold secondary timing/source detail and separate the response editor from reading.
 - Add Mark as completed with optional comments, persistent history, protection against model reopening and inline undo.

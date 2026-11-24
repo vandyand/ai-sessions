@@ -352,14 +352,14 @@ def agent_reply(store, name, ident, text, sender):
         raise ValueError("Supply a reply of at most 12,000 characters")
     with store._connect() as db:
         db.execute("BEGIN IMMEDIATE")
-        from .notifications import _targets
+        from .notifications import _same_target, _targets
 
         row = next((r for r in _rows(db, name) if r["id"] == ident), None)
         if (
             not row
             or row["status"] != "waiting"
-            or row.get("recipient") != sender
-            or sender not in _targets(store._get(db, name))
+            or not _same_target(row.get("recipient"), sender)
+            or not any(_same_target(sender, target) for target in _targets(store._get(db, name)))
         ):
             raise ValueError(
                 "Reply must come from the bound Desk conversation requested for this question"

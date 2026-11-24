@@ -217,3 +217,60 @@ def test_reply_cli_ensures_worker_after_saving(desk, monkeypatch):
     assert cli.main(["reply", "fixture", row["id"], "--message", "Staging only"]) == 0
     assert started == ["fixture"]
     assert desk.get("fixture")["decision_discussion"]["ask"][-1]["agent_reply"] == "Staging only"
+
+
+@pytest.mark.parametrize("case_only", [False, True])
+def test_queued_answer_matches_same_native_home_and_delivers_once(
+    desk, monkeypatch, tmp_path, case_only
+):
+    if case_only and os.name != "nt":
+        pytest.skip("Windows path casing")
+    home = str(tmp_path / "NativeHome")
+    desk.bind_agent("fixture", "claude", "human-desk", home.lower() if case_only else home)
+    row = submit(desk, "decision")
+    receiver = dict(
+        tool="claude", session_id="human-desk", home=home.upper() if case_only else home + "/./"
+    )
+    calls = []
+    monkeypatch.setattr(worker.messaging, "reachable", lambda **_: [receiver])
+    monkeypatch.setattr(
+        worker.messaging, "deliver", lambda *a: calls.append(a) or {"status": "submitted"}
+    )
+    worker.deliver_pending(desk, "fixture")
+    worker.deliver_pending(desk, "fixture")
+    assert len(calls) == 1
+    assert calls[0][0] == receiver
+    saved = desk.get("fixture")["decision_discussion"]["ask"][-1]
+    assert saved["id"] == row["id"] and saved["delivery"] == "submitted"
+
+
+def test_reply_accepts_only_same_canonical_native_identity(desk, tmp_path):
+    home = str(tmp_path / "NativeHome")
+    desk.bind_agent("fixture", "claude", "human-desk", home)
+    row = submit(desk)
+    discussion.update(desk, "fixture", row["id"], status="waiting")
+    discussion.agent_reply(
+        desk,
+        "fixture",
+        row["id"],
+        "Requested context",
+        dict(tool="claude", session_id="human-desk", home=home + "/./"),
+    )
+    assert (
+        desk.get("fixture")["decision_discussion"]["ask"][-1]["agent_reply"] == "Requested context"
+    )
+
+
+def test_equivalent_home_does_not_choose_between_two_receivers(desk, monkeypatch, tmp_path):
+    home = str(tmp_path / "home")
+    desk.bind_agent("fixture", "claude", "human-desk", home)
+    submit(desk, "decision")
+    receiver = dict(tool="claude", session_id="human-desk", home=home)
+    monkeypatch.setattr(
+        worker.messaging, "reachable", lambda **_: [receiver, dict(receiver, home=home + "/./")]
+    )
+    monkeypatch.setattr(
+        worker.messaging, "deliver", lambda *a: pytest.fail("Ambiguous receivers must not send")
+    )
+    worker.deliver_pending(desk, "fixture")
+    assert desk.get("fixture")["decision_discussion"]["ask"][-1]["delivery_wait"] == "ambiguous"
