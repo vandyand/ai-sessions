@@ -127,11 +127,15 @@ def save_draft(store, name, key, text, version):
         raise ValueError("Notes are limited to 12,000 characters")
     with store._connect() as db:
         db.execute("BEGIN IMMEDIATE")
-        snapshot = store._get(db, name)
-        card(snapshot, key)
+        # Typing must not hydrate/validate every decision and source excerpt.
+        row = db.execute("SELECT name,data FROM desks WHERE name=?", (name,)).fetchone()
+        if row is None or not any(d["key"] == key for d in json.loads(row[1])["decisions"]):
+            raise ConflictError(
+                "Decision is no longer listed; keep your draft until it can be saved"
+            )
         db.execute(
             "INSERT OR REPLACE INTO desk_decision_drafts VALUES (?,?,?)",
-            (snapshot["name"], key, json.dumps(dict(text=text, version=version))),
+            (row[0], key, json.dumps(dict(text=text, version=version))),
         )
 
 

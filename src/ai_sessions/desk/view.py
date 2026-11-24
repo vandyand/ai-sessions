@@ -7,7 +7,6 @@ from __future__ import annotations
 
 import curses
 import re
-import time
 import unicodedata
 from copy import deepcopy
 from dataclasses import dataclass, replace
@@ -75,10 +74,12 @@ def wrap(value: object, width: int) -> list[str]:
     result = []
     for paragraph in sanitize(value).split("\n"):
         line = ""
+        used = 0
         for ch in paragraph:
-            if cell_width(ch) > width:
-                ch = "?"
-            if cell_width(line + ch) > width:
+            size = cell_width(ch)
+            if size > width:
+                ch, size = "?", 1
+            if used + size > width:
                 split = line.rfind(" ")
                 if split > 0:
                     result.append(line[:split])
@@ -87,10 +88,13 @@ def wrap(value: object, width: int) -> list[str]:
                     result.append(line)
                     line = ""
                 # The remainder plus a wide character can still overflow.
-                if cell_width(line + ch) > width:
+                used = cell_width(line)
+                if used + size > width:
                     result.append(line)
                     line = ""
+                    used = 0
             line += ch
+            used += size
         result.append(line)
     return result
 
@@ -556,6 +560,8 @@ def handle_key(
     elif key in ("d", "D") and state.tab == 3 and not state.help and state.selected_key:
         expanded = state.expanded ^ {state.selected_key}
         state = replace(state, expanded=frozenset(expanded))
+    elif key in ("wheel_down", "wheel_up"):
+        state = replace(state, scroll=state.scroll + (3 if key == "wheel_down" else -3))
     elif key in (curses.KEY_DOWN, "j"):
         state = replace(state, scroll=state.scroll + 1)
     elif key in (curses.KEY_UP, "k"):
@@ -638,10 +644,13 @@ def _clip(value: object, width: int) -> str:
     if cell_width(text) <= width:
         return text
     result = ""
+    used = 0
     for ch in text:
-        if cell_width(result + ch) > width - 1:
+        size = cell_width(ch)
+        if used + size > width - 1:
             break
         result += ch
+        used += size
     return result + "…"
 
 
@@ -779,34 +788,27 @@ def read_snapshot(
 def run(store: SnapshotStore, name: str, *, activity: dict | None = None) -> None:
     """Poll saved state at most once per second; draw only changed frames."""
 
+    from .view_polling import Poller
+
+    poller = Poller(store, name, read_snapshot, activity).start()
+
     def loop(screen):
         try:
             curses.curs_set(0)
         except curses.error:
             pass
-        screen.timeout(100)
+        try:
+            curses.mousemask(getattr(curses, "ALL_MOUSE_EVENTS", 0))
+            curses.mouseinterval(0)
+        except (curses.error, AttributeError):
+            pass
+        screen.timeout(20)
         state, snapshot, read_error = State(), None, None
-        next_poll = 0.0
         previous = None
         previous_input = None
         while not state.quit:
-            tick = time.monotonic()
-            if tick >= next_poll:
-                snapshot, read_error = read_snapshot(store, name, snapshot)
-                if snapshot and state.discussions:
-                    from .discussion import versions
-
-                    try:
-                        snapshot["_discussion_versions"] = {
-                            key: versions(store, name, key) for key in state.discussions
-                        }
-                    except (OSError, RuntimeError, ValueError):
-                        read_error = (
-                            read_error or "Earlier versions could not be loaded; retry shortly."
-                        )
-                if activity and activity.get("error"):
-                    read_error = read_error or activity.get("error")
-                next_poll = tick + 1.0
+            snapshot, read_error, busy = poller.latest()
+            poller.refresh(state.discussions)
             height, width = screen.getmaxyx()
             # Leave the final column free to avoid lower-right curses errors.
             width = max(1, width - 1)
@@ -818,7 +820,7 @@ def run(store: SnapshotStore, name: str, *, activity: dict | None = None) -> Non
                 snapshot,
                 read_error,
                 _observation_status(snapshot, now),
-                bool(activity and activity.get("busy")),
+                busy,
             )
             if current_input != previous_input:
                 state = normalize(state, snapshot, width, height)
@@ -830,7 +832,7 @@ def run(store: SnapshotStore, name: str, *, activity: dict | None = None) -> Non
                     height,
                     now=now,
                     read_error=read_error,
-                    updating=bool(activity and activity.get("busy")),
+                    updating=busy,
                 )
                 signature = (height, width, frame)
                 if signature != previous:
@@ -854,6 +856,12 @@ def run(store: SnapshotStore, name: str, *, activity: dict | None = None) -> Non
                 previous_input = current_input
             try:
                 key = screen.get_wch()
+                if key == curses.KEY_MOUSE:
+                    _, _, _, _, buttons = curses.getmouse()
+                    if buttons & getattr(curses, "BUTTON4_PRESSED", 0):
+                        key = "wheel_up"
+                    elif buttons & getattr(curses, "BUTTON5_PRESSED", 0):
+                        key = "wheel_down"
             except curses.error:
                 continue
             previous_editor = state.editor
@@ -867,7 +875,7 @@ def run(store: SnapshotStore, name: str, *, activity: dict | None = None) -> Non
                 if failed and failed["status"] == "failed":
                     try:
                         retry(store, name, failed["id"])
-                        next_poll = 0
+                        poller.refresh()
                     except (OSError, RuntimeError, ValueError):
                         state = replace(
                             state,
@@ -913,7 +921,7 @@ def run(store: SnapshotStore, name: str, *, activity: dict | None = None) -> Non
                                         + "; reopen the view to start background processing",
                                     ),
                                 )
-                    next_poll = 0
+                    poller.refresh()
                 except (OSError, RuntimeError, ValueError) as error:
                     message = (
                         str(error)
@@ -931,3 +939,5 @@ def run(store: SnapshotStore, name: str, *, activity: dict | None = None) -> Non
         curses.wrapper(loop)
     except KeyboardInterrupt:
         pass
+    finally:
+        poller.close()

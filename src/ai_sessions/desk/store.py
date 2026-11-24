@@ -186,6 +186,13 @@ class Store:
             raise ValueError("desk name must contain 1–80 ASCII letters, digits, _ or -")
         return name
 
+    def canonical_name(self, name):
+        with self._connect() as db:
+            row = db.execute("SELECT name FROM desks WHERE name=?", (name,)).fetchone()
+        if row is None:
+            raise KeyError(name)
+        return row[0]
+
     @staticmethod
     def _get(db, name):
         row = db.execute("SELECT data FROM desks WHERE name=?", (name,)).fetchone()

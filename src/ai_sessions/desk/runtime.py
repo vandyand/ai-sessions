@@ -65,9 +65,13 @@ def serialized(path):
         time.sleep(0.05)
 
 
+def _canonical_name(store, name):
+    lookup = getattr(store, "canonical_name", None)
+    return lookup(name) if callable(lookup) else store.get(name)["name"]
+
+
 def folder(store, name):
-    record = store.get(name)
-    key = hashlib.sha256(record["name"].casefold().encode()).hexdigest()
+    key = hashlib.sha256(_canonical_name(store, name).casefold().encode()).hexdigest()
     return store.root.resolve() / ".observers" / key
 
 
@@ -109,9 +113,8 @@ def status(store, name):
                 if attempt == 2:
                     raise
                 time.sleep(0.02 * (attempt + 1))
-        if (
-            Path(row["root"]).resolve() != store.root.resolve()
-            or row["name"] != store.get(name)["name"]
+        if Path(row["root"]).resolve() != store.root.resolve() or row["name"] != _canonical_name(
+            store, name
         ):
             return stopped
         process = psutil.Process(row["pid"])

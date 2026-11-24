@@ -186,10 +186,21 @@ def child(result):
         states = []
         captures = []
         keys_seen = []
+        input_times = []
+        mouse_events = []
+        original_getmouse = curses.getmouse
+
+        def getmouse():
+            event = original_getmouse()
+            mouse_events.append(event)
+            return event
+
+        curses.getmouse = getmouse
         original_handle = view.handle_key
 
         def handle(state, key, *args):
             keys_seen.append([repr(key), type(key).__name__])
+            input_times.append([repr(key), time.monotonic()])
             return original_handle(state, key, *args)
 
         view.handle_key = handle
@@ -244,8 +255,23 @@ def child(result):
                             ("control", wintypes.DWORD),
                         ]
 
+                    class Coord(ctypes.Structure):
+                        _fields_ = [("x", wintypes.SHORT), ("y", wintypes.SHORT)]
+
+                    class MouseEvent(ctypes.Structure):
+                        _fields_ = [
+                            ("position", Coord),
+                            ("buttons", wintypes.DWORD),
+                            ("control", wintypes.DWORD),
+                            ("flags", wintypes.DWORD),
+                        ]
+
                     class Event(ctypes.Union):
-                        _fields_ = [("key", KeyEvent), ("padding", ctypes.c_byte * 16)]
+                        _fields_ = [
+                            ("key", KeyEvent),
+                            ("mouse", MouseEvent),
+                            ("padding", ctypes.c_byte * 16),
+                        ]
 
                     class Input(ctypes.Structure):
                         _fields_ = [("type", wintypes.WORD), ("event", Event)]
@@ -268,39 +294,43 @@ def child(result):
                         wintypes.DWORD,
                         ctypes.POINTER(wintypes.DWORD),
                     ]
-                    keys = [
-                        (0x27, "", 0),
-                        (0x27, "", 0),
-                        (0x27, "", 0),
-                        (0x25, "", 0),
-                        (9, "\t", 0),
-                        (9, "\t", 16),
-                        (68, "d", 0),
-                        (0x23, "", 0),
-                        (0x26, "", 0),
-                        (0x28, "", 0),
-                        (0x21, "", 0),
-                        (0x22, "", 0),
-                        (0x24, "", 0),
-                        (68, "d", 0),
-                        (78, "n", 0),
-                        (80, "p", 0),
-                        (69, "e", 0),
-                        (81, "q", 0),
-                        (13, "\r", 0),
-                        (88, "x", 0),
-                        (9, "\t", 0),
-                        (13, "\r", 0),
-                        (84, "t", 0),
-                        (0x23, "", 0),
-                        (84, "t", 0),
-                        (72, "h", 0),
-                        (0x22, "", 0),
-                        (27, "\x1b", 0),
-                        (50, "2", 0),
-                        (0x23, "", 0),
-                        (81, "q", 0),
-                    ]
+                    keys = (
+                        [(0x28, "", 0)] * 20
+                        + [(0x27, "", 0), (0x25, "", 0)]
+                        + [
+                            (0x27, "", 0),
+                            (0x27, "", 0),
+                            (0x27, "", 0),
+                            (0x25, "", 0),
+                            (9, "\t", 0),
+                            (9, "\t", 16),
+                            (68, "d", 0),
+                            (0x23, "", 0),
+                            (0x26, "", 0),
+                            (0x28, "", 0),
+                            (0x21, "", 0),
+                            (0x22, "", 0),
+                            (0x24, "", 0),
+                            (68, "d", 0),
+                            (78, "n", 0),
+                            (80, "p", 0),
+                            (69, "e", 0),
+                            (81, "q", 0),
+                            (13, "\r", 0),
+                            (88, "x", 0),
+                            (9, "\t", 0),
+                            (13, "\r", 0),
+                            (84, "t", 0),
+                            (0x23, "", 0),
+                            (84, "t", 0),
+                            (72, "h", 0),
+                            (0x22, "", 0),
+                            (27, "\x1b", 0),
+                            (50, "2", 0),
+                            (0x23, "", 0),
+                            (81, "q", 0),
+                        ]
+                    )
                     records = []
                     for virtual, char, control in keys:
                         for down in (True, False):
@@ -321,19 +351,25 @@ def child(result):
                             )
                             records.append(record)
 
+                    for delta in (120, -120):
+                        wheel = Input()
+                        wheel.type = 2
+                        wheel.event.mouse = MouseEvent(Coord(3, 5), (delta & 0xFFFF) << 16, 0, 4)
+                        records.insert(44, wheel)
+
                     def feed():
                         import time
 
                         time.sleep(0.3)
                         console = kernel.CreateFileW("CONIN$", 0xC0000000, 3, None, 3, 0, None)
                         try:
-                            for record in records:
+                            for index, record in enumerate(records):
                                 written = wintypes.DWORD()
                                 if not kernel.WriteConsoleInputW(
                                     console, ctypes.byref(record), 1, ctypes.byref(written)
                                 ):
                                     raise ctypes.WinError(ctypes.get_last_error())
-                                time.sleep(0.03)
+                                time.sleep(0.001 if index < 44 else 0.03)
                         finally:
                             kernel.CloseHandle(console)
 
@@ -354,6 +390,8 @@ def child(result):
                     "exited": True,
                     "captures": captures,
                     "keys": keys_seen,
+                    "input_times": input_times,
+                    "mouse_events": mouse_events,
                     "states": states,
                 }
             ),
@@ -421,6 +459,14 @@ def main():
             "? Help" in frame["lines"][-1] or "Tab Select" in frame["lines"][-1]
             for frame in data["captures"]
         )
+        for start in range(len(data["input_times"]) - 20):
+            window = data["input_times"][start : start + 21]
+            if all(item[0] == str(curses.KEY_DOWN) for item in window[:20]):
+                assert window[-1][1] - window[0][1] < 1.5, window
+        assert any(key == "'wheel_down'" for key, _ in data["keys"]), (
+            "Wheel down did not reach the app"
+        )
+        assert any(key == "'wheel_up'" for key, _ in data["keys"]), "Wheel up did not reach the app"
         assert any(row["editing"] for row in data["states"])
         assert any("Note saved" in "\n".join(frame["lines"]) for frame in data["captures"])
         print(

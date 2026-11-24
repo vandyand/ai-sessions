@@ -6,7 +6,7 @@ import hashlib
 import json
 import os
 import re
-from functools import partial
+from functools import lru_cache, partial
 from pathlib import Path
 
 SCHEMA_VERSION = 1
@@ -192,6 +192,11 @@ def validate_evidence(evidence, sources=None):
         raise ValueError("decision details require bounded retrieved evidence")
     ids = set()
     total = 0
+
+    @lru_cache(maxsize=128)
+    def normalized(path):
+        return os.path.normcase(str(Path(path).resolve()))
+
     for entry in evidence:
         if not isinstance(entry, dict) or set(entry) != EVIDENCE_FIELDS:
             raise ValueError("invalid authoritative evidence shape")
@@ -212,10 +217,6 @@ def validate_evidence(evidence, sources=None):
         ):
             raise ValueError("invalid pinned evidence range or identity")
         if sources is not None:
-
-            def normalized(path):
-                return os.path.normcase(str(Path(path).resolve()))
-
             matches = [
                 s
                 for s in sources

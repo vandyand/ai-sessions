@@ -113,12 +113,17 @@ def test_unavailable_unobserved_and_partial_coverage():
 
 
 def test_fake_store_loop_is_read_only_rate_limited_and_quiet(monkeypatch):
+    import threading
+
+    ready = threading.Event()
+
     class Store:
         calls = 0
 
         def get(self, name):
             assert name == "Garden"
             self.calls += 1
+            ready.set()
             return snapshot()
 
     class Screen:
@@ -141,21 +146,19 @@ def test_fake_store_loop_is_read_only_rate_limited_and_quiet(monkeypatch):
             pass
 
         def get_wch(self):
+            assert ready.wait(0.5)
             self.ticks += 1
-            clock[0] += 0.1
             if self.ticks == 26:
                 return "q"
             raise curses.error()
 
-    clock = [0.0]
-    monkeypatch.setattr(view.time, "monotonic", lambda: clock[0])
     monkeypatch.setattr(view, "_now", lambda: NOW)
     monkeypatch.setattr(curses, "curs_set", lambda _: None)
     screen, store = Screen(), Store()
     monkeypatch.setattr(curses, "wrapper", lambda callback: callback(screen))
     view.run(store, "Garden")
-    assert 2 <= store.calls <= 3
-    assert screen.paints == 1
+    assert store.calls == 1
+    assert 1 <= screen.paints <= 2
 
 
 def test_store_error_keeps_last_good_content(monkeypatch):
@@ -209,7 +212,7 @@ def test_idle_loop_does_not_rebuild_frames(monkeypatch):
 
     monkeypatch.setattr(view, "render", counted)
     test_fake_store_loop_is_read_only_rate_limited_and_quiet(monkeypatch)
-    assert len(calls) == 1
+    assert 1 <= len(calls) <= 2
 
 
 def test_partial_history_detail_is_available_in_help():

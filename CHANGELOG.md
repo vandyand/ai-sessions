@@ -2,6 +2,8 @@
 
 ## 3.22.3
 
+- Fix severe Desk scrolling/input stalls by moving snapshot/status reads off the input thread, avoiding repeated full-record status reads and quadratic wrapping. Enable in-app mouse-wheel scrolling.
+
 - Add saved decision notes, clarification questions and submitted answers in the Desk view, with immutable Discussion and prior card versions.
 - Ground one-off clarifications with bounded read-only project search; request missing context only from the exact bound Desk conversation. Send final answers with a discussion reference and durable delivery status.
 - Preserve every unanswered Desk request while bounding the model working set. Archive closed/superseded requests, expose review candidates and revision-checked dismissal, and retain original context.
