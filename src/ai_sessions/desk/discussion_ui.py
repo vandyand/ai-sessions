@@ -9,7 +9,123 @@ from datetime import datetime, timezone
 from .discussion import MAX_TEXT
 from .time_format import eastern_time
 
-ACTIONS = ("Save note", "Ask for clarification", "Submit decision")
+ACTIONS = ("Save note", "Ask for clarification", "Send answer")
+ACTION_HELP = (
+    "Keep this note with the question.",
+    "Ask the reviewer to explain or find missing context.",
+    "Send your answer to the Desk agent.",
+)
+
+
+def answer(snapshot, key, *, core=None):
+    from .decisions import core_fingerprint
+
+    core = core or next((d for d in snapshot.get("decisions", []) if d.get("key") == key), None)
+    if core is None:
+        return None
+    fingerprint = core_fingerprint(core)
+    result = next(
+        (
+            row
+            for row in reversed(snapshot.get("decision_discussion", {}).get(key, []))
+            if row["kind"] == "decision" and row.get("core_hash") == fingerprint
+        ),
+        None,
+    )
+    changed = snapshot.get("decision_meta", {}).get(key, {}).get("last_changed", 0)
+    if result and core.get("status") == "pending" and changed > result["created_at"]:
+        return None
+    if result:
+        old = (result.get("card", {}).get("details") or {}).get("summary") or result.get(
+            "card", {}
+        ).get("decision", {}).get("question", "")
+        current = (snapshot.get("decision_details", {}).get(key) or {}).get("summary") or core.get(
+            "question", ""
+        )
+        if " ".join(old.casefold().split()) != " ".join(current.casefold().split()):
+            return None
+    return result
+
+
+def answered_keys(snapshot):
+    if not snapshot:
+        return set()
+    discussion = snapshot.get("decision_discussion", {})
+    return {
+        core["key"]
+        for core in snapshot.get("decisions", [])
+        if core["key"] in discussion and answer(snapshot, core["key"], core=core)
+    }
+
+
+def receipt(snapshot, row, wrap, width, *, reviewing=False):
+    kind = row["kind"]
+    delivery = row.get("delivery")
+    if kind == "decision":
+        title = (
+            "Answer sent to the Desk agent"
+            if delivery in ("submitted", "delivered")
+            else "Your answer is saved"
+        )
+        detail = "Waiting to send to the Desk agent."
+        if delivery in ("submitted", "delivered"):
+            detail = "You can move on to the next question."
+        elif delivery == "uncertain":
+            detail = "Delivery is unconfirmed. Check the Desk conversation before sending again."
+        elif delivery == "binding_changed":
+            detail = "The Desk recipient changed. Your answer is saved; delivery is paused."
+        elif row.get("delivery_wait") == "offline":
+            detail = "Waiting for the Desk agent to connect."
+        elif not row.get("recipient"):
+            detail = "Open the Desk conversation to send your saved answer."
+        elif row.get("delivery_wait") == "ambiguous":
+            detail = "The Desk connection is ambiguous. Your answer is saved; delivery is paused."
+        if delivery == "uncertain":
+            title = "Answer saved; delivery unconfirmed"
+        elif delivery == "binding_changed":
+            title = "Answer saved; delivery paused"
+        label = "Your answer"
+        primary = "Enter: Unanswered questions" if reviewing else "Enter: Next unanswered question"
+    elif kind == "note":
+        title, detail, label, primary = (
+            "Note saved",
+            "",
+            "Your note",
+            "Enter: Return to the question",
+        )
+    else:
+        title, detail, label, primary = (
+            status(row, bool(snapshot.get("agents"))),
+            "",
+            "Your question",
+            "Enter: View the question",
+        )
+        if row["status"] == "complete":
+            primary = "Enter: View the updated question"
+    card = row.get("card") or {}
+    question = (card.get("details") or {}).get("summary") or card.get("decision", {}).get(
+        "question", ""
+    )
+    parts = [title, primary, "b Question · e Comment · t Discussion", ""]
+    parts += [label, row["text"], ""]
+    if detail:
+        parts += [detail, ""]
+    if row.get("reply"):
+        parts += ["", "Clarification", row["reply"]]
+    if row["status"] == "failed":
+        parts += ["", "r Retry clarification"]
+    if (
+        kind == "decision"
+        and delivery == "queued"
+        and (not row.get("recipient") or row.get("delivery_wait") == "offline")
+    ):
+        command = "ses desk open " + snapshot["name"]
+        tool = (row.get("recipient") or {}).get("tool")
+        if tool:
+            command += " --tool " + tool
+        parts += ["", "To connect, run in another terminal:", command]
+    parts += ["", "Question", question]
+    return wrap("\n".join(parts), width)
 
 
 @dataclass(frozen=True)
@@ -82,24 +198,27 @@ def editor_lines(editor, wrap, width, height, title):
     capacity = max(1, height - 18)
     start = max(0, len(before) - capacity)
     visible = lines[start : start + capacity]
-    result = wrap("Comment on: " + title, width)[:2] + [
+    result = wrap("Question: " + title, width)[:2] + [
         "",
-        "Your text" + (" [editing]" if editor.focus == 0 else ""),
+        "Your response" + (" [typing]" if editor.focus == 0 else ""),
         *visible,
         "",
     ]
     if height < 15:
         result = wrap("Your comment", width)[:1] + visible[-1:]
     for i, action in enumerate(ACTIONS, 1):
-        result += wrap(("[" + action + "]") if editor.focus == i else action, width)
+        result += wrap(("[ " + action + " ]") if editor.focus == i else action, width)
     if height < 15:
         return result + wrap("Tab selects · Enter activates", width)[:1]
     result += [
         "",
         *wrap(
-            "Tab selects · Enter types a new line or activates a selected action · Esc keeps draft",
+            ACTION_HELP[editor.focus - 1]
+            if editor.focus
+            else "Type your response. Tab chooses what to do with it.",
             width,
         ),
+        *wrap("Enter: new line / selected action · Esc: keep draft", width),
     ]
     return result
 
@@ -126,7 +245,9 @@ def status(row, bound=True):
             return "Answer saved · delivery unconfirmed; check the Desk conversation"
         if delivery == "binding_changed":
             return "Answer saved · Desk recipient changed; delivery paused"
-        return "Answer saved · notification queued" + (
+        if row.get("delivery_wait") == "offline":
+            return "Answer saved · waiting for the Desk agent"
+        return "Answer saved · waiting to send" + (
             " · open the Desk conversation" if not bound else ""
         )
     return {
@@ -168,15 +289,16 @@ def _copy(card):
     return lines
 
 
-def lines(snapshot, key, expanded=False):
+def lines(snapshot, key, expanded=False, show_versions=False):
     rows = snapshot.get("decision_discussion", {}).get(key, [])
     result = ["", "Discussion" + (f" ({len(rows)})" if rows else "")]
     if expanded:
-        for version in snapshot.get("_discussion_versions", {}).get(key, []):
-            stamp = eastern_time(datetime.fromtimestamp(version["created_at"], timezone.utc))
-            result += ["", "Saved decision version · " + stamp, *_copy(version["card"])]
+        result = ["Discussion", "t Back · v Earlier versions", ""]
+    if not rows and not expanded:
+        return []
     if not rows:
-        return result
+        if not show_versions:
+            return result + ["No comments yet.", "e Write a note or question"]
     clarification = next((r for r in reversed(rows) if r["kind"] == "clarification"), None)
     selected = rows if expanded else [r for r in rows if r is clarification or r is rows[-1]]
     for row in selected:
@@ -194,7 +316,7 @@ def lines(snapshot, key, expanded=False):
             result += ["", "Clarification", row["reply"]]
         if row.get("agent_reply"):
             result += ["", "Project context from the Desk conversation", row["agent_reply"]]
-        if expanded:
+        if expanded and show_versions:
             for response in row.get("responses", [])[:-1]:
                 result += ["", "Earlier clarification", response["reply"]]
                 if response.get("details"):
@@ -205,4 +327,8 @@ def lines(snapshot, key, expanded=False):
             result += ["", "Decision when you wrote this", *_copy(row["card"])]
             if row.get("updated_details"):
                 result += ["", "Updated decision", *_copy(dict(details=row["updated_details"]))]
+    if expanded and show_versions:
+        for version in snapshot.get("_discussion_versions", {}).get(key, []):
+            stamp = eastern_time(datetime.fromtimestamp(version["created_at"], timezone.utc))
+            result += ["", "Saved decision version · " + stamp, *_copy(version["card"])]
     return result

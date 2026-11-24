@@ -319,3 +319,12 @@ Decisions provides a keyboard-operated multiline editor with Save note, Ask for 
 Clarification is finite background work owned by the existing per-Desk observer. It may use only bounded root-confined read/search MCP tools; source/model content cannot execute commands or edit files. Unavailable intent/history is requested from one exact bound Desk agent, never workers or the operational supervisor. Waiting requires no running model. Replies are accepted only from the requested native identity/home. Model output is validated and cannot resolve decisions or alter Overview/Review. Changed-card results remain discussion history without replacing current presentation.
 
 A submitted decision delivers exact human text plus canonical summary and a Discussion reference. Notes/questions are not approval. Durable transport claims prevent duplicate retries after uncertainty; offline work remains queued. Status distinguishes answer saved, notification submitted, delivery uncertain and clarification failed. All original human text and card versions remain retained.
+
+
+### Decision completion and reading flow
+
+The primary journey is question → response → explicit action → saved response/delivery status → next unanswered question. Completion is a focused inline pane, not a modal or the original unanswered card with stacked notices. The exact submitted text and Enter-to-continue control are visible before optional context. A saved human answer removes that item from unanswered navigation without claiming execution or changing the operational core. The current answered item stays selected until the user moves on. Saved answers remain available through a; b reviews the question, and e writes a further comment/correction. A materially changed core requires a new answer.
+
+Clarification and notes stay distinct from definitive answers. Their completion panes show the saved text and live clarification state/reply, with Enter returning to the question. Delivery status distinguishes waiting, disconnected, sent, changed recipient and uncertain transport. The UI never claims a queued answer was sent. An unavailable exact recipient yields a useful next step, not raw queue terminology.
+
+Discussion is its own reading stage. Comments/replies lead; full previous card versions and source excerpts stay behind v. Editor actions are Save note, Ask for clarification and Send answer, with visible focus and a short effect explanation. Global view navigation and the nonblocking polling/input contract remain intact.

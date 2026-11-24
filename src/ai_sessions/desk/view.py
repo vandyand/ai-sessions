@@ -34,6 +34,10 @@ class State:
     editor: Editor | None = None
     discussions: frozenset[str] = frozenset()
     notice: tuple[str, str] | None = None
+    feedback: dict | None = None
+    answered: bool = False
+    question_open: frozenset[str] = frozenset()
+    versions: frozenset[str] = frozenset()
 
 
 @dataclass(frozen=True)
@@ -100,11 +104,67 @@ def wrap(value: object, width: int) -> list[str]:
 
 
 def _pending(snapshot: dict | None) -> list[dict]:
+    from .discussion_ui import answered_keys
+
+    answered = answered_keys(snapshot)
     return [
         item
         for item in (snapshot or {}).get("decisions", [])
-        if isinstance(item, dict) and item.get("status") == "pending"
+        if isinstance(item, dict)
+        and item.get("status") == "pending"
+        and item.get("key") not in answered
     ]
+
+
+def _answered(snapshot):
+    from .discussion_ui import answered_keys
+
+    keys = answered_keys(snapshot)
+    return [row for row in (snapshot or {}).get("decisions", []) if row.get("key") in keys]
+
+
+def _browse(snapshot, state):
+    return _answered(snapshot) if state.answered else _pending(snapshot)
+
+
+def _feedback(snapshot, state):
+    if state.selected_key in state.question_open:
+        return None
+    rows = (snapshot or {}).get("decision_discussion", {}).get(state.selected_key, [])
+    if state.feedback and state.feedback["key"] == state.selected_key:
+        current = next(
+            (
+                row
+                for row in (snapshot or {}).get("decisions", [])
+                if row.get("key") == state.selected_key
+            ),
+            None,
+        )
+        from .decisions import core_fingerprint
+
+        if current and state.feedback.get("core_hash") == core_fingerprint(current):
+            if state.feedback["kind"] == "decision":
+                from .discussion_ui import answer
+
+                return answer(snapshot, state.selected_key)
+            return next((row for row in rows if row["id"] == state.feedback["id"]), state.feedback)
+    from .discussion_ui import answer
+
+    return answer(snapshot or {}, state.selected_key)
+
+
+def _with_saved_feedback(snapshot, feedback):
+    if not snapshot or not feedback:
+        return snapshot
+    rows = snapshot.get("decision_discussion", {}).get(feedback["key"], [])
+    if any(row["id"] == feedback["id"] for row in rows):
+        return snapshot
+    return dict(
+        snapshot,
+        decision_discussion=dict(
+            snapshot.get("decision_discussion", {}), **{feedback["key"]: [*rows, feedback]}
+        ),
+    )
 
 
 def _human_text(value: object) -> str:
@@ -128,7 +188,12 @@ def _detail(snapshot: dict | None, state: State, width: int) -> list[str]:
     if state.help:
         return wrap(
             "Briefing help\n\n"
-            "Left / Right or Tab / Shift+Tab: switch views\n"
+            + (
+                ("Update problem: " + _human_text(snapshot["error"]) + "\n\n")
+                if snapshot and snapshot.get("error")
+                else ""
+            )
+            + "Left / Right or Tab / Shift+Tab: switch views\n"
             "1 Overview: background, position, direction and goal\n"
             "2 Review: recent progress and current outcome\n"
             "3 Decisions: ask, context, options and recommendation\n"
@@ -154,12 +219,15 @@ def _detail(snapshot: dict | None, state: State, width: int) -> list[str]:
             "Reconnecting: the saved briefing cannot be reloaded right now.\n\n"
             "Observer stopped: reopen a live view or Desk conversation to restart it. "
             "Use ses desk status HANDLE or ses desk stop HANDLE to manage observation.\n\n"
-            "In Decisions, e opens your text area; Tab selects Save note, Ask for clarification, or Submit decision. "
+            "In Decisions, e opens your text area; Tab selects Save note, Ask for clarification, or Send answer. "
             "Enter inserts a new line while typing or activates the selected action. Esc keeps your draft. "
             "t opens Discussion with earlier cards and comments; r retries a failed clarification. "
             "Ask for clarification searches project files read-only and consults the bound Desk conversation only when needed. "
-            "Submit decision sends your exact answer and a discussion reference to that conversation. "
-            "Submitted answers do not automatically close a decision or mean the work was performed."
+            "Send answer sends your exact answer and a discussion reference to that conversation. "
+            "Enter on a saved answer moves to the next unanswered question. "
+            "a switches between unanswered questions and your saved answers; b reviews the question. "
+            "Discussion has earlier card versions behind v. "
+            "Saved answers remain pending operationally until the project records an outcome."
             + "\n\nWatched sessions\n"
             + (
                 "\n".join(
@@ -177,11 +245,6 @@ def _detail(snapshot: dict | None, state: State, width: int) -> list[str]:
             + (
                 "\n\nRecent history only: earlier conversation may be missing."
                 if _partial(snapshot)
-                else ""
-            )
-            + (
-                "\n\nUpdate problem: " + _human_text(snapshot["error"])
-                if snapshot and snapshot.get("error")
                 else ""
             )
             + "\n\nReview old or repeated requests:\n"
@@ -236,7 +299,12 @@ def _decision_details(snapshot, key):
 def _decision_teasers(snapshot, state):
     pending = _pending(snapshot)
     if not pending:
-        return ""
+        saved = len(_answered(snapshot))
+        return (
+            f"\n\nYour decisions · {saved} answers saved\n3 Decisions · a Review your answers"
+            if saved
+            else ""
+        )
     index = next((i for i, row in enumerate(pending) if row.get("key") == state.selected_key), 0)
     shown = pending[index : index + 2]
     lines = ["", "", f"Your decisions · {len(pending)} open", "n/p: open Decisions"]
@@ -254,7 +322,7 @@ def _selected(snapshot, state):
         return item, _decision_details(snapshot, state.selected_key), False
     if state.retained and state.selected_key == state.retained["decision"].get("key"):
         return state.retained["decision"], state.retained.get("details"), True
-    pending = _pending(snapshot)
+    pending = _browse(snapshot, state)
     item = pending[0] if pending else None
     return item, _decision_details(snapshot, item.get("key")) if item else None, False
 
@@ -292,7 +360,39 @@ def _decision_body(snapshot, state, width):
         if state.notice and state.notice[0] == state.editor.key:
             lines = wrap(state.notice[1], width) + [""] + lines
         return lines
+    if selected and selected.get("key") in state.discussions:
+        from .discussion_ui import lines as discussion_lines
+
+        return wrap(
+            "\n".join(
+                discussion_lines(
+                    snapshot,
+                    selected["key"],
+                    expanded=True,
+                    show_versions=selected["key"] in state.versions,
+                )
+            ),
+            width,
+        )
+    feedback = _feedback(snapshot, state)
+    if feedback:
+        from .discussion_ui import receipt
+
+        result = receipt(snapshot, feedback, wrap, width, reviewing=state.answered)
+        if state.notice and state.notice[0] == state.selected_key:
+            result = wrap(state.notice[1], width) + [""] + result
+        return result
     if selected is None:
+        if state.answered:
+            return wrap(
+                "Your saved answers\n\nThere are no answers to the current questions yet. Earlier comments remain in each question's Discussion.\n\na Return to unanswered questions",
+                width,
+            )
+        if _answered(snapshot):
+            return wrap(
+                "No questions are waiting for your answer.\n\nYour answers are saved.\n\na Review your answers",
+                width,
+            )
         if not snapshot.get("observed_at"):
             qualification = "The first briefing is still being prepared."
         elif snapshot.get("error"):
@@ -304,7 +404,12 @@ def _decision_body(snapshot, state, width):
         return wrap("No open decisions. " + qualification, width)
     key = selected.get("key")
     index = next((i + 1 for i, row in enumerate(pending) if row.get("key") == key), None)
-    if missing:
+    from .discussion_ui import answer
+
+    saved_answer = answer(snapshot, key)
+    if saved_answer and not missing:
+        position = "Your answer is saved · Question"
+    elif missing:
         position = "No longer listed · saved decision"
     elif selected.get("status") != "pending":
         position = "Resolved" if selected.get("status") == "resolved" else "Superseded"
@@ -326,27 +431,11 @@ def _decision_body(snapshot, state, width):
     active = not missing and selected.get("status") == "pending"
     parts = [
         position + (" · " + background if active else ""),
-        "e Write · t Discussion" if active else "t Discussion",
+        "e Respond · t Discussion" if active else "t Discussion",
         "",
     ]
-    if len(pending) > 1 or index is None and pending:
+    if len(_browse(snapshot, state)) > 1 or index is None and pending:
         parts[0] += " · n/p"
-    if state.notice and state.notice[0] == key:
-        parts.extend([state.notice[1], ""])
-    discussion_rows = snapshot.get("decision_discussion", {}).get(key, [])
-    if discussion_rows:
-        from .discussion_ui import status as discussion_status
-
-        last_question = next(
-            (r for r in reversed(discussion_rows) if r["kind"] == "clarification"), None
-        )
-        status_row = (
-            last_question
-            if last_question
-            and last_question["status"] in ("queued", "working", "waiting", "failed")
-            else discussion_rows[-1]
-        )
-        parts.extend([discussion_status(status_row, bool(snapshot.get("agents"))), ""])
 
     def section(title, value):
         if value:
@@ -433,14 +522,14 @@ def _decision_body(snapshot, state, width):
     parts.extend(
         [
             "",
-            "Submit decision sends your answer to the Desk conversation."
+            "Send answer sends your answer to the Desk conversation."
             if active
             else "Saved context for the previously viewed decision.",
         ]
     )
     from .discussion_ui import lines as discussion_lines
 
-    parts.extend(discussion_lines(snapshot, key, key in state.discussions))
+    parts.extend(discussion_lines(snapshot, key))
     return wrap("\n".join(parts), width)
 
 
@@ -473,7 +562,7 @@ def _body_height(height: int) -> int:
 def normalize(state: State, snapshot: dict | None, width: int, height: int) -> State:
     """Preserve the viewed decision, including a resolved/removed selection."""
     tab = min(3, max(1, state.tab))
-    keys = [item.get("key") for item in _pending(snapshot)]
+    keys = [item.get("key") for item in _browse(snapshot, state)]
     selected = state.selected_key
     if selected not in keys and not (
         tab == 3
@@ -501,6 +590,69 @@ def handle_key(
         from .discussion_ui import edit
 
         return replace(state, editor=edit(state.editor, key), scroll=0)
+    if state.tab == 3 and not state.help:
+        if key == "a":
+            reviewing = not state.answered
+            rows = _answered(snapshot) if reviewing else _pending(snapshot)
+            return normalize(
+                replace(
+                    state,
+                    answered=reviewing,
+                    selected_key=rows[0]["key"] if rows else None,
+                    feedback=None,
+                    scroll=0,
+                ),
+                snapshot,
+                width,
+                height,
+            )
+        if key == "b" and state.selected_key:
+            return normalize(
+                replace(
+                    state,
+                    question_open=state.question_open | {state.selected_key},
+                    discussions=state.discussions - {state.selected_key},
+                    feedback=None,
+                    scroll=0,
+                ),
+                snapshot,
+                width,
+                height,
+            )
+        if key == "v" and state.selected_key in state.discussions:
+            return normalize(
+                replace(state, versions=state.versions ^ {state.selected_key}, scroll=0),
+                snapshot,
+                width,
+                height,
+            )
+        if key in ("\n", "\r", curses.KEY_ENTER) and _feedback(snapshot, state):
+            row = _feedback(snapshot, state)
+            if row["kind"] != "decision":
+                return normalize(
+                    replace(
+                        state,
+                        question_open=state.question_open | {state.selected_key},
+                        feedback=None,
+                        scroll=0,
+                    ),
+                    snapshot,
+                    width,
+                    height,
+                )
+            rows = _pending(snapshot)
+            return normalize(
+                replace(
+                    state,
+                    answered=False,
+                    selected_key=rows[0]["key"] if rows else None,
+                    feedback=None,
+                    scroll=0,
+                ),
+                snapshot,
+                width,
+                height,
+            )
     if key in ("e", "E") and state.tab == 3 and state.selected_key and not state.help:
         from .discussion import card_version
 
@@ -515,10 +667,11 @@ def handle_key(
                 ),
                 scroll=0,
                 notice=None,
+                feedback=None,
             )
     if key in ("t", "T") and state.tab == 3 and state.selected_key and not state.help:
         return normalize(
-            replace(state, discussions=state.discussions ^ {state.selected_key}),
+            replace(state, discussions=state.discussions ^ {state.selected_key}, scroll=0),
             snapshot,
             width,
             height,
@@ -550,13 +703,13 @@ def handle_key(
                 height,
             )
     if key in ("n", "p") and state.tab == 3 and not state.help:
-        keys = [item.get("key") for item in _pending(snapshot)]
+        keys = [item.get("key") for item in _browse(snapshot, state)]
         if keys:
             if state.selected_key in keys:
                 index = (keys.index(state.selected_key) + (1 if key == "n" else -1)) % len(keys)
             else:
                 index = 0 if key == "n" else len(keys) - 1
-            state = replace(state, selected_key=keys[index], scroll=0)
+            state = replace(state, selected_key=keys[index], scroll=0, feedback=None)
     elif key in ("d", "D") and state.tab == 3 and not state.help and state.selected_key:
         expanded = state.expanded ^ {state.selected_key}
         state = replace(state, expanded=frozenset(expanded))
@@ -723,21 +876,34 @@ def render(
         if len(body) > capacity
         else ""
     )
-    controls = "Tab Select · Esc Back" if state.editor else "? Help · q Exit"
+    controls = "Tab Actions · Esc Keep draft" if state.editor else "? Help · q Exit"
     extra = []
     if not state.help and not state.editor and state.tab == 3 and state.selected_key:
-        extra.append("d Sources" if state.selected_key not in state.expanded else "d Hide")
+        if state.selected_key in state.discussions:
+            extra.extend(["t Back", "v Versions"])
+        elif _feedback(snapshot, state):
+            extra.extend(["Enter Next", "b Question"])
+        else:
+            extra.append("d Sources" if state.selected_key not in state.expanded else "d Hide")
         selected, _, missing = _selected(snapshot, state)
         if selected and not missing and selected.get("status") == "pending":
             extra.append("e Write")
-        extra.append("t Discussion")
+        if state.selected_key not in state.discussions:
+            extra.append("t Discussion")
     available = width - (len(position) + 2 if position else 0)
     if position:
         extra.append("↑↓ Scroll")
-    if not state.help and not state.editor and _pending(snapshot):
+    if (
+        not state.help
+        and not state.editor
+        and state.tab == 3
+        and (_answered(snapshot) or state.answered)
+    ):
+        extra.append("a Questions" if state.answered else "a Your answers")
+    if not state.help and not state.editor and _browse(snapshot, state):
         if state.tab in (1, 2):
             extra.append("n Decisions")
-        elif len(_pending(snapshot)) > 1:
+        elif len(_browse(snapshot, state)) > 1:
             extra.append("n/p Decisions")
     if not state.help and not state.editor:
         extra.append("←→ Views")
@@ -808,7 +974,8 @@ def run(store: SnapshotStore, name: str, *, activity: dict | None = None) -> Non
         previous_input = None
         while not state.quit:
             snapshot, read_error, busy = poller.latest()
-            poller.refresh(state.discussions)
+            snapshot = _with_saved_feedback(snapshot, state.feedback)
+            poller.refresh(state.discussions & state.versions)
             height, width = screen.getmaxyx()
             # Leave the final column free to avoid lower-right curses errors.
             width = max(1, width - 1)
@@ -837,13 +1004,22 @@ def run(store: SnapshotStore, name: str, *, activity: dict | None = None) -> Non
                 signature = (height, width, frame)
                 if signature != previous:
                     screen.erase()
+                    from .discussion_ui import ACTIONS
+
+                    selected_action = (
+                        f"[ {ACTIONS[state.editor.focus - 1]} ]"
+                        if state.editor and state.editor.focus
+                        else None
+                    )
                     for row, line in enumerate(frame.lines):
                         try:
                             screen.addstr(
                                 row,
                                 0,
                                 line,
-                                curses.A_BOLD
+                                curses.A_REVERSE | curses.A_BOLD
+                                if selected_action and line.strip() == selected_action
+                                else curses.A_BOLD
                                 if row < 2
                                 else curses.A_DIM
                                 if row == len(frame.lines) - 1
@@ -904,7 +1080,10 @@ def run(store: SnapshotStore, name: str, *, activity: dict | None = None) -> Non
                         state = replace(
                             state,
                             editor=None,
-                            notice=(editor.key, message + " · n Next decision"),
+                            notice=None,
+                            feedback=entry,
+                            question_open=state.question_open - {editor.key},
+                            discussions=state.discussions - {editor.key},
                             scroll=0,
                         )
                         from .runtime import ensure_observer
@@ -928,6 +1107,10 @@ def run(store: SnapshotStore, name: str, *, activity: dict | None = None) -> Non
                         if isinstance(error, (ValueError, RuntimeError))
                         else "Could not save. Keep this view open and try again."
                     )
+                    if message.startswith("Decision changed"):
+                        message = "Question changed. Esc to review. Your draft is saved."
+                    elif "clarification is already in progress" in message:
+                        message = "A reply is already in progress. Save a note or wait."
                     state = replace(
                         state,
                         editor=replace(editor, request=None),

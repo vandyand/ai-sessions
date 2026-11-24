@@ -180,6 +180,25 @@ def child(result):
                     decision_drafts=snapshot["decision_drafts"],
                 )
 
+        from ai_sessions.desk import discussion, runtime
+
+        original_submit = discussion.submit
+
+        def submit_fixture(*args, **kwargs):
+            entry = original_submit(*args, **kwargs)
+            if entry["kind"] == "decision":
+                entry = discussion.update(
+                    args[0],
+                    args[1],
+                    entry["id"],
+                    delivery_wait="offline",
+                    recipient=dict(tool="claude", session_id="fixture-desk", home=root),
+                )
+            return entry
+
+        discussion.submit = submit_fixture
+        runtime.ensure_observer = lambda *args, **kwargs: None
+
         original_wrapper = curses.wrapper
         original_render = view.render
         tabs = []
@@ -218,6 +237,9 @@ def child(result):
             return original_render(snapshot, state, *args, **kwargs)
 
         for columns, rows in ((100, 25), (60, 12), (40, 18)):
+            with store._connect() as db:
+                db.execute("DELETE FROM desk_discussion WHERE desk=?", ("smoke",))
+                db.execute("DELETE FROM desk_decision_drafts WHERE desk=?", ("smoke",))
 
             class Screen:
                 def __init__(self, screen):
@@ -321,8 +343,27 @@ def child(result):
                             (9, "\t", 0),
                             (13, "\r", 0),
                             (84, "t", 0),
+                            (84, "t", 0),
+                            (13, "\r", 0),
+                            (69, "e", 0),
+                            (70, "F", 0),
+                            (82, "r", 0),
+                            (73, "i", 0),
+                            (68, "d", 0),
+                            (65, "a", 0),
+                            (89, "y", 0),
+                            (190, ".", 0),
+                            (9, "\t", 0),
+                            (9, "\t", 0),
+                            (9, "\t", 0),
+                            (13, "\r", 0),
+                            (84, "t", 0),
+                            (86, "v", 0),
                             (0x23, "", 0),
                             (84, "t", 0),
+                            (13, "\r", 0),
+                            (65, "a", 0),
+                            (66, "b", 0),
                             (72, "h", 0),
                             (0x22, "", 0),
                             (27, "\x1b", 0),
@@ -418,7 +459,7 @@ def main():
                 stderr=errors,
             )
             try:
-                code = process.wait(timeout=20)
+                code = process.wait(timeout=30)
             except subprocess.TimeoutExpired:
                 process.terminate()
                 process.wait(timeout=5)
@@ -456,7 +497,7 @@ def main():
         assert {frame["width"] for frame in data["captures"]} == {40, 60, 100}
         assert any("Briefing help" in "\n".join(frame["lines"]) for frame in data["captures"])
         assert all(
-            "? Help" in frame["lines"][-1] or "Tab Select" in frame["lines"][-1]
+            "? Help" in frame["lines"][-1] or "Tab Actions" in frame["lines"][-1]
             for frame in data["captures"]
         )
         for start in range(len(data["input_times"]) - 20):
@@ -467,6 +508,10 @@ def main():
             "Wheel down did not reach the app"
         )
         assert any(key == "'wheel_up'" for key, _ in data["keys"]), "Wheel up did not reach the app"
+        assert any(
+            "Your answer is saved" in "\n".join(frame["lines"]) for frame in data["captures"]
+        )
+        assert any("v Earlier versions" in "\n".join(frame["lines"]) for frame in data["captures"])
         assert any(row["editing"] for row in data["states"])
         assert any("Note saved" in "\n".join(frame["lines"]) for frame in data["captures"])
         print(

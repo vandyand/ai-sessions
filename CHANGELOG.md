@@ -1,5 +1,11 @@
 # Changelog
 
+## 3.22.4
+
+- Make decision submission end with the exact saved answer, truthful delivery status and a clear next-question action.
+- Separate unanswered questions from saved answers without changing operational resolution. Keep clarification open and preserve prior answers when a question changes.
+- Make Discussion a focused reading view, fold old card versions separately, and clarify editor action labels/focus. Explain when feedback is waiting for the Desk agent to connect.
+
 ## 3.22.3
 
 - Fix severe Desk scrolling/input stalls by moving snapshot/status reads off the input thread, avoiding repeated full-record status reads and quadratic wrapping. Enable in-app mouse-wheel scrolling.

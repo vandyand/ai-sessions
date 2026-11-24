@@ -218,6 +218,9 @@ def deliver_pending(store, name, stop=None):
             continue
         matches = [r for r in receivers if all(r.get(k) == v for k, v in recipient.items())]
         if len(matches) != 1:
+            reason = "offline" if not matches else "ambiguous"
+            if event.get("delivery_wait") != reason:
+                discussion.update(store, name, event["id"], delivery_wait=reason)
             continue
         path = discussion.export(store, name, event["id"])
         title = (event["card"].get("details") or {}).get("summary") or event["card"]["decision"][
@@ -245,7 +248,7 @@ def deliver_pending(store, name, stop=None):
                 continue
             if recipient not in _targets(store._get(db, name)):
                 continue
-            current.update(delivery="uncertain", recipient=recipient)
+            current.update(delivery="uncertain", recipient=recipient, delivery_wait=None)
             discussion._put(db, name, current)
         sender = dict(tool="system", session_id="desk-feedback", name="Desk user feedback")
         mid = "desk-feedback-" + event["id"]
