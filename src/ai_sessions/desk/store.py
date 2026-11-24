@@ -18,7 +18,7 @@ from ..paths import APP_CONFIG_DIR, env_path
 from .time_format import eastern_time
 
 MAX_PENDING_COUNT = 80
-MAX_PENDING_CHARS = 24000
+MAX_PENDING_CHARS = 64000
 MAX_TERMINAL_COUNT = 20
 OVERVIEW_FIELDS = ("background", "current", "direction", "goal")
 MAX_OVERVIEW_FIELD_CHARS = 6000

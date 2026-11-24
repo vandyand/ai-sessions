@@ -126,7 +126,7 @@ def _pending_item(index):
 def test_pending_budget_rejection_preserves_store(tmp_path, kind):
     store = Store(tmp_path)
     good = store.create("demo", [SOURCE], "fiction")
-    decisions = [_pending_item(i) for i in range(81 if kind == "count" else 4)]
+    decisions = [_pending_item(i) for i in range(81 if kind == "count" else 10)]
     if kind == "characters":
         for item in decisions:
             item["context"] = "x" * 7000

@@ -184,7 +184,7 @@ The observer reads bounded windows of plain Claude/Codex JSONL: at most 256 KiB 
 
 Pending requests are preserved if omitted from model output. Explicit current cited evidence can resolve or supersede them even when coverage is partial; missing questions alone never imply resolution. These are model-attributed judgments, not operational approvals. The current snapshot keeps every pending request plus the most recent 20 resolved/superseded records. Older terminal records leave the current view; this prototype is not an immutable decision audit. The underlying native conversations remain untouched.
 
-Pending state is limited to 80 requests and 24,000 serialized characters so it stays within the next synthesis budget. An oversized model result is refused before publication, preserving the last usable briefing and source cursor. The failure is visible; it never silently drops an unresolved request.
+Pending state is limited to 80 requests and 64,000 serialized characters so it stays within the next synthesis budget. An oversized model result is refused before publication, preserving the last usable briefing and source cursor. The failure is visible; it never silently drops an unresolved request.
 
 Errors preserve the last good synthesis and display its age/error. Observation time and synthesis time are separate. Source material is untrusted data, and a generated recommendation is never user consent. The model cannot send messages. The host sends only the new-request notices described above, to bound human-facing Desk conversations.
 

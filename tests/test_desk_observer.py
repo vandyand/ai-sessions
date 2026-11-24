@@ -37,6 +37,20 @@ def decision(status="pending"):
     }
 
 
+def test_backlog_near_old_limit_can_publish_progress_without_losing_requests(tmp_path, monkeypatch):
+    store, path = setup_source(tmp_path, monkeypatch)
+    pending = [dict(decision(), key=f"prior-{i}", context="x" * 800) for i in range(20)]
+    store.publish("demo", 0, {}, "Old briefing", pending)
+    new = dict(decision(), key="new-request", question="Which delivery day?", context="y" * 7000)
+    result = observer.refresh(store, "demo", runner=lambda prompt: output([new]))
+    assert result["error"] is None
+    assert "Recent source activity" in result["review"]
+    assert result["decisions"][:20] == pending
+    assert result["decisions"][-1]["key"] == "new-request"
+    assert result["observation"]["sources"][0]["checkpoint"] == path.stat().st_size
+    observer.refresh(store, "demo", runner=lambda prompt: pytest.fail("unchanged model call"))
+
+
 def test_refresh_incremental_and_no_unchanged_model_call(tmp_path, monkeypatch):
     store, path = setup_source(tmp_path, monkeypatch)
     calls = []
@@ -518,7 +532,7 @@ def test_excessive_synthesis_pending_preserves_last_safe_snapshot(tmp_path, monk
     store, _ = setup_source(tmp_path, monkeypatch)
     items = [
         dict(decision(), key=f"q{i}", question=f"Question {i}?", context="x" * 7000)
-        for i in range(4)
+        for i in range(10)
     ]
     result = observer.refresh(store, "demo", runner=lambda p: output(items))
     assert result["error"] and result["review"] == "" and result["decisions"] == []

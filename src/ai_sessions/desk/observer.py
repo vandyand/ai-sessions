@@ -17,7 +17,7 @@ from pathlib import Path
 from ..harnesses import desk_observer as model_backend
 from ..harnesses.desk_support import TOOLS
 from ..model import NativeRef
-from .store import ConflictError, validate_decisions, validate_overview
+from .store import MAX_PENDING_CHARS, ConflictError, validate_decisions, validate_overview
 
 MAX_SOURCE_BYTES = 256 * 1024
 MAX_SOURCE_CHARS = 12000
@@ -58,7 +58,7 @@ SYSTEM = (
     "audit of the previous summary or lead with coverage, byte offsets, citation mechanics, "
     "or repeated verification disclaimers. Keep technical source metadata out of the prose. "
     "Use US Eastern Time (EST/EDT) for any human-facing times. "
-    " Be concise: all pending records together must fit 24000 serialized JSON characters and "
+    f" Be concise: all pending records together must fit {MAX_PENDING_CHARS} serialized JSON characters and "
     "at most 80 pending items, including carried pending records and expanded evidence citations. "
     "Use short questions/context/recommendations; avoid repeating review prose in each item."
     " Overview explains the project's background, current work, direction and intended goal "
@@ -552,6 +552,8 @@ def _refresh(store, name, *, runner=None, stop=None):
         message = "Briefing update failed; retrying automatically. Previous briefing preserved."
         if isinstance(exc, json.JSONDecodeError):
             message = "The summarizer returned an unreadable reply; retrying automatically. Previous briefing preserved."
+        if isinstance(exc, ValueError) and str(exc).startswith("pending decision"):
+            message = "Pending requests exceed the briefing capacity. Previous briefing and requests preserved; resolve outstanding requests in the Desk conversation."
         if isinstance(exc, PromptBudgetError):
             message += " " + str(exc)
         failed = store._fail(name, message, before["revision"], coverage=coverage)

@@ -694,3 +694,8 @@ forwarded without creating an empty conversation.
 ## Quiet project conversations
 
 [Project Desk](docs/PROJECT_DESK.md) pairs a human-facing native Claude/Codex conversation with a live terminal Overview / Review / Needs you / Next action view, while an observer watches explicitly selected operational sessions. Start with `sessions desk --help`.
+
+`ses reset` and `sessions --reset` are aliases for restart (`ses restart` /
+`sessions --restart`). Harness flags, including `--grok`, work identically.
+`sessions identity` is an alias for `sessions identify`, including `--json` and
+the same no-session exit status.
