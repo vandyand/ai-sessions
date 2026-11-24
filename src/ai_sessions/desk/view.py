@@ -460,6 +460,9 @@ def _decision_body(snapshot, state, width):
         if value:
             parts.extend(["", styled(title, "heading"), _human_text(value)])
 
+    from .discussion_ui import latest_clarification
+
+    parts.extend(latest_clarification(snapshot, key))
     if failed:
         parts.extend(
             [

@@ -80,3 +80,46 @@ def test_visual_roles_survive_wrap_scroll_and_frame_layout():
     assert "question" in frame.roles
     assert "action" in frame.roles
     assert "metadata" in frame.roles
+
+
+def test_return_from_clarification_keeps_question_reply_and_offline_status_visible():
+    snap = snapshot()
+    row = dict(
+        id="clarify",
+        key="ask",
+        kind="clarification",
+        text="Why not Monday?",
+        status="waiting",
+        reply="Monday is possible, but availability is unconfirmed.",
+        delivery="queued",
+        delivery_wait="offline",
+        created_at=1,
+    )
+    snap["agents"] = {"codex": {"id": "bound-but-offline"}}
+    snap["decision_discussion"] = {"ask": [row]}
+    state = view.normalize(view.State(tab=3, selected_key="ask", feedback=row), snap, 60, 24)
+    state = view.handle_key(state, "\n", snap, 60, 24)
+    text = "\n".join(view._body(snap, state, 60))
+    assert "Why not Monday?" in text
+    assert "Monday is possible" in text
+    assert "Desk agent is offline" in text
+    assert "unchanged" in text.lower()
+    assert "n/p" in text
+
+
+def test_clarification_receipt_explains_waiting_without_claiming_updated_card():
+    from ai_sessions.desk.discussion_ui import receipt
+
+    snap = snapshot()
+    row = dict(
+        kind="clarification",
+        text="Explain Friday",
+        status="waiting",
+        delivery="queued",
+        delivery_wait="offline",
+        reply="Need the delivery schedule.",
+    )
+    text = "\n".join(receipt(snap, row, view.wrap, 60))
+    assert "Desk agent is offline" in text
+    assert "unchanged" in text.lower()
+    assert "n/p" in text

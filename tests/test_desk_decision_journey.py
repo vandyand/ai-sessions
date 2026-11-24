@@ -147,3 +147,16 @@ def test_completed_question_review_has_undo_instead_of_dead_response_controls():
     text = "\n".join(view.render(snap, state, 60, 24).lines)
     assert "[u Undo completion]" in text
     assert "[e Respond]" not in text and "[c Mark completed]" not in text
+
+
+def test_background_rewording_does_not_revoke_answer_to_unchanged_choice():
+    snap = fixture()
+    snap["decision_discussion"]["day"][0]["card"]["details"] = dict(
+        kind="choice", summary="Who should choose the delivery day?"
+    )
+    snap["decision_details"]["day"] = dict(
+        kind="choice", summary="Who should set the delivery day and review the wording?"
+    )
+    assert [d["key"] for d in view._pending(snap)] == ["next"]
+    snap["decision_details"]["day"]["kind"] = "information"
+    assert [d["key"] for d in view._pending(snap)] == ["day", "next"]

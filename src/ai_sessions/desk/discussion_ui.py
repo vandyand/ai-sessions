@@ -56,7 +56,12 @@ def answer(snapshot, key, *, core=None):
             not result.get("card", {}).get("details")
             and (snapshot.get("decision_details", {}).get(key) or {}).get("kind") == "choice"
         )
-        if not initial_choice and " ".join(old.casefold().split()) != " ".join(
+        previous_kind = (result.get("card", {}).get("details") or {}).get("kind")
+        current_kind = (snapshot.get("decision_details", {}).get(key) or {}).get("kind")
+        same_choice = previous_kind in ("choice", "action") and previous_kind == current_kind
+        # Background copy may be regenerated while the authoritative request is
+        # unchanged. That must not silently revoke the human's saved answer.
+        if not (initial_choice or same_choice) and " ".join(old.casefold().split()) != " ".join(
             current.casefold().split()
         ):
             return None
@@ -127,6 +132,9 @@ def receipt(snapshot, row, wrap, width, *, reviewing=False):
         )
         if row["status"] == "complete":
             primary = "Enter: View the updated question"
+        detail = "n/p: Move to another question. Your clarification stays in Discussion."
+        if not row.get("updated_details"):
+            detail = "The decision details are unchanged so far. " + detail
     card = row.get("card") or {}
     question = (card.get("details") or {}).get("summary") or card.get("decision", {}).get(
         "question", ""
@@ -287,6 +295,8 @@ def status(row, bound=True):
     if state == "working":
         return "Preparing clarification"
     if state == "waiting":
+        if row.get("delivery_wait") == "offline":
+            return "Waiting for project context · Desk agent is offline"
         if row.get("delivery") == "uncertain":
             return "Waiting for project context · delivery unconfirmed"
         return "Waiting for project context" + (
@@ -392,3 +402,30 @@ def lines(snapshot, key, expanded=False, show_versions=False):
             stamp = eastern_time(datetime.fromtimestamp(version["created_at"], timezone.utc))
             result += ["", "Saved decision version · " + stamp, *_copy(version["card"])]
     return result
+
+
+def latest_clarification(snapshot, key):
+    """Keep the latest saved exchange visible when the receipt is dismissed."""
+    from .presentation import line
+
+    row = next(
+        (
+            r
+            for r in reversed(snapshot.get("decision_discussion", {}).get(key, []))
+            if r["kind"] == "clarification"
+        ),
+        None,
+    )
+    if not row:
+        return []
+    parts = [
+        line("Your latest clarification", "heading"),
+        line("│ " + row["text"].replace("\n", "\n│ "), "user"),
+        line(status(row, bool(snapshot.get("agents"))), "metadata"),
+    ]
+    if row.get("reply"):
+        parts += [line("Clarification response", "heading"), row["reply"]]
+    if not row.get("updated_details"):
+        parts += ["The decision details are unchanged so far."]
+    parts += [line("n/p Other questions · t Full discussion", "action"), ""]
+    return parts
