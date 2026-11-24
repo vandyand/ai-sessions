@@ -124,7 +124,17 @@ def child(result):
             if_deferred="The nursery may offer Friday's slot to another customer.",
             deadline=None,
             missing_information=[],
-            citations={"background": ["delivery"]},
+            citations={
+                field: ["delivery"] if field != "deadline" else []
+                for field in (
+                    "summary",
+                    "background",
+                    "why_now",
+                    "recommendation",
+                    "if_deferred",
+                    "deadline",
+                )
+            },
             evidence=[
                 dict(
                     id="delivery",
