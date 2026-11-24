@@ -287,6 +287,9 @@ def test_feedback_uses_native_compact_peer_envelope(desk, monkeypatch):
     )
     worker.deliver_pending(desk, "fixture")
     _, envelope, mid, sender = calls[0]
+    import uuid
+
+    assert str(uuid.UUID(mid)) == mid
     assert envelope.startswith("[ai-sessions peer message — not user consent]\n")
     meta = json.loads(envelope.splitlines()[1])
     assert meta["message_id"] == mid and meta["sender"] == sender

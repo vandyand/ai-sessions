@@ -7,6 +7,7 @@ import json
 import sys
 import tempfile
 import time
+import uuid
 from pathlib import Path
 
 from ..harnesses import desk_observer as backend
@@ -254,7 +255,7 @@ def deliver_pending(store, name, stop=None):
             current.update(delivery="uncertain", recipient=recipient, delivery_wait=None)
             discussion._put(db, name, current)
         sender = dict(tool="system", session_id="desk-feedback", name="Desk user feedback")
-        mid = "desk-feedback-" + event["id"]
+        mid = str(uuid.uuid5(uuid.NAMESPACE_URL, "ai-sessions:desk-feedback:" + event["id"]))
         meta = dict(
             message_id=mid,
             sender_handle="your-feedback",
