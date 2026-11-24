@@ -160,3 +160,12 @@ def test_background_rewording_does_not_revoke_answer_to_unchanged_choice():
     assert [d["key"] for d in view._pending(snap)] == ["next"]
     snap["decision_details"]["day"]["kind"] = "information"
     assert [d["key"] for d in view._pending(snap)] == ["day", "next"]
+
+
+def test_next_answer_continues_after_current_instead_of_restarting_at_first():
+    snap = fixture()
+    core = snap["decisions"][0]
+    snap["decisions"] = [dict(core, key="earlier"), core, dict(core, key="later")]
+    state = view.State(tab=3, selected_key="day")
+    state = view.handle_key(state, "\n", snap, 60, 24)
+    assert state.selected_key == "later"

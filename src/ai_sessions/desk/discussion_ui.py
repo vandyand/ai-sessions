@@ -236,52 +236,76 @@ def edit(editor, key):
     return editor
 
 
-def editor_lines(editor, wrap, width, height, title):
+def editor_layout(editor, wrap, width, height, title):
     from .presentation import line
+    from .view import cell_width
 
-    marked = (
-        editor.text[: editor.cursor] + "|" + editor.text[editor.cursor :]
-        if editor.focus == 0
-        else editor.text or "(Optional comment)"
-    )
-    lines = wrap(marked, width)
-    before = wrap(editor.text[: editor.cursor] + "|", width)
-    capacity = max(1, height - 19)
-    start = max(0, len(before) - capacity)
-    visible = lines[start : start + capacity]
-    result = wrap(line(title, "question"), width)[:2] + [
-        "",
-        line("Your response" + (" [typing]" if editor.focus == 0 else ""), "heading"),
-        line("─" * min(width, 72), "metadata"),
-        *(line(row, "user") for row in visible),
-        "",
-    ]
-    if height < 15:
-        result = (
-            wrap(line(title, "question"), width)[:1]
-            + [line("Your comment", "heading")]
-            + [line(row, "user") for row in visible[-1:]]
-        )
+    width = max(1, width)
+    # The view reserves header, tabs, action strip and footer.
+    capacity = max(1, height - 4)
+    actions = []
     for i, action in enumerate(ACTIONS, 1):
-        result += wrap(
+        actions += wrap(
             line(
                 ("› [ " + action + " ]") if editor.focus == i else "  [ " + action + " ]",
                 "focus" if editor.focus == i else "action",
             ),
             width,
         )
-    if height < 15:
-        return result + wrap("Tab selects · Enter activates", width)[:1]
-    result += [
-        "",
-        *wrap(
+    if height < 14 and width >= 36:
+        # Two compact action rows leave a real multiline field in short panes.
+        labels = ("Save note", "Ask clarification", "Send answer", "Mark completed")
+        actions = []
+        for first in (1, 3):
+            text = "  ".join(
+                ("›" if editor.focus == i else " ") + "[" + labels[i - 1] + "]"
+                for i in (first, first + 1)
+            )
+            actions.append(line(text, "focus" if editor.focus in (first, first + 1) else "action"))
+    title_rows = wrap(line(title, "question"), width)[: 1 if height < 18 else 2]
+    prefix = title_rows + [
+        line("Your response" + (" · typing" if not editor.focus else ""), "heading")
+    ]
+    help_rows = (
+        []
+        if height < 18
+        else wrap(
             ACTION_HELP[editor.focus - 1]
             if editor.focus
             else "Type your response. Tab selects an action.",
             width,
-        ),
-    ]
-    return result
+        )[:2]
+    )
+    field_height = max(1, capacity - len(prefix) - len(actions) - len(help_rows) - 1)
+    rows, current, column = [], "", 0
+    caret = (0, 0)
+    for index in range(len(editor.text) + 1):
+        char = editor.text[index] if index < len(editor.text) else None
+        size = cell_width(char) if char and char != "\n" else 0
+        if column >= width or char not in (None, "\n") and column + size > width:
+            rows.append(current)
+            current, column = "", 0
+        if index == editor.cursor:
+            caret = (len(rows), column)
+        if char is None:
+            break
+        if char == "\n":
+            rows.append(current)
+            current, column = "", 0
+        else:
+            current += char
+            column += size
+    rows.append(current)
+    start = max(0, caret[0] - field_height + 1)
+    visible = rows[start : start + field_height]
+    visible += [""] * (field_height - len(visible))
+    result = prefix + [line(row, "user") for row in visible] + [""] + actions + help_rows
+    cursor = (len(prefix) + caret[0] - start, caret[1]) if not editor.focus else None
+    return result, cursor
+
+
+def editor_lines(editor, wrap, width, height, title):
+    return editor_layout(editor, wrap, width, height, title)[0]
 
 
 def status(row, bound=True):

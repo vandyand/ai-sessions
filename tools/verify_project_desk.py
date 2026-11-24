@@ -216,6 +216,7 @@ def child(result):
         tabs = []
         states = []
         captures = []
+        expected_cursor = [None]
         keys_seen = []
         input_times = []
         mouse_events = []
@@ -246,7 +247,9 @@ def child(result):
                     editing=bool(state.editor),
                 )
             )
-            return original_render(snapshot, state, *args, **kwargs)
+            frame = original_render(snapshot, state, *args, **kwargs)
+            expected_cursor[0] = frame.cursor
+            return frame
 
         for columns, rows in ((100, 25), (60, 12), (40, 18)):
             with store._connect() as db:
@@ -266,6 +269,8 @@ def child(result):
                         dict(
                             width=columns,
                             height=rows,
+                            cursor=list(self.screen.getyx()),
+                            expected_cursor=expected_cursor[0],
                             lines=[
                                 self.screen.instr(row, 0).decode("utf-8", errors="replace").rstrip()
                                 for row in range(rows)
@@ -527,6 +532,9 @@ def main():
         if capture_file:
             Path(capture_file).write_text(json.dumps(data), encoding="utf-8")
         assert {frame["width"] for frame in data["captures"]} == {40, 60, 100}
+        typing_frames = [frame for frame in data["captures"] if frame.get("expected_cursor")]
+        assert typing_frames, "No real editor cursor was captured"
+        assert all(frame["cursor"] == frame["expected_cursor"] for frame in typing_frames)
         assert any("Briefing help" in "\n".join(frame["lines"]) for frame in data["captures"])
         assert all(
             "? Help" in frame["lines"][-1] or "Tab Actions" in frame["lines"][-1]

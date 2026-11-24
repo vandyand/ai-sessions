@@ -314,3 +314,35 @@ def test_notification_matches_equivalent_home_without_duplicate_send(desk, monke
     notifications.drain(store, "demo")
     assert len(deliveries) == 1
     assert deliveries[0][0] == receiver
+
+
+def test_offline_backlog_is_one_digest_not_one_interrupt_per_question(desk, monkeypatch):
+    store, deliveries, _ = desk
+    publish(store, [dict(decision(str(i)), question="Question " + str(i)) for i in range(20)])
+    notifications.drain(store, "demo")
+    notifications.drain(store, "demo")
+    assert len(deliveries) == 1
+    assert "20" in deliveries[0][1] and "questions" in deliveries[0][1]
+    assert notifications.pending(store, "demo") == []
+
+
+def test_competing_drains_claim_whole_digest_once(desk):
+    store, deliveries, _ = desk
+    publish(store, [decision(str(i)) for i in range(12)])
+    with concurrent.futures.ThreadPoolExecutor(max_workers=4) as pool:
+        list(pool.map(lambda _: notifications.drain(Store(store.root), "demo"), range(4)))
+    assert len(deliveries) == 1
+    assert notifications.pending(store, "demo") == []
+
+
+def test_uncertain_digest_is_never_replayed(desk, monkeypatch):
+    store, deliveries, _ = desk
+    publish(store, [decision(str(i)) for i in range(12)])
+    monkeypatch.setattr(
+        notifications.messaging,
+        "deliver",
+        lambda *a: deliveries.append(a) or {"status": "uncertain"},
+    )
+    notifications.drain(store, "demo")
+    notifications.drain(store, "demo")
+    assert len(deliveries) == 1 and notifications.pending(store, "demo") == []

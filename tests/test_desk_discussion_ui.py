@@ -123,3 +123,44 @@ def test_clarification_receipt_explains_waiting_without_claiming_updated_card():
     assert "Desk agent is offline" in text
     assert "unchanged" in text.lower()
     assert "n/p" in text
+
+
+def test_short_editor_has_multiline_input_without_fake_cursor():
+    from ai_sessions.desk.discussion_ui import editor_layout
+
+    editor = Editor("ask", "version", "first line\nsecond line\nthird line", 12)
+    rows, cursor = editor_layout(editor, view.wrap, 40, 14, "A long decision title")
+    text = "\n".join(rows)
+    assert "first line" in text and "second line" in text and "third line" in text
+    assert "|" not in text
+    assert cursor is not None
+    y, x = cursor
+    assert rows[y][x] == "e"
+    assert len(rows) <= 10
+    assert all(
+        action in text
+        for action in ("Save note", "Ask for clarification", "Send answer", "Mark as completed")
+    )
+
+
+def test_twelve_row_pane_keeps_three_response_rows_and_all_actions():
+    from ai_sessions.desk.discussion_ui import editor_layout
+
+    rows, caret = editor_layout(
+        Editor("ask", "v", "first\nsecond\nthird", 0), view.wrap, 40, 12, "Question"
+    )
+    text = "\n".join(rows)
+    assert all(
+        word in text
+        for word in (
+            "first",
+            "second",
+            "third",
+            "Save note",
+            "Ask clarification",
+            "Send answer",
+            "Mark completed",
+        )
+    )
+    assert len(rows) <= 8 and caret is not None
+    assert all(view.cell_width(row) <= 40 for row in rows)

@@ -57,3 +57,31 @@ def test_observer_path_does_not_hydrate_snapshot(tmp_path, monkeypatch):
         store, "get", lambda *args: (_ for _ in ()).throw(AssertionError("Full hydration"))
     )
     assert runtime.folder(store, "fixture").parent.name == ".observers"
+
+
+def test_typing_draft_writer_coalesces_without_blocking_input():
+    from ai_sessions.desk.discussion_ui import Editor
+    from ai_sessions.desk.view_polling import DraftWriter
+
+    entered, release = threading.Event(), threading.Event()
+    saved = []
+
+    def save(editor):
+        entered.set()
+        release.wait(2)
+        saved.append(editor.text)
+
+    writer = DraftWriter(save)
+    try:
+        writer.queue(Editor("key", "v", "first", 5))
+        assert entered.wait(1)
+        began = time.monotonic()
+        for i in range(100):
+            writer.queue(Editor("key", "v", str(i), len(str(i))))
+        assert time.monotonic() - began < 0.1
+        release.set()
+        writer.flush()
+        assert saved[-1] == "99" and len(saved) <= 2
+    finally:
+        release.set()
+        writer.close()

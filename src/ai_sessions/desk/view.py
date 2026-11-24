@@ -45,6 +45,7 @@ class State:
 class Frame:
     lines: tuple[str, ...]
     roles: tuple[str, ...] = ()
+    cursor: tuple[int, int] | None = None
 
 
 # Remove complete OSC/DCS strings and CSI sequences before filtering controls.
@@ -667,12 +668,19 @@ def handle_key(
                     width,
                     height,
                 )
+            from .backlog import ordered_decisions
+
             rows = _pending(snapshot)
+            keys = {row["key"] for row in rows}
+            ordered = [row["key"] for row in ordered_decisions(snapshot)]
+            index = ordered.index(state.selected_key) + 1 if state.selected_key in ordered else 0
+            following = ordered[index:] + ordered[:index]
+            next_key = next((key for key in following if key in keys), None)
             return normalize(
                 replace(
                     state,
                     answered=False,
-                    selected_key=rows[0]["key"] if rows else None,
+                    selected_key=next_key,
                     feedback=None,
                     scroll=0,
                 ),
@@ -902,14 +910,18 @@ def render(
     if height < 6:
         return Frame(tuple([header, tabs, _clip("? Help · q Exit", width)][:height]))
     body = _body(snapshot, state, width)
+    cursor = None
     if state.editor:
-        from .discussion_ui import editor_lines
+        from .discussion_ui import editor_layout
 
         selected, details, _ = _selected(snapshot, state)
         title = (details or {}).get("summary") or (selected or {}).get("question", "Decision")
-        body = editor_lines(state.editor, wrap, width, height, title)
+        body, cursor = editor_layout(state.editor, wrap, width, height, title)
         if state.notice and state.notice[0] == state.editor.key:
-            body = wrap(state.notice[1], width)[:2] + body
+            notice = wrap(state.notice[1], width)[:2]
+            body = notice + body
+            if cursor:
+                cursor = (cursor[0] + len(notice), cursor[1])
     capacity = _body_height(height)
     offset = min(state.scroll, max(0, len(body) - capacity))
     visible = body[offset : offset + capacity]
@@ -979,7 +991,11 @@ def render(
         + visible
         + [styled(footer, "hint")]
     )
-    return Frame(tuple(rows), tuple(getattr(row, "role", "body") for row in rows))
+    if cursor:
+        cursor = (cursor[0] - offset + 3, cursor[1])
+        if not 3 <= cursor[0] < height - 1:
+            cursor = None
+    return Frame(tuple(rows), tuple(getattr(row, "role", "body") for row in rows), cursor)
 
 
 def _watched_sources(snapshot):
@@ -1039,8 +1055,12 @@ def read_snapshot(
 def run(store: SnapshotStore, name: str, *, activity: dict | None = None) -> None:
     """Poll saved state at most once per second; draw only changed frames."""
 
-    from .view_polling import Poller
+    from .discussion import save_draft
+    from .view_polling import DraftWriter, Poller
 
+    drafts = DraftWriter(
+        lambda editor: save_draft(store, name, editor.key, editor.text, editor.version)
+    )
     poller = Poller(store, name, read_snapshot, activity).start()
 
     def loop(screen):
@@ -1062,6 +1082,14 @@ def run(store: SnapshotStore, name: str, *, activity: dict | None = None) -> Non
         previous_input = None
         while not state.quit:
             snapshot, read_error, busy = poller.latest()
+            if drafts.error and state.editor:
+                state = replace(
+                    state,
+                    notice=(
+                        state.editor.key,
+                        "Draft save failed. Text is kept here; Esc retries saving.",
+                    ),
+                )
             snapshot = _with_saved_feedback(snapshot, state.feedback)
             poller.refresh(state.discussions & state.versions)
             height, width = screen.getmaxyx()
@@ -1102,6 +1130,12 @@ def run(store: SnapshotStore, name: str, *, activity: dict | None = None) -> Non
                             )
                         except curses.error:
                             pass  # A terminal resize may race this paint.
+                    try:
+                        curses.curs_set(1 if frame.cursor else 0)
+                        if frame.cursor:
+                            screen.move(*frame.cursor)
+                    except (curses.error, AttributeError):
+                        pass
                     screen.refresh()
                     previous = signature
                 previous_input = current_input
@@ -1192,10 +1226,14 @@ def run(store: SnapshotStore, name: str, *, activity: dict | None = None) -> Non
             state = handle_key(state, key, snapshot, width, height)
             editor = state.editor or previous_editor
             if editor:
-                from .discussion import save_draft, submit
+                from .discussion import submit
 
                 try:
-                    save_draft(store, name, editor.key, editor.text, editor.version)
+                    changed = previous_editor is None or editor.text != previous_editor.text
+                    if changed or drafts.error:
+                        drafts.queue(editor)
+                    if state.editor is None or state.editor.request:
+                        drafts.flush()
                     if state.editor and state.editor.request:
                         entry = submit(
                             store, name, editor.key, editor.request, editor.text, editor.version
@@ -1229,7 +1267,8 @@ def run(store: SnapshotStore, name: str, *, activity: dict | None = None) -> Non
                                         + "; reopen the view to start background processing",
                                     ),
                                 )
-                    poller.refresh()
+                    if state.editor is None:
+                        poller.refresh()
                 except (OSError, RuntimeError, ValueError) as error:
                     message = (
                         str(error)
@@ -1253,3 +1292,4 @@ def run(store: SnapshotStore, name: str, *, activity: dict | None = None) -> Non
         pass
     finally:
         poller.close()
+        drafts.close()

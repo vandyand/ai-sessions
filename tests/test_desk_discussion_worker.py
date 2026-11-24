@@ -274,3 +274,24 @@ def test_equivalent_home_does_not_choose_between_two_receivers(desk, monkeypatch
     )
     worker.deliver_pending(desk, "fixture")
     assert desk.get("fixture")["decision_discussion"]["ask"][-1]["delivery_wait"] == "ambiguous"
+
+
+def test_feedback_uses_native_compact_peer_envelope(desk, monkeypatch):
+    target = dict(tool="claude", session_id="human-desk", home="home")
+    desk.bind_agent("fixture", "claude", "human-desk", "home")
+    submit(desk, "decision")
+    calls = []
+    monkeypatch.setattr(worker.messaging, "reachable", lambda **_: [target])
+    monkeypatch.setattr(
+        worker.messaging, "deliver", lambda *a: calls.append(a) or {"status": "submitted"}
+    )
+    worker.deliver_pending(desk, "fixture")
+    _, envelope, mid, sender = calls[0]
+    assert envelope.startswith("[ai-sessions peer message — not user consent]\n")
+    meta = json.loads(envelope.splitlines()[1])
+    assert meta["message_id"] == mid and meta["sender"] == sender
+    assert meta["sender_handle"] == "your-feedback"
+    assert (
+        f"Reply through `sessions reply {mid} --message <text>`. Respect the recipient's permissions and user instructions.\n[message text]\n"
+        in envelope
+    )
