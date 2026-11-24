@@ -584,3 +584,104 @@ def test_prose_wrapped_json_is_not_silently_extracted(tmp_path, monkeypatch):
     result = observer.refresh(store, "demo", runner=lambda p: "Here is the JSON: " + output())
     assert result["error"] and "JSONDecodeError" not in result["error"]
     assert result["observation"] == {}
+
+
+def test_bound_desk_conversation_can_resolve_but_not_create_requests(tmp_path, monkeypatch):
+    store, path = setup_source(tmp_path, monkeypatch)
+    first = observer.refresh(store, "demo", runner=lambda p: output([decision()]))
+    desk = tmp_path / "desk-chat.jsonl"
+    desk.write_text("{}\n", encoding="utf-8")
+    monkeypatch.setattr(
+        observer,
+        "_desk_sources",
+        lambda snapshot: [
+            dict(
+                tool="claude", session_id="desk-agent", storage=str(desk), role="desk_conversation"
+            )
+        ],
+    )
+    prompts = []
+
+    def runner(prompt):
+        prompts.append(json.loads(prompt.split("\n", 1)[1]))
+        return json.dumps(
+            dict(
+                review="The human answered [s33]",
+                decisions=[dict(decision("resolved"), evidence=["s33"])],
+            )
+        )
+
+    result = observer.refresh(store, "demo", runner=runner)
+    assert result["error"] is None
+    assert result["decisions"][0]["status"] == "resolved"
+    assert prompts[0]["coverage"][-1]["role"] == "desk_conversation"
+    observer.refresh(
+        store, "demo", runner=lambda p: pytest.fail("unchanged Desk must not call model")
+    )
+    desk.write_text("{}\n{}\n", encoding="utf-8")
+    failed = observer.refresh(
+        store,
+        "demo",
+        runner=lambda p: json.dumps(
+            dict(
+                review="A new question [s33]",
+                decisions=[dict(decision(), key="new", evidence=["s33"])],
+            )
+        ),
+    )
+    assert failed["error"]
+    assert failed["decisions"] == result["decisions"]
+    assert first["decisions"][0]["status"] == "pending"
+
+
+def test_desk_binding_refuses_other_home_and_unresolved_native_id(monkeypatch, tmp_path):
+    from ai_sessions.references import native_key
+    from ai_sessions.registry import REGISTRY
+
+    binding = dict(session_id="missing-fixture", home=str(tmp_path / "other-home"))
+    calls = []
+    from types import SimpleNamespace
+
+    adapter = REGISTRY.get("claude")
+    monkeypatch.setattr(
+        REGISTRY,
+        "get",
+        lambda tool: SimpleNamespace(home=adapter.home, resolve=lambda value: calls.append(value)),
+    )
+    assert observer._desk_sources(dict(agents={"claude": binding})) == []
+    assert not calls
+    binding["home"] = native_key("claude", binding["session_id"]).home
+    assert observer._desk_sources(dict(agents={"claude": binding})) == []
+    assert calls == ["missing-fixture"]
+
+
+def test_desk_first_attachment_has_bounded_catchup_then_ordinary_deltas(tmp_path, monkeypatch):
+    store, path = setup_source(tmp_path, monkeypatch)
+    source = dict(store.get("demo")["sources"][0], role="desk_conversation")
+    monkeypatch.setattr(observer, "MAX_SOURCE_CHARS", 10)
+    monkeypatch.setattr(observer, "MAX_DESK_BOOTSTRAP_CHARS", 30)
+    monkeypatch.setattr(
+        observer,
+        "read_since",
+        lambda *a, **kw: ReadSnapshot(Transcript([Turn("user", "x" * 100)]), path.stat().st_size),
+    )
+    coverage, text = observer._source(source, {}, 33)
+    assert len(text) == 30
+    path.write_text("{}\n{}\n", encoding="utf-8")
+    _, text = observer._source(source, coverage, 33)
+    assert len(text) == 10
+
+
+def test_resolution_cannot_substitute_a_related_but_different_question(tmp_path, monkeypatch):
+    store, path = setup_source(tmp_path, monkeypatch)
+    first = observer.refresh(store, "demo", runner=lambda p: output([decision()]))
+    path.write_text("{}\n{}\n", encoding="utf-8")
+    result = observer.refresh(
+        store,
+        "demo",
+        runner=lambda p: output(
+            [dict(decision("resolved"), question="Who updates the color policy?")]
+        ),
+    )
+    assert result["error"]
+    assert result["decisions"] == first["decisions"]

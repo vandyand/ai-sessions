@@ -236,6 +236,7 @@ def deliver_pending(store, name, stop=None):
         )
         body += (
             f"\nDecision: {title}\n"
+            + f"Question reference: {event['key']}\n"
             + ("Context question: " if event["kind"] == "clarification" else "Exact human answer: ")
             + text
             + f"\nDiscussion and original card: {path}"

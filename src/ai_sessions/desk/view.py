@@ -104,12 +104,13 @@ def wrap(value: object, width: int) -> list[str]:
 
 
 def _pending(snapshot: dict | None) -> list[dict]:
+    from .backlog import ordered_decisions
     from .discussion_ui import answered_keys
 
     answered = answered_keys(snapshot)
     return [
         item
-        for item in (snapshot or {}).get("decisions", [])
+        for item in ordered_decisions(snapshot)
         if isinstance(item, dict)
         and item.get("status") == "pending"
         and item.get("key") not in answered
@@ -117,10 +118,11 @@ def _pending(snapshot: dict | None) -> list[dict]:
 
 
 def _answered(snapshot):
+    from .backlog import ordered_decisions
     from .discussion_ui import answered_keys
 
     keys = answered_keys(snapshot)
-    return [row for row in (snapshot or {}).get("decisions", []) if row.get("key") in keys]
+    return [row for row in ordered_decisions(snapshot) if row.get("key") in keys]
 
 
 def _browse(snapshot, state):
@@ -232,7 +234,7 @@ def _detail(snapshot: dict | None, state: State, width: int) -> list[str]:
             + (
                 "\n".join(
                     f"- {source.get('title') or ('Supervisor' if source.get('role', 'supervisor') == 'supervisor' else 'Team session')}"
-                    for source in (snapshot or {}).get("sources", [])
+                    for source in _watched_sources(snapshot)
                 )
                 or "No source details available."
             )
@@ -782,7 +784,7 @@ def _observation_status(snapshot: dict | None, now: datetime | None) -> str:
         status = {
             "current": "Up to date",
             "changed": "Supervisor has new content"
-            if len(snapshot.get("sources", [])) == 1
+            if len(_watched_sources(snapshot)) == 1
             else "Watched sessions have new content",
             "unavailable": "Source unavailable",
         }.get(snapshot.get("_freshness"), "Saved")
@@ -914,10 +916,27 @@ def render(
     return Frame(tuple([header, tabs, ""] + visible + [footer]))
 
 
+def _watched_sources(snapshot):
+    snapshot = snapshot or {}
+    sources = list(snapshot.get("sources", []))
+    known = {(s.get("tool"), s.get("session_id")) for s in sources}
+    for source in snapshot.get("observation", {}).get("sources", []):
+        binding = snapshot.get("agents", {}).get(source.get("tool"), {})
+        if (
+            source.get("role") == "desk_conversation"
+            and source.get("session_id") == binding.get("session_id")
+            and source.get("home") == binding.get("home")
+            and (source.get("tool"), source.get("session_id")) not in known
+        ):
+            sources.append(dict(source, title="Desk conversation"))
+            known.add((source.get("tool"), source.get("session_id")))
+    return sources
+
+
 def _source_freshness(snapshot: dict) -> str:
-    """Check at most 32 file stats; no transcript reads, model calls or writes."""
-    sources = snapshot.get("sources", [])
-    if not sources or len(sources) > 32:
+    """Check at most 36 file stats; no transcript reads, model calls or writes."""
+    sources = _watched_sources(snapshot)
+    if not sources or len(sources) > 36:
         return "unknown"
     previous = {
         (s.get("tool"), s.get("session_id"), s.get("storage")): s

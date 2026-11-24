@@ -275,3 +275,10 @@ The Decisions tab immediately shows the exact saved answer, delivery state and *
 A queued answer says it is saved and waiting to send. When the exact Desk receiver is unavailable, the view says it is waiting for the Desk agent to connect and shows the command for opening that conversation. Submitted transport is shown as sent; uncertain transport is shown as unconfirmed. Successful save clears the editor. Failed saves preserve its contents. Clarification questions and notes never count as answers.
 
 **t Discussion** opens the conversation on its own, rather than below the whole current card. It shows comments and replies first. **v Earlier versions** reveals prior cards and source excerpts; **t** returns. The editor calls the final action **Send answer**, highlights the selected action and explains its effect. Tab/Shift+Tab selects the action; Enter activates it, while Enter in the text area still adds a line.
+
+
+### Keeping answers and questions synchronized
+
+The observer reads the exact bound Desk conversation as well as the configured operational sources. Explicit human answers there can resolve existing questions. It does not infer agreement from agent suggestions, copied questions, silence or a send receipt. Older pending keys are included in a compact index so an answer can match a question outside the detailed model window. Old questions without resolution evidence remain available; their age alone does not close them.
+
+The Decisions tab numbers questions **1 through n, newest first**. Background updates do not move older questions to the top. The generated decisions file uses the same ordering and omits matching saved answers, so the Desk agent does not re-ask them.

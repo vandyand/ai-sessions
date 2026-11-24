@@ -173,3 +173,53 @@ def test_review_audit_prefers_canonical_asks_over_false_legacy_premises():
         },
     )
     assert not any("Duplicate wording" in row["flags"] for row in audit(record))
+
+
+def test_index_exposes_old_keys_outside_detailed_window(tmp_path):
+    store = Store(tmp_path)
+    store.create(
+        "desk", [{"tool": "claude", "session_id": "fixture", "storage": "log"}], str(tmp_path)
+    )
+    current = store.publish("desk", 0, {}, "First", [item(n) for n in range(62)])
+    coverage = [dict(id="s0", status="available", changed=True)]
+    payload = json.loads(
+        observer._build_prompt(
+            current, coverage, [dict(citation="s0", text="Answer to an older question")]
+        ).split("\n", 1)[1]
+    )
+    assert len(payload["previous_decisions"]) <= 20
+    assert len(payload["pending_question_index"]) == 62
+    assert not payload["pending_question_index_partial"]
+
+
+def test_newest_creation_order_survives_rewording_and_store_reopen(tmp_path):
+    from ai_sessions.desk.backlog import ordered_decisions
+
+    store = Store(tmp_path)
+    store.create(
+        "desk", [{"tool": "claude", "session_id": "fixture", "storage": "log"}], str(tmp_path)
+    )
+    first = store.publish("desk", 0, {}, "First", [item(1), item(2)])
+    second = store.publish(
+        "desk",
+        first["revision"],
+        {},
+        "Next",
+        [dict(item(1), context="Updated background"), item(3)],
+    )
+    assert [d["key"] for d in ordered_decisions(second)] == ["q3", "q2", "q1"]
+    assert [d["key"] for d in ordered_decisions(Store(tmp_path).get("desk"))] == ["q3", "q2", "q1"]
+
+
+def test_same_batch_duplicate_wording_reuses_one_key():
+    first = item(1)
+    duplicate = dict(item(2), question=first["question"])
+    assert [d["key"] for d in observer._reconcile([], [first, duplicate], [])] == ["q1"]
+
+
+def test_known_key_wins_over_another_questions_lossy_wording():
+    first, second = item(1), item(2)
+    changed = dict(second, question=first["question"])
+    result = observer._reconcile([first, second], [changed], [])
+    assert {d["key"] for d in result} == {"q1", "q2"}
+    assert next(d for d in result if d["key"] == "q1") == first

@@ -162,3 +162,25 @@ def test_age_uses_summary_not_unchanged_poll_and_updating_is_explicit():
         "Updating briefing · 2h"
         in view.render(data, view.State(), 80, 20, now=now, updating=True).lines[0]
     )
+
+
+def test_bound_desk_changes_are_included_in_freshness_and_help(tmp_path):
+    supervisor = tmp_path / "source.jsonl"
+    desk = tmp_path / "desk.jsonl"
+    supervisor.write_text("{}\n")
+    desk.write_text("{}\n")
+    data = saved(supervisor)
+    other = saved(desk)["observation"]["sources"][0]
+    other.update(session_id="bound", home="home", role="desk_conversation")
+    data["agents"] = {"claude": dict(session_id="bound", home="home")}
+    data["observation"]["sources"].append(other)
+    assert view._source_freshness(data) == "current"
+    desk.write_text("{}\n{}\n")
+    assert view._source_freshness(data) == "changed"
+    data["_freshness"] = "changed"
+    assert (
+        "Watched sessions have new content"
+        in view.render(data, view.State(tab=2), 100, 20).lines[0]
+    )
+    data["agents"]["claude"]["session_id"] = "rebound"
+    assert view._source_freshness(data) == "current"

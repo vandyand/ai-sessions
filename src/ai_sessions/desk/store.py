@@ -252,21 +252,26 @@ class Store:
         snapshot["decision_meta"] = {}
         if db.execute("SELECT 1 FROM sqlite_master WHERE name='decision_lifecycle'").fetchone():
             snapshot["decision_meta"] = {
-                key: dict(first_seen=first, last_changed=changed, imported=bool(imported))
-                for key, first, changed, imported in db.execute(
-                    "SELECT key,first_seen,last_changed,imported FROM decision_lifecycle WHERE desk=?",
+                key: dict(
+                    first_seen=first,
+                    last_changed=changed,
+                    imported=bool(imported),
+                    sequence=sequence,
+                )
+                for key, first, changed, imported, sequence in db.execute(
+                    "SELECT key,first_seen,last_changed,imported,rowid FROM decision_lifecycle WHERE desk=?",
                     (name,),
                 )
                 if key in cores
             }
+        from .discussion import hydrate
+
+        hydrate(db, snapshot)
         from .backlog import audit
 
         snapshot["decision_review"] = {
             row["key"]: row["flags"] for row in audit(snapshot) if row["flags"]
         }
-        from .discussion import hydrate
-
-        hydrate(db, snapshot)
         return snapshot
 
     @staticmethod
@@ -808,7 +813,15 @@ class Store:
                     f"observed {_when(source.get('observed_at'))}; "
                     f"modified {_when(source.get('source_modified_at'))}\n"
                 )
-            pending = [d for d in snapshot["decisions"] if d["status"] == "pending"]
+            from .backlog import ordered_decisions
+            from .discussion_ui import answered_keys
+
+            answered = answered_keys(snapshot)
+            pending = [
+                d
+                for d in ordered_decisions(snapshot)
+                if d["status"] == "pending" and d["key"] not in answered
+            ]
             text = (
                 "\n\n".join(
                     f"## {d['question']}\n{d['context']}\nRecommendation: {d['recommendation']}\n"

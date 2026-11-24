@@ -1,5 +1,11 @@
 # Changelog
 
+## 3.22.5
+
+- Read the exact bound Desk conversation as resolution evidence so explicit answers can retire existing questions. Index older questions outside the model working set to avoid paraphrased duplicates.
+- Preserve a saved answer during initial choice-background hydration and order questions newest-first with stable creation order.
+- Keep the conversation and briefing on the same unanswered-question projection.
+
 ## 3.22.4
 
 - Make decision submission end with the exact saved answer, truthful delivery status and a clear next-question action.

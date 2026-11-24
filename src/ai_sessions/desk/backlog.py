@@ -67,11 +67,30 @@ def record(db, snapshot, *, imported=False, note=None):
         )
 
 
+def ordered_decisions(snapshot):
+    """Newest creation first; observing an old request never makes it new."""
+    snapshot = snapshot or {}
+    meta = snapshot.get("decision_meta", {})
+    rows = snapshot.get("decisions", [])
+    # Pure legacy fixtures have no creation metadata; retain their known order.
+    return sorted(
+        rows,
+        key=lambda row: (
+            meta.get(row.get("key"), {}).get("first_seen", 0),
+            meta.get(row.get("key"), {}).get("sequence", 0),
+        ),
+        reverse=True,
+    )
+
+
 def audit(snapshot, *, now=None):
+    from .discussion_ui import answered_keys
+
     now = time.time() if now is None else now
     seen, rows = {}, []
-    for decision in snapshot.get("decisions", []):
-        if decision["status"] != "pending":
+    answered = answered_keys(snapshot)
+    for decision in ordered_decisions(snapshot):
+        if decision["status"] != "pending" or decision["key"] in answered:
             continue
         key = decision["key"]
         summary = (

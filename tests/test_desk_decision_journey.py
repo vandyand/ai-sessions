@@ -102,3 +102,39 @@ def test_empty_saved_answers_does_not_claim_all_questions_are_done():
     text = "\n".join(view.render(snap, state, 60, 24).lines)
     assert "no answers to the current questions" in text
     assert "a Return to unanswered questions" in text
+
+
+def test_legacy_answer_survives_choice_background_hydration():
+    snap = fixture()
+    snap["decision_details"]["day"] = dict(
+        kind="choice", summary="Choose Friday delivery or provide a different delivery day."
+    )
+    assert [d["key"] for d in view._pending(snap)] == ["next"]
+
+
+def test_pending_order_is_newest_created_not_latest_reworded():
+    snap = fixture(kind="clarification")
+    snap["decision_meta"] = {
+        "day": dict(first_seen=10, last_changed=99, sequence=1),
+        "next": dict(first_seen=20, last_changed=20, sequence=2),
+    }
+    assert [d["key"] for d in view._pending(snap)] == ["next", "day"]
+
+
+def test_imported_ties_use_stable_creation_sequence():
+    snap = fixture(kind="clarification")
+    snap["decision_meta"] = {
+        "day": dict(first_seen=10, sequence=1),
+        "next": dict(first_seen=10, sequence=2),
+    }
+    assert [d["key"] for d in view._pending(snap)] == ["next", "day"]
+
+
+def test_cli_audit_and_view_have_the_same_numbered_unanswered_projection():
+    from ai_sessions.desk.backlog import audit
+
+    snap = fixture()
+    assert (
+        [row["key"] for row in audit(snap)] == [d["key"] for d in view._pending(snap)] == ["next"]
+    )
+    assert audit(snap)[0]["number"] == 1

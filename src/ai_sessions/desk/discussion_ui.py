@@ -42,7 +42,17 @@ def answer(snapshot, key, *, core=None):
         current = (snapshot.get("decision_details", {}).get(key) or {}).get("summary") or core.get(
             "question", ""
         )
-        if " ".join(old.casefold().split()) != " ".join(current.casefold().split()):
+        # First-time choice hydration expands a legacy card; it does not revoke
+        # the answer attached to its unchanged core. A reconstructed historical
+        # approval question (information), or a changed existing canonical ask,
+        # still requires human review.
+        initial_choice = (
+            not result.get("card", {}).get("details")
+            and (snapshot.get("decision_details", {}).get(key) or {}).get("kind") == "choice"
+        )
+        if not initial_choice and " ".join(old.casefold().split()) != " ".join(
+            current.casefold().split()
+        ):
             return None
     return result
 

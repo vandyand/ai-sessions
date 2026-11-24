@@ -328,3 +328,10 @@ The primary journey is question → response → explicit action → saved respo
 Clarification and notes stay distinct from definitive answers. Their completion panes show the saved text and live clarification state/reply, with Enter returning to the question. Delivery status distinguishes waiting, disconnected, sent, changed recipient and uncertain transport. The UI never claims a queued answer was sent. An unavailable exact recipient yields a useful next step, not raw queue terminology.
 
 Discussion is its own reading stage. Comments/replies lead; full previous card versions and source excerpts stay behind v. Editor actions are Save note, Ask for clarification and Send answer, with visible focus and a short effect explanation. Global view navigation and the nonblocking polling/input contract remain intact.
+
+
+## Answer synchronization and question order
+
+The observer also reads the exact bound Desk conversation in its configured native home. Explicit human answers and superseding outcomes may resolve existing questions; copied briefings, agent suggestions and transport receipts cannot establish consent. Desk conversation evidence alone cannot create or reopen questions. The bounded synthesis prompt indexes pending question identities beyond the detailed twenty-item window so later answers can match older keys rather than create paraphrases.
+
+Questions are numbered newest-first by persisted first-seen order, with insertion sequence breaking ties. Editing or hydrating an old question does not make it new. Imported history has a known relative order, not fabricated original timestamps. Saved answers survive first-time choice hydration; corrected information asks and changed underlying cores still require review. The view and generated decisions file exclude matching saved answers while preserving discussion and operational status separately.
