@@ -17,12 +17,16 @@ from pathlib import Path
 from ..harnesses import desk_observer as model_backend
 from ..harnesses.desk_support import TOOLS
 from ..model import NativeRef
+from .backlog import WINDOW_CHARS, WINDOW_COUNT, working_set
 from .store import ConflictError, validate_decisions, validate_overview
 
 MAX_SOURCE_BYTES = 256 * 1024
 MAX_SOURCE_CHARS = 12000
+MAX_DESK_BOOTSTRAP_BYTES = 4 * 1024 * 1024
+MAX_DESK_BOOTSTRAP_CHARS = 48000
 MAX_OUTPUT_BYTES = 256 * 1024
 MAX_PROMPT_CHARS = 128000
+VALIDATION_RESERVE_CHARS = 2048
 MAX_CONTEXT_BYTES = 16 * 1024
 MAX_CONTEXT_CHARS = 6000
 MAX_CANONICAL_REF_CHARS = 16000
@@ -58,8 +62,26 @@ SYSTEM = (
     "audit of the previous summary or lead with coverage, byte offsets, citation mechanics, "
     "or repeated verification disclaimers. Keep technical source metadata out of the prose. "
     "Use US Eastern Time (EST/EDT) for any human-facing times. "
-    " Be concise: all pending records together must fit 24000 serialized JSON characters and "
-    "at most 80 pending items, including carried pending records and expanded evidence citations. "
+    f" Be concise: this pass sees at most {WINDOW_COUNT} pending requests in a {WINDOW_CHARS}-character working set. "
+    "Other pending requests remain stored. Never infer their resolution or absence. "
+    "pending_question_index lists existing requests outside the detailed working set too. "
+    "Reuse those keys rather than creating paraphrased duplicates. Check ALL indexed asks "
+    "against explicit answers and superseding outcomes in current evidence. Sources with "
+    "role desk_conversation are the bound human-facing Desk conversation: explicit human "
+    "answers there can resolve existing questions, but agent speculation, questions, copied "
+    "briefings, peer envelopes and proposals are never answers or consent. Never create or "
+    "reopen a question from desk_conversation alone. Resolution records the answer, not "
+    "permission to perform any operational action. "
+    "human_completed_questions records explicit manual closures. Do not reopen or create "
+    "a paraphrased duplicate of those requests. A genuinely different later human request "
+    "must have its own key and explicit current evidence. "
+    "To resolve an existing key, return its ORIGINAL question verbatim. Compare both the "
+    "original question and canonical_summary: hydrated wording can drift onto a different "
+    "topic. An answer to that different topic does NOT resolve the original request. Leave "
+    "the original pending if those asks conflict. Do not invent a new question while closing "
+    "an old key. Explicitly supersede an older wording only when the source establishes "
+    "that the same request was replaced. "
+    "Context/evidence may be excerpts; unchanged requests must be omitted from output. "
     "Use short questions/context/recommendations; avoid repeating review prose in each item."
     " Overview explains the project's background, current work, direction and intended goal "
     "in plain language. Cite supplied source IDs in each new or changed overview field. "
@@ -72,6 +94,12 @@ SYSTEM = (
     " The current Overview field must cite current tail evidence, never historical initial "
     "context alone. If only historical context is supplied, preserve previous_review and "
     "use the missing-information sentence for current unless carrying forward an unchanged field."
+    " review_citation_ids is the citation allowlist for this pass. Coverage metadata for "
+    "unchanged sources is NOT supplied text and its s-number must not be cited. When carrying "
+    "forward a prior reported fact, preserve its full prior attribution verbatim; never turn "
+    "an old full attribution or shorthand from a prior request into a current [sN] citation. "
+    "If validation_feedback is present, correct that error using only the same evidence; "
+    "do not remove attribution from an unsupported claim to hide the error."
 )
 
 
@@ -107,13 +135,30 @@ def _run_model(prompt, stop=None):
     )
 
 
+def _prepare_grok(source):
+    if source.get("tool") != "grok":
+        return source
+    from .grok_projection import prepare_storage
+
+    storage = prepare_storage(source["storage"])
+    if storage == source["storage"]:
+        return source
+    return dict(source, storage=storage)
+
+
 def _source(source, previous, index):
+    source = _prepare_grok(source)
     ref = NativeRef(source["session_id"], source["storage"])
     if source["tool"] not in TOOLS or not ref.storage.endswith(".jsonl"):
         raise ValueError("bounded observer supports a projection jsonl only")
     if source["tool"] == "grok" and not ref.storage.endswith(".desk.jsonl"):
         raise ValueError("desk grok sources must be the wrapper projection, not updates.jsonl")
     path = Path(ref.storage)
+    # First attachment must catch answers the old observer never watched, not
+    # just the most recent exchange. Subsequent reads keep ordinary delta bounds.
+    desk_bootstrap = source.get("role") == "desk_conversation" and not previous
+    byte_limit = MAX_DESK_BOOTSTRAP_BYTES if desk_bootstrap else MAX_SOURCE_BYTES
+    char_limit = MAX_DESK_BOOTSTRAP_CHARS if desk_bootstrap else MAX_SOURCE_CHARS
     stamp = path.stat()
     # Windows reports different ctime semantics for stat vs fstat; mtime and
     # native file identity are consistent across both paths.
@@ -131,7 +176,7 @@ def _source(source, previous, index):
         stat = os.fstat(handle.fileno())
         # Fixed, bounded tail: neither a huge partial record nor concurrent appends
         # can turn this into an unbounded scan.
-        floor = max(0, stat.st_size - MAX_SOURCE_BYTES)
+        floor = max(0, stat.st_size - byte_limit)
         handle.seek(floor)
         tail = handle.read(stat.st_size - floor)
         newline = tail.rfind(b"\n")
@@ -188,8 +233,8 @@ def _source(source, previous, index):
     # Use only human/assistant text. Raw tool request/results are deliberately excluded.
     lines = [f"{turn.role}: {turn.text}" for turn in captured.transcript.turns if turn.text]
     text = "\n".join(lines)
-    if len(text) > MAX_SOURCE_CHARS:
-        text = text[-MAX_SOURCE_CHARS:]
+    if len(text) > char_limit:
+        text = text[-char_limit:]
         coverage["partial"] = True
     if captured.transcript.opaque_compactions or captured.transcript.carried_windows:
         coverage["partial"] = True
@@ -211,6 +256,7 @@ def _citation(source):
 
 def _initial_context(source):
     """Read only the supervisor's bounded prefix ending at a complete JSONL boundary."""
+    source = _prepare_grok(source)
     if source["tool"] not in TOOLS or not source["storage"].endswith(".jsonl"):
         raise ValueError("initial context requires supported plain JSONL")
     if source["tool"] == "grok" and not source["storage"].endswith(".desk.jsonl"):
@@ -258,7 +304,7 @@ def _build_prompt(before, coverage, evidence):
     prior = before["review"][-6000:]
     # Closed records remain in the bounded Store view, but cannot consume the
     # next synthesis budget or crowd out any pending question.
-    decisions = [d for d in before["decisions"] if d["status"] == "pending"]
+    decisions = working_set(before, evidence)
     primary = next(
         (s for s in before["sources"] if s.get("role") == "supervisor"), before["sources"][0]
     )
@@ -266,11 +312,47 @@ def _build_prompt(before, coverage, evidence):
         previous_review=prior,
         previous_review_partial=len(prior) < len(before["review"]),
         previous_decisions=decisions,
+        pending_total=sum(d["status"] == "pending" for d in before["decisions"]),
+        previous_decisions_partial=True,
         previous_overview=before.get("overview", {}),
         primary_source=primary,
         coverage=coverage,
         evidence=[dict(e, text="") for e in evidence],
         canonical_decision_refs=[],
+        pending_question_index=[],
+        human_completed_questions=[],
+        review_citation_ids=[e["citation"] for e in evidence],
+    )
+    from .discussion import completed
+
+    completed_chars = 0
+    for key, entry in reversed(list(completed(before).items())):
+        question = entry["card"]["decision"]["question"][:400]
+        reference = dict(key=key, question=question)
+        cost = len(json.dumps(reference, ensure_ascii=False))
+        if completed_chars + cost > 8000:
+            break
+        payload["human_completed_questions"].append(reference)
+        completed_chars += cost
+    # A compact identity index prevents a twenty-item working window from hiding
+    # older keys when their answers arrive. Keep serialized prompt growth bounded.
+    index_chars = 0
+    for item in before["decisions"]:
+        if item["status"] != "pending":
+            continue
+        summary = (before.get("decision_details", {}).get(item["key"]) or {}).get(
+            "summary"
+        ) or item["question"]
+        entry = dict(
+            key=item["key"], question=item["question"][:800], canonical_summary=summary[:600]
+        )
+        cost = len(json.dumps(entry, ensure_ascii=False))
+        if index_chars + cost > 40000:
+            break
+        payload["pending_question_index"].append(entry)
+        index_chars += cost
+    payload["pending_question_index_partial"] = (
+        len(payload["pending_question_index"]) < payload["pending_total"]
     )
     by_id = {s["id"]: s for s in coverage}
     for item in evidence:
@@ -281,7 +363,11 @@ def _build_prompt(before, coverage, evidence):
 
     # Optional whole-summary references cannot crowd out pending cores or source
     # text. Deep details/evidence never enter this ordinary synthesis payload.
-    remaining = MAX_PROMPT_CHARS - len(render())
+    repair_reserve = min(
+        VALIDATION_RESERVE_CHARS,
+        max(0, (MAX_PROMPT_CHARS - len(render()) - 128 * len(evidence)) // 4),
+    )
+    remaining = MAX_PROMPT_CHARS - repair_reserve - len(render())
     allowance = min(
         MAX_CANONICAL_REF_CHARS,
         max(0, remaining - max(128 * len(evidence), min(12000, remaining // 2))),
@@ -299,7 +385,7 @@ def _build_prompt(before, coverage, evidence):
         if used + cost <= allowance:
             payload["canonical_decision_refs"].append(reference)
             used += cost
-    remaining = MAX_PROMPT_CHARS - len(render())
+    remaining = MAX_PROMPT_CHARS - repair_reserve - len(render())
     if remaining < 128 * len(evidence):
         raise PromptBudgetError(
             "pending decisions and metadata exceed prompt budget; no model call"
@@ -374,8 +460,18 @@ def _validate(raw, coverage, previous=(), previous_overview=None):
     for item in data["decisions"]:
         if item in previous:
             continue  # exact known historical evidence is valid only for an unchanged record
+        prior = next((d for d in previous if d["key"] == item["key"]), None)
+        if prior and item["status"] == "resolved" and item["question"] != prior["question"]:
+            raise ValueError("resolution cannot rewrite the original question")
         if any(citation not in current_citations for citation in item["evidence"]):
             raise ValueError("model decision cites unavailable or unknown source evidence")
+        operational = {c["id"] for c in coverage if c.get("role") != "desk_conversation"}
+        if item["status"] == "pending" and not any(ref in operational for ref in item["evidence"]):
+            raise ValueError("Desk conversation cannot create or reopen requests")
+        if not any(ref in operational for ref in item["evidence"]) and item["key"] not in {
+            d["key"] for d in previous
+        }:
+            raise ValueError("resolution requires an existing request")
         item["evidence"] = [citations[citation] for citation in item["evidence"]]
     for key, citation in citations.items():
         data["review"] = data["review"].replace(f"[{key}]", f"[{citation}]")
@@ -387,7 +483,8 @@ def _reconcile(previous, proposed, coverage):
     questions = {" ".join(d["question"].casefold().split()): d["key"] for d in previous}
     for item in proposed:
         item = item.copy()
-        key = questions.get(" ".join(item["question"].casefold().split()), item["key"])
+        wording = " ".join(item["question"].casefold().split())
+        key = item["key"] if item["key"] in result else questions.get(wording, item["key"])
         item["key"] = key
         prior = result.get(key)
         if prior and prior["status"] == "pending" and item["status"] != "pending":
@@ -398,9 +495,13 @@ def _reconcile(previous, proposed, coverage):
             }
             if not any(e in current for e in item["evidence"]):
                 raise ValueError("resolution requires current cited source evidence")
+            # Closing an ask does not replace its original wording/background or
+            # detach its saved human answer from the immutable card fingerprint.
+            item = dict(prior, status=item["status"], evidence=item["evidence"])
         # Reinsert updates so terminal retention follows most recent observations.
         result.pop(key, None)
         result[key] = item
+        questions[wording] = key
     return list(result.values())
 
 
@@ -424,6 +525,35 @@ def _export_snapshot(store, name, snapshot):
         return failed
 
 
+def _desk_sources(snapshot):
+    """Resolve only exact bound native sessions in the configured harness home."""
+    from ..references import native_key
+    from ..registry import REGISTRY
+
+    sources = []
+    for tool, binding in snapshot.get("agents", {}).items():
+        try:
+            if native_key(tool, binding["session_id"], binding["home"]) != native_key(
+                tool, binding["session_id"]
+            ):
+                continue
+            ref = REGISTRY.get(tool).resolve(binding["session_id"])
+            if ref is None or ref.session_id != binding["session_id"]:
+                continue
+            sources.append(
+                dict(
+                    tool=tool,
+                    session_id=ref.session_id,
+                    home=binding["home"],
+                    storage=ref.storage,
+                    role="desk_conversation",
+                )
+            )
+        except (KeyError, OSError, ValueError, RuntimeError):
+            continue
+    return sources
+
+
 def _refresh(store, name, *, runner=None, stop=None):
     """Observe once, preserving last good synthesis on errors and rejecting stale work."""
     before = store.get(name)
@@ -435,8 +565,16 @@ def _refresh(store, name, *, runner=None, stop=None):
     )
     try:
         _check_stop(stop)
-        for index, source in enumerate(before["sources"]):
+        selected = list(enumerate(before["sources"]))
+        known = {(s["tool"], s["session_id"]) for s in before["sources"]}
+        selected.extend(
+            (33 + i, source)
+            for i, source in enumerate(_desk_sources(before))
+            if (source["tool"], source["session_id"]) not in known
+        )
+        for index, source in selected:
             _check_stop(stop)
+            source = _prepare_grok(source)
             key = (source["tool"], source["session_id"], source["storage"])
             try:
                 observed, text = _source(source, old.get(key, {}), index)
@@ -487,6 +625,9 @@ def _refresh(store, name, *, runner=None, stop=None):
             "synthesized_at": before.get("observation", {}).get("synthesized_at"),
             "overview_context_attempted": context_attempted,
             "overview_context": before.get("observation", {}).get("overview_context"),
+            "decision_window_offset": before.get("observation", {}).get(
+                "decision_window_offset", 0
+            ),
             "limitations": "Bounded plain JSONL history; tool results excluded. "
             "Initial history and reset/gap coverage are partial; synthesis is attributed.",
         }
@@ -494,14 +635,52 @@ def _refresh(store, name, *, runner=None, stop=None):
         current_text_ids = {e["citation"] for e in evidence if e["citation"] != "s32"}
         if evidence:
             prompt = _build_prompt(before, coverage + context_coverage, evidence)
+            pending_count = sum(d["status"] == "pending" for d in before["decisions"])
+            observation["decision_window_offset"] = (
+                before.get("observation", {}).get("decision_window_offset", 0)
+                + len(working_set(before, evidence))
+            ) % max(1, pending_count)
             partial = any(s["partial"] for s in coverage)
             observation["partial"] = partial
             _check_stop(stop)
-            raw = runner(prompt) if runner is not None else _run_model(prompt, stop=stop)
-            _check_stop(stop)
-            data = _validate(
-                raw, coverage + context_coverage, before["decisions"], before.get("overview")
-            )
+            for attempt in range(2):
+                _check_stop(stop)
+                raw = runner(prompt) if runner is not None else _run_model(prompt, stop=stop)
+                _check_stop(stop)
+                try:
+                    data = _validate(
+                        raw,
+                        coverage + context_coverage,
+                        before["decisions"],
+                        before.get("overview"),
+                    )
+                    break
+                except ValueError as error:
+                    hints = {
+                        "model review cites unknown source evidence": "Review cited a source ID outside review_citation_ids. Only that allowlist contains supplied text. Unchanged coverage entries cannot supply current s-number citations. Preserve full prior attributions for unchanged reported facts, or omit unsupported claims.",
+                        "model review must cite supplied source evidence": "Review must attribute its new claims to supplied review_citation_ids.",
+                        "model decision cites unavailable or unknown source evidence": "Changed decisions must cite current supplied evidence, not historical or coverage-only IDs.",
+                        "resolution cannot rewrite the original question": "Return the original question verbatim for a resolved key. Do not replace the request with a related different question.",
+                        "Desk conversation cannot create or reopen requests": "Desk conversation evidence may resolve existing questions, but cannot create or reopen pending requests. Omit those pending changes.",
+                    }
+                    hint = (
+                        "Return one valid JSON object matching the schema."
+                        if isinstance(error, json.JSONDecodeError)
+                        else hints.get(str(error))
+                    )
+                    if attempt or hint is None:
+                        raise
+                    payload = json.loads(prompt[len(SYSTEM) + 1 :])
+                    payload["validation_feedback"] = hint
+                    prompt = (
+                        SYSTEM
+                        + "\n"
+                        + json.dumps(payload, ensure_ascii=False, separators=(",", ":"))
+                    )
+                    if len(prompt) > MAX_PROMPT_CHARS:
+                        raise PromptBudgetError(
+                            "validation repair exceeds prompt budget; previous briefing preserved"
+                        ) from error
             observation["synthesized_at"] = time.time()
             observation["overview_context_attempted"] = True
             if context_coverage:
@@ -538,6 +717,8 @@ def _refresh(store, name, *, runner=None, stop=None):
         message = "Briefing update failed; retrying automatically. Previous briefing preserved."
         if isinstance(exc, json.JSONDecodeError):
             message = "The summarizer returned an unreadable reply; retrying automatically. Previous briefing preserved."
+        if isinstance(exc, ValueError) and str(exc).startswith("pending decision"):
+            message = "Pending requests exceed the briefing capacity. Previous briefing and requests preserved; resolve outstanding requests in the Desk conversation."
         if isinstance(exc, PromptBudgetError):
             message += " " + str(exc)
         failed = store._fail(name, message, before["revision"], coverage=coverage)
@@ -557,7 +738,9 @@ def refresh(
     result = _refresh(store, name, runner=runner, stop=stop)
     # Legacy runner fixtures replace core synthesis only. Enrichment is injectable
     # separately so no existing unit fixture can accidentally call a live model.
-    if runner is None or details_runner is not None or context_runner is not None:
+    if result.get("error") is None and (
+        runner is None or details_runner is not None or context_runner is not None
+    ):
         try:
             from .decisions import enrich_pending
 

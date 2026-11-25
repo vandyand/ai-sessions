@@ -1,5 +1,37 @@
 # Changelog
 
+## 3.22.6
+
+- Batch queued new-question notices into one digest per Desk recipient; never flood a reconnected Desk with individual historical notices. Use the canonical compact-message envelope for submitted human feedback.
+- Keep a multiline response field in short panes and use the real terminal cursor. Coalesce draft saves off the input thread; advance from the just-answered question instead of restarting at the first.
+
+- Fix Desk message delivery falsely treating the same Windows native home as offline when path casing differs. Feedback, new-request notifications, and context replies use canonical native identity; ambiguous receivers still refuse and uncertain sends never retry.
+- Repair a rejected briefing once with explicit valid citation IDs; preserve the last good record if correction fails and keep unrelated enrichment from delaying recovery.
+- Give Decisions semantic visual hierarchy: bold questions/options, accent section headings, distinct user text, focused buttons and subdued metadata. Fold secondary timing/source detail and separate the response editor from reading.
+- Add Mark as completed with optional comments, persistent history, protection against model reopening and inline undo.
+- Require summary attribution and repair one invalid background reply within the existing time budget. Recover failed background lookups with bounded automatic retries and a direct per-card retry action. Prioritize questions without background and explain proposed behavior/customer impact before implementation details.
+
+## 3.22.5
+
+- Read the exact bound Desk conversation as resolution evidence so explicit answers can retire existing questions. Index older questions outside the model working set to avoid paraphrased duplicates.
+- Preserve a saved answer during initial choice-background hydration and order questions newest-first with stable creation order.
+- Keep the conversation and briefing on the same unanswered-question projection.
+
+## 3.22.4
+
+- Make decision submission end with the exact saved answer, truthful delivery status and a clear next-question action.
+- Separate unanswered questions from saved answers without changing operational resolution. Keep clarification open and preserve prior answers when a question changes.
+- Make Discussion a focused reading view, fold old card versions separately, and clarify editor action labels/focus. Explain when feedback is waiting for the Desk agent to connect.
+
+## 3.22.3
+
+- Fix severe Desk scrolling/input stalls by moving snapshot/status reads off the input thread, avoiding repeated full-record status reads and quadratic wrapping. Enable in-app mouse-wheel scrolling.
+
+- Add saved decision notes, clarification questions and submitted answers in the Desk view, with immutable Discussion and prior card versions.
+- Ground one-off clarifications with bounded read-only project search; request missing context only from the exact bound Desk conversation. Send final answers with a discussion reference and durable delivery status.
+- Preserve every unanswered Desk request while bounding the model working set. Archive closed/superseded requests, expose review candidates and revision-checked dismissal, and retain original context.
+- Restore Desk updates when accumulated pending requests exceed the old aggregate prompt limit; add reset/restart and identity/identify aliases while preserving Grok integration.
+
 ## 3.22.1.post1 — 2026-11-25
 
 - Open an existing Desk by its short name after switching its supervisor to

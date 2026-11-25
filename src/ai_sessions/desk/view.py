@@ -1,4 +1,4 @@
-"""Read-only Project Desk terminal view; no observer or messaging dependencies.
+"""Project Desk terminal view with durable decision input and pure rendering.
 
 Rendering is deterministic with explicit ``now``; normalization and keys are pure. ``run`` owns polling and curses; ``read_snapshot`` handles store failures. Decision keys remain in state, never in the frame.
 """
@@ -7,7 +7,6 @@ from __future__ import annotations
 
 import curses
 import re
-import time
 import unicodedata
 from copy import deepcopy
 from dataclasses import dataclass, replace
@@ -15,6 +14,8 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Protocol
 
+from .discussion_ui import Editor
+from .presentation import line as styled
 from .time_format import eastern_time
 
 
@@ -31,11 +32,20 @@ class State:
     help: bool = False
     expanded: frozenset[str] = frozenset()
     retained: dict | None = None
+    editor: Editor | None = None
+    discussions: frozenset[str] = frozenset()
+    notice: tuple[str, str] | None = None
+    feedback: dict | None = None
+    answered: bool = False
+    question_open: frozenset[str] = frozenset()
+    versions: frozenset[str] = frozenset()
 
 
 @dataclass(frozen=True)
 class Frame:
     lines: tuple[str, ...]
+    roles: tuple[str, ...] = ()
+    cursor: tuple[int, int] | None = None
 
 
 # Remove complete OSC/DCS strings and CSI sequences before filtering controls.
@@ -71,10 +81,12 @@ def wrap(value: object, width: int) -> list[str]:
     result = []
     for paragraph in sanitize(value).split("\n"):
         line = ""
+        used = 0
         for ch in paragraph:
-            if cell_width(ch) > width:
-                ch = "?"
-            if cell_width(line + ch) > width:
+            size = cell_width(ch)
+            if size > width:
+                ch, size = "?", 1
+            if used + size > width:
                 split = line.rfind(" ")
                 if split > 0:
                     result.append(line[:split])
@@ -83,20 +95,90 @@ def wrap(value: object, width: int) -> list[str]:
                     result.append(line)
                     line = ""
                 # The remainder plus a wide character can still overflow.
-                if cell_width(line + ch) > width:
+                used = cell_width(line)
+                if used + size > width:
                     result.append(line)
                     line = ""
+                    used = 0
             line += ch
+            used += size
         result.append(line)
-    return result
+    return [styled(row, getattr(value, "role", "body")) for row in result]
 
 
 def _pending(snapshot: dict | None) -> list[dict]:
+    from .backlog import ordered_decisions
+    from .discussion_ui import answered_keys
+
+    answered = answered_keys(snapshot)
     return [
         item
-        for item in (snapshot or {}).get("decisions", [])
-        if isinstance(item, dict) and item.get("status") == "pending"
+        for item in ordered_decisions(snapshot)
+        if isinstance(item, dict)
+        and item.get("status") == "pending"
+        and item.get("key") not in answered
     ]
+
+
+def _answered(snapshot):
+    from .backlog import ordered_decisions
+    from .discussion_ui import answered_keys
+
+    keys = answered_keys(snapshot)
+    rows = [row for row in ordered_decisions(snapshot) if row.get("key") in keys]
+    from .discussion import completed
+
+    known = {row["key"] for row in rows}
+    rows.extend(
+        dict(entry["card"]["decision"], status="resolved")
+        for key, entry in completed(snapshot or {}).items()
+        if key not in known
+    )
+    return rows
+
+
+def _browse(snapshot, state):
+    return _answered(snapshot) if state.answered else _pending(snapshot)
+
+
+def _feedback(snapshot, state):
+    if state.selected_key in state.question_open:
+        return None
+    rows = (snapshot or {}).get("decision_discussion", {}).get(state.selected_key, [])
+    if state.feedback and state.feedback["key"] == state.selected_key:
+        current = next(
+            (
+                row
+                for row in (snapshot or {}).get("decisions", [])
+                if row.get("key") == state.selected_key
+            ),
+            None,
+        )
+        from .decisions import core_fingerprint
+
+        if current and state.feedback.get("core_hash") == core_fingerprint(current):
+            if state.feedback["kind"] == "decision":
+                from .discussion_ui import answer
+
+                return answer(snapshot, state.selected_key)
+            return next((row for row in rows if row["id"] == state.feedback["id"]), state.feedback)
+    from .discussion_ui import answer
+
+    return answer(snapshot or {}, state.selected_key)
+
+
+def _with_saved_feedback(snapshot, feedback):
+    if not snapshot or not feedback:
+        return snapshot
+    rows = snapshot.get("decision_discussion", {}).get(feedback["key"], [])
+    if any(row["id"] == feedback["id"] for row in rows):
+        return snapshot
+    return dict(
+        snapshot,
+        decision_discussion=dict(
+            snapshot.get("decision_discussion", {}), **{feedback["key"]: [*rows, feedback]}
+        ),
+    )
 
 
 def _human_text(value: object) -> str:
@@ -120,7 +202,12 @@ def _detail(snapshot: dict | None, state: State, width: int) -> list[str]:
     if state.help:
         return wrap(
             "Briefing help\n\n"
-            "Left / Right or Tab / Shift+Tab: switch views\n"
+            + (
+                ("Update problem: " + _human_text(snapshot["error"]) + "\n\n")
+                if snapshot and snapshot.get("error")
+                else ""
+            )
+            + "Left / Right or Tab / Shift+Tab: switch views\n"
             "1 Overview: background, position, direction and goal\n"
             "2 Review: recent progress and current outcome\n"
             "3 Decisions: ask, context, options and recommendation\n"
@@ -146,12 +233,21 @@ def _detail(snapshot: dict | None, state: State, width: int) -> list[str]:
             "Reconnecting: the saved briefing cannot be reloaded right now.\n\n"
             "Observer stopped: reopen a live view or Desk conversation to restart it. "
             "Use ses desk status HANDLE or ses desk stop HANDLE to manage observation.\n\n"
-            "Discuss questions and give answers in your Desk conversation."
+            "In Decisions, e opens your text area; f prepares a clarification for the listed missing facts. c selects Mark as completed with an optional comment. u undoes completion. "
+            "Tab selects Save note, Ask for clarification, Send answer, or Mark as completed. "
+            "Enter inserts a new line while typing or activates the selected action. Esc keeps your draft. "
+            "t opens Discussion with earlier cards and comments; r retries the failed background or clarification shown. "
+            "Ask for clarification searches project files read-only and consults the bound Desk conversation only when needed. "
+            "Send answer sends your exact answer and a discussion reference to that conversation. "
+            "Enter on a saved answer moves to the next unanswered question. "
+            "a switches between unanswered questions and your saved answers; b reviews the question. "
+            "Discussion has earlier card versions behind v. "
+            "Saved answers remain pending operationally until the project records an outcome."
             + "\n\nWatched sessions\n"
             + (
                 "\n".join(
                     f"- {source.get('title') or ('Supervisor' if source.get('role', 'supervisor') == 'supervisor' else 'Team session')}"
-                    for source in (snapshot or {}).get("sources", [])
+                    for source in _watched_sources(snapshot)
                 )
                 or "No source details available."
             )
@@ -166,11 +262,11 @@ def _detail(snapshot: dict | None, state: State, width: int) -> list[str]:
                 if _partial(snapshot)
                 else ""
             )
-            + (
-                "\n\nUpdate problem: " + _human_text(snapshot["error"])
-                if snapshot and snapshot.get("error")
-                else ""
-            ),
+            + "\n\nReview old or repeated requests:\n"
+            "Review suggested flags old or repeated requests; it never closes them.\n"
+            "ses desk decisions HANDLE lists review candidates and the revision.\n"
+            "Dismiss explicitly with: ses desk dismiss HANDLE NUMBER --revision N --reason REASON\n"
+            "ses desk history HANDLE shows preserved request history.\n",
             width,
         )
     if snapshot is None:
@@ -218,7 +314,12 @@ def _decision_details(snapshot, key):
 def _decision_teasers(snapshot, state):
     pending = _pending(snapshot)
     if not pending:
-        return ""
+        saved = len(_answered(snapshot))
+        return (
+            f"\n\nYour decisions · {saved} answers saved\n3 Decisions · a Review your answers"
+            if saved
+            else ""
+        )
     index = next((i for i, row in enumerate(pending) if row.get("key") == state.selected_key), 0)
     shown = pending[index : index + 2]
     lines = ["", "", f"Your decisions · {len(pending)} open", "n/p: open Decisions"]
@@ -234,9 +335,13 @@ def _selected(snapshot, state):
     item = next((row for row in rows if row.get("key") == state.selected_key), None)
     if item is not None:
         return item, _decision_details(snapshot, state.selected_key), False
+    if state.answered:
+        item = next((row for row in _answered(snapshot) if row["key"] == state.selected_key), None)
+        if item is not None:
+            return item, _decision_details(snapshot, state.selected_key), False
     if state.retained and state.selected_key == state.retained["decision"].get("key"):
         return state.retained["decision"], state.retained.get("details"), True
-    pending = _pending(snapshot)
+    pending = _browse(snapshot, state)
     item = pending[0] if pending else None
     return item, _decision_details(snapshot, item.get("key")) if item else None, False
 
@@ -266,7 +371,46 @@ def _deadline_text(value):
 def _decision_body(snapshot, state, width):
     pending = _pending(snapshot)
     selected, details, missing = _selected(snapshot, state)
+    if state.editor:
+        from .discussion_ui import editor_lines
+
+        title = (details or {}).get("summary") or (selected or {}).get("question", "Decision")
+        lines = editor_lines(state.editor, wrap, width, 24, title)
+        if state.notice and state.notice[0] == state.editor.key:
+            lines = wrap(state.notice[1], width) + [""] + lines
+        return lines
+    if selected and selected.get("key") in state.discussions:
+        from .discussion_ui import lines as discussion_lines
+
+        return [
+            row
+            for part in discussion_lines(
+                snapshot,
+                selected["key"],
+                expanded=True,
+                show_versions=selected["key"] in state.versions,
+            )
+            for row in wrap(part, width)
+        ]
+    feedback = _feedback(snapshot, state)
+    if feedback:
+        from .discussion_ui import receipt
+
+        result = receipt(snapshot, feedback, wrap, width, reviewing=state.answered)
+        if state.notice and state.notice[0] == state.selected_key:
+            result = wrap(state.notice[1], width) + [""] + result
+        return result
     if selected is None:
+        if state.answered:
+            return wrap(
+                "Your saved answers\n\nThere are no answers to the current questions yet. Earlier comments remain in each question's Discussion.\n\na Return to unanswered questions",
+                width,
+            )
+        if _answered(snapshot):
+            return wrap(
+                "No questions are waiting for your answer.\n\nYour answers are saved.\n\na Review your answers",
+                width,
+            )
         if not snapshot.get("observed_at"):
             qualification = "The first briefing is still being prepared."
         elif snapshot.get("error"):
@@ -278,7 +422,16 @@ def _decision_body(snapshot, state, width):
         return wrap("No open decisions. " + qualification, width)
     key = selected.get("key")
     index = next((i + 1 for i, row in enumerate(pending) if row.get("key") == key), None)
-    if missing:
+    from .discussion_ui import answer
+
+    saved_answer = answer(snapshot, key)
+    if saved_answer and not missing:
+        position = (
+            "Completed · Question"
+            if saved_answer["kind"] == "completion"
+            else "Your answer is saved · Question"
+        )
+    elif missing:
         position = "No longer listed · saved decision"
     elif selected.get("status") != "pending":
         position = "Resolved" if selected.get("status") == "resolved" else "Superseded"
@@ -298,43 +451,52 @@ def _decision_body(snapshot, state, width):
         else "Preparing background"
     )
     active = not missing and selected.get("status") == "pending"
-    parts = [position + (" · " + background if active else ""), ""]
-    if len(pending) > 1 or index is None and pending:
-        parts[0] += " · n/p"
+    parts = [styled(position + (" · " + background if active else ""), "metadata"), ""]
+    if state.notice and state.notice[0] == key:
+        parts[:0] = [styled(state.notice[1], "success"), ""]
+    if len(_browse(snapshot, state)) > 1 or index is None and pending:
+        parts[0] = styled(parts[0] + " · n/p", "metadata")
 
     def section(title, value):
         if value:
-            parts.extend(["", title, _human_text(value)])
+            parts.extend(["", styled(title, "heading"), _human_text(value)])
 
+    from .discussion_ui import latest_clarification
+
+    parts.extend(latest_clarification(snapshot, key))
     if failed:
         parts.extend(
             [
                 "Background update unavailable. Showing saved context."
                 if details
                 else "Background lookup failed. Saved request shown below.",
-                "Retry the background lookup; ? Help has the command.",
+                styled("r Retry background lookup", "action"),
                 "",
             ]
         )
+    flags = [
+        flag
+        for flag in snapshot.get("decision_review", {}).get(key, [])
+        if flag != "Imported request; age unknown"
+    ]
+    if active and flags:
+        parts.extend(["Review suggested: " + "; ".join(flags) + ". ? Help", ""])
     if details:
-        parts.append(_human_text(details.get("summary")) or _human_text(selected.get("question")))
+        parts.append(
+            styled(
+                _human_text(details.get("summary")) or _human_text(selected.get("question")),
+                "question",
+            )
+        )
+        missing_facts = details.get("missing_information") or []
+        if missing_facts:
+            section(
+                "Missing information", "\n".join("- " + _human_text(fact) for fact in missing_facts)
+            )
+        elif not ready:
+            section("Missing information", "The background or options are not complete yet.")
         section("Context", details.get("background") or "Background is still being prepared.")
-        section("Why now", details.get("why_now"))
         options = details.get("options") or []
-        if options:
-            parts.extend(["", "Options and tradeoffs"])
-            for number, option in enumerate(options, 1):
-                parts.append(f"{number}. " + _human_text(option.get("label")))
-                if option.get("description"):
-                    parts.append(_human_text(option["description"]))
-                for values, label in (("benefits", "Benefits"), ("risks", "Risks")):
-                    if option.get(values):
-                        parts.append(
-                            label + ": " + "; ".join(_human_text(v) for v in option[values])
-                        )
-                if option.get("consequences"):
-                    parts.append("Consequence: " + _human_text(option["consequences"]))
-                parts.append("")
         recommendation = details.get("recommendation") or {}
         recommended = next(
             (o for o in options if o.get("id") == recommendation.get("option_id")), None
@@ -345,17 +507,32 @@ def _decision_body(snapshot, state, width):
             ((_human_text(recommended.get("label")) + ". ") if recommended else "")
             + (reason or "No supported recommendation yet."),
         )
-        missing_facts = details.get("missing_information") or []
-        if missing_facts:
-            section(
-                "Missing information", "\n".join("- " + _human_text(fact) for fact in missing_facts)
-            )
-        elif not ready:
-            section("Missing information", "The background or options are not complete yet.")
-        section("If deferred", details.get("if_deferred"))
+        if key in state.expanded:
+            section("Why now", details.get("why_now"))
+        if options:
+            parts.extend(["", styled("Options and tradeoffs", "heading")])
+            for number, option in enumerate(options, 1):
+                parts.append(styled(f"{number}. " + _human_text(option.get("label")), "option"))
+                if option.get("description"):
+                    parts.append(_human_text(option["description"]))
+                for values, label in (("benefits", "Benefits"), ("risks", "Risks")):
+                    if option.get(values):
+                        parts.append(
+                            label + ": " + "; ".join(_human_text(v) for v in option[values])
+                        )
+                if option.get("consequences"):
+                    parts.append("Consequence: " + _human_text(option["consequences"]))
+                parts.append("")
+        if key in state.expanded:
+            section("If deferred", details.get("if_deferred"))
         section("Deadline", _deadline_text(details.get("deadline")))
     else:
-        parts.append(_human_text(selected.get("question")) or "A decision needs your attention.")
+        parts.append(
+            styled(
+                _human_text(selected.get("question")) or "A decision needs your attention.",
+                "question",
+            )
+        )
         section("Saved context", selected.get("context"))
         section(
             "Background and options",
@@ -377,15 +554,11 @@ def _decision_body(snapshot, state, width):
                 if failed
                 else "Source excerpts are still being prepared. The saved context above is available now."
             )
-    parts.extend(
-        [
-            "",
-            "Discuss your answer in the Desk conversation."
-            if active
-            else "Saved context for the previously viewed decision.",
-        ]
-    )
-    return wrap("\n".join(parts), width)
+        if active:
+            parts.extend(
+                ["", styled("Send answer sends your answer to the Desk conversation.", "metadata")]
+            )
+    return [row for part in parts for row in wrap(part, width)]
 
 
 def _partial(snapshot: dict | None) -> bool:
@@ -417,7 +590,7 @@ def _body_height(height: int) -> int:
 def normalize(state: State, snapshot: dict | None, width: int, height: int) -> State:
     """Preserve the viewed decision, including a resolved/removed selection."""
     tab = min(3, max(1, state.tab))
-    keys = [item.get("key") for item in _pending(snapshot)]
+    keys = [item.get("key") for item in _browse(snapshot, state)]
     selected = state.selected_key
     if selected not in keys and not (
         tab == 3
@@ -441,6 +614,119 @@ def handle_key(
     state: State, key: str | int, snapshot: dict | None, width: int, height: int
 ) -> State:
     state = normalize(state, snapshot, width, height)
+    if state.editor:
+        from .discussion_ui import edit
+
+        return replace(state, editor=edit(state.editor, key), scroll=0)
+    if state.tab == 3 and not state.help:
+        if key == "a":
+            reviewing = not state.answered
+            rows = _answered(snapshot) if reviewing else _pending(snapshot)
+            return normalize(
+                replace(
+                    state,
+                    answered=reviewing,
+                    selected_key=rows[0]["key"] if rows else None,
+                    feedback=None,
+                    scroll=0,
+                ),
+                snapshot,
+                width,
+                height,
+            )
+        if key == "b" and state.selected_key:
+            return normalize(
+                replace(
+                    state,
+                    question_open=state.question_open | {state.selected_key},
+                    discussions=state.discussions - {state.selected_key},
+                    feedback=None,
+                    scroll=0,
+                ),
+                snapshot,
+                width,
+                height,
+            )
+        if key == "v" and state.selected_key in state.discussions:
+            return normalize(
+                replace(state, versions=state.versions ^ {state.selected_key}, scroll=0),
+                snapshot,
+                width,
+                height,
+            )
+        if key in ("\n", "\r", curses.KEY_ENTER) and _feedback(snapshot, state):
+            row = _feedback(snapshot, state)
+            if row["kind"] not in ("decision", "completion"):
+                return normalize(
+                    replace(
+                        state,
+                        question_open=state.question_open | {state.selected_key},
+                        feedback=None,
+                        scroll=0,
+                    ),
+                    snapshot,
+                    width,
+                    height,
+                )
+            from .backlog import ordered_decisions
+
+            rows = _pending(snapshot)
+            keys = {row["key"] for row in rows}
+            ordered = [row["key"] for row in ordered_decisions(snapshot)]
+            index = ordered.index(state.selected_key) + 1 if state.selected_key in ordered else 0
+            following = ordered[index:] + ordered[:index]
+            next_key = next((key for key in following if key in keys), None)
+            return normalize(
+                replace(
+                    state,
+                    answered=False,
+                    selected_key=next_key,
+                    feedback=None,
+                    scroll=0,
+                ),
+                snapshot,
+                width,
+                height,
+            )
+    if (
+        key in ("e", "E", "c", "C", "f", "F")
+        and state.tab == 3
+        and state.selected_key
+        and not state.help
+    ):
+        from .discussion import card_version
+
+        selected, selected_details, missing = _selected(snapshot, state)
+        if selected and not missing and selected.get("status") == "pending":
+            draft = (snapshot or {}).get("decision_drafts", {}).get(state.selected_key, {})
+            text = draft.get("text", "")
+            if key in ("f", "F"):
+                facts = (selected_details or {}).get("missing_information") or []
+                if not facts:
+                    return state
+                text = text or "Please find and explain the missing context:\n" + "\n".join(
+                    "- " + fact for fact in facts
+                )
+            return replace(
+                state,
+                editor=Editor(
+                    state.selected_key,
+                    card_version(snapshot, state.selected_key),
+                    text,
+                    len(text),
+                    focus=4 if key in ("c", "C") else 2 if key in ("f", "F") else 0,
+                ),
+                scroll=0,
+                notice=None,
+                feedback=None,
+            )
+    if key in ("t", "T") and state.tab == 3 and state.selected_key and not state.help:
+        return normalize(
+            replace(state, discussions=state.discussions ^ {state.selected_key}, scroll=0),
+            snapshot,
+            width,
+            height,
+        )
     if key in ("q", "Q"):
         return replace(state, quit=True)
     if key in ("?", "h", "H") or key == "\x1b" and state.help:
@@ -468,16 +754,18 @@ def handle_key(
                 height,
             )
     if key in ("n", "p") and state.tab == 3 and not state.help:
-        keys = [item.get("key") for item in _pending(snapshot)]
+        keys = [item.get("key") for item in _browse(snapshot, state)]
         if keys:
             if state.selected_key in keys:
                 index = (keys.index(state.selected_key) + (1 if key == "n" else -1)) % len(keys)
             else:
                 index = 0 if key == "n" else len(keys) - 1
-            state = replace(state, selected_key=keys[index], scroll=0)
+            state = replace(state, selected_key=keys[index], scroll=0, feedback=None)
     elif key in ("d", "D") and state.tab == 3 and not state.help and state.selected_key:
         expanded = state.expanded ^ {state.selected_key}
         state = replace(state, expanded=frozenset(expanded))
+    elif key in ("wheel_down", "wheel_up"):
+        state = replace(state, scroll=state.scroll + (3 if key == "wheel_down" else -3))
     elif key in (curses.KEY_DOWN, "j"):
         state = replace(state, scroll=state.scroll + 1)
     elif key in (curses.KEY_UP, "k"):
@@ -545,7 +833,7 @@ def _observation_status(snapshot: dict | None, now: datetime | None) -> str:
         status = {
             "current": "Up to date",
             "changed": "Supervisor has new content"
-            if len(snapshot.get("sources", [])) == 1
+            if len(_watched_sources(snapshot)) == 1
             else "Watched sessions have new content",
             "unavailable": "Source unavailable",
         }.get(snapshot.get("_freshness"), "Saved")
@@ -560,10 +848,13 @@ def _clip(value: object, width: int) -> str:
     if cell_width(text) <= width:
         return text
     result = ""
+    used = 0
     for ch in text:
-        if cell_width(result + ch) > width - 1:
+        size = cell_width(ch)
+        if used + size > width - 1:
             break
         result += ch
+        used += size
     return result + "…"
 
 
@@ -619,6 +910,18 @@ def render(
     if height < 6:
         return Frame(tuple([header, tabs, _clip("? Help · q Exit", width)][:height]))
     body = _body(snapshot, state, width)
+    cursor = None
+    if state.editor:
+        from .discussion_ui import editor_layout
+
+        selected, details, _ = _selected(snapshot, state)
+        title = (details or {}).get("summary") or (selected or {}).get("question", "Decision")
+        body, cursor = editor_layout(state.editor, wrap, width, height, title)
+        if state.notice and state.notice[0] == state.editor.key:
+            notice = wrap(state.notice[1], width)[:2]
+            body = notice + body
+            if cursor:
+                cursor = (cursor[0] + len(notice), cursor[1])
     capacity = _body_height(height)
     offset = min(state.scroll, max(0, len(body) - capacity))
     visible = body[offset : offset + capacity]
@@ -628,31 +931,94 @@ def render(
         if len(body) > capacity
         else ""
     )
-    controls = "? Help · q Exit"
+    controls = "Tab Actions · Esc Keep draft" if state.editor else "? Help · q Exit"
     extra = []
-    if not state.help and state.tab == 3 and state.selected_key:
-        extra.append("d Sources" if state.selected_key not in state.expanded else "d Hide")
+    if not state.help and not state.editor and state.tab == 3 and state.selected_key:
+        if state.selected_key in state.discussions:
+            extra.extend(["t Back", "v Versions"])
+        elif _feedback(snapshot, state):
+            extra.extend(["Enter Next", "b Question"])
+        else:
+            extra.append("d Sources" if state.selected_key not in state.expanded else "d Hide")
+        selected, _, missing = _selected(snapshot, state)
+        if selected and not missing and selected.get("status") == "pending":
+            extra.append("e Write")
+        if state.selected_key not in state.discussions:
+            extra.append("t Discussion")
     available = width - (len(position) + 2 if position else 0)
     if position:
         extra.append("↑↓ Scroll")
-    if not state.help and _pending(snapshot):
+    if (
+        not state.help
+        and not state.editor
+        and state.tab == 3
+        and (_answered(snapshot) or state.answered)
+    ):
+        extra.append("a Questions" if state.answered else "a Your answers")
+    if not state.help and not state.editor and _browse(snapshot, state):
         if state.tab in (1, 2):
             extra.append("n Decisions")
-        elif len(_pending(snapshot)) > 1:
+        elif len(_browse(snapshot, state)) > 1:
             extra.append("n/p Decisions")
-    if not state.help:
+    if not state.help and not state.editor:
         extra.append("←→ Views")
     for hint in extra:
         if cell_width(controls + " · " + hint) <= available:
             controls += " · " + hint
     footer = _header(controls, position, width) if position else _clip(controls, width)
-    return Frame(tuple([header, tabs, ""] + visible + [footer]))
+    action = ""
+    if state.tab == 3 and not state.help and not state.editor:
+        feedback = _feedback(snapshot, state)
+        action_selected, action_details, action_missing = _selected(snapshot, state)
+        action = (
+            "[e Respond]   [c Mark completed]"
+            if action_selected
+            and action_selected.get("status") == "pending"
+            and not action_missing
+            and not feedback
+            and state.selected_key not in state.discussions
+            else ""
+        )
+        if action and (action_details or {}).get("missing_information"):
+            action = "[f Find context]   [e Respond]"
+        if not action and not feedback and state.selected_key not in state.discussions:
+            from .discussion import completed
+
+            if state.selected_key in completed(snapshot or {}):
+                action = "[u Undo completion]  [t Discussion]"
+    rows = (
+        [styled(header, "header"), styled(tabs, "tabs"), styled(_clip(action, width), "action")]
+        + visible
+        + [styled(footer, "hint")]
+    )
+    if cursor:
+        cursor = (cursor[0] - offset + 3, cursor[1])
+        if not 3 <= cursor[0] < height - 1:
+            cursor = None
+    return Frame(tuple(rows), tuple(getattr(row, "role", "body") for row in rows), cursor)
+
+
+def _watched_sources(snapshot):
+    snapshot = snapshot or {}
+    sources = list(snapshot.get("sources", []))
+    known = {(s.get("tool"), s.get("session_id")) for s in sources}
+    for source in snapshot.get("observation", {}).get("sources", []):
+        binding = snapshot.get("agents", {}).get(source.get("tool"), {})
+        if (
+            source.get("role") == "desk_conversation"
+            and source.get("session_id") == binding.get("session_id")
+            and source.get("home") == binding.get("home")
+            and (source.get("tool"), source.get("session_id")) not in known
+        ):
+            sources.append(dict(source, title="Desk conversation"))
+            known.add((source.get("tool"), source.get("session_id")))
+    return sources
 
 
 def _source_freshness(snapshot: dict) -> str:
-    """Check at most 32 file stats; no transcript reads, model calls or writes."""
-    sources = snapshot.get("sources", [])
-    if not sources or len(sources) > 32:
+    """Check at most 36 file stats; no transcript reads, model calls or writes."""
+    sources = _watched_sources(snapshot)
+    if not sources or len(sources) > 36:
         return "unknown"
     previous = {
         (s.get("tool"), s.get("session_id"), s.get("storage")): s
@@ -689,23 +1055,43 @@ def read_snapshot(
 def run(store: SnapshotStore, name: str, *, activity: dict | None = None) -> None:
     """Poll saved state at most once per second; draw only changed frames."""
 
+    from .discussion import save_draft
+    from .view_polling import DraftWriter, Poller
+
+    drafts = DraftWriter(
+        lambda editor: save_draft(store, name, editor.key, editor.text, editor.version)
+    )
+    poller = Poller(store, name, read_snapshot, activity).start()
+
     def loop(screen):
+        from .presentation import attributes, palette
+
+        colors = palette()
         try:
             curses.curs_set(0)
         except curses.error:
             pass
-        screen.timeout(100)
+        try:
+            curses.mousemask(getattr(curses, "ALL_MOUSE_EVENTS", 0))
+            curses.mouseinterval(0)
+        except (curses.error, AttributeError):
+            pass
+        screen.timeout(20)
         state, snapshot, read_error = State(), None, None
-        next_poll = 0.0
         previous = None
         previous_input = None
         while not state.quit:
-            tick = time.monotonic()
-            if tick >= next_poll:
-                snapshot, read_error = read_snapshot(store, name, snapshot)
-                if activity and activity.get("error"):
-                    read_error = read_error or activity.get("error")
-                next_poll = tick + 1.0
+            snapshot, read_error, busy = poller.latest()
+            if drafts.error and state.editor:
+                state = replace(
+                    state,
+                    notice=(
+                        state.editor.key,
+                        "Draft save failed. Text is kept here; Esc retries saving.",
+                    ),
+                )
+            snapshot = _with_saved_feedback(snapshot, state.feedback)
+            poller.refresh(state.discussions & state.versions)
             height, width = screen.getmaxyx()
             # Leave the final column free to avoid lower-right curses errors.
             width = max(1, width - 1)
@@ -717,7 +1103,7 @@ def run(store: SnapshotStore, name: str, *, activity: dict | None = None) -> Non
                 snapshot,
                 read_error,
                 _observation_status(snapshot, now),
-                bool(activity and activity.get("busy")),
+                busy,
             )
             if current_input != previous_input:
                 state = normalize(state, snapshot, width, height)
@@ -729,7 +1115,7 @@ def run(store: SnapshotStore, name: str, *, activity: dict | None = None) -> Non
                     height,
                     now=now,
                     read_error=read_error,
-                    updating=bool(activity and activity.get("busy")),
+                    updating=busy,
                 )
                 signature = (height, width, frame)
                 if signature != previous:
@@ -740,24 +1126,170 @@ def run(store: SnapshotStore, name: str, *, activity: dict | None = None) -> Non
                                 row,
                                 0,
                                 line,
-                                curses.A_BOLD
-                                if row < 2
-                                else curses.A_DIM
-                                if row == len(frame.lines) - 1
-                                else 0,
+                                attributes(frame.roles[row] if frame.roles else "body", colors),
                             )
                         except curses.error:
                             pass  # A terminal resize may race this paint.
+                    try:
+                        curses.curs_set(1 if frame.cursor else 0)
+                        if frame.cursor:
+                            screen.move(*frame.cursor)
+                    except (curses.error, AttributeError):
+                        pass
                     screen.refresh()
                     previous = signature
                 previous_input = current_input
             try:
                 key = screen.get_wch()
+                if key == curses.KEY_MOUSE:
+                    _, _, _, _, buttons = curses.getmouse()
+                    if buttons & getattr(curses, "BUTTON4_PRESSED", 0):
+                        key = "wheel_up"
+                    elif buttons & getattr(curses, "BUTTON5_PRESSED", 0):
+                        key = "wheel_down"
             except curses.error:
                 continue
+            previous_editor = state.editor
+            if key == "u" and state.tab == 3 and not state.editor and not state.help:
+                from .discussion import completed
+
+                entry = _feedback(snapshot, state) or completed(snapshot or {}).get(
+                    state.selected_key
+                )
+                if entry and entry["kind"] == "completion":
+                    from .discussion import undo_completion
+
+                    try:
+                        undo_completion(store, name, entry["id"])
+                        state = replace(
+                            state,
+                            feedback=None,
+                            notice=(state.selected_key, "Completion undone"),
+                            answered=False,
+                            question_open=state.question_open | {state.selected_key},
+                            scroll=0,
+                        )
+                        poller.refresh()
+                    except (OSError, RuntimeError, ValueError):
+                        state = replace(
+                            state,
+                            notice=(state.selected_key, "Could not undo completion. Try again."),
+                        )
+                continue
+            if key == "r" and state.tab == 3 and not state.editor and not state.help:
+                from .discussion import retry
+
+                rows = (snapshot or {}).get("decision_discussion", {}).get(state.selected_key, [])
+                failed = next(
+                    (row for row in reversed(rows) if row["kind"] == "clarification"), None
+                )
+                if (
+                    failed
+                    and failed["status"] == "failed"
+                    and (
+                        state.selected_key in state.discussions
+                        or (_feedback(snapshot, state) or {}).get("kind") == "clarification"
+                    )
+                ):
+                    try:
+                        retry(store, name, failed["id"])
+                        poller.refresh()
+                    except (OSError, RuntimeError, ValueError):
+                        state = replace(
+                            state,
+                            notice=(
+                                state.selected_key,
+                                "Retry unavailable; your question is saved.",
+                            ),
+                        )
+                    continue
+                attempt = (
+                    (snapshot or {}).get("decision_enrichment", {}).get(state.selected_key, {})
+                )
+                if attempt.get("status") == "failed":
+                    from .decisions import core_fingerprint
+
+                    selected, _, _ = _selected(snapshot, state)
+                    try:
+                        store.retry_decision_background(
+                            name, state.selected_key, core_fingerprint(selected)
+                        )
+                        poller.refresh()
+                        state = replace(
+                            state, notice=(state.selected_key, "Background lookup queued.")
+                        )
+                    except (OSError, RuntimeError, ValueError):
+                        state = replace(
+                            state, notice=(state.selected_key, "Could not retry. Try again.")
+                        )
+                    continue
             state = handle_key(state, key, snapshot, width, height)
+            editor = state.editor or previous_editor
+            if editor:
+                from .discussion import submit
+
+                try:
+                    changed = previous_editor is None or editor.text != previous_editor.text
+                    if changed or drafts.error:
+                        drafts.queue(editor)
+                    if state.editor is None or state.editor.request:
+                        drafts.flush()
+                    if state.editor and state.editor.request:
+                        entry = submit(
+                            store, name, editor.key, editor.request, editor.text, editor.version
+                        )
+                        message = {
+                            "note": "Note saved",
+                            "clarification": "Question saved",
+                            "decision": "Answer saved",
+                            "completion": "Marked as completed",
+                        }[entry["kind"]]
+                        state = replace(
+                            state,
+                            editor=None,
+                            notice=None,
+                            feedback=entry,
+                            question_open=state.question_open - {editor.key},
+                            discussions=state.discussions - {editor.key},
+                            scroll=0,
+                        )
+                        from .runtime import ensure_observer
+
+                        if entry["kind"] not in ("note", "completion"):
+                            try:
+                                ensure_observer(store, name)
+                            except (OSError, RuntimeError, ValueError):
+                                state = replace(
+                                    state,
+                                    notice=(
+                                        editor.key,
+                                        message
+                                        + "; reopen the view to start background processing",
+                                    ),
+                                )
+                    if state.editor is None:
+                        poller.refresh()
+                except (OSError, RuntimeError, ValueError) as error:
+                    message = (
+                        str(error)
+                        if isinstance(error, (ValueError, RuntimeError))
+                        else "Could not save. Keep this view open and try again."
+                    )
+                    if message.startswith("Decision changed"):
+                        message = "Question changed. Esc to review. Your draft is saved."
+                    elif "clarification is already in progress" in message:
+                        message = "A reply is already in progress. Save a note or wait."
+                    state = replace(
+                        state,
+                        editor=replace(editor, request=None),
+                        notice=(editor.key, message),
+                        scroll=0,
+                    )
 
     try:
         curses.wrapper(loop)
     except KeyboardInterrupt:
         pass
+    finally:
+        poller.close()
+        drafts.close()

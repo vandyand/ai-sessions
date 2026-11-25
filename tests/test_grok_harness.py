@@ -169,6 +169,14 @@ def test_rename_delete_and_launcher(tmp_path, monkeypatch):
     assert grok.new_session_args(session_id="abc") == ["-s", "abc"]
 
 
+def test_grown_transcript_uses_the_frontier_changed_status(tmp_path):
+    path = tmp_path / "updates.jsonl"
+    path.write_text('{"ok":true}\n', encoding="utf-8")
+    ref = grok.NativeRef("8554a9c4-bccc-4b26-9a38-8db40663a800", str(path))
+    assert grok.change_status(ref, 0) == "changed"
+    assert grok.change_status(ref, path.stat().st_size) == "unchanged"
+
+
 def test_generation_changes_with_the_process():
     first = grok._generation("sid", 10, 1.5)
     assert first != "1"

@@ -124,7 +124,17 @@ def child(result):
             if_deferred="The nursery may offer Friday's slot to another customer.",
             deadline=None,
             missing_information=[],
-            citations={"background": ["delivery"]},
+            citations={
+                field: ["delivery"] if field != "deadline" else []
+                for field in (
+                    "summary",
+                    "background",
+                    "why_now",
+                    "recommendation",
+                    "if_deferred",
+                    "deadline",
+                )
+            },
             evidence=[
                 dict(
                     id="delivery",
@@ -161,30 +171,90 @@ def child(result):
             ),
         }
 
-        class FixtureStore:
+        class FixtureStore(Store):
+            def __init__(self):
+                self.root, self.path, self.readonly = store.root, store.path, False
+
+            def _get(self, db, name):
+                snapshot = Store._get(db, name)
+                # Rendering-only fixture details; production validates retrieved sources.
+                snapshot["decision_details"] = record["decision_details"]
+                return snapshot
+
             def get(self, name):
-                return record
+                with self._connect() as db:
+                    snapshot = self._get(db, name)
+                return dict(
+                    record,
+                    decisions=snapshot["decisions"],
+                    decision_meta=snapshot["decision_meta"],
+                    decision_discussion=snapshot["decision_discussion"],
+                    decision_drafts=snapshot["decision_drafts"],
+                )
+
+        from ai_sessions.desk import discussion, runtime
+
+        original_submit = discussion.submit
+
+        def submit_fixture(*args, **kwargs):
+            entry = original_submit(*args, **kwargs)
+            if entry["kind"] == "decision":
+                entry = discussion.update(
+                    args[0],
+                    args[1],
+                    entry["id"],
+                    delivery_wait="offline",
+                    recipient=dict(tool="claude", session_id="fixture-desk", home=root),
+                )
+            return entry
+
+        discussion.submit = submit_fixture
+        runtime.ensure_observer = lambda *args, **kwargs: None
 
         original_wrapper = curses.wrapper
         original_render = view.render
         tabs = []
         states = []
         captures = []
+        expected_cursor = [None]
         keys_seen = []
+        input_times = []
+        mouse_events = []
+        original_getmouse = curses.getmouse
+
+        def getmouse():
+            event = original_getmouse()
+            mouse_events.append(event)
+            return event
+
+        curses.getmouse = getmouse
         original_handle = view.handle_key
 
         def handle(state, key, *args):
             keys_seen.append([repr(key), type(key).__name__])
+            input_times.append([repr(key), time.monotonic()])
             return original_handle(state, key, *args)
 
         view.handle_key = handle
 
         def render(snapshot, state, *args, **kwargs):
             tabs.append(state.tab)
-            states.append(dict(tab=state.tab, expanded=bool(state.expanded), scroll=state.scroll))
-            return original_render(snapshot, state, *args, **kwargs)
+            states.append(
+                dict(
+                    tab=state.tab,
+                    expanded=bool(state.expanded),
+                    scroll=state.scroll,
+                    editing=bool(state.editor),
+                )
+            )
+            frame = original_render(snapshot, state, *args, **kwargs)
+            expected_cursor[0] = frame.cursor
+            return frame
 
         for columns, rows in ((100, 25), (60, 12), (40, 18)):
+            with store._connect() as db:
+                db.execute("DELETE FROM desk_discussion WHERE desk=?", ("smoke",))
+                db.execute("DELETE FROM desk_decision_drafts WHERE desk=?", ("smoke",))
 
             class Screen:
                 def __init__(self, screen):
@@ -199,9 +269,15 @@ def child(result):
                         dict(
                             width=columns,
                             height=rows,
+                            cursor=list(self.screen.getyx()),
+                            expected_cursor=expected_cursor[0],
                             lines=[
                                 self.screen.instr(row, 0).decode("utf-8", errors="replace").rstrip()
                                 for row in range(rows)
+                            ],
+                            cells=[
+                                [self.screen.inch(y, x) for x in range(columns)]
+                                for y in range(rows)
                             ],
                         )
                     )
@@ -222,8 +298,23 @@ def child(result):
                             ("control", wintypes.DWORD),
                         ]
 
+                    class Coord(ctypes.Structure):
+                        _fields_ = [("x", wintypes.SHORT), ("y", wintypes.SHORT)]
+
+                    class MouseEvent(ctypes.Structure):
+                        _fields_ = [
+                            ("position", Coord),
+                            ("buttons", wintypes.DWORD),
+                            ("control", wintypes.DWORD),
+                            ("flags", wintypes.DWORD),
+                        ]
+
                     class Event(ctypes.Union):
-                        _fields_ = [("key", KeyEvent), ("padding", ctypes.c_byte * 16)]
+                        _fields_ = [
+                            ("key", KeyEvent),
+                            ("mouse", MouseEvent),
+                            ("padding", ctypes.c_byte * 16),
+                        ]
 
                     class Input(ctypes.Structure):
                         _fields_ = [("type", wintypes.WORD), ("event", Event)]
@@ -246,30 +337,74 @@ def child(result):
                         wintypes.DWORD,
                         ctypes.POINTER(wintypes.DWORD),
                     ]
-                    keys = [
-                        (0x27, "", 0),
-                        (0x27, "", 0),
-                        (0x27, "", 0),
-                        (0x25, "", 0),
-                        (9, "\t", 0),
-                        (9, "\t", 16),
-                        (68, "d", 0),
-                        (0x23, "", 0),
-                        (0x26, "", 0),
-                        (0x28, "", 0),
-                        (0x21, "", 0),
-                        (0x22, "", 0),
-                        (0x24, "", 0),
-                        (68, "d", 0),
-                        (78, "n", 0),
-                        (80, "p", 0),
-                        (72, "h", 0),
-                        (0x22, "", 0),
-                        (27, "\x1b", 0),
-                        (50, "2", 0),
-                        (0x23, "", 0),
-                        (81, "q", 0),
-                    ]
+                    keys = (
+                        [(0x28, "", 0)] * 20
+                        + [(0x27, "", 0), (0x25, "", 0)]
+                        + [
+                            (0x27, "", 0),
+                            (0x27, "", 0),
+                            (0x27, "", 0),
+                            (0x25, "", 0),
+                            (9, "\t", 0),
+                            (9, "\t", 16),
+                            (68, "d", 0),
+                            (0x23, "", 0),
+                            (0x26, "", 0),
+                            (0x28, "", 0),
+                            (0x21, "", 0),
+                            (0x22, "", 0),
+                            (0x24, "", 0),
+                            (68, "d", 0),
+                            (78, "n", 0),
+                            (80, "p", 0),
+                            (69, "e", 0),
+                            (81, "q", 0),
+                            (13, "\r", 0),
+                            (88, "x", 0),
+                            (9, "\t", 0),
+                            (13, "\r", 0),
+                            (84, "t", 0),
+                            (84, "t", 0),
+                            (13, "\r", 0),
+                            (69, "e", 0),
+                            (70, "F", 0),
+                            (82, "r", 0),
+                            (73, "i", 0),
+                            (68, "d", 0),
+                            (65, "a", 0),
+                            (89, "y", 0),
+                            (190, ".", 0),
+                            (9, "\t", 0),
+                            (9, "\t", 0),
+                            (9, "\t", 0),
+                            (13, "\r", 0),
+                            (84, "t", 0),
+                            (86, "v", 0),
+                            (0x23, "", 0),
+                            (84, "t", 0),
+                            (13, "\r", 0),
+                            (65, "a", 0),
+                            (66, "b", 0),
+                            (67, "c", 0),
+                            (9, "\t", 0),
+                            (70, "F", 0),
+                            (73, "i", 0),
+                            (88, "x", 0),
+                            (69, "e", 0),
+                            (68, "d", 0),
+                            (9, "\t", 16),
+                            (13, "\r", 0),
+                            (85, "u", 0),
+                            (84, "t", 0),
+                            (84, "t", 0),
+                            (72, "h", 0),
+                            (0x22, "", 0),
+                            (27, "\x1b", 0),
+                            (50, "2", 0),
+                            (0x23, "", 0),
+                            (81, "q", 0),
+                        ]
+                    )
                     records = []
                     for virtual, char, control in keys:
                         for down in (True, False):
@@ -290,19 +425,25 @@ def child(result):
                             )
                             records.append(record)
 
+                    for delta in (120, -120):
+                        wheel = Input()
+                        wheel.type = 2
+                        wheel.event.mouse = MouseEvent(Coord(3, 5), (delta & 0xFFFF) << 16, 0, 4)
+                        records.insert(44, wheel)
+
                     def feed():
                         import time
 
                         time.sleep(0.3)
                         console = kernel.CreateFileW("CONIN$", 0xC0000000, 3, None, 3, 0, None)
                         try:
-                            for record in records:
+                            for index, record in enumerate(records):
                                 written = wintypes.DWORD()
                                 if not kernel.WriteConsoleInputW(
                                     console, ctypes.byref(record), 1, ctypes.byref(written)
                                 ):
                                     raise ctypes.WinError(ctypes.get_last_error())
-                                time.sleep(0.03)
+                                time.sleep(0.001 if index < 44 else 0.03)
                         finally:
                             kernel.CloseHandle(console)
 
@@ -323,6 +464,8 @@ def child(result):
                     "exited": True,
                     "captures": captures,
                     "keys": keys_seen,
+                    "input_times": input_times,
+                    "mouse_events": mouse_events,
                     "states": states,
                 }
             ),
@@ -342,14 +485,18 @@ def main():
         startup.dwFlags |= subprocess.STARTF_USESHOWWINDOW
         startup.wShowWindow = subprocess.SW_HIDE
         with (Path(root) / "error.log").open("w", encoding="utf-8") as errors:
+            environment = dict(os.environ)
+            if not environment.get("AI_SESSIONS_DESK_SMOKE_MONO"):
+                environment.pop("NO_COLOR", None)
             process = subprocess.Popen(
                 [sys.executable, str(Path(__file__).resolve()), str(result)],
                 creationflags=subprocess.CREATE_NEW_CONSOLE,
                 startupinfo=startup,
                 stderr=errors,
+                env=environment,
             )
             try:
-                code = process.wait(timeout=20)
+                code = process.wait(timeout=30)
             except subprocess.TimeoutExpired:
                 process.terminate()
                 process.wait(timeout=5)
@@ -385,9 +532,46 @@ def main():
         if capture_file:
             Path(capture_file).write_text(json.dumps(data), encoding="utf-8")
         assert {frame["width"] for frame in data["captures"]} == {40, 60, 100}
+        typing_frames = [frame for frame in data["captures"] if frame.get("expected_cursor")]
+        assert typing_frames, "No real editor cursor was captured"
+        assert all(frame["cursor"] == frame["expected_cursor"] for frame in typing_frames)
         assert any("Briefing help" in "\n".join(frame["lines"]) for frame in data["captures"])
-        assert all("? Help" in frame["lines"][-1] for frame in data["captures"])
-        print("Native Windows console: 40/60/100 columns, view keys, help, scroll and exit passed.")
+        assert all(
+            "? Help" in frame["lines"][-1] or "Tab Actions" in frame["lines"][-1]
+            for frame in data["captures"]
+        )
+        for start in range(len(data["input_times"]) - 20):
+            window = data["input_times"][start : start + 21]
+            if all(item[0] == str(curses.KEY_DOWN) for item in window[:20]):
+                assert window[-1][1] - window[0][1] < 1.5, window
+        assert any(key == "'wheel_down'" for key, _ in data["keys"]), (
+            "Wheel down did not reach the app"
+        )
+        assert any(key == "'wheel_up'" for key, _ in data["keys"]), "Wheel up did not reach the app"
+        assert any(
+            "Your answer is saved" in "\n".join(frame["lines"]) for frame in data["captures"]
+        )
+        assert any("v Earlier versions" in "\n".join(frame["lines"]) for frame in data["captures"])
+        assert any(row["editing"] for row in data["states"])
+        assert any("Note saved" in "\n".join(frame["lines"]) for frame in data["captures"])
+        assert any("Marked as completed" in "\n".join(frame["lines"]) for frame in data["captures"])
+        assert any("Completion undone" in "\n".join(frame["lines"]) for frame in data["captures"])
+        assert any(
+            cell & curses.A_REVERSE
+            for frame in data["captures"]
+            for row in frame["cells"]
+            for cell in row
+        )
+        colored = any(
+            cell & curses.A_COLOR
+            for frame in data["captures"]
+            for row in frame["cells"]
+            for cell in row
+        )
+        assert not colored if os.environ.get("AI_SESSIONS_DESK_SMOKE_MONO") else colored
+        print(
+            "Native Windows console: 40/60/100 columns, view keys, multiline notes, discussion, help, scroll and exit passed."
+        )
 
 
 if __name__ == "__main__":

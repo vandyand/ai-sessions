@@ -263,6 +263,7 @@ def test_legacy_unowned_claim_reads_failed_and_migrates_for_manual_retry(desk):
     with desk._connect() as db:
         db.execute("ALTER TABLE decision_enrichment_attempts DROP COLUMN started_at")
         db.execute("ALTER TABLE decision_enrichment_attempts DROP COLUMN attempt_token")
+        db.execute("ALTER TABLE decision_enrichment_attempts DROP COLUMN retry_count")
         db.execute(
             "INSERT INTO decision_enrichment_attempts VALUES (?,?,?,?,?,?,?,?)",
             ("demo", "oct16", fingerprint, "context-1", 1, "claimed", 9999999999, "old"),
@@ -477,7 +478,7 @@ def test_cached_unknowns_do_not_starve_later_pending_items(desk, monkeypatch):
             context_runner=lambda r, d: calls.append(d["key"]) or context(),
             runner=lambda p: json.dumps(details()),
         )
-    assert set(calls) == {f"q{i}" for i in range(5)}
+    assert set(calls) == {"oct16", *(f"q{i}" for i in range(5))}
     assert len(calls) == 6
 
 
@@ -623,7 +624,7 @@ def test_base_prompt_references_canonical_ask_without_importing_deep_details(des
     assert "NOT new evidence" in observer.SYSTEM
 
 
-def test_canonical_reference_budget_keeps_all_eighty_pending_cores_and_current_text(desk):
+def test_canonical_reference_budget_uses_bounded_window_and_keeps_current_text(desk):
     from ai_sessions.desk import observer
 
     record = desk.get("demo")
@@ -636,7 +637,9 @@ def test_canonical_reference_budget_keeps_all_eighty_pending_cores_and_current_t
         record, coverage, [dict(citation="s0", text="Latest evidence " * 1000)]
     )
     payload = json.loads(prompt[len(observer.SYSTEM) + 1 :])
-    assert len(payload["previous_decisions"]) == 80
+    assert len(payload["previous_decisions"]) <= 20
+    assert payload["pending_total"] == 80
+    assert len(record["decisions"]) == 80
     assert (
         len(json.dumps(payload["canonical_decision_refs"], separators=(",", ":")))
         <= observer.MAX_CANONICAL_REF_CHARS
@@ -671,3 +674,56 @@ def test_default_model_uses_details_schema_and_existing_tools_disabled_backend(m
     assert schema["properties"]["citations"]["properties"]["summary"]["items"]["enum"] == ["d0"]
     assert command[command.index("--tools") + 1] == ""
     assert "--safe-mode" in command and "--strict-mcp-config" in command
+
+
+def test_failed_background_retries_are_bounded_and_explicit_retry_resets_budget(desk, monkeypatch):
+    import time
+
+    fingerprint = decisions.core_fingerprint(core())
+    clock = [time.time()]
+    monkeypatch.setattr("ai_sessions.desk.store.time.time", lambda: clock[0])
+
+    def fail():
+        token = desk.claim_decision_enrichment("demo", "oct16", fingerprint, "context-1")
+        assert token
+        desk.finish_decision_enrichment(
+            "demo", "oct16", fingerprint, "context-1", attempt_token=token
+        )
+
+    fail()
+    assert not desk.claim_decision_enrichment("demo", "oct16", fingerprint, "context-1")
+    clock[0] += 61
+    fail()
+    clock[0] += 301
+    fail()
+    clock[0] += 1000
+    assert not desk.claim_decision_enrichment("demo", "oct16", fingerprint, "context-1")
+    desk.retry_decision_background("demo", "oct16", fingerprint)
+    assert desk.get("demo")["decision_enrichment"]["oct16"]["status"] == "in_progress"
+    assert desk.claim_decision_enrichment("demo", "oct16", fingerprint, "context-1")
+
+
+def test_missing_field_attribution_gets_one_repair_before_failure_is_cached(desk):
+    calls = []
+
+    def runner(prompt):
+        calls.append(prompt)
+        value = details()
+        if len(calls) == 1:
+            value["citations"]["summary"] = []
+        else:
+            assert "attribution_feedback" in json.loads(prompt.split("\n", 1)[1])
+        return json.dumps(value)
+
+    result = enrich(desk, runner=runner)
+    assert len(calls) == 2 and "oct16" in result["decision_details"]
+    assert result["decision_enrichment"]["oct16"]["status"] == "success"
+
+
+def test_summary_schema_requires_an_evidence_reference():
+    assert (
+        decisions.details_schema(["d0"])["properties"]["citations"]["properties"]["summary"][
+            "minItems"
+        ]
+        == 1
+    )

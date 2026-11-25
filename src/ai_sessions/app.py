@@ -6721,6 +6721,8 @@ def build_parser() -> argparse.ArgumentParser:
               sesres  (shorthand for sessions --restart)
               sesres --grok  (restart this session in Grok, from any harness)
               ses whoami  (or ses handle: show this session's handle)
+              sessions identify / sessions identity  (show this terminal's recorded session)
+              sessions restart / sessions reset  (same as --restart / --reset)
 
             New native sessions:
               sessions new codex
@@ -6812,6 +6814,8 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument(
         "--restart",
+        "--reset",
+        dest="restart",
         action="store_true",
         help=(
             "Windows, typed inside a session as `! sessions --restart`: close it and reopen it "
@@ -6937,6 +6941,9 @@ def main(argv: list[str] | None = None) -> int:
 
 def _main(argv: list[str] | None = None) -> int:
     raw = sys.argv[1:] if argv is None else argv
+    if raw and raw[0] in ("restart", "reset"):
+        raw = ["--restart", *raw[1:]]
+        argv = raw
     if IS_WINDOWS:
         # Windows PowerShell and SSH sessions may still expose a legacy code
         # page even though Windows Terminal itself is Unicode-capable.
@@ -6955,6 +6962,10 @@ def _main(argv: list[str] | None = None) -> int:
         from .desk.cli import main as desk_main
 
         return desk_main(raw[1:])
+    if raw and raw[0] in ("identify", "identity"):
+        from .handle_lookup import identify
+
+        return identify(raw[1:])
     if raw and raw[0] in ("list", "open", "project", "handle", "whoami"):
         from .handles_cli import main as handles_main
 

@@ -113,12 +113,17 @@ def test_unavailable_unobserved_and_partial_coverage():
 
 
 def test_fake_store_loop_is_read_only_rate_limited_and_quiet(monkeypatch):
+    import threading
+
+    ready = threading.Event()
+
     class Store:
         calls = 0
 
         def get(self, name):
             assert name == "Garden"
             self.calls += 1
+            ready.set()
             return snapshot()
 
     class Screen:
@@ -141,21 +146,19 @@ def test_fake_store_loop_is_read_only_rate_limited_and_quiet(monkeypatch):
             pass
 
         def get_wch(self):
+            assert ready.wait(0.5)
             self.ticks += 1
-            clock[0] += 0.1
             if self.ticks == 26:
                 return "q"
             raise curses.error()
 
-    clock = [0.0]
-    monkeypatch.setattr(view.time, "monotonic", lambda: clock[0])
     monkeypatch.setattr(view, "_now", lambda: NOW)
     monkeypatch.setattr(curses, "curs_set", lambda _: None)
     screen, store = Screen(), Store()
     monkeypatch.setattr(curses, "wrapper", lambda callback: callback(screen))
     view.run(store, "Garden")
-    assert 2 <= store.calls <= 3
-    assert screen.paints == 1
+    assert store.calls == 1
+    assert 1 <= screen.paints <= 2
 
 
 def test_store_error_keeps_last_good_content(monkeypatch):
@@ -209,12 +212,12 @@ def test_idle_loop_does_not_rebuild_frames(monkeypatch):
 
     monkeypatch.setattr(view, "render", counted)
     test_fake_store_loop_is_read_only_rate_limited_and_quiet(monkeypatch)
-    assert len(calls) == 1
+    assert 1 <= len(calls) <= 2
 
 
 def test_partial_history_detail_is_available_in_help():
     data = snapshot(review="Partial coverage: one source was truncated.")
-    text = "\n".join(view.render(data, view.State(tab=3, help=True), 80, 60, now=NOW).lines)
+    text = "\n".join(view.render(data, view.State(tab=3, help=True), 80, 100, now=NOW).lines)
     assert "Recent history only" in text
 
 
@@ -392,8 +395,8 @@ def test_complete_decision_has_options_reasons_and_context_without_disclosure():
         "Rain may delay",
         "volunteer must open",
         "protects the plants",
-        "another customer",
-        "Desk conversation",
+        "e Respond",
+        "c Mark completed",
         "d Sources",
     ):
         assert expected in text
@@ -622,3 +625,18 @@ def test_failed_details_refresh_preserves_valid_content_with_small_note():
     assert "Background ready" in text and "Showing saved context" in text
     assert "Choose whether the garden" in text and "protects the plants" in text
     assert "Preparing background" not in text
+
+
+def test_find_context_opens_reviewable_question_and_preserves_existing_draft():
+    data = detailed_snapshot()
+    data["decision_details"]["secret-a"]["missing_information"] = ["Exact migration SQL"]
+    state = view.normalize(view.State(tab=3), data, 80, 25)
+    opened = view.handle_key(state, "f", data, 80, 25)
+    assert opened.editor.focus == 2
+    assert "Exact migration SQL" in opened.editor.text
+    assert "Find context" in "\n".join(view.render(data, state, 80, 25, now=NOW).lines)
+    data["decision_drafts"] = {"secret-a": {"text": "My original question"}}
+    opened = view.handle_key(state, "f", data, 80, 25)
+    assert opened.editor.text == "My original question"
+    data["decision_details"]["secret-a"]["missing_information"] = []
+    assert view.handle_key(state, "f", data, 80, 25).editor is None

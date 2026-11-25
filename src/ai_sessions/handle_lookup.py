@@ -102,6 +102,16 @@ def register_current(tool, ident, items, state):
     return [item]
 
 
+def terminal_session():
+    """The session this Windows Terminal window last recorded, if any."""
+    from .detached import remembered, terminal_id
+
+    terminal = terminal_id()
+    if not terminal:
+        return None
+    return terminal, remembered().get(terminal)
+
+
 def current_identity():
     candidates = set()
     for adapter in REGISTRY.adapters():
@@ -124,6 +134,55 @@ def current_identity():
     raise ValueError(
         'Run ! ses whoami inside an agent session; from a separate shell, use ses -q "session title".'
     )
+
+
+def _print_terminal(terminal: str, entry: dict, *, json_output: bool) -> None:
+    row = {
+        "terminal": terminal,
+        "state": "closed" if entry.get("closed") else "running",
+        "tool": entry.get("tool") or "",
+        "session_id": entry.get("session_id") or "",
+        "title": entry.get("title") or "",
+        "cwd": entry.get("cwd") or "",
+        "pid": entry.get("pid") or 0,
+    }
+    if json_output:
+        print(json.dumps(row, ensure_ascii=False))
+        return
+    state = (
+        "closed; sessions --reopen opens it here" if entry.get("closed") else "recorded as running"
+    )
+    print(
+        f"Terminal: {terminal}\n"
+        f"State: {state}\n"
+        f"Title: {row['title']}\n"
+        f"Harness: {row['tool']}\n"
+        f"Session: {row['session_id']}\n"
+        f"Directory: {row['cwd']}"
+    )
+
+
+def identify(argv=None) -> int:
+    """Show the session this terminal last recorded. Does not scan the catalog."""
+    parser = argparse.ArgumentParser(
+        prog="sessions identify",
+        description="Show the session recorded for this terminal, if any.",
+    )
+    parser.add_argument("--json", action="store_true")
+    args = parser.parse_args(argv)
+    recorded = terminal_session()
+    if recorded is None:
+        print(
+            "sessions: this shell is not in Windows Terminal, so it has no tab record.",
+            file=sys.stderr,
+        )
+        return 2
+    terminal, entry = recorded
+    if entry is None:
+        print(f"sessions: no session is recorded for this terminal ({terminal}).", file=sys.stderr)
+        return 1
+    _print_terminal(terminal, entry, json_output=args.json)
+    return 0
 
 
 def main(argv=None):

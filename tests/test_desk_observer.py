@@ -37,6 +37,20 @@ def decision(status="pending"):
     }
 
 
+def test_backlog_near_old_limit_can_publish_progress_without_losing_requests(tmp_path, monkeypatch):
+    store, path = setup_source(tmp_path, monkeypatch)
+    pending = [dict(decision(), key=f"prior-{i}", context="x" * 800) for i in range(20)]
+    store.publish("demo", 0, {}, "Old briefing", pending)
+    new = dict(decision(), key="new-request", question="Which delivery day?", context="y" * 7000)
+    result = observer.refresh(store, "demo", runner=lambda prompt: output([new]))
+    assert result["error"] is None
+    assert "Recent source activity" in result["review"]
+    assert result["decisions"][:20] == pending
+    assert result["decisions"][-1]["key"] == "new-request"
+    assert result["observation"]["sources"][0]["checkpoint"] == path.stat().st_size
+    observer.refresh(store, "demo", runner=lambda prompt: pytest.fail("unchanged model call"))
+
+
 def test_refresh_incremental_and_no_unchanged_model_call(tmp_path, monkeypatch):
     store, path = setup_source(tmp_path, monkeypatch)
     calls = []
@@ -514,15 +528,15 @@ def test_explicit_latest_answer_in_clipped_long_tail_resolves(tmp_path, monkeypa
     assert result["observation"]["sources"][0]["checkpoint"] == path.stat().st_size
 
 
-def test_excessive_synthesis_pending_preserves_last_safe_snapshot(tmp_path, monkeypatch):
+def test_large_valid_synthesis_does_not_block_progress(tmp_path, monkeypatch):
     store, _ = setup_source(tmp_path, monkeypatch)
     items = [
         dict(decision(), key=f"q{i}", question=f"Question {i}?", context="x" * 7000)
-        for i in range(4)
+        for i in range(10)
     ]
     result = observer.refresh(store, "demo", runner=lambda p: output(items))
-    assert result["error"] and result["review"] == "" and result["decisions"] == []
-    assert result["observation"] == {} and result["observed_at"] is None
+    assert result["error"] is None and len(result["decisions"]) == 10
+    assert result["observed_at"] is not None
 
 
 def test_fenced_legacy_json_is_validated_without_accepting_surrounding_prose(tmp_path, monkeypatch):
@@ -570,3 +584,140 @@ def test_prose_wrapped_json_is_not_silently_extracted(tmp_path, monkeypatch):
     result = observer.refresh(store, "demo", runner=lambda p: "Here is the JSON: " + output())
     assert result["error"] and "JSONDecodeError" not in result["error"]
     assert result["observation"] == {}
+
+
+def test_bound_desk_conversation_can_resolve_but_not_create_requests(tmp_path, monkeypatch):
+    store, path = setup_source(tmp_path, monkeypatch)
+    first = observer.refresh(store, "demo", runner=lambda p: output([decision()]))
+    desk = tmp_path / "desk-chat.jsonl"
+    desk.write_text("{}\n", encoding="utf-8")
+    monkeypatch.setattr(
+        observer,
+        "_desk_sources",
+        lambda snapshot: [
+            dict(
+                tool="claude", session_id="desk-agent", storage=str(desk), role="desk_conversation"
+            )
+        ],
+    )
+    prompts = []
+
+    def runner(prompt):
+        prompts.append(json.loads(prompt.split("\n", 1)[1]))
+        return json.dumps(
+            dict(
+                review="The human answered [s33]",
+                decisions=[dict(decision("resolved"), evidence=["s33"])],
+            )
+        )
+
+    result = observer.refresh(store, "demo", runner=runner)
+    assert result["error"] is None
+    assert result["decisions"][0]["status"] == "resolved"
+    assert prompts[0]["coverage"][-1]["role"] == "desk_conversation"
+    observer.refresh(
+        store, "demo", runner=lambda p: pytest.fail("unchanged Desk must not call model")
+    )
+    desk.write_text("{}\n{}\n", encoding="utf-8")
+    failed = observer.refresh(
+        store,
+        "demo",
+        runner=lambda p: json.dumps(
+            dict(
+                review="A new question [s33]",
+                decisions=[dict(decision(), key="new", evidence=["s33"])],
+            )
+        ),
+    )
+    assert failed["error"]
+    assert failed["decisions"] == result["decisions"]
+    assert first["decisions"][0]["status"] == "pending"
+
+
+def test_desk_binding_refuses_other_home_and_unresolved_native_id(monkeypatch, tmp_path):
+    from ai_sessions.references import native_key
+    from ai_sessions.registry import REGISTRY
+
+    binding = dict(session_id="missing-fixture", home=str(tmp_path / "other-home"))
+    calls = []
+    from types import SimpleNamespace
+
+    adapter = REGISTRY.get("claude")
+    monkeypatch.setattr(
+        REGISTRY,
+        "get",
+        lambda tool: SimpleNamespace(home=adapter.home, resolve=lambda value: calls.append(value)),
+    )
+    assert observer._desk_sources(dict(agents={"claude": binding})) == []
+    assert not calls
+    binding["home"] = native_key("claude", binding["session_id"]).home
+    assert observer._desk_sources(dict(agents={"claude": binding})) == []
+    assert calls == ["missing-fixture"]
+
+
+def test_desk_first_attachment_has_bounded_catchup_then_ordinary_deltas(tmp_path, monkeypatch):
+    store, path = setup_source(tmp_path, monkeypatch)
+    source = dict(store.get("demo")["sources"][0], role="desk_conversation")
+    monkeypatch.setattr(observer, "MAX_SOURCE_CHARS", 10)
+    monkeypatch.setattr(observer, "MAX_DESK_BOOTSTRAP_CHARS", 30)
+    monkeypatch.setattr(
+        observer,
+        "read_since",
+        lambda *a, **kw: ReadSnapshot(Transcript([Turn("user", "x" * 100)]), path.stat().st_size),
+    )
+    coverage, text = observer._source(source, {}, 33)
+    assert len(text) == 30
+    path.write_text("{}\n{}\n", encoding="utf-8")
+    _, text = observer._source(source, coverage, 33)
+    assert len(text) == 10
+
+
+def test_resolution_cannot_substitute_a_related_but_different_question(tmp_path, monkeypatch):
+    store, path = setup_source(tmp_path, monkeypatch)
+    first = observer.refresh(store, "demo", runner=lambda p: output([decision()]))
+    path.write_text("{}\n{}\n", encoding="utf-8")
+    result = observer.refresh(
+        store,
+        "demo",
+        runner=lambda p: output(
+            [dict(decision("resolved"), question="Who updates the color policy?")]
+        ),
+    )
+    assert result["error"]
+    assert result["decisions"] == first["decisions"]
+
+
+def test_bad_review_citation_gets_one_bounded_repair_without_advancing_bad_state(
+    tmp_path, monkeypatch
+):
+    store, path = setup_source(tmp_path, monkeypatch)
+    calls = []
+
+    def runner(prompt):
+        payload = json.loads(prompt.split("\n", 1)[1])
+        calls.append(payload)
+        if len(calls) == 1:
+            return json.dumps(
+                dict(review="Unsupported old source [s7] and current [s0]", decisions=[])
+            )
+        assert "s0" in payload["review_citation_ids"]
+        assert "validation_feedback" in payload
+        return output()
+
+    result = observer.refresh(store, "demo", runner=runner)
+    assert result["error"] is None and len(calls) == 2
+    assert result["observation"]["sources"][0]["checkpoint"] == path.stat().st_size
+
+
+def test_repeated_bad_citation_stays_bounded_and_preserves_briefing(tmp_path, monkeypatch):
+    store, path = setup_source(tmp_path, monkeypatch)
+    calls = []
+    result = observer.refresh(
+        store,
+        "demo",
+        runner=lambda prompt: (
+            calls.append(prompt) or json.dumps(dict(review="Current [s0], bad [s7]", decisions=[]))
+        ),
+    )
+    assert result["error"] and len(calls) == 2
+    assert not result["observation"].get("synthesized_at")

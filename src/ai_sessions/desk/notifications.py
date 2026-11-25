@@ -43,6 +43,25 @@ def create_tables(db):
     )
 
 
+def _same_target(left, right):
+    """Compare a complete native identity using the platform's home-path semantics."""
+    from ..references import NativeKey
+
+    if not isinstance(left, dict) or not isinstance(right, dict):
+        return False
+    fields = ("tool", "session_id", "home")
+    if any(
+        not isinstance(row.get(k), str) or not row[k].strip()
+        for row in (left, right)
+        for k in fields
+    ):
+        return False
+    try:
+        return NativeKey(*(left[k] for k in fields)) == NativeKey(*(right[k] for k in fields))
+    except (ValueError, OSError, RuntimeError):
+        return False
+
+
 def _targets(snapshot):
     targets = []
     for tool, binding in snapshot.get("agents", {}).items():
@@ -130,7 +149,11 @@ def pending(store, name):
 
 
 def _current_request(snapshot, event):
-    if event["recipient"] not in _targets(snapshot):
+    from .discussion_ui import answer
+
+    if answer(snapshot, event["key"]):
+        return None
+    if not any(_same_target(event["recipient"], target) for target in _targets(snapshot)):
         return None
     return next(
         (d for d in snapshot["decisions"] if d["key"] == event["key"] and d["status"] == "pending"),
@@ -198,41 +221,92 @@ def _envelope(snapshot, item, folder, receiver, event):
     return meta, envelope
 
 
+def _claim_batch(store, name, events):
+    """Claim the entire recipient batch in one transaction, including competing drains."""
+    claimed = []
+    with store._connect() as db:
+        db.execute("BEGIN IMMEDIATE")
+        snapshot = store._get(db, name)
+        for event in events:
+            item = _current_request(snapshot, event)
+            changed = db.execute(
+                "UPDATE desk_notification_events SET status=? WHERE desk=? AND key_hash=? "
+                "AND recipient=? AND status='queued'",
+                (
+                    "submitting" if item else "canceled",
+                    name,
+                    event["key_hash"],
+                    _json(event["recipient"]),
+                ),
+            ).rowcount
+            if changed and item:
+                claimed.append((event, item))
+    return snapshot, claimed
+
+
+def _digest(snapshot, claimed, folder, receiver):
+    event, item = claimed[0]
+    if len(claimed) == 1:
+        return _envelope(snapshot, item, folder, receiver, event)
+    titles = "\n".join("- " + item["question"][:220] for _, item in claimed[:3])
+    summary = dict(
+        item,
+        question=f"{len(claimed)} new questions are available in {snapshot['name']}'s Desk.",
+        context=titles
+        + ("\nMore questions are listed in the Desk view." if len(claimed) > 3 else ""),
+    )
+    return _envelope(snapshot, summary, folder, receiver, event)
+
+
 def drain(store, name, *, stop=None):
-    """Best effort delivery; offline queue is untouched and ambiguous submissions never retry."""
+    """One durable digest per exact recipient; never replay uncertain submissions."""
     events = pending(store, name)
     if not events or stop is not None and stop.is_set():
         return
     rows = messaging.reachable()
+    groups = []
     for event in events:
+        group = next(
+            (g for g in groups if _same_target(g[0]["recipient"], event["recipient"])), None
+        )
+        if group is None:
+            groups.append([event])
+        else:
+            group.append(event)
+    for group in groups:
         if stop is not None and stop.is_set():
             return
-        matches = [r for r in rows if all(r.get(k) == v for k, v in event["recipient"].items())]
+        matches = [r for r in rows if _same_target(r, group[0]["recipient"])]
         if len(matches) != 1:
             continue
         receiver = matches[0]
-        # Preparing a view may fail before claim, leaving the event queued for later.
         folder = store.folder(name)
-        claimed = _claim(store, name, event)
-        if claimed is None:
+        snapshot, claimed = _claim_batch(store, name, group)
+        if not claimed:
             continue
-        snapshot, item = claimed
-        meta, envelope = _envelope(snapshot, item, folder, receiver, event)
+        meta, envelope = _digest(snapshot, claimed, folder, receiver)
         status = "uncertain"
         try:
             receipts.save_receipt({**meta, "status": "submitting"})
-            # Revalidate after receipt I/O, immediately before the one transport call.
             snapshot = store.get(name)
-            item = _current_request(snapshot, event)
-            if item is None or stop is not None and stop.is_set():
+            current = [
+                (event, item)
+                for event, _ in claimed
+                if (item := _current_request(snapshot, event)) is not None
+            ]
+            if not current or stop is not None and stop.is_set():
                 status = "canceled"
             else:
-                meta, envelope = _envelope(snapshot, item, folder, receiver, event)
-                result = messaging.deliver(receiver, envelope, event["message_id"], dict(SENDER))
+                # Keep the claimed batch ID stable even if a question was resolved during I/O.
+                meta, envelope = _digest(snapshot, current, folder, receiver)
+                meta["message_id"] = claimed[0][0]["message_id"]
+                if current[0][0] != claimed[0][0]:
+                    envelope = envelope.replace(current[0][0]["message_id"], meta["message_id"])
+                result = messaging.deliver(receiver, envelope, meta["message_id"], dict(SENDER))
                 status = result.get("status", "uncertain")
             receipts.save_receipt({**meta, "status": status})
         except Exception:
-            # Includes receipt failures after a submission. No exception reaches synthesis.
             status = "uncertain"
         finally:
-            _finish(store, name, event, status if status != "queued" else "uncertain")
+            for event, _ in claimed:
+                _finish(store, name, event, status if status != "queued" else "uncertain")

@@ -195,7 +195,7 @@ file, so a compressed copy can never be mistaken for no copy and bridged again. 
 ## Project Desk Briefing
 
 The human's job is to regain project context, understand progress, and decide what
-to discuss in the adjacent Desk conversation. The read-only terminal pane often
+to discuss in the adjacent Desk conversation. The terminal briefing pane often
 has only 40 columns. The approved navigation is **1 Overview / 2 Review / 3 Decisions**.
 A single decision keeps the ask, context and recommendation together. Splitting
 context and next action into separate views made understanding depend on recall;
@@ -233,8 +233,8 @@ a separate source reader would add another selection and scrolling mode.
   row separates navigation from prose. The footer has contextual controls and an
   overflow-only line range. Help and Exit remain available. Help documents all
   keys, source scope, status meanings, history limits and exact Eastern times.
-- Answers go in the Desk conversation. No send controls or approval buttons.
-  Background observation/lifecycle is unchanged; rendering performs no model or
+- Decisions provides notes, clarification and answer submission through the durable Discussion flow below.
+  Background processing uses the existing observer lifetime; rendering performs no model or
   filesystem I/O. The viewer checks source stats at most once per second.
   After a package upgrade, q and reopening the view loads the new UI; either fresh
   Desk entry also replaces a verified older observer through the existing scoped
@@ -252,7 +252,7 @@ legacy question is only a fallback, never a second contradictory title. In
 particular, an already-run test with missing prior approval is an information
 request about remembered consent, not a new approval action. Result files never
 become approval evidence through UI wording.
-No backend/store/observer changes belong to this UI work.
+The Discussion envelope extends this boundary without changing the legacy six-field cores.
 
 ### Implementation and validation plan
 
@@ -290,3 +290,78 @@ keeps saved context and directs the reader to the retry command in help:
 `ses desk refresh HANDLE --retry-context`. Existing valid details survive a failed
 refresh with a small note. Pending/in-progress hydration says Preparing background.
 Raw exception messages are never presentation text.
+
+
+## Decision backlog lifecycle
+
+Pending request storage is independent of model context. A bounded rotating and
+source-relevant working set (at most 20 requests / 24,000 characters) feeds each
+synthesis. The complete pending ledger remains available in the UI; closed
+versions move to paginated local history while the live projection keeps 20.
+Missing model output never deletes pending records. Archive import is idempotent.
+
+Seven-day unchanged, duplicate wording and explicit team-addressed questions are
+review flags only. No age-based closure, inferred approval, or automatic semantic
+merge is allowed. The Decisions card may show Review suggested; help points to
+`ses desk decisions HANDLE` and `ses desk history HANDLE`. Explicit dismissal
+requires the listing's revision, the selected number and a human reason. A changed
+revision refuses the action. The original and reason remain in history.
+
+Validation covers >200 pending requests, bounded prompt rotation, original-text
+preservation, terminal-history retention, stale-selection rejection, canonical
+summary audit, and unchanged-source model-call suppression.
+
+
+### Decision input and Discussion
+
+Decisions provides a keyboard-operated multiline editor with Save note, Ask for clarification and Submit decision. Drafts are persisted per decision; successful submission clears the input, failures preserve it. Each entry captures the exact card/version the human read. A materially changed card requires review before resubmission. One current card and latest exchange stay visible, with prior versions/comments under Discussion. Inline confirmations offer the existing n/p navigation rather than a modal.
+
+Clarification is finite background work owned by the existing per-Desk observer. It may use only bounded root-confined read/search MCP tools; source/model content cannot execute commands or edit files. Unavailable intent/history is requested from one exact bound Desk agent, never workers or the operational supervisor. Waiting requires no running model. Replies are accepted only from the requested native identity/home. Model output is validated and cannot resolve decisions or alter Overview/Review. Changed-card results remain discussion history without replacing current presentation.
+
+A submitted decision delivers exact human text plus canonical summary and a Discussion reference. Notes/questions are not approval. Durable transport claims prevent duplicate retries after uncertainty; offline work remains queued. Status distinguishes answer saved, notification submitted, delivery uncertain and clarification failed. All original human text and card versions remain retained.
+
+
+### Decision completion and reading flow
+
+The primary journey is question → response → explicit action → saved response/delivery status → next unanswered question. Completion is a focused inline pane, not a modal or the original unanswered card with stacked notices. The exact submitted text and Enter-to-continue control are visible before optional context. A saved human answer removes that item from unanswered navigation without claiming execution or changing the operational core. The current answered item stays selected until the user moves on. Saved answers remain available through a; b reviews the question, and e writes a further comment/correction. A materially changed core requires a new answer.
+
+Clarification and notes stay distinct from definitive answers. Their completion panes show the saved text and live clarification state/reply, with Enter returning to the question. Delivery status distinguishes waiting, disconnected, sent, changed recipient and uncertain transport. The UI never claims a queued answer was sent. An unavailable exact recipient yields a useful next step, not raw queue terminology.
+
+Discussion is its own reading stage. Comments/replies lead; full previous card versions and source excerpts stay behind v. Editor actions are Save note, Ask for clarification and Send answer, with visible focus and a short effect explanation. Global view navigation and the nonblocking polling/input contract remain intact.
+
+
+## Answer synchronization and question order
+
+The observer also reads the exact bound Desk conversation in its configured native home. Explicit human answers and superseding outcomes may resolve existing questions; copied briefings, agent suggestions and transport receipts cannot establish consent. Desk conversation evidence alone cannot create or reopen questions. The bounded synthesis prompt indexes pending question identities beyond the detailed twenty-item window so later answers can match older keys rather than create paraphrases.
+
+Questions are numbered newest-first by persisted first-seen order, with insertion sequence breaking ties. Editing or hydrating an old question does not make it new. Imported history has a known relative order, not fabricated original timestamps. Saved answers survive first-time choice hydration; corrected information asks and changed underlying cores still require review. The view and generated decisions file exclude matching saved answers while preserving discussion and operational status separately.
+
+
+## Decisions: visual hierarchy and explicit completion
+
+Andrew's job is to understand the specific proposal, respond or close it, and move on. Success requires a self-contained ask with actual behavior, impact, options and tradeoffs, plus persistence of the user's exact input. A failed lookup must not leave an opaque approval request looking ready.
+
+| Journey | Contract |
+| --- | --- |
+| Orient | Project/status and view tabs form chrome; the numbered question is a bold title. Primary reading controls remain in a separate action row. |
+| Understand | Context, options and recommendation use accent headings; options are bold content, not pretend selectable controls. Required background/tradeoffs remain visible; secondary timing/source detail is disclosed with d. |
+| Respond | e opens the response editor. User text is bold and visibly separate from model copy. Bracketed action buttons use a pointer plus reverse fill for keyboard focus. Tab/Shift+Tab cycle input and actions. |
+| Complete | c opens the same editor at Mark as completed. Text is optional. Completion closes the question, archives the original card and exact comment, and cannot be reversed by model publication. It does not send an operational approval. |
+| Recover | u undoes completion in place with visible confirmation. Original comments remain. Changed-card submission preserves the draft. Failed background has r Retry on the card, bounded automatic retries, and an explicit unavailable state. |
+| Continue | Inline success offers Enter for the next unanswered question. Completed items remain accessible with saved responses and Discussion. |
+
+Terminal roles are explicit rendering metadata, never guessed from user/model text: header/tabs = bold; question/option = bold; heading/action = cyan accent plus bold; user = bold with a visible comment rail; success = green plus bold; metadata/hints = subdued; focused action = reverse plus bold and a pointer. Colors use the terminal palette/default background and honor NO_COLOR. Weight, brackets, pointer, spacing and labels retain hierarchy without color. The pure frame carries roles through wrapping and scrolling, and the native paint uses those roles.
+
+Validation uses isolated persistence/retry tests and actual Windows console input at 40/60/100 columns, including completion/undo, typed comments, focus, arrows, wheel and rapid navigation. Native character/attribute captures verify actual color, bold and reverse states. Renderings of those captured cells are visual QA artifacts, not claimed desktop pixel screenshots. They provide implementation evidence, not a substitute for Andrew's usability feedback.
+
+Sources: IBM Carbon button hierarchy https://carbondesignsystem.com/components/button/usage/ and USWDS typography/spacing https://designsystem.digital.gov/components/typography/.
+
+Briefing validation advertises an explicit per-pass citation allowlist. Unknown citations are never guessed or silently stripped. A known validation failure receives at most one tools-disabled correction attempt with the same evidence and a bounded prompt reserve. A second failure preserves the saved briefing. Core synthesis failure skips unrelated enrichment so background recovery is not delayed.
+
+Decision-detail generation also corrects one missing field-attribution reply, within a shared 120-second model budget and the existing ownership lease. The schema requires a summary citation; every reply still passes unchanged provenance and readiness checks before publication. No missing reference is silently accepted or inferred.
+
+Clarification continuity: returning to a decision retains the latest submitted question, response and job/delivery status above its saved details. An offline context request must say the Desk agent is offline; unchanged details are labeled honestly. n/p moves on without deleting the exchange. Background rewording of an unchanged choice/action cannot revoke a saved answer; core changes and reconstructed question kinds still require review.
+
+Decision input uses the native curses cursor, with cell-aware hard wrapping inside a multiline field. Short 12-row panes pack four actions into two rows to retain at least three field rows at normal widths. Draft writes are coalesced on one background writer; typing/cursor motion never waits for SQLite. Leaving or submitting flushes the latest draft before changing its durable state. Enter after an answer advances relative to that record in the stable newest-first ordering, skipping saved answers and wrapping only at the end.
+
+Notification recovery: a reconnected bound Desk receives one digest for queued new human requests, not one interruption per request. A recipient batch is claimed atomically and never replayed after ambiguous transport. Saved local answers cancel redundant new-question notices. Human answers retain their exact individual text/reference and use the canonical compact peer-message envelope; automatic notices remain informational.

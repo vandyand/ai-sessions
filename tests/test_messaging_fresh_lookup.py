@@ -26,7 +26,7 @@ def fresh_lookup(tmp_path, monkeypatch):
     registry = SlugStore(tmp_path / "slugs.sqlite3")
     monkeypatch.setattr(cli, "_slug_store", lambda: registry)
 
-    def reachable():
+    def reachable(*, enrich=True):
         calls.append("receivers")
         return list(receivers)
 
