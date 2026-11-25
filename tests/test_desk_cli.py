@@ -291,3 +291,75 @@ def test_saved_desk_name_remains_readable_after_handle_retirement():
         assert cli.main(["view", "old-handle", "--no-watch"]) == 0
         view.assert_called_once_with(factory.return_value, "old-handle")
         watcher.assert_not_called()
+
+
+class DeskStaleCatalogTests(unittest.TestCase):
+    def test_saved_name_uses_unique_running_linked_copy_over_old_activity(self):
+        from ai_sessions.references import native_key
+
+        old = native_key("grok", "old")
+        new = native_key("codex", "new")
+        entry = dict(tool=new.tool, session_id=new.session_id, home=new.home)
+        item = Session("codex", "new", "Supervisor", ".", 0, 0, "", True, "new.jsonl")
+        record = {"name": "lego-sup-1"}
+        with (
+            patch("ai_sessions.desk.cli.Store") as factory,
+            patch("ai_sessions.handles.HandleStore") as handles,
+            patch("ai_sessions.detached.remembered", return_value={"tab": entry}),
+            patch("ai_sessions.detached._live_remembered", return_value=True),
+            patch("ai_sessions.handles_cli.catalog", return_value=([item], object())),
+            patch("ai_sessions.references.resolve_session", return_value=item) as resolve,
+            patch.object(cli, "target_desks", return_value=[record]),
+            patch.object(cli, "update_target") as update,
+        ):
+            factory.return_value.get.return_value = record
+            handles.return_value.current_key.return_value = old
+            handles.return_value.lookup_members.return_value = [old, new]
+            self.assertEqual(
+                cli.resolve_desk_name(factory.return_value, "lego-sup-1", update=True), "lego-sup-1"
+            )
+            self.assertEqual(resolve.call_args.args[0], "codex:new")
+            update.assert_called_once_with(factory.return_value, record, item)
+
+    def test_view_refreshes_missing_canonical_copy_before_retargeting(self):
+        from ai_sessions.references import native_key
+
+        old = Session("grok", "old", "Supervisor", ".", 0, 0, "", True, "old.jsonl")
+        new = Session("codex", "new", "Supervisor", ".", 0, 0, "", True, "new.jsonl")
+        record = {"name": "lego-sup-1"}
+        with (
+            patch("ai_sessions.desk.cli.Store") as factory,
+            patch("ai_sessions.handles.HandleStore") as handles,
+            patch("ai_sessions.handles_cli.catalog", return_value=([old], object())),
+            patch(
+                "ai_sessions.references.resolve_session", side_effect=[ValueError("missing"), new]
+            ),
+            patch("ai_sessions.app.load_sessions", return_value=[old, new]) as discover,
+            patch("ai_sessions.app.save_session_catalog") as save,
+            patch.object(cli, "target_desks", return_value=[record]),
+            patch.object(cli, "update_target") as update,
+            patch.object(cli, "ensure_observer"),
+            patch("ai_sessions.desk.view.run"),
+        ):
+            factory.return_value.get.return_value = record
+            handles.return_value.current_key.return_value = native_key("codex", "new")
+            self.assertEqual(cli.main(["view", "lego-sup-1"]), 0)
+            discover.assert_called_once()
+            save.assert_called_once_with([old, new])
+            update.assert_called_once_with(factory.return_value, record, new)
+
+    def test_existing_ambiguous_canonical_copy_does_not_trigger_retry(self):
+        from ai_sessions.references import native_key
+
+        item = Session("codex", "new", "Supervisor", ".", 0, 0, "", True, "new.jsonl")
+        with (
+            patch("ai_sessions.desk.cli.Store") as factory,
+            patch("ai_sessions.handles.HandleStore") as handles,
+            patch("ai_sessions.handles_cli.catalog", return_value=([item, item], object())),
+            patch("ai_sessions.references.resolve_session", side_effect=ValueError("ambiguous")),
+            patch("ai_sessions.app.load_sessions") as discover,
+        ):
+            handles.return_value.current_key.return_value = native_key("codex", "new")
+            with self.assertRaisesRegex(ValueError, "ambiguous"):
+                cli.resolve_desk_name(factory.return_value, "lego-sup-1", update=True)
+            discover.assert_not_called()
