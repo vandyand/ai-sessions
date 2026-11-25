@@ -166,6 +166,21 @@ def ensure_record(store, item, state):
         return name
 
 
+def _live_desk_member(members):
+    from ..detached import _live_remembered, remembered
+    from ..references import native_key
+
+    live = set()
+    for entry in remembered().values():
+        tool, session_id, home = (entry.get(field) for field in ("tool", "session_id", "home"))
+        if not all(isinstance(value, str) and value for value in (tool, session_id, home)):
+            continue
+        key = native_key(tool, session_id, home)
+        if key in members and key == native_key(tool, session_id) and _live_remembered(entry):
+            live.add(key)
+    return next(iter(live)) if len(live) == 1 else None
+
+
 def resolve_desk_name(store, reference, *, update=False, create=False):
     from ..handles import HandleStore
 
@@ -174,19 +189,42 @@ def resolve_desk_name(store, reference, *, update=False, create=False):
     except KeyError:
         saved = None
     # A saved name that is also a session handle must follow its linked copy.
+    live = None
     if saved is not None:
+        handles = HandleStore()
         try:
-            current = HandleStore().current_key(reference)
+            current = handles.current_key(reference)
         except ValueError:
             # A retired/unavailable handle must not invalidate an existing desk name.
             return reference
         if current is None:
             return reference
+        members = set(handles.lookup_members(reference) or ())
+        if len(members) > 1:
+            live = _live_desk_member(members)
     from ..handles_cli import catalog
-    from ..references import resolve_session
+    from ..references import native_key, resolve_session
 
     items, state = catalog()
-    item = resolve_session(reference, items, store=getattr(state, "slugs", None))
+    slugs = getattr(state, "slugs", None)
+    target = f"{live.tool}:{live.session_id}" if live else reference
+    try:
+        item = resolve_session(target, items, store=slugs)
+    except ValueError:
+        # Switching harnesses can move the canonical handle before the saved
+        # catalog sees the new copy. Refresh only for a known, missing key.
+        key = live or HandleStore(slugs.path if slugs is not None else None).current_key(reference)
+        if key is None or any(native_key(row.tool, row.session_id) == key for row in items):
+            raise
+        from ..app import load_sessions, save_session_catalog
+
+        items = load_sessions(state=state)
+        item = resolve_session(target, items, store=slugs)
+        if native_key(item.tool, item.session_id) != key:
+            raise ValueError(f"Handle {reference!r} changed during discovery; try again") from None
+        save_session_catalog(items)
+    if live and native_key(item.tool, item.session_id) != live:
+        raise ValueError(f"The running copy of {reference!r} changed during discovery; try again")
     matches = target_desks(store, item, state)
     if not matches and create:
         if item.compressed or not item.storage:

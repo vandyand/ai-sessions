@@ -1,5 +1,11 @@
 # Changelog
 
+## 3.22.1.post1 — 2026-11-25
+
+- Open an existing Desk by its short name after switching its supervisor to
+  another harness. Refresh the catalog when the linked session is missing and
+  prefer the uniquely verified running copy.
+
 ## 3.22.1 — 2026-11-23
 
 - Deliver a Grok peer message by writing the owner pipe directly. Do not run
