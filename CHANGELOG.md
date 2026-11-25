@@ -32,6 +32,12 @@
 - Preserve every unanswered Desk request while bounding the model working set. Archive closed/superseded requests, expose review candidates and revision-checked dismissal, and retain original context.
 - Restore Desk updates when accumulated pending requests exceed the old aggregate prompt limit; add reset/restart and identity/identify aliases while preserving Grok integration.
 
+## 3.22.1.post1 — 2026-11-25
+
+- Open an existing Desk by its short name after switching its supervisor to
+  another harness. Refresh the catalog when the linked session is missing and
+  prefer the uniquely verified running copy.
+
 ## 3.22.1 — 2026-11-23
 
 - Deliver a Grok peer message by writing the owner pipe directly. Do not run
