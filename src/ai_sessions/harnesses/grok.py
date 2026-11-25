@@ -490,7 +490,7 @@ def change_status(ref: NativeRef, checkpoint_value) -> str:
         previous = int(checkpoint_value)
     except (TypeError, ValueError):
         return "unknown"
-    return "advanced" if current > previous else "unchanged"
+    return "changed" if current > previous else "unchanged"
 
 
 def resume_args(
